@@ -1,0 +1,26 @@
+[package]
+name = "buttercup-eye-tracking"
+version = "0.1.0"
+edition = "2021"
+default-run = "buttercup-eye-viewer"
+
+[dependencies]
+serde_json = "1.0"
+softbuffer = { version = "0.4.8", default-features = false, features = ["wayland", "wayland-dlopen"] }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen"] }
+opencv = { version = "0.92.3", optional = true, default-features = false, features = ["clang-runtime", "imgproc", "calib3d"] }
+tch = { version = "0.22.0", optional = true }
+
+[features]
+default = ["checkerboard"]
+checkerboard = ["dep:opencv"]
+sam31 = ["dep:opencv", "dep:tch"]
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+
+[[bin]]
+name = "buttercup-eye-viewer"
+path = "src/main.rs"

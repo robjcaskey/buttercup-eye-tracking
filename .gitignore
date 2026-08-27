@@ -1,0 +1,42 @@
+/data
+/outputs
+/target
+
+# Local configuration and editor/OS state.
+.env
+.env.*
+!.env.example
+.DS_Store
+*.swp
+*.swo
+
+# Captures, recordings, weights, and compiled/vendor artifacts do not belong
+# in this source repository.
+*.log
+*.jsonl
+*.raw
+*.raw10
+*.gray16le
+*.nv12
+*.yuv
+*.dng
+*.tar
+*.zip
+*.7z
+*.mkv
+*.mp4
+*.ppm
+*.pgm
+*.pnm
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.pt
+*.pth
+*.onnx
+*.so
+*.ko
+*.dll
+*.exe
+*.bin
