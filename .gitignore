@@ -29,6 +29,7 @@
 *.pgm
 *.pnm
 *.png
+!docs/viewer-overview.png
 *.jpg
 *.jpeg
 *.webp

@@ -1,36 +1,35 @@
-# Buttercup eye tracking
+# Buttercup
 
-A host-side Rust eye tracker and Wayland viewer. The project consumes lossless
-RAW eye frames from an already-running camera service over TCP. It does not
-contain, install, start, or modify camera firmware, kernel modules, USB/UVC
-drivers, sensor code, or a proprietary camera application.
+Buttercup is an experimental Rust viewer and analysis workspace for lossless
+RAW eye-camera data.
 
-## Build
+![Buttercup viewer with sensor overview and eye ROIs](docs/viewer-overview.png)
+
+It combines a coarse sensor view with native-resolution eye regions and makes
+its motion, segmentation, and projected-geometry state visible. The approach
+could be useful for low-latency gaze input, calibration, and related
+camera-space interaction work, but it is still a research prototype.
+
+Buttercup expects a compatible external RAW camera service over TCP. Camera
+firmware and device-side control live elsewhere.
+
+Coarse semantic reacquisition uses the MediaPipe Tasks C ABI directly from
+Rust. It consumes a lossless 500x375 GRAY16 sensor overview, converts the
+linear 10-bit samples in process, and reads the refined iris landmarks without
+starting Python, loading libpython, or importing a Python package.
+
+The native runtime and face-landmarker model are external runtime data and are
+not stored in Git. By default Buttercup looks for them at:
+
+```text
+data/runtime/mediapipe/libmediapipe.so
+data/models/mediapipe/face_landmarker.task
+```
+
+Set `BUTTERCUP_MEDIAPIPE_LIBRARY` and `BUTTERCUP_MEDIAPIPE_MODEL` to use other
+locations.
 
 ```bash
 cargo build --release
-```
-
-The default build includes checkerboard camera-intrinsics calibration. The
-optional SAM 3.1 adapter is source-only and requires an externally supplied
-model/runtime:
-
-```bash
-cargo build --release --features sam31
-```
-
-## Run
-
-With a compatible camera service already available:
-
-```bash
 scripts/run-viewer.sh
 ```
-
-Addresses and initial sensor coordinates are supplied through `BUTTERCUP_*`
-environment variables documented in the launcher. No camera provider is
-started by this repository.
-
-Runtime output is stored through `data` and `outputs`, both of which resolve
-to the separate `/mnt/bulk_data/buttercup-eye-tracking` data root. Run
-`scripts/audit-tree.sh` to verify the source-tree boundary and file allowlist.

@@ -2,6 +2,7 @@
 
 use softbuffer::{Context, Surface};
 mod checkerboard_calibration;
+mod native_mediapipe;
 mod offline_segmentation_replay;
 mod pupil_clock_supervision;
 mod raw10;
@@ -345,6 +346,8 @@ const MEDIAPIPE_REACQUIRE: &str = "MEDIAPIPE_REACQUIRE:";
 const MEDIAPIPE_REFRESH: &str = "MEDIAPIPE_REFRESH:";
 const LINEAR_SNAPSHOT: &str = "LINEAR_SNAPSHOT:";
 const LINEAR_SNAPSHOT_METADATA: &str = "/tmp/buttercup-raw-mediapipe-linear.json";
+const LINEAR_SNAPSHOT_GRAY16: &str = "/tmp/buttercup-raw-mediapipe-linear.gray16le";
+const GLOBAL_PRESENTATION_PPM: &str = "/tmp/buttercup-latest-tracking.ppm";
 const MEDIAPIPE_TASK_COMPLETE: &str = "MEDIAPIPE_TASK_COMPLETE";
 const MANUAL_ROI_UPDATE: &str = "MANUAL_ROI_UPDATE";
 const MEDIAPIPE_FULL_BASE_CACHE: &str = "/tmp/buttercup-mediapipe-full-base.ppm";
@@ -1337,7 +1340,39 @@ struct Config {
     segmentation: SegmentationMode,
     rough_pupil_center: RoughPupilCenterMode,
     driving_submode: DrivingSubmode,
+    global_capture_format: GlobalCaptureFormat,
     sam31_model: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum GlobalCaptureFormat {
+    #[default]
+    Gray16,
+    Raw10,
+}
+
+impl GlobalCaptureFormat {
+    fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "gray16" | "gray" | "luma" => Some(Self::Gray16),
+            "raw10" | "raw" | "bayer" => Some(Self::Raw10),
+            _ => None,
+        }
+    }
+
+    fn protocol_name(self) -> &'static str {
+        match self {
+            Self::Gray16 => "GRAY16",
+            Self::Raw10 => "RAW10",
+        }
+    }
+
+    fn dimensions(self) -> (usize, usize) {
+        match self {
+            Self::Gray16 => (500, 375),
+            Self::Raw10 => (1000, 750),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1572,9 +1607,9 @@ fn provisional_focus_from_uncropped_receipt(
     Ok(Some(ProvisionalFocusVerification {
         anchor_position,
         candidate_position,
-        // The acquisition helper re-ran the semantic detector on a second
-        // full-sensor exposure at the selected DAC. Native fine-eye anatomy
-        // is still required before the rollback anchor is released.
+        // The uncropped focus transaction verified the selected DAC on a
+        // second full-sensor exposure. Native fine-eye anatomy is still
+        // required before the rollback anchor is released.
         semantic_verified: true,
     }))
 }
@@ -6793,6 +6828,9 @@ struct SharedState {
     reacquire_request: Option<String>,
     linear_snapshot_request: bool,
     reacquire_status: Option<String>,
+    /// Native runtime/model availability is separate from the user's R freeze
+    /// so radius learning can remain active when coarse inference is absent.
+    semantic_reacquisition_unavailable: bool,
     mediapipe_reacquisition_disabled: bool,
     mediapipe_reacquisition_generation: u64,
     contrast_percent: u16,
@@ -6806,6 +6844,9 @@ struct SharedState {
     raw_export_request: Option<RawExportRequest>,
     raw_export_result: Option<RawExportResult>,
     next_raw_export_id: u64,
+    /// One-shot lossless export of the viewer's own composed framebuffer.
+    /// This is fulfilled by the render thread and never captures the desktop.
+    presentation_export_request: Option<PathBuf>,
     timed_record_request: Option<TimedRecordRequest>,
     timed_record_result: Option<TimedRecordResult>,
     next_timed_record_id: u64,
@@ -7584,7 +7625,7 @@ fn camera_automation_allowed(shared: &Arc<Mutex<SharedState>>) -> bool {
 }
 
 fn selected_mediapipe_cadence(state: &SharedState) -> MediaPipeCadence {
-    if state.mediapipe_reacquisition_disabled {
+    if state.semantic_reacquisition_unavailable || state.mediapipe_reacquisition_disabled {
         return MediaPipeCadence::None;
     }
     let requested = state
@@ -7595,7 +7636,9 @@ fn selected_mediapipe_cadence(state: &SharedState) -> MediaPipeCadence {
 }
 
 fn effective_mediapipe_cadence_label(state: &SharedState) -> &'static str {
-    if state.mediapipe_reacquisition_disabled {
+    if state.semantic_reacquisition_unavailable {
+        "native-runtime-unavailable"
+    } else if state.mediapipe_reacquisition_disabled {
         "disabled-by-r"
     } else {
         selected_mediapipe_cadence(state).requirement_label()
@@ -7622,6 +7665,9 @@ fn authorize_mediapipe_task(
         return Ok(MediaPipeTaskAuthorization {
             reacquisition_generation: None,
         });
+    }
+    if state.semantic_reacquisition_unavailable {
+        return Err("the native MediaPipe runtime or face-landmarker model is unavailable");
     }
     if state.mediapipe_reacquisition_disabled {
         return Err("R disabled semantic ROI reacquisition");
@@ -7697,6 +7743,10 @@ fn mediapipe_reacquisition_enabled(shared: &Arc<Mutex<SharedState>>) -> bool {
                 .manual_camera_tuning_until
                 .is_some_and(|until| Instant::now() < until)
     })
+}
+
+fn native_semantic_reacquisition_available() -> Result<native_mediapipe::RuntimePaths, String> {
+    native_mediapipe::RuntimePaths::discover()
 }
 
 fn mediapipe_continuous_refresh_enabled(shared: &Arc<Mutex<SharedState>>) -> bool {
@@ -8996,6 +9046,15 @@ fn handle_control_command(command: &str, shared: &Arc<Mutex<SharedState>>) -> St
             "{\"ok\":true,\"queued\":\"roi-auto\"}".to_string()
         }
         [reacquire] if reacquire.eq_ignore_ascii_case("REACQUIRE") => {
+            if state.semantic_reacquisition_unavailable {
+                state.linear_snapshot_request = true;
+                state.reacquire_status = Some(
+                    "NATIVE MEDIAPIPE UNAVAILABLE; SENSOR OVERVIEW REFRESH QUEUED".to_string(),
+                );
+                return control_error(
+                    "native MediaPipe runtime/model is unavailable; queued a sensor overview refresh",
+                );
+            }
             if state.mediapipe_reacquisition_disabled {
                 return control_error("MediaPipe reacquisition is disabled by the R toggle");
             }
@@ -9035,6 +9094,23 @@ fn handle_control_command(command: &str, shared: &Arc<Mutex<SharedState>>) -> St
                 }
                 Err(error) => control_error(error),
             }
+        }
+        [export, presentation, path]
+            if export.eq_ignore_ascii_case("EXPORT")
+                && presentation.eq_ignore_ascii_case("PRESENTATION") =>
+        {
+            let path = PathBuf::from(path);
+            if !path.is_absolute() {
+                return control_error("presentation export path must be absolute");
+            }
+            if state.presentation_export_request.is_some() {
+                return control_error("a presentation export is already pending");
+            }
+            state.presentation_export_request = Some(path.clone());
+            format!(
+                "{{\"ok\":true,\"queued\":\"presentation-export\",\"path\":{}}}",
+                json_string(&path.to_string_lossy()),
+            )
         }
         [record, raw, side, seconds, path]
             if record.eq_ignore_ascii_case("RECORD") && raw.eq_ignore_ascii_case("RAW") =>
@@ -9128,7 +9204,7 @@ fn handle_control_command(command: &str, shared: &Arc<Mutex<SharedState>>) -> St
             }
         }
         [help] if help.eq_ignore_ascii_case("HELP") => {
-            "{\"ok\":true,\"commands\":[\"PING\",\"STATUS\",\"CHECKERBOARD START|STOP|RESET|STATUS\",\"SEGMENTATION NATIVE|SAM31|CLUSTERS|DRIVING\",\"SEGMENTATION STATUS\",\"IRIS STATUS\",\"IRIS BOUNDS MINIMUM|MAXIMUM +|-\",\"IRIS BOUNDS AUTO\",\"PUPIL STATUS\",\"PUPIL BOUNDS MINIMUM|MAXIMUM +|-\",\"PUPIL BOUNDS DEFAULT\",\"PUPIL CENTER IRIS-GUIDED|RAW-FOCUS|SAM31-CENTER|MEDIAPIPE-ACQUIRE|MEDIAPIPE-CONTINUOUS|DRIVING-TOPOLOGY\",\"PUPIL|IRIS RETICLE OFF|STATIC|PROJECTED|ON|TOGGLE\",\"EYE LASER ON|OFF|TOGGLE|STATUS\",\"DRIVING NORMAL|DOUBLE-SCLERA-10DEG|STATUS\",\"LEASE CLAIM OWNER TTL_MS\",\"LEASE RENEW TOKEN TTL_MS\",\"LEASE RELEASE TOKEN\",\"LEASE STATUS\",\"WITH TOKEN REACQUIRE\",\"WITH TOKEN LINEAR SNAPSHOT\",\"WITH TOKEN ROI HOLD RIGHT_X RIGHT_Y LEFT_X LEFT_Y\",\"WITH TOKEN ROI AUTO\",\"WITH TOKEN FOCUS EYE RIGHT|LEFT\",\"WITH TOKEN FOCUS SET N\",\"WITH TOKEN FOCUS AUTO\",\"WITH TOKEN EXPORT RAW RIGHT /absolute/path.raw10\",\"WITH TOKEN EXPORT RAW BOTH /absolute/prefix\",\"WITH TOKEN RECORD RAW BOTH SECONDS /absolute/file.tar\",\"RECORD STATUS\",\"EXPORT ANNOTATED RIGHT|LEFT|BOTH /absolute/path.ppm\",\"EXPORT ANNOTATED RIGHT|LEFT|BOTH QUAD_COLOR|RAW_COLOR|BLUE_FILTER|RED_FILTER|GREEN_FILTER|SPECULAR_MAP|CROSS_POLARIZED|DIFFUSE|QUAD_LUMA|RAW_LUMA|CANNY /absolute/path.ppm\",\"EXPORT STATUS\"]}".to_string()
+            "{\"ok\":true,\"commands\":[\"PING\",\"STATUS\",\"CHECKERBOARD START|STOP|RESET|STATUS\",\"SEGMENTATION NATIVE|SAM31|CLUSTERS|DRIVING\",\"SEGMENTATION STATUS\",\"IRIS STATUS\",\"IRIS BOUNDS MINIMUM|MAXIMUM +|-\",\"IRIS BOUNDS AUTO\",\"PUPIL STATUS\",\"PUPIL BOUNDS MINIMUM|MAXIMUM +|-\",\"PUPIL BOUNDS DEFAULT\",\"PUPIL CENTER IRIS-GUIDED|RAW-FOCUS|SAM31-CENTER|MEDIAPIPE-ACQUIRE|MEDIAPIPE-CONTINUOUS|DRIVING-TOPOLOGY\",\"PUPIL|IRIS RETICLE OFF|STATIC|PROJECTED|ON|TOGGLE\",\"EYE LASER ON|OFF|TOGGLE|STATUS\",\"DRIVING NORMAL|DOUBLE-SCLERA-10DEG|STATUS\",\"LEASE CLAIM OWNER TTL_MS\",\"LEASE RENEW TOKEN TTL_MS\",\"LEASE RELEASE TOKEN\",\"LEASE STATUS\",\"WITH TOKEN REACQUIRE\",\"WITH TOKEN LINEAR SNAPSHOT\",\"WITH TOKEN ROI HOLD RIGHT_X RIGHT_Y LEFT_X LEFT_Y\",\"WITH TOKEN ROI AUTO\",\"WITH TOKEN FOCUS EYE RIGHT|LEFT\",\"WITH TOKEN FOCUS SET N\",\"WITH TOKEN FOCUS AUTO\",\"WITH TOKEN EXPORT RAW RIGHT /absolute/path.raw10\",\"WITH TOKEN EXPORT RAW BOTH /absolute/prefix\",\"WITH TOKEN RECORD RAW BOTH SECONDS /absolute/file.tar\",\"RECORD STATUS\",\"EXPORT PRESENTATION /absolute/path.ppm\",\"EXPORT ANNOTATED RIGHT|LEFT|BOTH /absolute/path.ppm\",\"EXPORT ANNOTATED RIGHT|LEFT|BOTH QUAD_COLOR|RAW_COLOR|BLUE_FILTER|RED_FILTER|GREEN_FILTER|SPECULAR_MAP|CROSS_POLARIZED|DIFFUSE|QUAD_LUMA|RAW_LUMA|CANNY /absolute/path.ppm\",\"EXPORT STATUS\"]}".to_string()
         }
         [] => control_error("empty command"),
         _ => control_error("unknown command; send HELP"),
@@ -27606,9 +27682,11 @@ impl RawRoiTracker {
                 .unwrap_or_else(ContextTranslation::rejected)
         };
         if bootstrap && translation.motion.is_none() {
-            let mut identity = [false; 2];
-            identity[required_eye.min(1)] = true;
-            self.set_context_identity_present(identity);
+            // This bootstrap follows a face-landmarker result that supplied
+            // both semantic iris centers. Stale fine patches are allowed to
+            // disprove neither slot; they only become the new appearance
+            // keyframe after the typed two-eye acquisition is accepted.
+            self.set_context_identity_present([true; 2]);
             self.context_failures = 0;
             self.context_lock = true;
             self.context_residual = [(0, 0); 2];
@@ -28184,18 +28262,29 @@ fn tracking_config(current: &Config) -> Result<Config, String> {
         .map_err(|error| format!("read MediaPipe ROI document: {error}"))?;
     let document = parse_tracking_roi_document(&text)?;
     let centers = tracking_roi_centers(&document);
+    tracking_config_from_sensor_centers(
+        current,
+        centers,
+        PathBuf::from("/tmp/buttercup-latest-tracking.ppm"),
+        "MediaPipe ROI document",
+    )
+}
+
+fn tracking_config_from_sensor_centers(
+    current: &Config,
+    centers: [(u32, u32); 2],
+    tracking: PathBuf,
+    source: &str,
+) -> Result<Config, String> {
     let eye = current.eye_size;
     let average_y = ((centers[0].1 as u64 + centers[1].1 as u64) / 2) as i64;
     let absolute = |center: u32, extent: u32, sensor: u32, alignment: u32| {
         let value = (center as i64 - extent as i64 / 2).clamp(0, (sensor - extent) as i64) as u32;
         value & !(alignment - 1)
     };
-    let eyes = centers.map(|center| {
-        (
-            absolute(center.0, eye.0, 8000, 4),
-            absolute(center.1, eye.1, 6000, 2),
-        )
-    });
+    let horizontal = centers.map(|center| absolute(center.0, eye.0, SENSOR_WIDTH, 4));
+    let vertical = fit_eye_centers_into_fine_band(centers.map(|center| center.1), eye.1)?;
+    let eyes = [(horizontal[0], vertical[0]), (horizontal[1], vertical[1])];
     validate_anatomical_roi_geometry(eyes, eye)?;
     let minimum_y = eyes[0].1.min(eyes[1].1);
     let maximum_y = (eyes[0].1 + eye.1).max(eyes[1].1 + eye.1);
@@ -28221,12 +28310,12 @@ fn tracking_config(current: &Config) -> Result<Config, String> {
     next.origin = (origin_x, origin_y);
     next.window_size = window;
     next.eyes = eyes;
-    next.tracking = Some(PathBuf::from("/tmp/buttercup-latest-tracking.ppm"));
+    next.tracking = Some(tracking);
     // A successful current-subject acquisition re-arms autofocus. Loss of the
     // prior subject deliberately disarms it until this confirmation succeeds.
     next.autofocus_armed = true;
     eprintln!(
-        "MediaPipe live reacquisition sensor centers image-left={},{} image-right={},{}; window={},{} {}x{}; ROIs={},{} and {},{}",
+        "{source} live reacquisition sensor centers image-left={},{} image-right={},{}; window={},{} {}x{}; ROIs={},{} and {},{}",
         centers[0].0,
         centers[0].1,
         centers[1].0,
@@ -28241,6 +28330,64 @@ fn tracking_config(current: &Config) -> Result<Config, String> {
         eyes[1].1,
     );
     Ok(next)
+}
+
+/// Place both true semantic eye centers inside fixed-size slices while keeping
+/// the slices in one resident sensor band. A rolled head can separate the
+/// centers by more than `band_height - eye_height`; centering both rectangles
+/// would then reject valid anatomy. Shift the rectangles toward each other,
+/// retaining a guard around each actual center and leaving RAW pixels native.
+fn fit_eye_centers_into_fine_band(center_y: [u32; 2], eye_height: u32) -> Result<[u32; 2], String> {
+    if eye_height == 0 || eye_height > FINE_SENSOR_WINDOW_HEIGHT || eye_height > SENSOR_HEIGHT {
+        return Err("eye slice height cannot fit the resident fine sensor band".to_string());
+    }
+    let centered = center_y.map(|center| {
+        (center as i64 - eye_height as i64 / 2).clamp(0, (SENSOR_HEIGHT - eye_height) as i64) as u32
+            & !1
+    });
+    // The local tracker also bounds anatomical vertical slice displacement by
+    // one crop height. Respect the tighter of that bound and physical band
+    // containment so the semantic seed remains a valid subsequent baseline.
+    let maximum_top_delta = eye_height.min(FINE_SENSOR_WINDOW_HEIGHT - eye_height) & !1;
+    let current_delta = centered[0].abs_diff(centered[1]);
+    if current_delta <= maximum_top_delta {
+        return Ok(centered);
+    }
+
+    let (upper_index, lower_index) = if centered[0] <= centered[1] {
+        (0usize, 1usize)
+    } else {
+        (1usize, 0usize)
+    };
+    let combined = centered[upper_index] as i64 + centered[lower_index] as i64;
+    let mut upper = ((combined - maximum_top_delta as i64) / 2)
+        .clamp(0, (SENSOR_HEIGHT - eye_height - maximum_top_delta) as i64)
+        as u32;
+    upper &= !1;
+    let lower = upper + maximum_top_delta;
+    let mut fitted = [0u32; 2];
+    fitted[upper_index] = upper;
+    fitted[lower_index] = lower;
+
+    let vertical_guard = CONTEXT_ROI_CONTAINMENT_MARGIN.1.max(0) as u32;
+    for index in 0..2 {
+        if center_y[index] < fitted[index].saturating_add(vertical_guard)
+            || center_y[index]
+                >= fitted[index]
+                    .saturating_add(eye_height)
+                    .saturating_sub(vertical_guard)
+        {
+            return Err(format!(
+                "semantic eye centers are too vertically separated for guarded {}px slices in the {}px resident band: centers={center_y:?}",
+                eye_height, FINE_SENSOR_WINDOW_HEIGHT,
+            ));
+        }
+    }
+    eprintln!(
+        "semantic tilted-face packing retained true eye centers {center_y:?} by offsetting fine ROI tops {centered:?} -> {fitted:?} inside the {}px sensor band",
+        FINE_SENSOR_WINDOW_HEIGHT,
+    );
+    Ok(fitted)
 }
 
 fn apply_eye_config(config: &Config) -> Result<(), String> {
@@ -28336,6 +28483,392 @@ fn ensure_fine_sensor_mode(config: &Config) -> Result<(), String> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GlobalCapturePacketInfo {
+    sequence: u64,
+    timestamp_ns: u64,
+    width: usize,
+    height: usize,
+    stride: usize,
+    payload_bytes: usize,
+}
+
+fn validate_global_capture_header(
+    bytes: &[u8; HEADER_BYTES],
+    requested_format: GlobalCaptureFormat,
+    requested_sequence: u64,
+    requested_width: usize,
+    requested_height: usize,
+) -> Result<GlobalCapturePacketInfo, String> {
+    if le16(bytes, 4) != 1 || le16(bytes, 6) as usize != HEADER_BYTES {
+        return Err("invalid global capture packet header".to_string());
+    }
+    let status = le32(bytes, 8) as i32;
+    if status != 0 {
+        return Err(format!(
+            "camera refused global capture with status {status}"
+        ));
+    }
+    let (magic, format, pixel_format, stride) = match requested_format {
+        GlobalCaptureFormat::Gray16 => (
+            b"OTH1".as_slice(),
+            GRAY16_FORMAT,
+            16,
+            requested_width.saturating_mul(2),
+        ),
+        GlobalCaptureFormat::Raw10 => (
+            b"ORT1".as_slice(),
+            RAW10_FORMAT,
+            RAW10_PIXEL,
+            requested_width / 4 * 5,
+        ),
+    };
+    let width = le32(bytes, 40) as usize;
+    let height = le32(bytes, 44) as usize;
+    let declared_stride = le32(bytes, 48) as usize;
+    let payload_bytes = le32(bytes, 52) as usize;
+    if &bytes[0..4] != magic
+        || le32(bytes, 12) != format
+        || le64(bytes, 16) != requested_sequence
+        || le32(bytes, 32) != 0
+        || le32(bytes, 36) != 0
+        || width != requested_width
+        || height != requested_height
+        || declared_stride != stride
+        || payload_bytes != stride.saturating_mul(height)
+        || le32(bytes, 56) != pixel_format
+    {
+        return Err(format!(
+            "global {} response geometry or format does not match the request",
+            requested_format.protocol_name(),
+        ));
+    }
+    Ok(GlobalCapturePacketInfo {
+        sequence: le64(bytes, 16),
+        timestamp_ns: le64(bytes, 24),
+        width,
+        height,
+        stride,
+        payload_bytes,
+    })
+}
+
+fn phase_average_raw10_to_gray16(
+    raw: &[u16],
+    width: usize,
+    height: usize,
+) -> Result<(Vec<u16>, usize, usize), String> {
+    if width & 1 != 0 || height & 1 != 0 || raw.len() != width.saturating_mul(height) {
+        return Err("RAW10 global frame cannot be phase-averaged as 2x2 Bayer cells".to_string());
+    }
+    let output_width = width / 2;
+    let output_height = height / 2;
+    let mut gray = Vec::with_capacity(output_width * output_height);
+    for y in (0..height).step_by(2) {
+        for x in (0..width).step_by(2) {
+            let sum = u32::from(raw[y * width + x])
+                + u32::from(raw[y * width + x + 1])
+                + u32::from(raw[(y + 1) * width + x])
+                + u32::from(raw[(y + 1) * width + x + 1]);
+            gray.push((sum / 4) as u16);
+        }
+    }
+    Ok((gray, output_width, output_height))
+}
+
+/// Display-only bilinear demosaic for the conventional RGGB mosaic emitted by
+/// Podbay's 4x4-binned/scaled global sensor mode. The transported RAW10 values
+/// remain untouched; this conversion is used only for the coarse backdrop.
+fn global_rggb_color_preview(
+    raw: &[u16],
+    width: usize,
+    height: usize,
+    contrast_percent: u16,
+) -> Vec<u32> {
+    if width < 4 || height < 4 || width & 1 != 0 || height & 1 != 0 {
+        return context_display(raw);
+    }
+    let mut sums = [0u64; 3];
+    let mut counts = [0u64; 3];
+    for y in 0..height {
+        for x in 0..width {
+            let channel = match (y & 1, x & 1) {
+                (0, 0) => 0,
+                (1, 1) => 2,
+                _ => 1,
+            };
+            let value = raw[y * width + x];
+            if value < 1016 {
+                sums[channel] += u64::from(value);
+                counts[channel] += 1;
+            }
+        }
+    }
+    let means: [f64; 3] =
+        std::array::from_fn(|channel| sums[channel] as f64 / counts[channel].max(1) as f64);
+    let gains = [
+        (means[1] / means[0].max(1.0)).clamp(0.25, 4.0),
+        1.0,
+        (means[1] / means[2].max(1.0)).clamp(0.25, 4.0),
+    ];
+    let reflect = |index: isize, length: usize| -> usize {
+        if index < 0 {
+            (-index) as usize
+        } else if index >= length as isize {
+            (2 * length as isize - index - 2) as usize
+        } else {
+            index as usize
+        }
+    };
+    let at = |x: isize, y: isize| -> f64 {
+        f64::from(raw[reflect(y, height) * width + reflect(x, width)])
+    };
+    let mut linear = Vec::with_capacity(raw.len());
+    let mut luma = Vec::with_capacity(raw.len());
+    for y in 0..height {
+        for x in 0..width {
+            let x = x as isize;
+            let y = y as isize;
+            let center = at(x, y);
+            let horizontal = (at(x - 1, y) + at(x + 1, y)) * 0.5;
+            let vertical = (at(x, y - 1) + at(x, y + 1)) * 0.5;
+            let diagonal =
+                (at(x - 1, y - 1) + at(x + 1, y - 1) + at(x - 1, y + 1) + at(x + 1, y + 1)) * 0.25;
+            let mut pixel = match (y as usize & 1, x as usize & 1) {
+                (0, 0) => [center, (horizontal + vertical) * 0.5, diagonal],
+                (0, 1) => [horizontal, center, vertical],
+                (1, 0) => [vertical, center, horizontal],
+                (1, 1) => [diagonal, (horizontal + vertical) * 0.5, center],
+                _ => unreachable!(),
+            };
+            for channel in 0..3 {
+                pixel[channel] *= gains[channel];
+            }
+            luma.push(((pixel[0] + 2.0 * pixel[1] + pixel[2]) * 0.25) as u16);
+            linear.push(pixel);
+        }
+    }
+    let (low, high) = percentile_range(&luma);
+    let span = f64::from(high.saturating_sub(low).max(1));
+    linear
+        .into_iter()
+        .map(|pixel| {
+            let channel = |value: f64| {
+                let baseline = (value - f64::from(low)) * 255.0 / span;
+                (128.0 + (baseline - 128.0) * f64::from(contrast_percent) / 100.0)
+                    .round()
+                    .clamp(0.0, 255.0) as u32
+            };
+            (channel(pixel[0]) << 16) | (channel(pixel[1]) << 8) | channel(pixel[2])
+        })
+        .collect()
+}
+
+fn publish_linear_gray16_snapshot(
+    samples: &[u16],
+    width: usize,
+    height: usize,
+    sequence: u64,
+    timestamp_ns: u64,
+) -> Result<(), String> {
+    if samples.len() != width.saturating_mul(height) || samples.iter().any(|sample| *sample > 1023)
+    {
+        return Err("linear GRAY16 snapshot violates its 10-bit sample contract".to_string());
+    }
+    let mut payload = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        payload.extend_from_slice(&sample.to_le_bytes());
+    }
+    let payload_path = Path::new(LINEAR_SNAPSHOT_GRAY16);
+    let payload_temporary = payload_path.with_extension("gray16le.new");
+    fs::write(&payload_temporary, payload)
+        .and_then(|()| fs::rename(&payload_temporary, payload_path))
+        .map_err(|error| format!("publish linear GRAY16 payload: {error}"))?;
+    let metadata = format!(
+        "{{\n  \"schema\": \"buttercup-linear-sensor-thumbnail-v1\",\n  \"sample_format\": \"gray16le-linear-raw-average\",\n  \"sample_max\": 1023,\n  \"sensor_x\": 0,\n  \"sensor_y\": 0,\n  \"width\": {width},\n  \"height\": {height},\n  \"sequence\": {sequence},\n  \"timestamp_ns\": {timestamp_ns},\n  \"payload\": {}\n}}\n",
+        json_string(LINEAR_SNAPSHOT_GRAY16),
+    );
+    let metadata_path = Path::new(LINEAR_SNAPSHOT_METADATA);
+    let metadata_temporary = metadata_path.with_extension("json.new");
+    fs::write(&metadata_temporary, metadata)
+        .and_then(|()| fs::rename(&metadata_temporary, metadata_path))
+        .map_err(|error| format!("publish linear snapshot metadata: {error}"))
+}
+
+struct GlobalPresentationCapture {
+    path: PathBuf,
+    gray: Vec<u16>,
+    gray_width: usize,
+    gray_height: usize,
+    sequence: u64,
+    timestamp_ns: u64,
+}
+
+fn capture_global_presentation(config: &Config) -> Result<GlobalPresentationCapture, String> {
+    let format = config.global_capture_format;
+    let (width, height) = format.dimensions();
+    let sequence = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64;
+    let address: SocketAddr = config
+        .camera
+        .parse()
+        .map_err(|error| format!("global capture camera address: {error}"))?;
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(3))
+        .map_err(|error| format!("connect global capture: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(12)))
+        .and_then(|()| stream.set_write_timeout(Some(Duration::from_secs(3))))
+        .map_err(|error| format!("configure global capture socket: {error}"))?;
+    writeln!(
+        stream,
+        "CAPTURE_GLOBAL {sequence} {width} {height} {}",
+        format.protocol_name(),
+    )
+    .map_err(|error| format!("request global {} capture: {error}", format.protocol_name()))?;
+    stream.flush().map_err(|error| error.to_string())?;
+    stream.shutdown(Shutdown::Write).ok();
+    let mut header = [0u8; HEADER_BYTES];
+    stream
+        .read_exact(&mut header)
+        .map_err(|error| format!("read global {} header: {error}", format.protocol_name()))?;
+    let info = validate_global_capture_header(&header, format, sequence, width, height)?;
+    let mut payload = vec![0u8; info.payload_bytes];
+    stream
+        .read_exact(&mut payload)
+        .map_err(|error| format!("read global {} payload: {error}", format.protocol_name()))?;
+
+    let (presentation, gray, gray_width, gray_height) = match format {
+        GlobalCaptureFormat::Gray16 => {
+            let gray = payload
+                .chunks_exact(2)
+                .map(|sample| u16::from_le_bytes([sample[0], sample[1]]))
+                .collect::<Vec<_>>();
+            let presentation = context_display(&gray);
+            (presentation, gray, width, height)
+        }
+        GlobalCaptureFormat::Raw10 => {
+            let raw = unpack_raw10(&payload, width, height, info.stride);
+            let presentation =
+                global_rggb_color_preview(&raw, width, height, DEFAULT_DISPLAY_CONTRAST_PERCENT);
+            let (gray, gray_width, gray_height) =
+                phase_average_raw10_to_gray16(&raw, width, height)?;
+            (presentation, gray, gray_width, gray_height)
+        }
+    };
+    publish_linear_gray16_snapshot(
+        &gray,
+        gray_width,
+        gray_height,
+        info.sequence,
+        info.timestamp_ns,
+    )?;
+    let path = PathBuf::from(GLOBAL_PRESENTATION_PPM);
+    export_eye_ppm(&path, &presentation, width, height)?;
+    eprintln!(
+        "captured full-sensor {} {}x{} and decoded its presentation on the host",
+        format.protocol_name(),
+        width,
+        height,
+    );
+    Ok(GlobalPresentationCapture {
+        path,
+        gray,
+        gray_width,
+        gray_height,
+        sequence: info.sequence,
+        timestamp_ns: info.timestamp_ns,
+    })
+}
+
+fn native_mediapipe_tracking_config(
+    current: &Config,
+    capture: &GlobalPresentationCapture,
+) -> Result<Config, String> {
+    let inference_started = Instant::now();
+    let (runtime, detection) = native_mediapipe::detect_eye_centers_gray10(
+        &capture.gray,
+        capture.gray_width,
+        capture.gray_height,
+    )?;
+    let sensor_centers = detection.eyes.map(|eye| {
+        (
+            (f64::from(eye.x) * f64::from(SENSOR_WIDTH))
+                .round()
+                .clamp(0.0, f64::from(SENSOR_WIDTH - 1)) as u32,
+            (f64::from(eye.y) * f64::from(SENSOR_HEIGHT))
+                .round()
+                .clamp(0.0, f64::from(SENSOR_HEIGHT - 1)) as u32,
+        )
+    });
+
+    // Publish the native result as a human-readable diagnostic contract. The
+    // live configuration below consumes the typed centers directly; JSON is
+    // never an inference or control dependency.
+    let rois = detection
+        .eyes
+        .iter()
+        .enumerate()
+        .map(|(index, eye)| {
+            let center_x = (f64::from(eye.x) * capture.gray_width as f64).round() as i64;
+            let center_y = (f64::from(eye.y) * capture.gray_height as f64).round() as i64;
+            let width = (f64::from(eye.eye_width) * capture.gray_width as f64 * 1.25)
+                .round()
+                .clamp(24.0, (capture.gray_width / 2).max(24) as f64)
+                as i64;
+            let height = (width as f64 * 0.70)
+                .round()
+                .clamp(18.0, capture.gray_height.max(18) as f64) as i64;
+            let x = (center_x - width / 2)
+                .clamp(0, capture.gray_width.saturating_sub(width as usize) as i64);
+            let y = (center_y - height / 2).clamp(
+                0,
+                capture.gray_height.saturating_sub(height as usize) as i64,
+            );
+            serde_json::json!({
+                "id": index + 1,
+                "x": x,
+                "y": y,
+                "width": width,
+                "height": height,
+                "iris_radius": eye.iris_radius,
+            })
+        })
+        .collect::<Vec<_>>();
+    let document = serde_json::json!({
+        "schema": "buttercup-native-mediapipe-eye-rois-v1",
+        "tracking_basis": [capture.gray_width, capture.gray_height],
+        "sensor_active": [0, 0, SENSOR_WIDTH, SENSOR_HEIGHT],
+        "presentation_sensor_active": [0, 0, SENSOR_WIDTH, SENSOR_HEIGHT],
+        "sequence": capture.sequence,
+        "timestamp_ns": capture.timestamp_ns,
+        "landmark_count": detection.landmark_count,
+        "runtime": runtime.library.file_name().and_then(|name| name.to_str()),
+        "model": runtime.model.file_name().and_then(|name| name.to_str()),
+        "rois": rois,
+    });
+    let path = Path::new("/tmp/buttercup-latest-eye-rois.json");
+    let temporary = path.with_extension("json.new");
+    let payload = serde_json::to_vec_pretty(&document)
+        .map_err(|error| format!("serialize native MediaPipe ROI diagnostic: {error}"))?;
+    fs::write(&temporary, payload)
+        .and_then(|()| fs::rename(&temporary, path))
+        .map_err(|error| format!("publish native MediaPipe ROI diagnostic: {error}"))?;
+    eprintln!(
+        "native Rust MediaPipe face landmarker found {} landmarks and two refined iris centers in {}ms",
+        detection.landmark_count,
+        inference_started.elapsed().as_millis(),
+    );
+    tracking_config_from_sensor_centers(
+        current,
+        sensor_centers,
+        capture.path.clone(),
+        "native MediaPipe",
+    )
+}
+
 fn write_franken_context_snapshot(frame: &ContextFrame) -> Result<PathBuf, String> {
     let path = PathBuf::from(format!(
         "/tmp/buttercup-franken-context-{}.raw",
@@ -28367,93 +28900,32 @@ fn write_franken_context_snapshot(frame: &ContextFrame) -> Result<PathBuf, Strin
 fn reacquire_with_mediapipe(
     current: &Config,
     restore_ready: &std::sync::mpsc::SyncSender<()>,
-    context_snapshot: Option<&Path>,
+    _context_snapshot: Option<&Path>,
     task_kind: MediaPipeTaskKind,
 ) -> Result<Config, String> {
     let phase_started = Instant::now();
     eprintln!("REACQUIRE_PHASE task={task_kind:?} phase=spawn_acquisition elapsed_ms=0");
-    let hint_x = ((current.eyes[0].0 as u64 + current.eyes[1].0 as u64 + current.eye_size.0 as u64)
-        / 2) as u32;
-    let hint_y = ((current.eyes[0].1 as u64 + current.eyes[1].1 as u64 + current.eye_size.1 as u64)
-        / 2) as u32;
-    let restore_mode = format!(
-        "{},{},{},{}",
-        current.origin.0, current.origin.1, current.window_size.0, current.window_size.1
+    let capture = capture_global_presentation(current)?;
+    // Podbay restores the prior fine sensor mode before it writes the
+    // completed capture packet. Release the eye receiver immediately; native
+    // inference runs in parallel with the newly resumed fine stream.
+    let _ = restore_ready.try_send(());
+    eprintln!(
+        "REACQUIRE_PHASE task={task_kind:?} phase=global_capture_complete elapsed_ms={}",
+        phase_started.elapsed().as_millis(),
     );
-    let ready_file = PathBuf::from(format!(
-        "/tmp/buttercup-mediapipe-fine-restored-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_file(&ready_file);
-    let acquisition_helper = env::var_os("BUTTERCUP_MEDIAPIPE_ACQUIRE_HELPER")
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            "semantic reacquisition requires an external helper named by BUTTERCUP_MEDIAPIPE_ACQUIRE_HELPER"
-                .to_string()
-        })?;
-    let mut command = Command::new("timeout");
-    command
-        .arg("45")
-        .arg(&acquisition_helper)
-        .env("BUTTERCUP_ACQUIRE_HINT_X", hint_x.to_string())
-        .env("BUTTERCUP_ACQUIRE_HINT_Y", hint_y.to_string())
-        .env("BUTTERCUP_RESTORE_SENSOR_MODE", restore_mode)
-        .env("BUTTERCUP_RESTORE_READY_FILE", &ready_file);
     if task_kind == MediaPipeTaskKind::LinearSnapshot {
-        command.env("BUTTERCUP_LINEAR_CAPTURE_ONLY", "1");
+        let mut next = current.clone();
+        next.tracking = Some(capture.path);
+        return Ok(next);
     }
-    if let Some(path) = context_snapshot {
-        command.env("BUTTERCUP_FRANKEN_CONTEXT_FILE", path);
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("start bounded MediaPipe acquisition: {error}"))?;
     eprintln!(
-        "REACQUIRE_PHASE task={task_kind:?} phase=acquisition_process_started elapsed_ms={}",
+        "REACQUIRE_PHASE task={task_kind:?} phase=native_inference_started elapsed_ms={}",
         phase_started.elapsed().as_millis(),
     );
-    let mut restore_announced = false;
-    let status = loop {
-        if !restore_announced && ready_file.is_file() {
-            let _ = restore_ready.try_send(());
-            restore_announced = true;
-            eprintln!(
-                "REACQUIRE_PHASE task={task_kind:?} phase=fine_sensor_restored elapsed_ms={}",
-                phase_started.elapsed().as_millis(),
-            );
-        }
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("wait for bounded MediaPipe acquisition: {error}"))?
-        {
-            break status;
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
-    if !restore_announced && ready_file.is_file() {
-        let _ = restore_ready.try_send(());
-        restore_announced = true;
-        eprintln!(
-            "REACQUIRE_PHASE task={task_kind:?} phase=fine_sensor_restored_at_exit elapsed_ms={}",
-            phase_started.elapsed().as_millis(),
-        );
-    }
-    if !restore_announced {
-        // Unblock the receiver so it can process this failed task and restore
-        // the prior fine mode itself after the acquisition process exits.
-        let _ = restore_ready.try_send(());
-    }
-    let _ = fs::remove_file(&ready_file);
-    if !status.success() {
-        return Err(format!("bounded MediaPipe acquisition exited {status}"));
-    }
+    let config = native_mediapipe_tracking_config(current, &capture)?;
     eprintln!(
-        "REACQUIRE_PHASE task={task_kind:?} phase=acquisition_process_complete elapsed_ms={}",
-        phase_started.elapsed().as_millis(),
-    );
-    let config = tracking_config(current)?;
-    eprintln!(
-        "REACQUIRE_PHASE task={task_kind:?} phase=tracking_config_loaded elapsed_ms={}",
+        "REACQUIRE_PHASE task={task_kind:?} phase=native_tracking_config_ready elapsed_ms={}",
         phase_started.elapsed().as_millis(),
     );
     Ok(config)
@@ -33650,6 +34122,19 @@ fn receive(
                 host_telemetry.record(HOST_STAGE_REACQUIRE, reacquire_elapsed);
                 publish_host_telemetry(&mut host_telemetry, &shared);
                 if task_kind == MediaPipeTaskKind::LinearSnapshot {
+                    let presentation_backdrop = reacquire_result
+                        .as_ref()
+                        .ok()
+                        .and_then(|next| next.tracking.as_deref())
+                        .and_then(|path| match load_ppm(path) {
+                            Ok(backdrop) => Some(backdrop),
+                            Err(error) => {
+                                eprintln!(
+                                    "full-sensor presentation snapshot could not be loaded: {error}"
+                                );
+                                None
+                            }
+                        });
                     let restore = ensure_fine_sensor_mode(&config);
                     camera_automation_wait = None;
                     checkerboard_snapshot_due = Instant::now() + Duration::from_millis(1_200);
@@ -33689,6 +34174,9 @@ fn receive(
                             None
                         };
                     if let Ok(mut state) = shared.lock() {
+                        if let Some(backdrop) = presentation_backdrop {
+                            state.presentation_backdrop = Some(backdrop);
+                        }
                         state.reacquire_status =
                             Some(match (&reacquire_result, &checkerboard_submit) {
                                 (Ok(_), Some(Ok(outcome))) => {
@@ -34408,9 +34896,8 @@ fn receive(
                             context_snapshot.as_deref(),
                             task_kind,
                         );
-                        // A failure before the acquisition helper published
-                        // its fine-mode marker must still release the receiver
-                        // to inspect the failed result and restore explicitly.
+                        // A capture failure must still release the receiver so
+                        // it can inspect the result and restore explicitly.
                         let _ = restore_sender.try_send(());
                         let _ = sender.send((result, started.elapsed()));
                     })
@@ -37992,6 +38479,40 @@ fn draw_virtual_mouse(mode: &VirtualMouseMode, pixels: &mut [u32], width: usize,
     }
 }
 
+fn fulfill_pending_presentation_export(
+    shared: &Arc<Mutex<SharedState>>,
+    pixels: &[u32],
+    width: usize,
+    height: usize,
+) {
+    let path = shared
+        .lock()
+        .ok()
+        .and_then(|mut state| state.presentation_export_request.take());
+    let Some(path) = path else {
+        return;
+    };
+    let result = path
+        .parent()
+        .map_or(Ok(()), |parent| {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("create presentation export directory: {error}"))
+        })
+        .and_then(|()| export_eye_ppm(&path, pixels, width, height));
+    match result {
+        Ok(()) => eprintln!(
+            "exported lossless viewer presentation {}x{} to {}",
+            width,
+            height,
+            path.display(),
+        ),
+        Err(error) => eprintln!(
+            "lossless viewer presentation export {} failed: {error}",
+            path.display(),
+        ),
+    }
+}
+
 fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
     if let Ok(shared) = app.shared.lock() {
         app.focus_target = shared.focus_target;
@@ -38065,6 +38586,7 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
         mode.observe(Instant::now(), observation);
         pixels.fill(VIRTUAL_MOUSE_BACKGROUND);
         draw_virtual_mouse(mode, pixels, width, height);
+        fulfill_pending_presentation_export(&app.shared, pixels, width, height);
         state.window.pre_present_notify();
         return buffer.present().map_err(|error| error.to_string());
     }
@@ -38090,15 +38612,24 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
     };
     let status_gap = usize::from(status_panel_width != 0) * 12;
     let content_width = width.saturating_sub(status_panel_width + status_gap);
-    let focus_scale = (content_width.saturating_sub(16) / eye_width.max(1)).clamp(1, 3);
-    let eye_scales = if app.focus_eye == 0 {
-        [focus_scale, 1]
+    // Once the coarse sensor view is present, both native eye slices are the
+    // primary multi-ROI demo and should remain equally sized.  The old
+    // focus-eye magnification forced the second ROI below the fold and left no
+    // room for the overview in the default 1200x850 window.
+    let gap = if app.backdrop.is_some() { 20 } else { 28 };
+    let eye_scales = if app.backdrop.is_some() {
+        let paired_scale = (content_width.saturating_sub(gap) / (eye_width.max(1) * 2)).clamp(1, 3);
+        [paired_scale, paired_scale]
     } else {
-        [1, focus_scale]
+        let focus_scale = (content_width.saturating_sub(16) / eye_width.max(1)).clamp(1, 3);
+        if app.focus_eye == 0 {
+            [focus_scale, 1]
+        } else {
+            [1, focus_scale]
+        }
     };
     let display_widths = [eye_width * eye_scales[0], eye_width * eye_scales[1]];
     let display_heights = [eye_height * eye_scales[0], eye_height * eye_scales[1]];
-    let gap = 28usize;
     let total = display_widths[0] + display_widths[1] + gap;
     let side_by_side = content_width >= total;
     let eye_area_height = if side_by_side {
@@ -38118,83 +38649,81 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
         .map(|state| state.segmentation_mode)
         .unwrap_or(SegmentationMode::Native);
     let driving_mode = segmentation_mode == SegmentationMode::Driving;
-    if !driving_mode {
-        if let Some(backdrop) = app.backdrop.as_ref() {
-            let backdrop_y = if status_panel_width == 0 { 168 } else { 28 };
-            let backdrop_height = start_y.saturating_sub(backdrop_y + 28);
-            let image_rect = blit_scaled(
-                pixels,
-                width,
-                height,
-                &backdrop.pixels,
-                backdrop.width,
-                backdrop.height,
-                0,
-                backdrop_y,
-                content_width,
-                backdrop_height,
-            );
-            draw_text(
-                pixels,
-                width,
-                height,
-                image_rect.0 as i32,
-                backdrop_y as i32 - 20,
-                "LAST COARSE SENSOR SNAPSHOT  DISPLAY ONLY",
-                0x00c8_d6e5,
-            );
-            for (index, frame, normal_color) in [(0, left, 0x0000_e5ff), (1, right, 0x00ff_4f81)] {
-                if let Some(frame) = frame {
-                    let color = if app.eye_identity_present[index] {
-                        normal_color
-                    } else {
-                        0x00ff_3030
-                    };
-                    let roi = project_sensor_rect(
-                        (frame.sensor_x, frame.sensor_y, frame.width, frame.height),
-                        image_rect,
-                    );
-                    draw_outline(
-                        pixels,
-                        width,
-                        height,
-                        roi,
-                        if app.focus_eye == index { 7 } else { 3 },
-                        color,
-                    );
-                }
+    if let Some(backdrop) = app.backdrop.as_ref() {
+        let backdrop_y = if status_panel_width == 0 { 168 } else { 28 };
+        let backdrop_height = start_y.saturating_sub(backdrop_y + 28);
+        let image_rect = blit_scaled(
+            pixels,
+            width,
+            height,
+            &backdrop.pixels,
+            backdrop.width,
+            backdrop.height,
+            0,
+            backdrop_y,
+            content_width,
+            backdrop_height,
+        );
+        draw_text(
+            pixels,
+            width,
+            height,
+            image_rect.0 as i32,
+            backdrop_y as i32 - 20,
+            "LAST COARSE SENSOR SNAPSHOT  DISPLAY ONLY",
+            0x00c8_d6e5,
+        );
+        for (index, frame, normal_color) in [(0, left, 0x0000_e5ff), (1, right, 0x00ff_4f81)] {
+            if let Some(frame) = frame {
+                let color = if app.eye_identity_present[index] {
+                    normal_color
+                } else {
+                    0x00ff_3030
+                };
+                let roi = project_sensor_rect(
+                    (frame.sensor_x, frame.sensor_y, frame.width, frame.height),
+                    image_rect,
+                );
+                draw_outline(
+                    pixels,
+                    width,
+                    height,
+                    roi,
+                    if app.focus_eye == index { 7 } else { 3 },
+                    color,
+                );
             }
-            draw_text(
-                pixels,
-                width,
-                height,
-                image_rect.0 as i32 + 8,
-                (image_rect.1 + image_rect.3).saturating_sub(20) as i32,
-                if !app.eye_identity_present[0] {
-                    "SUBJECT RIGHT ID HELD"
-                } else if app.focus_eye == 0 {
-                    "SUBJECT RIGHT ROI FOCUS"
-                } else {
-                    "SUBJECT RIGHT ROI"
-                },
-                0x0000_e5ff,
-            );
-            draw_text(
-                pixels,
-                width,
-                height,
-                (image_rect.0 + image_rect.2).saturating_sub(116) as i32,
-                (image_rect.1 + image_rect.3).saturating_sub(20) as i32,
-                if !app.eye_identity_present[1] {
-                    "SUBJECT LEFT ID HELD"
-                } else if app.focus_eye == 1 {
-                    "SUBJECT LEFT ROI FOCUS"
-                } else {
-                    "SUBJECT LEFT ROI"
-                },
-                0x00ff_4f81,
-            );
         }
+        draw_text(
+            pixels,
+            width,
+            height,
+            image_rect.0 as i32 + 8,
+            (image_rect.1 + image_rect.3).saturating_sub(20) as i32,
+            if !app.eye_identity_present[0] {
+                "SUBJECT RIGHT ID HELD"
+            } else if app.focus_eye == 0 {
+                "SUBJECT RIGHT ROI FOCUS"
+            } else {
+                "SUBJECT RIGHT ROI"
+            },
+            0x0000_e5ff,
+        );
+        draw_text(
+            pixels,
+            width,
+            height,
+            (image_rect.0 + image_rect.2).saturating_sub(116) as i32,
+            (image_rect.1 + image_rect.3).saturating_sub(20) as i32,
+            if !app.eye_identity_present[1] {
+                "SUBJECT LEFT ID HELD"
+            } else if app.focus_eye == 1 {
+                "SUBJECT LEFT ROI FOCUS"
+            } else {
+                "SUBJECT LEFT ROI"
+            },
+            0x00ff_4f81,
+        );
     }
     if let Some(frame) = left {
         let checkerboard = app.checkerboard_status.overlay.as_ref().filter(|overlay| {
@@ -38724,6 +39253,7 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
             );
         }
     }
+    fulfill_pending_presentation_export(&app.shared, pixels, width, height);
     state.window.pre_present_notify();
     buffer.present().map_err(|error| error.to_string())
 }
@@ -39223,17 +39753,28 @@ impl ApplicationHandler for App {
                         if !event.repeat {
                             if let Ok(mut shared) = self.shared.lock() {
                                 if local_camera_control_allowed(&mut shared, "REACQUIRE") {
-                                    let enabled = toggle_mediapipe_reacquisition(&mut shared);
-                                    eprintln!(
-                                        "MediaPipe ROI reacquisition {} and iris-radius support recomputation {} by R{}",
-                                        if enabled { "enabled" } else { "disabled" },
-                                        if enabled { "enabled" } else { "frozen" },
-                                        if enabled {
-                                            "; immediate full scan and ROI relocation queued"
-                                        } else {
-                                            ""
-                                        },
-                                    );
+                                    if shared.semantic_reacquisition_unavailable {
+                                        shared.linear_snapshot_request = true;
+                                        shared.reacquire_status = Some(
+                                            "NATIVE MEDIAPIPE UNAVAILABLE; SENSOR OVERVIEW REFRESH QUEUED"
+                                                .to_string(),
+                                        );
+                                        eprintln!(
+                                            "R refreshed the lossless sensor overview; native MediaPipe runtime/model assets are unavailable"
+                                        );
+                                    } else {
+                                        let enabled = toggle_mediapipe_reacquisition(&mut shared);
+                                        eprintln!(
+                                            "MediaPipe ROI reacquisition {} and iris-radius support recomputation {} by R{}",
+                                            if enabled { "enabled" } else { "disabled" },
+                                            if enabled { "enabled" } else { "frozen" },
+                                            if enabled {
+                                                "; immediate full scan and ROI relocation queued"
+                                            } else {
+                                                ""
+                                            },
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -39418,22 +39959,56 @@ fn parse_config() -> Result<Config, String> {
     let segmentation_environment =
         env::var("BUTTERCUP_SEGMENTATION_MODE").unwrap_or_else(|_| "native".to_string());
     let legacy_sam31_pupil = is_legacy_sam31_pupil_mode(&segmentation_environment);
+    let environment_pair = |name: &str, default| {
+        env::var(name)
+            .ok()
+            .map(|value| parse_pair(&value))
+            .transpose()
+            .map(|value| value.unwrap_or(default))
+    };
+    let environment_size = |name: &str, default| {
+        env::var(name)
+            .ok()
+            .map(|value| parse_size(&value))
+            .transpose()
+            .map(|value| value.unwrap_or(default))
+    };
+    let focus_environment = env::var("BUTTERCUP_FOCUS_EYE").unwrap_or_else(|_| "auto".to_string());
+    let (focus_eye, focus_eye_auto) = match focus_environment.as_str() {
+        "auto" => (0, true),
+        "right" => (0, false),
+        "left" => (1, false),
+        other => {
+            return Err(format!(
+                "BUTTERCUP_FOCUS_EYE must be auto, left, or right, got {other}"
+            ));
+        }
+    };
     let mut config = Config {
-        camera: "192.168.88.10:5001".to_string(),
-        vcm: "192.168.88.10:5002".to_string(),
-        control: PathBuf::from("/tmp/buttercup-raw-eye-control.sock"),
+        camera: env::var("BUTTERCUP_CAMERA_ADDRESS")
+            .unwrap_or_else(|_| "192.168.88.10:5001".to_string()),
+        vcm: env::var("BUTTERCUP_VCM_ADDRESS").unwrap_or_else(|_| "192.168.88.10:5002".to_string()),
+        control: env::var_os("BUTTERCUP_CONTROL_SOCKET")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp/buttercup-eye-control.sock")),
         model_streams: Vec::new(),
-        origin: (0, 0),
-        eyes: [(0, 0), (0, 0)],
-        eye_size: (384, 256),
-        window_size: (8000, 384),
+        // These coordinates are only a bounded warm-start seed. Runtime
+        // context tracking and semantic reacquisition own later relocation.
+        origin: environment_pair("BUTTERCUP_SENSOR_ORIGIN", (0, 3250))?,
+        eyes: [
+            environment_pair("BUTTERCUP_LEFT_EYE", (3448, 3340))?,
+            environment_pair("BUTTERCUP_RIGHT_EYE", (4492, 3480))?,
+        ],
+        eye_size: environment_size("BUTTERCUP_EYE_SIZE", (384, 256))?,
+        window_size: environment_size("BUTTERCUP_SENSOR_WINDOW", (8000, 576))?,
         record: None,
-        tracking: None,
+        tracking: env::var_os("BUTTERCUP_TRACKING_FRAME").map(PathBuf::from),
         autofocus_armed: false,
-        focus_eye: 0,
-        focus_eye_auto: true,
+        focus_eye,
+        focus_eye_auto,
         segmentation: SegmentationMode::parse(&segmentation_environment).unwrap_or_default(),
-        rough_pupil_center: env::var("BUTTERCUP_ROUGH_PUPIL_CENTER")
+        rough_pupil_center: env::var("BUTTERCUP_ROUGH_CENTER_MODE")
+            .or_else(|_| env::var("BUTTERCUP_ROUGH_PUPIL_CENTER"))
             .ok()
             .as_deref()
             .and_then(RoughPupilCenterMode::parse)
@@ -39446,6 +40021,11 @@ fn parse_config() -> Result<Config, String> {
             .ok()
             .as_deref()
             .and_then(DrivingSubmode::parse)
+            .unwrap_or_default(),
+        global_capture_format: env::var("BUTTERCUP_GLOBAL_CAPTURE_FORMAT")
+            .ok()
+            .as_deref()
+            .and_then(GlobalCaptureFormat::parse)
             .unwrap_or_default(),
         sam31_model: env::var_os("BUTTERCUP_SAM31_MODEL")
             .map(PathBuf::from)
@@ -39493,6 +40073,10 @@ fn parse_config() -> Result<Config, String> {
                     "--driving-submode must be normal or double-sclera-10deg".to_string()
                 })?
             }
+            "--global-format" => {
+                config.global_capture_format = GlobalCaptureFormat::parse(value()?)
+                    .ok_or_else(|| "--global-format must be gray16 or raw10".to_string())?
+            }
             "--sam31-model" => config.sam31_model = PathBuf::from(value()?),
             "--autofocus-armed" => {
                 config.autofocus_armed = true;
@@ -39521,7 +40105,7 @@ fn parse_config() -> Result<Config, String> {
             }
             "-h" | "--help" => {
                 println!(
-                    "usage: buttercup-eye-viewer --origin SENSOR_BAND_X,Y --left ABS_SENSOR_X,Y --right ABS_SENSOR_X,Y [--focus-eye auto|left|right] [--eye WxH] [--window WxH] [--camera HOST:PORT] [--vcm HOST:PORT] [--control PATH.sock] [--model-stream PATH.sock ...] [--tracking FRAME.ppm] [--record FILE.tar] [--autofocus-armed] [--segmentation native|sam31|clusters|driving] [--rough-center iris-guided|raw-focus|sam31-center|mediapipe-acquire|mediapipe-continuous|driving-topology] [--driving-submode normal|double-sclera-10deg] [--sam31-model FILE.pt]\ncontrol commands: STATUS | SEGMENTATION NATIVE|SAM31|CLUSTERS|DRIVING | SEGMENTATION STATUS | IRIS STATUS | IRIS BOUNDS MINIMUM|MAXIMUM +/- | IRIS BOUNDS AUTO | PUPIL STATUS | PUPIL BOUNDS MINIMUM|MAXIMUM +/- | PUPIL BOUNDS DEFAULT | PUPIL CENTER MODE | PUPIL|IRIS RETICLE OFF|STATIC|PROJECTED|ON|TOGGLE | DRIVING NORMAL|DOUBLE-SCLERA-10DEG|STATUS | LEASE CLAIM OWNER TTL_MS | LEASE RENEW TOKEN TTL_MS | LEASE RELEASE TOKEN | LEASE STATUS | WITH TOKEN REACQUIRE | WITH TOKEN LINEAR SNAPSHOT | WITH TOKEN FOCUS EYE RIGHT|LEFT | WITH TOKEN FOCUS SET N | WITH TOKEN FOCUS AUTO | WITH TOKEN EXPORT RAW RIGHT /absolute/path.raw10 | EXPORT STATUS"
+                    "usage: buttercup-eye-viewer [OPTIONS]\n\nNo options are required for the standard Podbay camera. The default view uses a low-bandwidth GRAY16 sensor overview, two native RAW10 eye ROIs, Native segmentation, and automatic focus-eye selection.\n\noptional overrides: --camera HOST:PORT --vcm HOST:PORT --control PATH.sock --origin SENSOR_BAND_X,Y --left ABS_SENSOR_X,Y --right ABS_SENSOR_X,Y --eye WxH --window WxH --focus-eye auto|left|right --tracking FRAME.ppm --record FILE.tar --autofocus-armed --segmentation native|sam31|clusters|driving --rough-center iris-guided|raw-focus|sam31-center|mediapipe-acquire|mediapipe-continuous|driving-topology --driving-submode normal|double-sclera-10deg --global-format gray16|raw10 --model-stream PATH.sock --sam31-model FILE.pt\n\ncontrol commands: STATUS | SEGMENTATION NATIVE|SAM31|CLUSTERS|DRIVING | SEGMENTATION STATUS | IRIS STATUS | IRIS BOUNDS MINIMUM|MAXIMUM +/- | IRIS BOUNDS AUTO | PUPIL STATUS | PUPIL BOUNDS MINIMUM|MAXIMUM +/- | PUPIL BOUNDS DEFAULT | PUPIL CENTER MODE | PUPIL|IRIS RETICLE OFF|STATIC|PROJECTED|ON|TOGGLE | DRIVING NORMAL|DOUBLE-SCLERA-10DEG|STATUS | LEASE CLAIM OWNER TTL_MS | LEASE RENEW TOKEN TTL_MS | LEASE RELEASE TOKEN | LEASE STATUS | WITH TOKEN REACQUIRE | WITH TOKEN LINEAR SNAPSHOT | WITH TOKEN FOCUS EYE RIGHT|LEFT | WITH TOKEN FOCUS SET N | WITH TOKEN FOCUS AUTO | WITH TOKEN EXPORT RAW RIGHT /absolute/path.raw10 | EXPORT PRESENTATION /absolute/path.ppm | EXPORT STATUS"
                 );
                 std::process::exit(0);
             }
@@ -39558,8 +40142,27 @@ fn run() -> Result<(), String> {
     // band is temporarily replaced by CAPTURE_COARSE and restored in-process.
     apply_eye_config(&config)?;
     let backdrop = config.tracking.as_deref().map(load_ppm).transpose()?;
+    let native_mediapipe_runtime = native_semantic_reacquisition_available();
+    let semantic_reacquisition_configured = native_mediapipe_runtime.is_ok();
+    match &native_mediapipe_runtime {
+        Ok(paths) => eprintln!(
+            "native Rust MediaPipe reacquisition ready: runtime={} model={}",
+            paths.library.display(),
+            paths.model.display(),
+        ),
+        Err(error) => eprintln!("native Rust MediaPipe reacquisition unavailable: {error}"),
+    }
     let shared = Arc::new(Mutex::new(SharedState {
         presentation_backdrop: backdrop.clone(),
+        // A normal launch performs one native semantic scan. When the native
+        // assets are absent, still fetch the lossless overview without
+        // entering a capture/failure loop.
+        linear_snapshot_request: backdrop.is_none() && !semantic_reacquisition_configured,
+        reacquire_request: (backdrop.is_none() && semantic_reacquisition_configured)
+            .then(|| "startup native MediaPipe acquisition".to_string()),
+        semantic_reacquisition_unavailable: !semantic_reacquisition_configured,
+        reacquire_status: (!semantic_reacquisition_configured)
+            .then(|| "NATIVE MEDIAPIPE UNAVAILABLE; SHOWING WARM-START ROIS".to_string()),
         contrast_percent: DEFAULT_DISPLAY_CONTRAST_PERCENT,
         focus_eye,
         manual_focus: initial_manual_roi_hold,
@@ -41337,6 +41940,90 @@ mod tests {
     }
 
     #[test]
+    fn global_capture_headers_distinguish_explicit_gray16_and_raw10() {
+        let sequence = 0x1234_5678_u64;
+        let mut gray = [0u8; HEADER_BYTES];
+        gray[0..4].copy_from_slice(b"OTH1");
+        put16(&mut gray, 4, 1);
+        put16(&mut gray, 6, HEADER_BYTES as u16);
+        put32(&mut gray, 12, GRAY16_FORMAT);
+        put64(&mut gray, 16, sequence);
+        put64(&mut gray, 24, 99);
+        put32(&mut gray, 40, 500);
+        put32(&mut gray, 44, 375);
+        put32(&mut gray, 48, 1_000);
+        put32(&mut gray, 52, 375_000);
+        put32(&mut gray, 56, 16);
+        let gray_info =
+            validate_global_capture_header(&gray, GlobalCaptureFormat::Gray16, sequence, 500, 375)
+                .unwrap();
+        assert_eq!((gray_info.width, gray_info.height), (500, 375));
+        assert_eq!(gray_info.payload_bytes, 375_000);
+
+        let mut raw = [0u8; HEADER_BYTES];
+        raw[0..4].copy_from_slice(b"ORT1");
+        put16(&mut raw, 4, 1);
+        put16(&mut raw, 6, HEADER_BYTES as u16);
+        put32(&mut raw, 12, RAW10_FORMAT);
+        put64(&mut raw, 16, sequence);
+        put64(&mut raw, 24, 100);
+        put32(&mut raw, 40, 1_000);
+        put32(&mut raw, 44, 750);
+        put32(&mut raw, 48, 1_250);
+        put32(&mut raw, 52, 937_500);
+        put32(&mut raw, 56, RAW10_PIXEL);
+        let raw_info =
+            validate_global_capture_header(&raw, GlobalCaptureFormat::Raw10, sequence, 1_000, 750)
+                .unwrap();
+        assert_eq!((raw_info.width, raw_info.height), (1_000, 750));
+        assert_eq!(raw_info.stride, 1_250);
+        assert!(validate_global_capture_header(
+            &raw,
+            GlobalCaptureFormat::Gray16,
+            sequence,
+            500,
+            375,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn raw10_global_capture_keeps_color_decode_and_gray_contract_separate() {
+        let (width, height) = (8usize, 8usize);
+        let raw = (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| {
+                    let base = 100 + x as u16 * 8 + y as u16 * 5;
+                    match (y & 1, x & 1) {
+                        (0, 0) => base * 2,
+                        (1, 1) => base / 2,
+                        _ => base,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let color = global_rggb_color_preview(&raw, width, height, 100);
+        assert_eq!(color.len(), raw.len());
+        let center = color[4 * width + 4];
+        let channels = [
+            ((center >> 16) & 0xff) as i32,
+            ((center >> 8) & 0xff) as i32,
+            (center & 0xff) as i32,
+        ];
+        assert!(
+            channels.iter().max().unwrap() - channels.iter().min().unwrap() <= 24,
+            "decoded center channels: {channels:?}",
+        );
+        assert!(color.iter().any(|pixel| *pixel != 0));
+
+        let (gray, gray_width, gray_height) =
+            phase_average_raw10_to_gray16(&raw, width, height).unwrap();
+        assert_eq!((gray_width, gray_height), (4, 4));
+        assert_eq!(gray.len(), 16);
+        assert!(gray.iter().all(|sample| *sample <= 1023));
+    }
+
+    #[test]
     fn parses_compact_bounded_telemetry_packet() {
         let payload_bytes = TELEMETRY_PREFIX_BYTES + TELEMETRY_RECORD_BYTES;
         let mut header_bytes = [0u8; HEADER_BYTES];
@@ -41434,7 +42121,11 @@ mod tests {
     fn synthetic_context(shift: (i32, i32)) -> ContextFrame {
         let width = CONTEXT_WIDTH as usize;
         let height = CONTEXT_HEIGHT as usize;
-        let centers = [(85i32, 24i32), (315i32, 24i32)];
+        let scale = (
+            SENSOR_WIDTH as i32 / CONTEXT_WIDTH as i32,
+            FINE_SENSOR_WINDOW_HEIGHT as i32 / CONTEXT_HEIGHT as i32,
+        );
+        let centers = [(85i32, 16i32), (315i32, 16i32)];
         let mut pixels = vec![0u16; width * height];
         for y in 0..height as i32 {
             for x in 0..width as i32 {
@@ -41455,9 +42146,9 @@ mod tests {
             origin: (0, 2000),
             width,
             height,
-            scale: (20, 8),
+            scale,
             eye_size: (384, 256),
-            anchors: [(1508, 2064), (6108, 2064)],
+            anchors: [(1168, 2128), (4848, 2128)],
             pixels,
         }
     }
@@ -41469,9 +42160,9 @@ mod tests {
             control: PathBuf::new(),
             model_streams: Vec::new(),
             origin: (0, 2000),
-            eyes: [(1508, 2064), (6108, 2064)],
+            eyes: [(1168, 2128), (4848, 2128)],
             eye_size: (384, 256),
-            window_size: (8000, 768),
+            window_size: (SENSOR_WIDTH, FINE_SENSOR_WINDOW_HEIGHT),
             record: None,
             tracking: None,
             autofocus_armed: false,
@@ -41480,6 +42171,7 @@ mod tests {
             segmentation: SegmentationMode::Native,
             rough_pupil_center: RoughPupilCenterMode::IrisGuided,
             driving_submode: DrivingSubmode::Normal,
+            global_capture_format: GlobalCaptureFormat::Raw10,
             sam31_model: PathBuf::new(),
         };
         let mut tracker = RawRoiTracker::new(&config);
@@ -41921,17 +42613,17 @@ mod tests {
         let current = synthetic_context((3, 2));
         assert_eq!(
             estimate_context_translation(&previous, &current),
-            Some((60, 16))
+            Some((48, 32))
         );
     }
 
     #[test]
     fn cross_mode_context_match_covers_motion_during_sensor_switch() {
         let previous = synthetic_context((0, 0));
-        let current = synthetic_context((20, 10));
+        let current = synthetic_context((20, 4));
         assert_eq!(
             estimate_joint_context_translation(&previous, &current, (800, 256)),
-            Some((400, 80)),
+            Some((320, 64)),
         );
     }
 
@@ -41966,11 +42658,11 @@ mod tests {
     }
 
     #[test]
-    fn large_fine_context_motion_requires_two_strong_exposures() {
+    fn large_fine_context_motion_requires_confirmation_and_containment_debounce() {
         let mut tracker = synthetic_tracker();
         tracker.last_command = Instant::now();
         let before = tracker.absolute;
-        let shifted = synthetic_context((5, 8));
+        let shifted = synthetic_context((11, 4));
         tracker
             .observe_context(
                 (0, 2000),
@@ -41982,6 +42674,20 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tracker.absolute, before);
+        assert_eq!(tracker.context_residual[0], (176, 64));
+        for _ in 0..2 {
+            tracker
+                .observe_context(
+                    (0, 2000),
+                    (shifted.width, shifted.height),
+                    shifted.pixels.clone(),
+                    false,
+                    false,
+                    0,
+                )
+                .unwrap();
+            assert_eq!(tracker.absolute, before);
+        }
         tracker
             .observe_context(
                 (0, 2000),
@@ -41992,10 +42698,8 @@ mod tests {
                 0,
             )
             .unwrap();
-        assert_eq!(
-            tracker.absolute,
-            before.map(|point| (point.0 + 100, point.1 + 64))
-        );
+        assert_eq!(tracker.absolute[0], (before[0].0 + 176, before[0].1 + 64));
+        assert_eq!(tracker.absolute[1], before[1]);
     }
 
     #[test]
@@ -42023,10 +42727,10 @@ mod tests {
     fn fixed_keyframe_corrects_a_predicted_roi_drift_instead_of_integrating_it() {
         let anchor = synthetic_context((0, 0));
         let mut current = synthetic_context((0, 0));
-        current.anchors = current.anchors.map(|point| (point.0 + 40, point.1 + 32));
+        current.anchors = current.anchors.map(|point| (point.0 + 48, point.1 + 32));
         assert_eq!(
             estimate_joint_context_translation(&anchor, &current, (400, 192)),
-            Some((-40, -32)),
+            Some((-48, -32)),
         );
     }
 
@@ -42040,7 +42744,7 @@ mod tests {
         let diagnosis =
             diagnose_context_translation_with_search(&anchor, &one_eye_only, (400, 192));
         assert_eq!(diagnosis.motion, None);
-        assert_eq!(diagnosis.eye_motion, [Some((60, 0)), None]);
+        assert_eq!(diagnosis.eye_motion, [Some((48, 0)), None]);
         assert_eq!(diagnosis.eye_identity_present, [true, false]);
     }
 
@@ -42089,7 +42793,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        assert_eq!(tracker.absolute[0], (before[0].0 + 60, before[0].1));
+        assert_eq!(tracker.absolute[0], (before[0].0 + 48, before[0].1));
         assert_eq!(tracker.absolute[1], before[1]);
         assert_eq!(tracker.context_identity_present, [true, false]);
         assert_eq!(tracker.context_failures, 0);
@@ -42098,7 +42802,7 @@ mod tests {
     #[test]
     fn autofocus_blur_tolerance_does_not_suppress_corroborated_gross_reacquisition() {
         let mut tracker = synthetic_tracker();
-        let gross_move = synthetic_context((17, 0));
+        let gross_move = synthetic_context((21, 0));
         let mut normalized_move = gross_move.clone();
         normalized_move.pixels = normalize_context_pixels(normalized_move.pixels);
         assert_eq!(
@@ -42107,7 +42811,7 @@ mod tests {
                 &normalized_move,
                 (400, 192),
             ),
-            Some((340, 0)),
+            Some((336, 0)),
         );
         tracker
             .observe_context(
@@ -42119,7 +42823,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        assert_eq!(tracker.gross_motion_pending, Some((0, 340, 0)));
+        assert_eq!(tracker.gross_motion_pending, Some((0, 336, 0)));
 
         let error = tracker
             .observe_context(
@@ -42141,7 +42845,7 @@ mod tests {
         let mut tracker = synthetic_tracker();
         tracker.last_command = Instant::now();
         let before = tracker.absolute;
-        let boundary_move = synthetic_context((16, 0));
+        let boundary_move = synthetic_context((20, 0));
         tracker
             .observe_context(
                 (0, 2000),
@@ -42283,6 +42987,7 @@ mod tests {
             segmentation: SegmentationMode::Native,
             rough_pupil_center: RoughPupilCenterMode::IrisGuided,
             driving_submode: DrivingSubmode::Normal,
+            global_capture_format: GlobalCaptureFormat::Raw10,
             sam31_model: PathBuf::new(),
         };
         let mut tracker = RawRoiTracker::new(&config);
@@ -42917,6 +43622,7 @@ mod tests {
             segmentation: SegmentationMode::Native,
             rough_pupil_center: RoughPupilCenterMode::IrisGuided,
             driving_submode: DrivingSubmode::Normal,
+            global_capture_format: GlobalCaptureFormat::Raw10,
             sam31_model: PathBuf::new(),
         };
         let tracker = RawRoiTracker::new(&config);
@@ -42955,6 +43661,7 @@ mod tests {
             segmentation: SegmentationMode::Native,
             rough_pupil_center: RoughPupilCenterMode::IrisGuided,
             driving_submode: DrivingSubmode::Normal,
+            global_capture_format: GlobalCaptureFormat::Raw10,
             sam31_model: PathBuf::new(),
         };
         assert!(validate_anatomical_roi_geometry(current.eyes, current.eye_size).is_ok());
@@ -43343,6 +44050,7 @@ mod tests {
             segmentation: SegmentationMode::Native,
             rough_pupil_center: RoughPupilCenterMode::IrisGuided,
             driving_submode: DrivingSubmode::Normal,
+            global_capture_format: GlobalCaptureFormat::Raw10,
             sam31_model: PathBuf::new(),
         };
         let mut observed = current.clone();
@@ -43385,6 +44093,7 @@ mod tests {
             segmentation: SegmentationMode::Native,
             rough_pupil_center: RoughPupilCenterMode::IrisGuided,
             driving_submode: DrivingSubmode::Normal,
+            global_capture_format: GlobalCaptureFormat::Raw10,
             sam31_model: PathBuf::new(),
         };
         let held = manual_roi_config(&current, [(4512, 4090), (5200, 4100)]).unwrap();
@@ -43638,6 +44347,26 @@ mod tests {
         .unwrap();
         assert_eq!(legacy.roi_sensor_active, [0, 3400, 8000, 576]);
         assert_eq!(legacy.presentation_sensor_active, [0, 3400, 8000, 576]);
+    }
+
+    #[test]
+    fn tilted_semantic_eye_centers_are_retained_inside_one_fine_band() {
+        let centers = [3_456, 3_888];
+        let tops = fit_eye_centers_into_fine_band(centers, 256).unwrap();
+        assert_eq!(tops[0].abs_diff(tops[1]), 256);
+        assert_eq!(tops[0] & 1, 0);
+        assert_eq!(tops[1] & 1, 0);
+        assert!(tops[0] + 16 <= centers[0] && centers[0] < tops[0] + 256 - 16);
+        assert!(tops[1] + 16 <= centers[1] && centers[1] < tops[1] + 256 - 16);
+        let span = (tops[0] + 256).max(tops[1] + 256) - tops[0].min(tops[1]);
+        assert!(span <= FINE_SENSOR_WINDOW_HEIGHT);
+    }
+
+    #[test]
+    fn ordinary_level_eye_centers_remain_centered() {
+        let centers = [3_900, 4_020];
+        let tops = fit_eye_centers_into_fine_band(centers, 256).unwrap();
+        assert_eq!(tops, [3_772, 3_892]);
     }
 
     fn uniform_quad_bayer(width: usize, height: usize, sensor_x: u32, sensor_y: u32) -> Vec<u16> {
@@ -56388,6 +57117,23 @@ mod tests {
         assert!(response.contains("linear-snapshot"));
         assert!(shared.lock().unwrap().linear_snapshot_request);
 
+        let response = handle_control_command("EXPORT PRESENTATION relative.ppm", &shared);
+        assert!(response.contains("path must be absolute"));
+        let response = handle_control_command(
+            "EXPORT PRESENTATION /tmp/buttercup-presentation-test.ppm",
+            &shared,
+        );
+        assert!(response.contains("presentation-export"));
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .presentation_export_request
+                .take()
+                .as_deref(),
+            Some(Path::new("/tmp/buttercup-presentation-test.ppm")),
+        );
+
         let response = handle_control_command("ROI HOLD 4512 4090 5200 4100", &shared);
         assert!(response.contains("roi-hold"));
         let mut state = shared.lock().unwrap();
@@ -57096,6 +57842,7 @@ mod tests {
             segmentation: SegmentationMode::Native,
             rough_pupil_center: RoughPupilCenterMode::IrisGuided,
             driving_submode: DrivingSubmode::Normal,
+            global_capture_format: GlobalCaptureFormat::Raw10,
             sam31_model: PathBuf::new(),
         };
         let header = PacketHeader {

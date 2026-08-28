@@ -17,11 +17,13 @@ mapfile -t unexpected_files < <(
       ./Cargo.lock \
       ./Cargo.toml \
       ./README.md \
+      ./docs/viewer-overview.png \
       ./scripts/audit-tree.sh \
       ./scripts/run-viewer.sh \
       ./src/checkerboard_calibration.rs \
       ./src/coupled_eye_kinematics.rs \
       ./src/main.rs \
+      ./src/native_mediapipe.rs \
       ./src/offline_segmentation_replay.rs \
       ./src/pupil_clock_supervision.rs \
       ./src/raw10.rs \
@@ -39,6 +41,7 @@ fi
 
 mapfile -t forbidden_files < <(
   find -P . -path './.git' -prune -o -type f \
+    ! -path './docs/viewer-overview.png' \
     \( -iname '*.raw' -o -iname '*.raw10' -o -iname '*.gray16le' \
        -o -iname '*.nv12' -o -iname '*.yuv' -o -iname '*.dng' \
        -o -iname '*.tar' -o -iname '*.zip' -o -iname '*.7z' \
