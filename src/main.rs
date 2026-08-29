@@ -8063,7 +8063,7 @@ fn control_status_json(state: &SharedState) -> String {
             0.0
         };
         let nautilus = format!(
-            "{{\"build_micros\":{},\"candidates\":{},\"tree_nodes\":{},\"queries\":{},\"nodes_visited\":{},\"descriptor_evaluations\":{},\"refinement_evaluations\":{},\"distance_rejected\":{},\"spatial_rejected\":{},\"ambiguous_location\":{},\"ambiguous_identity\":{},\"collision_rejected\":{},\"relocated\":{},\"gap_relocated\":{},\"mean_acceptance_margin\":{:.4}}}",
+            "{{\"build_micros\":{},\"candidates\":{},\"tree_nodes\":{},\"queries\":{},\"nodes_visited\":{},\"descriptor_evaluations\":{},\"refinement_evaluations\":{},\"distance_rejected\":{},\"spatial_rejected\":{},\"ambiguous_location\":{},\"ambiguous_identity\":{},\"collision_rejected\":{},\"relocated\":{},\"gap_relocated\":{},\"extended_gap_relocated\":{},\"dormant_tracks\":{},\"mean_acceptance_margin\":{:.4}}}",
             matching.nautilus_build_micros,
             matching.nautilus_candidates,
             matching.nautilus_tree_nodes,
@@ -8078,7 +8078,54 @@ fn control_status_json(state: &SharedState) -> String {
             matching.nautilus_collision_rejected,
             matching.nautilus_relocated,
             matching.nautilus_gap_relocated,
+            matching.extended_gap_relocated,
+            matching.dormant_tracks,
             nautilus_mean_margin,
+        );
+        let light_field = &frame.motion_octrees.horizontal_light_field;
+        let horizontal_light_field = format!(
+            "{{\"micros\":{},\"nodes\":{},\"leaves\":{},\"evaluations\":{},\"translation_px\":{:.4},\"scale_delta\":{:.6},\"residual_px\":{:.4},\"confidence\":{:.4},\"horizontal_coverage\":{:.4},\"reliable\":{},\"rescue_tracks\":{},\"rescue_evaluations\":{},\"rescue_accepted\":{}}}",
+            light_field.elapsed_micros,
+            light_field.nodes.len(),
+            light_field.leaf_nodes,
+            light_field.evaluations,
+            light_field.horizontal_translation_px,
+            light_field.horizontal_scale_delta,
+            light_field.residual_px,
+            light_field.confidence,
+            light_field.horizontal_coverage,
+            light_field.reliable,
+            matching.light_field_rescue_tracks,
+            matching.light_field_rescue_evaluations,
+            matching.light_field_rescue_accepted,
+        );
+        let radial_probe_json = frame
+            .motion_octrees
+            .radial_limbus_probes
+            .iter()
+            .map(|probe| {
+                format!(
+                    "{{\"point\":[{:.3},{:.3}],\"normal\":[{:.4},{:.4}],\"phase_rad\":{:.5},\"radial_shift_px\":{:.4},\"profile_cost\":{:.5},\"confidence\":{:.5},\"fused\":{}}}",
+                    probe.point[0],
+                    probe.point[1],
+                    probe.normal[0],
+                    probe.normal[1],
+                    probe.phase_rad,
+                    probe.radial_shift_px,
+                    probe.profile_cost,
+                    probe.confidence,
+                    probe.fused,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let radial_limbus = format!(
+            "{{\"micros\":{},\"evaluations\":{},\"accepted\":{},\"fused\":{},\"probes\":[{}]}}",
+            matching.radial_limbus_micros,
+            matching.radial_limbus_evaluations,
+            matching.radial_limbus_accepted,
+            matching.radial_limbus_fused,
+            radial_probe_json,
         );
         let relation_origin = if matching.relation_origin_valid {
             format!(
@@ -8254,7 +8301,7 @@ fn control_status_json(state: &SharedState) -> String {
             coupled.micro_motion_likelihood,
         );
         format!(
-            "{{\"sequence\":{},\"timestamp_ns\":{},\"sensor_x\":{},\"sensor_y\":{},\"width\":{},\"height\":{},\"focus_score\":{:.6},\"focus_points\":{},\"focus_center\":{},\"eye_basin_valid\":{},\"anatomy_valid\":{},\"virtual_contact\":{},\"motion_octrees\":{{\"generation\":{},\"active_objects\":{},\"feature_trails\":{},\"nodes\":{},\"objects\":[{}],\"subpixel\":{},\"nautilus_fingerprint_tree\":{},\"relation_graph\":{},\"coupled_motion\":{},\"focus_sfm\":{}}}}}",
+            "{{\"sequence\":{},\"timestamp_ns\":{},\"sensor_x\":{},\"sensor_y\":{},\"width\":{},\"height\":{},\"focus_score\":{:.6},\"focus_points\":{},\"focus_center\":{},\"eye_basin_valid\":{},\"anatomy_valid\":{},\"virtual_contact\":{},\"motion_octrees\":{{\"generation\":{},\"active_objects\":{},\"feature_trails\":{},\"nodes\":{},\"objects\":[{}],\"subpixel\":{},\"nautilus_fingerprint_tree\":{},\"horizontal_light_field\":{},\"radial_limbus\":{},\"relation_graph\":{},\"coupled_motion\":{},\"focus_sfm\":{}}}}}",
             frame.sequence,
             frame.timestamp_ns,
             frame.sensor_x,
@@ -8274,6 +8321,8 @@ fn control_status_json(state: &SharedState) -> String {
             octrees,
             subpixel,
             nautilus,
+            horizontal_light_field,
+            radial_limbus,
             relation_graph,
             coupled_motion,
             focus_sfm,
@@ -37298,6 +37347,56 @@ fn draw_motion_octree_overlay(
             draw_line_clipped(pixels, width, height, a.0, a.1, b.0, b.1, 0x00b8_f8ff);
         }
     }
+    // Radial limbus probes are eleven exact sampling locations: five toward
+    // the projected pupil center, the selected transition, and five toward
+    // sclera. Yellow centers were fused into the joint iris-motion solve;
+    // dim centers passed photometry but were withheld by motion consistency.
+    for probe in &overlay.radial_limbus_probes {
+        let center_x = origin_x + (probe.point[0] * scale).round() as i32;
+        let center_y = origin_y + (probe.point[1] * scale).round() as i32;
+        for sample_index in 0..=2 * raw_motion_octrees::RADIAL_LIMBUS_HALF_SAMPLES {
+            let offset = (sample_index as f32
+                - raw_motion_octrees::RADIAL_LIMBUS_HALF_SAMPLES as f32)
+                * raw_motion_octrees::RADIAL_LIMBUS_SAMPLE_SPACING_PX;
+            let px =
+                origin_x + ((probe.point[0] + probe.normal[0] * offset) * scale).round() as i32;
+            let py =
+                origin_y + ((probe.point[1] + probe.normal[1] * offset) * scale).round() as i32;
+            let color = if !probe.fused {
+                0x0068_6858
+            } else if sample_index < raw_motion_octrees::RADIAL_LIMBUS_HALF_SAMPLES {
+                0x00b8_7830
+            } else if sample_index > raw_motion_octrees::RADIAL_LIMBUS_HALF_SAMPLES {
+                0x0060_e8ff
+            } else {
+                0x00ff_e040
+            };
+            let marker = if sample_index == raw_motion_octrees::RADIAL_LIMBUS_HALF_SAMPLES {
+                pixel_scale.max(2) as i32
+            } else {
+                pixel_scale.max(1) as i32
+            };
+            fill_rect(
+                pixels,
+                width,
+                height,
+                px - marker / 2,
+                py - marker / 2,
+                marker,
+                marker,
+                color,
+            );
+        }
+        if probe.fused {
+            let radius = pixel_scale.max(2) as i32 + 1;
+            for (a, b) in [
+                ((center_x - radius, center_y), (center_x + radius, center_y)),
+                ((center_x, center_y - radius), (center_x, center_y + radius)),
+            ] {
+                draw_line_clipped(pixels, width, height, a.0, a.1, b.0, b.1, 0x00ff_e040);
+            }
+        }
+    }
     // `semantic_iris` is a search region, not an anatomical publication.
     // Showing it as the same green ring after anatomy failed made the search
     // seed look like a confidently located pivot/contact. Keep using it for
@@ -37337,6 +37436,77 @@ fn draw_motion_octree_overlay(
                     }
                 }
                 previous = Some(point);
+            }
+        }
+    }
+    // Horizontal light-field walks are rendered as sparse affine spans rather
+    // than another stack of rectangles. Cyan opens outward (expansion),
+    // orange closes inward (contraction), and violet is translation-dominant.
+    // The broad root and accepted leaves make the coarse-to-fine tree visible
+    // without repainting every rejected search cell over the eye.
+    let light_field = &overlay.horizontal_light_field;
+    for (node_index, node) in light_field.nodes.iter().enumerate() {
+        if node.confidence < 0.08 || (!node.leaf && node.depth != 0) {
+            continue;
+        }
+        let color = if node.horizontal_scale_delta > 0.0025 {
+            0x0020_e0ff
+        } else if node.horizontal_scale_delta < -0.0025 {
+            0x00ff_8a28
+        } else {
+            0x00bf_78ff
+        };
+        let mapped_x = |source_x: f32| {
+            source_x
+                + node.local_translation_px
+                + node.horizontal_scale_delta * (source_x - node.source_center[0])
+        };
+        let line_y = origin_y + (node.destination_center[1] * scale).round() as i32;
+        let left_x = origin_x + (mapped_x(node.source_bounds[0]) * scale).round() as i32;
+        let right_x = origin_x + (mapped_x(node.source_bounds[2]) * scale).round() as i32;
+        draw_line_clipped(
+            pixels, width, height, left_x, line_y, right_x, line_y, color,
+        );
+        let tick = (2 + i32::from(node.depth)).min(6) * pixel_scale.max(1) as i32;
+        draw_line_clipped(
+            pixels,
+            width,
+            height,
+            left_x,
+            line_y - tick,
+            left_x,
+            line_y + tick,
+            color,
+        );
+        draw_line_clipped(
+            pixels,
+            width,
+            height,
+            right_x,
+            line_y - tick,
+            right_x,
+            line_y + tick,
+            color,
+        );
+        if let Some(parent) = node
+            .parent
+            .and_then(|parent| light_field.nodes.get(usize::from(parent)))
+        {
+            let parent_x = origin_x + (parent.destination_center[0] * scale).round() as i32;
+            let parent_y = origin_y + (parent.destination_center[1] * scale).round() as i32;
+            let child_x = origin_x + (node.destination_center[0] * scale).round() as i32;
+            let child_y = origin_y + (node.destination_center[1] * scale).round() as i32;
+            if node_index % 2 == 0 {
+                draw_line_clipped(
+                    pixels,
+                    width,
+                    height,
+                    parent_x,
+                    parent_y,
+                    child_x,
+                    child_y,
+                    0x0058_6078,
+                );
             }
         }
     }
@@ -37709,6 +37879,37 @@ fn draw_motion_octree_overlay(
             raw_motion_octrees::FocusSfmPhase::Accepted => 0x0048_ff60,
             raw_motion_octrees::FocusSfmPhase::Rejected => 0x00ff_5548,
             _ => 0x00ff_ffff,
+        },
+    );
+    let light_status = format!(
+        "LIGHTX {} T{:+.1}px S{:+.2}% Q{:.2} R{:.1} N{}/{} FX{}/{} RB{}/{} D{} XR{} {}/{}us",
+        if light_field.reliable { "LOCK" } else { "SCAN" },
+        light_field.horizontal_translation_px,
+        light_field.horizontal_scale_delta * 100.0,
+        light_field.confidence,
+        light_field.residual_px,
+        light_field.leaf_nodes,
+        light_field.nodes.len(),
+        overlay.match_diagnostics.light_field_rescue_accepted,
+        overlay.match_diagnostics.light_field_rescue_tracks,
+        overlay.match_diagnostics.radial_limbus_fused,
+        overlay.match_diagnostics.radial_limbus_accepted,
+        overlay.match_diagnostics.dormant_tracks,
+        overlay.match_diagnostics.extended_gap_relocated,
+        light_field.elapsed_micros,
+        overlay.match_diagnostics.radial_limbus_micros,
+    );
+    draw_text(
+        pixels,
+        width,
+        height,
+        origin_x + 4,
+        origin_y + 44,
+        &light_status,
+        if light_field.reliable {
+            0x0060_ffd0
+        } else {
+            0x0088_9098
         },
     );
 }

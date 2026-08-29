@@ -6,7 +6,7 @@
 //! differential/parallax motion as the third octree coordinate.  It does not
 //! claim metric depth or semantic object identity.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -142,8 +142,18 @@ impl LearningCannyProfile {
 // Offline 112-track replays regularly saturated the budget without improving
 // the number of coherent layers.
 const MAX_FEATURES: usize = 80;
-const MAX_TRAIL: usize = 14;
+// A dormant identity needs enough pre-occlusion history for nearby surviving
+// material to transport it across an ordinary blink.  This is coordinate
+// state only; no additional RAW frames are retained.
+const MAX_TRAIL: usize = 32;
 const MAX_AGE: u8 = 3;
+const MAX_FEATURE_DORMANT_AGE: u8 = 24;
+const MAX_FEATURE_DORMANT_NS: u64 = 750_000_000;
+// Keep only the strongest pre-occlusion identities beyond the ordinary
+// three-frame gap. Dormant tracks are cheap (they skip adjacent patch search),
+// but letting all eighty occupy the detector budget would prevent fresh
+// current-frame features from being seeded during unrelated local losses.
+const MAX_EXTENDED_DORMANT_FEATURES: usize = 24;
 const PATCH_RADIUS: i32 = 7;
 const PYRAMID_PATCH_RADIUS: i32 = 9;
 const PREDICTED_PATCH_RADIUS: i32 = 5;
@@ -174,6 +184,17 @@ const MIN_PERSISTENT_CANNY_SUPPORT: f32 = 0.055;
 const EDGE_TILE_SIZE: usize = 24;
 const EDGES_PER_TILE: usize = 18;
 const FEATURE_SEED_TILE_SIZE: usize = 48;
+// The general graph remains capped at eighty tracks, but an anatomically
+// plausible iris-to-sclera transition receives a lower *selection* cost so a
+// dense lid, brow, or glasses ridge cannot crowd every limbus observation out
+// of that fixed budget.  The discount is intentionally bounded: these are
+// still proposals, and an inaccurate iris seed must not manufacture anatomy.
+const LIMBUS_FEATURE_RESERVE: usize = 24;
+const LIMBUS_FEATURE_SECTORS: usize = 24;
+const LIMBUS_FEATURE_MAX_PER_TILE: u8 = 3;
+const LIMBUS_FEATURE_MAX_PER_SECTOR: u8 = 2;
+const LIMBUS_FEATURE_MIN_AFFINITY: f32 = 0.30;
+const LIMBUS_FEATURE_MAX_COST_DISCOUNT: f32 = 0.45;
 // A nautilus fingerprint follows four slowly rotating, opposed branches over
 // four outward shells.  Pair means retain the regional material while signed
 // pair differences retain direction; z-normalization makes the 32-byte result
@@ -195,10 +216,48 @@ const NAUTILUS_MIN_REVERSE_MARGIN: f32 = 0.04;
 const NAUTILUS_MIN_ACCEPTANCE_CONFIDENCE: f32 = 0.85;
 const NAUTILUS_IDENTITY_RADIUS_BASE: f32 = 2.0;
 const NAUTILUS_IDENTITY_RADIUS_PER_GAP: f32 = 0.5;
+const NAUTILUS_EXTENDED_GAP_IDENTITY_RADIUS_MAX: f32 = 6.5;
 const NAUTILUS_ANCHOR_PRIOR_DISAGREEMENT_BASE: f32 = 6.0;
 const NAUTILUS_ANCHOR_PRIOR_DISAGREEMENT_PER_GAP: f32 = 4.0;
 const NAUTILUS_ANCHOR_RESIDUAL_BASE: f32 = 2.5;
 const NAUTILUS_ANCHOR_RESIDUAL_PER_GAP: f32 = 0.75;
+// Horizontal light-field walks stay on the native RAW lattice.  A broad
+// linear box kernel is evaluated first; only textured, well-correlated
+// regions descend to narrower kernels.  The tree is deliberately small
+// enough to act as a gross search prior without competing with identity-
+// bearing point patches for the frame budget.
+const LIGHT_FIELD_MAX_DEPTH: u8 = 3;
+const LIGHT_FIELD_MAX_NODES: usize = 64;
+const LIGHT_FIELD_MIN_WIDTH: f32 = 56.0;
+const LIGHT_FIELD_MIN_HEIGHT: f32 = 36.0;
+const LIGHT_FIELD_BLUR_RADIUS: [i32; 4] = [12, 7, 3, 1];
+const LIGHT_FIELD_SAMPLE_STEP: [usize; 4] = [8, 6, 4, 3];
+const LIGHT_FIELD_TRANSLATION_RADIUS: [f32; 4] = [24.0, 6.0, 3.0, 1.5];
+const LIGHT_FIELD_TRANSLATION_STEP: [f32; 4] = [4.0, 2.0, 1.0, 0.5];
+const LIGHT_FIELD_SCALE_RADIUS: [f32; 4] = [0.08, 0.030, 0.015, 0.0075];
+const LIGHT_FIELD_SCALE_STEP: [f32; 4] = [0.020, 0.010, 0.005, 0.0025];
+const LIGHT_FIELD_VERTICAL_RADIUS: [f32; 4] = [8.0, 4.0, 2.0, 1.0];
+const LIGHT_FIELD_VERTICAL_STEP: [f32; 4] = [4.0, 2.0, 1.0, 1.0];
+const LIGHT_FIELD_MIN_CORRELATION: f32 = 0.58;
+const LIGHT_FIELD_MIN_TEXTURE: f32 = 0.010;
+const LIGHT_FIELD_BRANCH_CONFIDENCE: f32 = 0.24;
+// Twenty-four angular lanes provide opposing-meridian leverage without
+// turning the limbus into a dense contour tracer. Every lane samples the
+// native RAW field at the boundary plus five points inward and five outward.
+// The descriptor compares normalized gradients, so exposure/gain changes do
+// not erase a broad translucent iris-to-sclera transition.
+const RADIAL_LIMBUS_SECTORS: usize = 24;
+pub const RADIAL_LIMBUS_HALF_SAMPLES: usize = 5;
+const RADIAL_LIMBUS_SAMPLES: usize = RADIAL_LIMBUS_HALF_SAMPLES * 2 + 1;
+const RADIAL_LIMBUS_GRADIENTS: usize = RADIAL_LIMBUS_SAMPLES - 1;
+pub const RADIAL_LIMBUS_SAMPLE_SPACING_PX: f32 = 1.5;
+const RADIAL_LIMBUS_REFERENCE_SEARCH_PX: i32 = 4;
+const RADIAL_LIMBUS_CURRENT_SEARCH_PX: i32 = 8;
+const RADIAL_LIMBUS_MIN_QUALITY: f32 = 0.10;
+const RADIAL_LIMBUS_MAX_PROFILE_COST: f32 = 0.46;
+const RADIAL_LIMBUS_MAX_PRIOR_NORMAL_ERROR_PX: f32 = 5.0;
+const RADIAL_LIMBUS_MIN_JOINT_SUPPORT: usize = 5;
+const RADIAL_LIMBUS_MAX_FUSED: usize = 12;
 const ELLIPSE_ANGLE_BINS: usize = 24;
 const MOTION_SIGNATURE_LEN: usize = 8;
 const MIN_MOTION_SIGNATURE: usize = 4;
@@ -529,6 +588,36 @@ pub struct MatchDiagnostics {
     pub nautilus_relocated: usize,
     pub nautilus_gap_relocated: usize,
     pub nautilus_margin_sum: f32,
+    /// Sparse native-RAW horizontal light-field hierarchy.  `evaluations`
+    /// counts complete affine walk hypotheses, not individual RAW reads.
+    pub light_field_micros: u64,
+    pub light_field_nodes: usize,
+    pub light_field_leaves: usize,
+    pub light_field_evaluations: usize,
+    pub light_field_reliable: bool,
+    /// Established tracks whose ordinary prediction did not cover the
+    /// independently measured horizontal field basin.
+    pub light_field_rescue_tracks: usize,
+    /// Half-resolution patch evaluations spent only in those rescue basins.
+    pub light_field_rescue_evaluations: usize,
+    /// Exact current-frame matches selected from a field-guided basin after
+    /// the ordinary basin lost the feature.
+    pub light_field_rescue_accepted: usize,
+    /// Native five-in/five-out radial profile lanes evaluated around the
+    /// projected iris/sclera boundary.
+    pub radial_limbus_evaluations: usize,
+    /// Illumination-normalized adjacent-frame radial transitions retained as
+    /// current evidence before joint-motion consistency is applied.
+    pub radial_limbus_accepted: usize,
+    /// Accepted radial transitions actually admitted as one-dimensional
+    /// normal-flow constraints to the iris similarity solve.
+    pub radial_limbus_fused: usize,
+    pub radial_limbus_micros: u64,
+    /// Historical IDs retained without pretending their last observation is
+    /// present in the current exposure.
+    pub dormant_tracks: usize,
+    /// Dormant IDs recovered after more than the ordinary three-frame gap.
+    pub extended_gap_relocated: usize,
     /// Mature subpixel tracks admitted as nodes to the pairwise motion graph.
     pub relation_nodes: usize,
     /// Pairwise similarity tensors retained after baseline/finite checks.
@@ -598,6 +687,7 @@ struct FeatureTrack {
     points: VecDeque<[f32; 3]>, // absolute sensor x/y and relative parallax z
     object: usize,
     age: u8,
+    last_seen_timestamp_ns: u64,
     score: f32,
     motion_ema: [f32; 2],
     motion_variance: f32,
@@ -793,6 +883,61 @@ impl Default for EdgeEvidence {
     }
 }
 
+/// One accepted region in the coarse-to-fine horizontal RAW walk tree.
+/// Bounds and local translation are expressed on the previous/current ROI
+/// lattices; `sensor_translation_px` removes any camera-side ROI relocation
+/// and therefore describes material motion in absolute sensor coordinates.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HorizontalLightFieldNode {
+    pub parent: Option<u16>,
+    pub depth: u8,
+    pub leaf: bool,
+    pub source_bounds: [f32; 4],
+    pub source_center: [f32; 2],
+    pub destination_center: [f32; 2],
+    pub local_translation_px: f32,
+    pub sensor_translation_px: f32,
+    pub vertical_nuisance_px: f32,
+    pub horizontal_scale_delta: f32,
+    pub blur_radius_px: u8,
+    pub correlation: f32,
+    pub ambiguity_margin: f32,
+    pub texture: f32,
+    pub confidence: f32,
+    pub samples: u16,
+}
+
+/// Regional horizontal deformation evidence gathered independently of Canny
+/// feature identity.  It may center a broad point search, but it never labels
+/// a feature or directly publishes eye anatomy.
+#[derive(Clone, Debug, Default)]
+pub struct HorizontalLightFieldStatus {
+    pub nodes: Vec<HorizontalLightFieldNode>,
+    pub horizontal_translation_px: f32,
+    pub horizontal_scale_delta: f32,
+    pub residual_px: f32,
+    pub confidence: f32,
+    pub horizontal_coverage: f32,
+    pub leaf_nodes: usize,
+    pub evaluations: usize,
+    pub elapsed_micros: u64,
+    pub reliable: bool,
+}
+
+/// Exact current-frame radial limbus observation. `point` and `normal` are
+/// ROI-local native sensor coordinates; the five inward/five outward samples
+/// remain implicit so rendering does not retain or duplicate RAW pixels.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RadialLimbusProbe {
+    pub point: [f32; 2],
+    pub normal: [f32; 2],
+    pub phase_rad: f32,
+    pub radial_shift_px: f32,
+    pub profile_cost: f32,
+    pub confidence: f32,
+    pub fused: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct MotionOctreeOverlay {
     pub generation: u64,
@@ -820,6 +965,13 @@ pub struct MotionOctreeOverlay {
     /// comparison. Kept as telemetry so the live overlay can make the mask
     /// auditable instead of silently deleting evidence.
     pub motion_shadow_edges_downweighted: usize,
+    /// Coarse-to-fine native-RAW horizontal translation/scale field for the
+    /// exact displayed exposure pair.
+    pub horizontal_light_field: HorizontalLightFieldStatus,
+    /// Illumination-normalized five-in/five-out radial transitions measured
+    /// on this exact exposure pair. These are normal-flow constraints, not
+    /// claims of tangential point identity along a smooth limbus.
+    pub radial_limbus_probes: Vec<RadialLimbusProbe>,
     /// Current label-free/seeded outer-iris motion region in ROI-local pixels.
     /// It is exported so lossless reviews can audit exactly which Canny tracks
     /// were considered possible limbus normal-flow constraints.
@@ -1770,6 +1922,593 @@ struct RawFrame {
     width: usize,
     height: usize,
     pixels: Vec<u16>,
+}
+
+/// Native-resolution row integrals used only to evaluate sparse horizontal
+/// box-filtered walks.  No image is resized, demosaiced, or warped: every
+/// queried value is the linear mean of an interval on one original RAW row.
+struct NativeHorizontalRowIntegrals {
+    width: usize,
+    height: usize,
+    rows: Vec<u64>,
+}
+
+impl NativeHorizontalRowIntegrals {
+    fn new(frame: &RawFrame) -> Self {
+        let stride = frame.width + 1;
+        let mut rows = vec![0u64; stride.saturating_mul(frame.height)];
+        for y in 0..frame.height {
+            let mut sum = 0u64;
+            let output = y * stride;
+            let input = y * frame.width;
+            for x in 0..frame.width {
+                sum = sum.saturating_add(u64::from(frame.pixels[input + x]));
+                rows[output + x + 1] = sum;
+            }
+        }
+        Self {
+            width: frame.width,
+            height: frame.height,
+            rows,
+        }
+    }
+
+    fn integer_box_mean(&self, x: i32, y: i32, radius: i32) -> Option<f32> {
+        let left = x - radius;
+        let right = x + radius;
+        if y < 0 || y >= self.height as i32 || left < 0 || right >= self.width as i32 || radius < 0
+        {
+            return None;
+        }
+        let stride = self.width + 1;
+        let row = y as usize * stride;
+        let sum = self.rows[row + right as usize + 1] - self.rows[row + left as usize];
+        Some(sum as f32 / (2 * radius + 1) as f32)
+    }
+
+    /// Linearly interpolate between neighboring native box centers.  This
+    /// gives the affine scale search sub-pixel continuity without creating an
+    /// interpolated image plane.
+    fn sample_horizontal_blur(&self, x: f32, y: f32, radius: i32) -> Option<f32> {
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        let x0 = x.floor() as i32;
+        let x_phase = x - x0 as f32;
+        let y0 = y.round() as i32;
+        let vertical = (radius / 3).clamp(1, 4);
+        let mut weighted = 0.0f32;
+        let mut weight_sum = 0.0f32;
+        for (offset_y, weight) in [(-vertical, 1.0f32), (0, 2.0), (vertical, 1.0)] {
+            let left = self.integer_box_mean(x0, y0 + offset_y, radius)?;
+            let right = self.integer_box_mean(x0 + 1, y0 + offset_y, radius)?;
+            weighted += (left * (1.0 - x_phase) + right * x_phase) * weight;
+            weight_sum += weight;
+        }
+        Some(weighted / weight_sum)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct HorizontalWalkTransform {
+    translation: f32,
+    scale_delta: f32,
+    vertical_nuisance: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HorizontalWalkSample {
+    x: f32,
+    y: f32,
+    value: f32,
+}
+
+#[derive(Clone, Debug)]
+struct HorizontalWalkSource {
+    samples: Vec<HorizontalWalkSample>,
+    sum: f64,
+    squared_sum: f64,
+    texture: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HorizontalWalkCandidate {
+    transform: HorizontalWalkTransform,
+    cost: f32,
+    correlation: f32,
+}
+
+fn inclusive_search_values(center: f32, radius: f32, step: f32) -> Vec<f32> {
+    let half_steps = (radius / step).round().max(0.0) as i32;
+    (-half_steps..=half_steps)
+        .map(|offset| center + offset as f32 * step)
+        .collect()
+}
+
+fn horizontal_walk_source(
+    source: &NativeHorizontalRowIntegrals,
+    bounds: [f32; 4],
+    depth: u8,
+) -> Option<HorizontalWalkSource> {
+    let level = usize::from(depth.min(LIGHT_FIELD_MAX_DEPTH));
+    let radius = LIGHT_FIELD_BLUR_RADIUS[level];
+    let step = LIGHT_FIELD_SAMPLE_STEP[level];
+    let lane_count = if depth == 0 { 5usize } else { 3usize };
+    let left = bounds[0].ceil() as usize;
+    let right = bounds[2].floor().max(0.0) as usize;
+    if right <= left || bounds[3] <= bounds[1] {
+        return None;
+    }
+    let mut samples = Vec::new();
+    for lane in 0..lane_count {
+        let phase = (lane + 1) as f32 / (lane_count + 1) as f32;
+        let y = bounds[1] * (1.0 - phase) + bounds[3] * phase;
+        for x in (left..=right).step_by(step) {
+            let x = x as f32;
+            if let Some(value) = source.sample_horizontal_blur(x, y, radius) {
+                samples.push(HorizontalWalkSample { x, y, value });
+            }
+        }
+    }
+    let minimum_samples = if depth >= 3 { 12 } else { 18 };
+    if samples.len() < minimum_samples {
+        return None;
+    }
+    let sum = samples
+        .iter()
+        .map(|sample| f64::from(sample.value))
+        .sum::<f64>();
+    let squared_sum = samples
+        .iter()
+        .map(|sample| f64::from(sample.value).powi(2))
+        .sum::<f64>();
+    let count = samples.len() as f64;
+    let energy = (squared_sum - sum * sum / count).max(0.0);
+    let mean = (sum / count).abs().max(16.0);
+    let texture = (energy / count).sqrt() as f32 / mean as f32;
+    Some(HorizontalWalkSource {
+        samples,
+        sum,
+        squared_sum,
+        texture,
+    })
+}
+
+fn score_horizontal_walk(
+    source: &HorizontalWalkSource,
+    current: &NativeHorizontalRowIntegrals,
+    center_x: f32,
+    radius: i32,
+    transform: HorizontalWalkTransform,
+) -> Option<HorizontalWalkCandidate> {
+    let count = source.samples.len() as f64;
+    let mut current_sum = 0.0f64;
+    let mut current_squared_sum = 0.0f64;
+    let mut cross = 0.0f64;
+    for sample in &source.samples {
+        let current_x =
+            sample.x + transform.translation + transform.scale_delta * (sample.x - center_x);
+        let current_y = sample.y + transform.vertical_nuisance;
+        let current_value = current.sample_horizontal_blur(current_x, current_y, radius)?;
+        let current_value = f64::from(current_value);
+        current_sum += current_value;
+        current_squared_sum += current_value * current_value;
+        cross += f64::from(sample.value) * current_value;
+    }
+    let source_energy = source.squared_sum - source.sum * source.sum / count;
+    let current_energy = current_squared_sum - current_sum * current_sum / count;
+    if source_energy <= 1.0 || current_energy <= 1.0 {
+        return None;
+    }
+    let covariance = cross - source.sum * current_sum / count;
+    let correlation =
+        (covariance / (source_energy * current_energy).sqrt()).clamp(-1.0, 1.0) as f32;
+    Some(HorizontalWalkCandidate {
+        transform,
+        cost: 1.0 - correlation,
+        correlation,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_horizontal_light_field_node(
+    previous: &RawFrame,
+    current: &RawFrame,
+    previous_rows: &NativeHorizontalRowIntegrals,
+    current_rows: &NativeHorizontalRowIntegrals,
+    bounds: [f32; 4],
+    depth: u8,
+    parent: Option<usize>,
+    prior: HorizontalWalkTransform,
+    nodes: &mut Vec<HorizontalLightFieldNode>,
+    evaluations: &mut usize,
+) -> Option<usize> {
+    if nodes.len() >= LIGHT_FIELD_MAX_NODES
+        || bounds[2] - bounds[0] < LIGHT_FIELD_MIN_WIDTH
+        || bounds[3] - bounds[1] < LIGHT_FIELD_MIN_HEIGHT
+    {
+        return None;
+    }
+    let level = usize::from(depth.min(LIGHT_FIELD_MAX_DEPTH));
+    let source = horizontal_walk_source(previous_rows, bounds, depth)?;
+    if source.texture < LIGHT_FIELD_MIN_TEXTURE {
+        return None;
+    }
+    let center = [0.5 * (bounds[0] + bounds[2]), 0.5 * (bounds[1] + bounds[3])];
+    let translations = inclusive_search_values(
+        prior.translation,
+        LIGHT_FIELD_TRANSLATION_RADIUS[level],
+        LIGHT_FIELD_TRANSLATION_STEP[level],
+    );
+    let scales = inclusive_search_values(
+        prior.scale_delta,
+        LIGHT_FIELD_SCALE_RADIUS[level],
+        LIGHT_FIELD_SCALE_STEP[level],
+    );
+    let vertical = inclusive_search_values(
+        prior.vertical_nuisance,
+        LIGHT_FIELD_VERTICAL_RADIUS[level],
+        LIGHT_FIELD_VERTICAL_STEP[level],
+    );
+    let mut candidates = Vec::with_capacity(
+        translations
+            .len()
+            .saturating_mul(scales.len())
+            .saturating_mul(vertical.len()),
+    );
+    for translation in translations {
+        for scale_delta in scales.iter().copied() {
+            if !scale_delta.is_finite() || scale_delta.abs() > 0.12 {
+                continue;
+            }
+            for vertical_nuisance in vertical.iter().copied() {
+                *evaluations = evaluations.saturating_add(1);
+                if let Some(candidate) = score_horizontal_walk(
+                    &source,
+                    current_rows,
+                    center[0],
+                    LIGHT_FIELD_BLUR_RADIUS[level],
+                    HorizontalWalkTransform {
+                        translation,
+                        scale_delta,
+                        vertical_nuisance,
+                    },
+                ) {
+                    candidates.push(candidate);
+                }
+            }
+        }
+    }
+    candidates.sort_by(|left, right| left.cost.total_cmp(&right.cost));
+    let best = candidates.first().copied()?;
+    let span = (bounds[2] - bounds[0]).max(1.0);
+    let second_cost = candidates
+        .iter()
+        .find(|candidate| {
+            (candidate.transform.translation - best.transform.translation).abs()
+                >= LIGHT_FIELD_TRANSLATION_STEP[level] * 1.5
+                || (candidate.transform.scale_delta - best.transform.scale_delta).abs() * span
+                    >= 3.0
+                || (candidate.transform.vertical_nuisance - best.transform.vertical_nuisance).abs()
+                    >= LIGHT_FIELD_VERTICAL_STEP[level] * 1.5
+        })
+        .map_or(1.0, |candidate| candidate.cost);
+    let ambiguity_margin = (second_cost - best.cost).max(0.0);
+    let correlation_quality = ((best.correlation - 0.45) / 0.48).clamp(0.0, 1.0);
+    let texture_quality = ((source.texture - 0.008) / 0.075).clamp(0.0, 1.0);
+    let margin_quality = (ambiguity_margin / 0.018).clamp(0.0, 1.0);
+    let confidence = correlation_quality * texture_quality * (0.35 + 0.65 * margin_quality);
+    let minimum_correlation = if depth == 0 {
+        LIGHT_FIELD_MIN_CORRELATION
+    } else {
+        LIGHT_FIELD_MIN_CORRELATION - 0.04
+    };
+    if best.correlation < minimum_correlation || confidence < 0.06 {
+        return None;
+    }
+    let index = nodes.len();
+    let sensor_translation =
+        best.transform.translation + current.sensor_x as f32 - previous.sensor_x as f32;
+    nodes.push(HorizontalLightFieldNode {
+        parent: parent.and_then(|value| u16::try_from(value).ok()),
+        depth,
+        leaf: true,
+        source_bounds: bounds,
+        source_center: center,
+        destination_center: [
+            center[0] + best.transform.translation,
+            center[1] + best.transform.vertical_nuisance,
+        ],
+        local_translation_px: best.transform.translation,
+        sensor_translation_px: sensor_translation,
+        vertical_nuisance_px: best.transform.vertical_nuisance,
+        horizontal_scale_delta: best.transform.scale_delta,
+        blur_radius_px: LIGHT_FIELD_BLUR_RADIUS[level] as u8,
+        correlation: best.correlation,
+        ambiguity_margin,
+        texture: source.texture,
+        confidence,
+        samples: source.samples.len().min(usize::from(u16::MAX)) as u16,
+    });
+
+    let child_width = 0.5 * (bounds[2] - bounds[0]);
+    let child_height = 0.5 * (bounds[3] - bounds[1]);
+    if depth >= LIGHT_FIELD_MAX_DEPTH
+        || confidence < LIGHT_FIELD_BRANCH_CONFIDENCE
+        || best.correlation < 0.64
+        || child_width < LIGHT_FIELD_MIN_WIDTH
+        || child_height < LIGHT_FIELD_MIN_HEIGHT
+    {
+        return Some(index);
+    }
+    let midpoint = [center[0], center[1]];
+    let mut children = 0usize;
+    for child in 0..4usize {
+        if nodes.len() >= LIGHT_FIELD_MAX_NODES {
+            break;
+        }
+        let child_bounds = [
+            if child & 1 == 0 {
+                bounds[0]
+            } else {
+                midpoint[0]
+            },
+            if child & 2 == 0 {
+                bounds[1]
+            } else {
+                midpoint[1]
+            },
+            if child & 1 == 0 {
+                midpoint[0]
+            } else {
+                bounds[2]
+            },
+            if child & 2 == 0 {
+                midpoint[1]
+            } else {
+                bounds[3]
+            },
+        ];
+        let child_center_x = 0.5 * (child_bounds[0] + child_bounds[2]);
+        let child_prior = HorizontalWalkTransform {
+            translation: best.transform.translation
+                + best.transform.scale_delta * (child_center_x - center[0]),
+            scale_delta: best.transform.scale_delta,
+            vertical_nuisance: best.transform.vertical_nuisance,
+        };
+        children += usize::from(
+            append_horizontal_light_field_node(
+                previous,
+                current,
+                previous_rows,
+                current_rows,
+                child_bounds,
+                depth + 1,
+                Some(index),
+                child_prior,
+                nodes,
+                evaluations,
+            )
+            .is_some(),
+        );
+    }
+    if children > 0 {
+        nodes[index].leaf = false;
+    }
+    Some(index)
+}
+
+fn summarize_horizontal_light_field(
+    previous: &RawFrame,
+    nodes: Vec<HorizontalLightFieldNode>,
+    evaluations: usize,
+    elapsed_micros: u64,
+) -> HorizontalLightFieldStatus {
+    let leaves = nodes
+        .iter()
+        .filter(|node| node.leaf && node.confidence >= 0.08)
+        .collect::<Vec<_>>();
+    if leaves.is_empty() {
+        return HorizontalLightFieldStatus {
+            nodes,
+            evaluations,
+            elapsed_micros,
+            ..HorizontalLightFieldStatus::default()
+        };
+    }
+    let mut weight_sum = 0.0f64;
+    let mut mean_x = 0.0f64;
+    let mut mean_displacement = 0.0f64;
+    let mut weighted_node_scale = 0.0f64;
+    let mut minimum_x = f32::INFINITY;
+    let mut maximum_x = f32::NEG_INFINITY;
+    for node in &leaves {
+        let weight = f64::from(node.confidence.max(0.03))
+            * f64::from(node.confidence.max(0.03))
+            * f64::from(node.samples.max(1));
+        let x = previous.sensor_x as f64 + f64::from(node.source_center[0]);
+        weight_sum += weight;
+        mean_x += weight * x;
+        mean_displacement += weight * f64::from(node.sensor_translation_px);
+        weighted_node_scale += weight * f64::from(node.horizontal_scale_delta);
+        minimum_x = minimum_x.min(node.source_center[0]);
+        maximum_x = maximum_x.max(node.source_center[0]);
+    }
+    mean_x /= weight_sum.max(1.0e-9);
+    mean_displacement /= weight_sum.max(1.0e-9);
+    weighted_node_scale /= weight_sum.max(1.0e-9);
+    let mut numerator = 0.0f64;
+    let mut denominator = 0.0f64;
+    for node in &leaves {
+        let weight = f64::from(node.confidence.max(0.03)).powi(2) * f64::from(node.samples.max(1));
+        let x = previous.sensor_x as f64 + f64::from(node.source_center[0]) - mean_x;
+        let displacement = f64::from(node.sensor_translation_px) - mean_displacement;
+        numerator += weight * x * displacement;
+        denominator += weight * x * x;
+    }
+    let regression_scale = if denominator > 1.0 {
+        numerator / denominator
+    } else {
+        weighted_node_scale
+    };
+    let scale_delta =
+        (0.72 * regression_scale + 0.28 * weighted_node_scale).clamp(-0.12, 0.12) as f32;
+    let center_sensor_x = previous.sensor_x as f64 + previous.width as f64 * 0.5;
+    let translation =
+        (mean_displacement + f64::from(scale_delta) * (center_sensor_x - mean_x)) as f32;
+    let mut residual_sum = 0.0f64;
+    let mut confidence_sum = 0.0f64;
+    for node in &leaves {
+        let weight = f64::from(node.confidence.max(0.03)).powi(2) * f64::from(node.samples.max(1));
+        let x = previous.sensor_x as f64 + f64::from(node.source_center[0]) - center_sensor_x;
+        let predicted = f64::from(translation) + f64::from(scale_delta) * x;
+        residual_sum += weight * (predicted - f64::from(node.sensor_translation_px)).abs();
+        confidence_sum += weight * f64::from(node.confidence);
+    }
+    let residual_px = (residual_sum / weight_sum.max(1.0e-9)) as f32;
+    let horizontal_coverage =
+        ((maximum_x - minimum_x) / previous.width.max(1) as f32).clamp(0.0, 1.0);
+    let mean_confidence = (confidence_sum / weight_sum.max(1.0e-9)) as f32;
+    let coverage_quality = (horizontal_coverage / 0.52).clamp(0.0, 1.0);
+    let residual_quality = (1.0 - residual_px / 6.0).clamp(0.0, 1.0);
+    let confidence = mean_confidence * (0.40 + 0.60 * coverage_quality) * residual_quality;
+    let leaf_nodes = leaves.len();
+    let reliable = leaf_nodes >= 2
+        && horizontal_coverage >= 0.30
+        && confidence >= 0.16
+        && residual_px <= 4.0
+        && translation.is_finite()
+        && translation.abs() <= 48.0
+        && scale_delta.is_finite()
+        && scale_delta.abs() <= 0.10;
+    HorizontalLightFieldStatus {
+        nodes,
+        horizontal_translation_px: translation,
+        horizontal_scale_delta: scale_delta,
+        residual_px,
+        confidence,
+        horizontal_coverage,
+        leaf_nodes,
+        evaluations,
+        elapsed_micros,
+        reliable,
+    }
+}
+
+fn horizontal_light_field_tree(
+    previous: &RawFrame,
+    current: &RawFrame,
+    prior_motion: SimilarityMotion,
+) -> HorizontalLightFieldStatus {
+    let started = Instant::now();
+    if previous.width != current.width
+        || previous.height != current.height
+        || previous.width < 128
+        || previous.height < 96
+    {
+        return HorizontalLightFieldStatus::default();
+    }
+    let previous_rows = NativeHorizontalRowIntegrals::new(previous);
+    let current_rows = NativeHorizontalRowIntegrals::new(current);
+    let prior_translation = if prior_motion.support >= 3
+        && prior_motion.residual.is_finite()
+        && prior_motion.residual <= 4.0
+        && prior_motion.translation[0].abs() <= 24.0
+    {
+        prior_motion.translation
+    } else {
+        [0.0; 2]
+    };
+    let prior_scale = if prior_motion.support >= 4
+        && prior_motion.scale_delta.is_finite()
+        && prior_motion.scale_delta.abs() <= 0.06
+    {
+        prior_motion.scale_delta
+    } else {
+        0.0
+    };
+    let root_prior = HorizontalWalkTransform {
+        translation: previous.sensor_x as f32 - current.sensor_x as f32 + prior_translation[0],
+        scale_delta: prior_scale,
+        vertical_nuisance: previous.sensor_y as f32 - current.sensor_y as f32
+            + prior_translation[1],
+    };
+    let root_level = 0usize;
+    let horizontal_guard = LIGHT_FIELD_BLUR_RADIUS[root_level] as f32
+        + LIGHT_FIELD_TRANSLATION_RADIUS[root_level]
+        + LIGHT_FIELD_SCALE_RADIUS[root_level] * previous.width as f32 * 0.5
+        + 3.0;
+    let vertical_guard = LIGHT_FIELD_BLUR_RADIUS[root_level] as f32 / 3.0
+        + LIGHT_FIELD_VERTICAL_RADIUS[root_level]
+        + 3.0;
+    let bounds = [
+        horizontal_guard + (-root_prior.translation).max(0.0),
+        vertical_guard + (-root_prior.vertical_nuisance).max(0.0),
+        previous.width as f32 - horizontal_guard - root_prior.translation.max(0.0),
+        previous.height as f32 - vertical_guard - root_prior.vertical_nuisance.max(0.0),
+    ];
+    let mut nodes = Vec::new();
+    let mut evaluations = 0usize;
+    let _ = append_horizontal_light_field_node(
+        previous,
+        current,
+        &previous_rows,
+        &current_rows,
+        bounds,
+        0,
+        None,
+        root_prior,
+        &mut nodes,
+        &mut evaluations,
+    );
+    summarize_horizontal_light_field(
+        previous,
+        nodes,
+        evaluations,
+        started.elapsed().as_micros() as u64,
+    )
+}
+
+fn horizontal_light_field_sensor_prediction(
+    field: &HorizontalLightFieldStatus,
+    previous: &RawFrame,
+    current: &RawFrame,
+    previous_sensor: [f32; 2],
+) -> Option<f32> {
+    if !field.reliable {
+        return None;
+    }
+    let local = [
+        previous_sensor[0] - previous.sensor_x as f32,
+        previous_sensor[1] - previous.sensor_y as f32,
+    ];
+    let regional = field
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.confidence >= 0.10
+                && local[0] >= node.source_bounds[0]
+                && local[0] <= node.source_bounds[2]
+                && local[1] >= node.source_bounds[1]
+                && local[1] <= node.source_bounds[3]
+        })
+        .max_by(|left, right| {
+            left.depth
+                .cmp(&right.depth)
+                .then_with(|| left.confidence.total_cmp(&right.confidence))
+        });
+    let sensor_x = if let Some(node) = regional {
+        current.sensor_x as f32
+            + local[0]
+            + node.local_translation_px
+            + node.horizontal_scale_delta * (local[0] - node.source_center[0])
+    } else {
+        let center = previous.sensor_x as f32 + previous.width as f32 * 0.5;
+        previous_sensor[0]
+            + field.horizontal_translation_px
+            + field.horizontal_scale_delta * (previous_sensor[0] - center)
+    };
+    sensor_x.is_finite().then_some(sensor_x)
 }
 
 /// Zero-copy backing frame for the segmentation-independent whole-ROI scale
@@ -3332,7 +4071,7 @@ pub fn canny_proposal_overlay(pixels: &[u16], width: usize, height: usize) -> Mo
     };
     let mut field = canny_field(&current);
     let edges = edge_evidence(&mut field, width, height).edges;
-    let provisional_features = seed_points(&current, Some(&field), &[], MAX_FEATURES)
+    let provisional_features = seed_points(&current, Some(&field), &edges, None, &[], MAX_FEATURES)
         .into_iter()
         .map(|(point, _)| (point[0], point[1]))
         .collect();
@@ -4264,6 +5003,15 @@ pub struct FourMotionOctrees {
     /// separate from `previous`: it is expressly for identity recovery across
     /// a missed frame, while ordinary motion remains adjacent-frame evidence.
     nautilus_banks: BTreeMap<u64, NautilusFingerprintBank>,
+    /// Current adjacent-frame regional horizontal light-field evidence.  It
+    /// is recomputed from the exact RAW pair and never survives a cadence or
+    /// geometry reset as if it were a new observation.
+    horizontal_light_field: HorizontalLightFieldStatus,
+    /// Previous projected iris region and current native-RAW radial
+    /// transitions. They remain separate from point-ID tracks because a
+    /// smooth limbus constrains only motion along its normal.
+    radial_limbus_region: Option<EyeMotionRegion>,
+    radial_limbus_flows: Vec<RadialLimbusFlow>,
     motions: [SimilarityMotion; OBJECTS],
     layers: [MotionLayerStatus; OBJECTS],
     layer_signatures: [LayerMotionSignature; OBJECTS],
@@ -6928,7 +7676,16 @@ fn nautilus_track_prediction(
         .back()
         .copied()
         .unwrap_or([center[0], center[1], 0.0]);
-    let steps = track.age as f32 + 1.0;
+    let elapsed_steps = track.age as f32 + 1.0;
+    // Constant-velocity extrapolation through an entire blink is generally
+    // worse than holding the last material coordinate. Surviving current
+    // anchors, when available, still estimate the complete cross-gap motion
+    // in `nautilus_anchor_conditioned_prediction` below.
+    let prediction_steps = if track.age > MAX_AGE {
+        1.0
+    } else {
+        elapsed_steps
+    };
     let model = motions[track.object];
     let layer = layers[track.object];
     let model_usable = cadence_contiguous
@@ -6963,8 +7720,8 @@ fn nautilus_track_prediction(
         };
     (
         [
-            last[0] + displacement[0] * steps,
-            last[1] + displacement[1] * steps,
+            last[0] + displacement[0] * prediction_steps,
+            last[1] + displacement[1] * prediction_steps,
         ],
         uncertainty.clamp(20.0, 58.0),
     )
@@ -7220,25 +7977,37 @@ fn propose_nautilus_relocations(
     center: [f32; 2],
     sensor_origin: [f32; 2],
     cadence_contiguous: bool,
+    extended_gap_recovery_ready: bool,
     diagnostics: &mut MatchDiagnostics,
 ) -> Vec<NautilusRelocation> {
     if tree.candidates.is_empty() {
         return Vec::new();
     }
     let mut matched = vec![false; tracks.len()];
-    let regular_destinations = matches
-        .iter()
-        .map(|item| {
-            matched[item.track_index] = true;
-            [
+    let mut regular_destinations = Vec::new();
+    for item in matches {
+        matched[item.track_index] = true;
+        let track = &tracks[item.track_index];
+        // A one-observation seed is not an established identity. After a
+        // blink it may have appeared exactly where a dormant, fingerprinted
+        // feature is returning; let the established identity compete for that
+        // destination, then retire the duplicate if re-identification wins.
+        if track.points.len() > 1 || track.matched_streak > 0 {
+            regular_destinations.push([
                 item.current[0] - sensor_origin[0],
                 item.current[1] - sensor_origin[1],
-            ]
-        })
-        .collect::<Vec<_>>();
+            ]);
+        }
+    }
     let mut proposals = Vec::<NautilusRelocation>::new();
     for (track_index, track) in tracks.iter().enumerate() {
         if matched[track_index] {
+            continue;
+        }
+        // Longer-lived IDs are intentionally dormant during the occlusion.
+        // They may re-enter only after independently measured eye geometry
+        // and a coherent open-frame light field have both returned.
+        if track.age > MAX_AGE && !extended_gap_recovery_ready {
             continue;
         }
         let Some(bank) = banks.get(&track.id) else {
@@ -7274,8 +8043,12 @@ fn propose_nautilus_relocations(
         let radius = anchor_prediction
             .map(|prediction| prediction.search_radius)
             .unwrap_or(fallback_radius);
-        let physical_identity_radius =
+        let mut physical_identity_radius =
             NAUTILUS_IDENTITY_RADIUS_BASE + NAUTILUS_IDENTITY_RADIUS_PER_GAP * track.age as f32;
+        if track.age > MAX_AGE {
+            physical_identity_radius =
+                physical_identity_radius.min(NAUTILUS_EXTENDED_GAP_IDENTITY_RADIUS_MAX);
+        }
         let identity_radius = anchor_prediction
             .map(|prediction| prediction.identity_radius)
             .unwrap_or_else(|| nautilus_identity_acceptance_radius(track))
@@ -7337,6 +8110,9 @@ fn propose_nautilus_relocations(
         let mut competing_identity_distance = f32::INFINITY;
         for (other_index, other_track) in tracks.iter().enumerate() {
             if other_index == track_index {
+                continue;
+            }
+            if other_track.points.len() <= 1 && other_track.matched_streak == 0 {
                 continue;
             }
             let Some(other_bank) = banks.get(&other_track.id) else {
@@ -7406,15 +8182,26 @@ fn propose_nautilus_relocations(
 
 fn seed_points(
     frame: &RawFrame,
-    edges: Option<&CannyField>,
+    canny: Option<&CannyField>,
+    edge_evidence: &[EdgeEvidence],
+    iris_seed: Option<IrisEllipseSeed>,
     existing: &[[f32; 2]],
     wanted: usize,
 ) -> Vec<([f32; 2], f32)> {
-    let mut candidates = Vec::new();
+    #[derive(Clone, Copy)]
+    struct Candidate {
+        point: [f32; 2],
+        score: f32,
+        tile: usize,
+        limbus_affinity: f32,
+        limbus_sector: usize,
+    }
+
+    let mut candidates = Vec::<Candidate>::new();
     let tile_columns = frame.width.div_ceil(FEATURE_SEED_TILE_SIZE);
     for y in (5..frame.height.saturating_sub(5)).step_by(3) {
         for x in (5..frame.width.saturating_sub(5)).step_by(3) {
-            let edge_support = edges
+            let edge_support = canny
                 .map(|edges| local_canny_support(edges, frame.width, x, y))
                 .unwrap_or(1.0);
             let corner = corner_score(frame, x, y) * edge_support.clamp(0.0, 3.0);
@@ -7424,40 +8211,210 @@ fn seed_points(
             // coherence still decide whether they survive. The tile id below
             // prevents one high-contrast lid or hair edge from consuming the
             // whole bounded feature budget.
-            let line = edges.map_or(0.0, |_| 180.0 * edge_support.clamp(0.0, 2.0));
+            let line = canny.map_or(0.0, |_| 180.0 * edge_support.clamp(0.0, 2.0));
             let score = corner.max(line);
-            if edges.is_none_or(|_| edge_support >= 0.35) && score >= 64.0 {
-                candidates.push((
-                    [x as f32, y as f32],
+            if canny.is_none_or(|_| edge_support >= 0.35) && score >= 64.0 {
+                candidates.push(Candidate {
+                    point: [x as f32, y as f32],
                     score,
-                    (y / FEATURE_SEED_TILE_SIZE) * tile_columns + x / FEATURE_SEED_TILE_SIZE,
-                ));
+                    tile: (y / FEATURE_SEED_TILE_SIZE) * tile_columns + x / FEATURE_SEED_TILE_SIZE,
+                    limbus_affinity: 0.0,
+                    limbus_sector: 0,
+                });
             }
         }
     }
-    candidates.sort_by(|left, right| right.1.total_cmp(&left.1));
+
+    // The compact edge bank has already paid for full-resolution,
+    // illumination-normalized side-texture attributes. Reuse those exact RAW
+    // measurements rather than allocating another image or sampling a
+    // rendered color representation. Exact edge centers also avoid moving a
+    // smooth limbus observation onto the nearest three-pixel seed lattice.
+    if let Some(seed) = iris_seed {
+        for edge in edge_evidence {
+            let point = [edge.x, edge.y];
+            if point[0] < 5.0
+                || point[1] < 5.0
+                || point[0] + 5.0 >= frame.width as f32
+                || point[1] + 5.0 >= frame.height as f32
+            {
+                continue;
+            }
+            let Some((affinity, sector)) = limbus_feature_budget_affinity(*edge, seed) else {
+                continue;
+            };
+            if affinity < 0.08 {
+                continue;
+            }
+            let x = point[0].round() as usize;
+            let y = point[1].round() as usize;
+            let edge_support = edge.strength.clamp(0.20, 3.0);
+            let base_score = (corner_score(frame, x, y) * edge_support)
+                .max(180.0 * edge_support.clamp(0.0, 2.0));
+            if base_score < 64.0 {
+                continue;
+            }
+            // This is the requested budget discount. It changes ordering and
+            // the reserved limbus share, never the hard MAX_FEATURES cap.
+            let cost = (1.0 - LIMBUS_FEATURE_MAX_COST_DISCOUNT * affinity).clamp(0.55, 1.0);
+            candidates.push(Candidate {
+                point,
+                score: base_score / cost,
+                tile: (y / FEATURE_SEED_TILE_SIZE) * tile_columns + x / FEATURE_SEED_TILE_SIZE,
+                limbus_affinity: affinity,
+                limbus_sector: sector,
+            });
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| right.limbus_affinity.total_cmp(&left.limbus_affinity))
+            .then_with(|| left.tile.cmp(&right.tile))
+    });
     let mut selected = Vec::new();
     let mut tile_counts = vec![0u8; tile_columns * frame.height.div_ceil(FEATURE_SEED_TILE_SIZE)];
+    let mut sector_counts = [0u8; LIMBUS_FEATURE_SECTORS];
+    let mut covered_sectors = [false; LIMBUS_FEATURE_SECTORS];
+    for candidate in &candidates {
+        if candidate.limbus_affinity >= LIMBUS_FEATURE_MIN_AFFINITY {
+            covered_sectors[candidate.limbus_sector] = true;
+        }
+    }
+    let angular_coverage = covered_sectors.iter().filter(|covered| **covered).count();
+    let opposing_sectors = (0..LIMBUS_FEATURE_SECTORS / 2)
+        .filter(|sector| {
+            covered_sectors[*sector] && covered_sectors[*sector + LIMBUS_FEATURE_SECTORS / 2]
+        })
+        .count();
+    // A one-sided high-contrast arc is much more likely to be a lid, brow, or
+    // glasses rim. Only activate the reserved share after the current RAW
+    // frame contains distributed, opposing support around the proposed conic.
+    let reserve_enabled = angular_coverage >= 6 && opposing_sectors >= 2;
+
+    macro_rules! admit {
+        ($candidate:expr, $limbus_pass:expr) => {{
+            let candidate = $candidate;
+            let limbus_pass = $limbus_pass;
+            let rejected = selected.len() >= wanted
+                || (canny.is_some()
+                    && tile_counts[candidate.tile]
+                        >= if limbus_pass {
+                            LIMBUS_FEATURE_MAX_PER_TILE
+                        } else {
+                            2
+                        })
+                || (limbus_pass
+                    && sector_counts[candidate.limbus_sector] >= LIMBUS_FEATURE_MAX_PER_SECTOR)
+                || existing
+                    .iter()
+                    .chain(selected.iter().map(|item: &([f32; 2], f32)| &item.0))
+                    .any(|point| {
+                        (point[0] - candidate.point[0]).hypot(point[1] - candidate.point[1])
+                            < MIN_FEATURE_SEPARATION
+                    });
+            if !rejected {
+                tile_counts[candidate.tile] = tile_counts[candidate.tile].saturating_add(1);
+                if limbus_pass {
+                    sector_counts[candidate.limbus_sector] =
+                        sector_counts[candidate.limbus_sector].saturating_add(1);
+                }
+                selected.push((candidate.point, candidate.score));
+            }
+            !rejected
+        }};
+    }
+
+    if reserve_enabled {
+        for candidate in candidates
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.limbus_affinity >= LIMBUS_FEATURE_MIN_AFFINITY)
+        {
+            if selected.len() >= wanted.min(LIMBUS_FEATURE_RESERVE) {
+                break;
+            }
+            let _ = admit!(candidate, true);
+        }
+    }
     for candidate in candidates {
         if selected.len() >= wanted {
             break;
         }
-        if edges.is_some() && tile_counts[candidate.2] >= 2 {
-            continue;
-        }
-        if existing
-            .iter()
-            .chain(selected.iter().map(|item: &([f32; 2], f32)| &item.0))
-            .all(|point| {
-                (point[0] - candidate.0[0]).hypot(point[1] - candidate.0[1])
-                    >= MIN_FEATURE_SEPARATION
-            })
-        {
-            tile_counts[candidate.2] = tile_counts[candidate.2].saturating_add(1);
-            selected.push((candidate.0, candidate.1));
-        }
+        let limbus_pass =
+            reserve_enabled && candidate.limbus_affinity >= LIMBUS_FEATURE_MIN_AFFINITY;
+        let _ = admit!(candidate, limbus_pass);
     }
     selected
+}
+
+/// Score how cheaply an exact RAW edge should compete for a slot in the
+/// general feature bank. The score is deliberately not an anatomy claim: it
+/// needs a supplied affine iris seed, a persistent dark-to-bright step, an
+/// outward conic normal, and the characteristic contrast/texture difference
+/// between the two materials. A unilateral edge cannot unlock the reserved
+/// budget by itself; `seed_points` checks opposing angular support separately.
+fn limbus_feature_budget_affinity(
+    edge: EdgeEvidence,
+    seed: IrisEllipseSeed,
+) -> Option<(f32, usize)> {
+    let ellipse = seed.ellipse();
+    if !ellipse.center.0.is_finite()
+        || !ellipse.center.1.is_finite()
+        || !ellipse.major.is_finite()
+        || !ellipse.minor.is_finite()
+        || ellipse.major < 8.0
+        || ellipse.minor < 8.0
+    {
+        return None;
+    }
+    let (sine, cosine) = ellipse.angle.sin_cos();
+    let dx = edge.x as f64 - ellipse.center.0;
+    let dy = edge.y as f64 - ellipse.center.1;
+    let local_x = cosine * dx + sine * dy;
+    let local_y = -sine * dx + cosine * dy;
+    let normalized_x = local_x / ellipse.major;
+    let normalized_y = local_y / ellipse.minor;
+    let radius = normalized_x.hypot(normalized_y);
+    if !radius.is_finite() {
+        return None;
+    }
+    let radial_support = (1.0 - ((radius - 1.0).abs() / 0.20)).clamp(0.0, 1.0) as f32;
+    if radial_support <= 0.0 {
+        return None;
+    }
+    let normal_local_x = local_x / (ellipse.major * ellipse.major);
+    let normal_local_y = local_y / (ellipse.minor * ellipse.minor);
+    let normal_x = cosine * normal_local_x - sine * normal_local_y;
+    let normal_y = sine * normal_local_x + cosine * normal_local_y;
+    let normal_length = normal_x.hypot(normal_y).max(1.0e-9);
+    let alignment = ((normal_x * edge.gradient_x as f64 + normal_y * edge.gradient_y as f64)
+        / normal_length)
+        .clamp(0.0, 1.0) as f32;
+    let alignment_support = ((alignment - 0.25) / 0.75).clamp(0.0, 1.0);
+    if alignment_support <= 0.0 {
+        return None;
+    }
+    let material = ((0.35 + 0.65 * edge.multiscale_consistency.clamp(0.0, 1.0))
+        * (0.40 + 0.60 * edge.signed_step_persistence.clamp(0.0, 1.0)))
+    .sqrt();
+    let texture_split = (edge.dark_side_texture - edge.bright_side_texture)
+        .abs()
+        .clamp(0.0, 1.0);
+    let iris_texture_advantage = (edge.dark_side_texture - edge.bright_side_texture)
+        .max(0.0)
+        .clamp(0.0, 1.0);
+    let side_contrast =
+        (0.55 + 0.25 * texture_split + 0.20 * iris_texture_advantage).clamp(0.55, 1.0);
+    let affinity = (radial_support * alignment_support * material * side_contrast).clamp(0.0, 1.0);
+    let phase = normalized_y
+        .atan2(normalized_x)
+        .rem_euclid(std::f64::consts::TAU);
+    let sector = ((phase / std::f64::consts::TAU * LIMBUS_FEATURE_SECTORS as f64).floor() as usize)
+        .min(LIMBUS_FEATURE_SECTORS - 1);
+    Some((affinity, sector))
 }
 
 fn fit_similarity_selected(selected: &[&Match], center: [f32; 2]) -> SimilarityMotion {
@@ -7623,6 +8580,7 @@ fn solve_four(mut matrix: [[f64; 4]; 4], mut vector: [f64; 4]) -> Option<[f64; 4
 fn fit_similarity_with_normal_constraints(
     point_indices: &[usize],
     normal_indices: &[usize],
+    radial_constraints: &[RadialLimbusFlow],
     matches: &[Match],
     tracks: &[FeatureTrack],
     center: [f32; 2],
@@ -7632,7 +8590,7 @@ fn fit_similarity_with_normal_constraints(
         .map(|index| &matches[*index])
         .collect::<Vec<_>>();
     let prior = stable_similarity_prior(&points, center);
-    if normal_indices.is_empty() {
+    if normal_indices.is_empty() && radial_constraints.is_empty() {
         return prior;
     }
     let mut matrix = [[0.0f64; 4]; 4];
@@ -7665,6 +8623,25 @@ fn fit_similarity_with_normal_constraints(
             0.80,
         );
     }
+    for flow in radial_constraints {
+        let normal = normalized_vector(flow.normal);
+        if normal[0].hypot(normal[1]) < 0.5 {
+            continue;
+        }
+        let x = (flow.previous[0] - center[0]) as f64;
+        let y = (flow.previous[1] - center[1]) as f64;
+        let nx = normal[0] as f64;
+        let ny = normal[1] as f64;
+        let dx = (flow.current[0] - flow.previous[0]) as f64;
+        let dy = (flow.current[1] - flow.previous[1]) as f64;
+        accumulate_normal_equation(
+            &mut matrix,
+            &mut vector,
+            [nx, ny, nx * x + ny * y, -nx * y + ny * x],
+            nx * dx + ny * dy,
+            (0.30 + 0.35 * flow.confidence) as f64,
+        );
+    }
     let prior_values = [
         prior.translation[0] as f64,
         prior.translation[1] as f64,
@@ -7683,7 +8660,7 @@ fn fit_similarity_with_normal_constraints(
         translation: [solution[0] as f32, solution[1] as f32],
         scale_delta: solution[2] as f32,
         rotation: solution[3] as f32,
-        support: point_indices.len() + normal_indices.len(),
+        support: point_indices.len() + normal_indices.len() + radial_constraints.len(),
         ..SimilarityMotion::default()
     };
     if fitted.translation[0].hypot(fitted.translation[1]) > SEARCH_RADIUS as f32 * 1.75
@@ -7713,7 +8690,16 @@ fn fit_similarity_with_normal_constraints(
                 .abs()
         })
         .sum::<f32>();
-    fitted.residual = (point_error + normal_error) / fitted.support.max(1) as f32;
+    let radial_error = radial_constraints
+        .iter()
+        .map(|flow| {
+            let predicted = fitted.predict(flow.previous, center);
+            ((predicted[0] - flow.current[0]) * flow.normal[0]
+                + (predicted[1] - flow.current[1]) * flow.normal[1])
+                .abs()
+        })
+        .sum::<f32>();
+    fitted.residual = (point_error + normal_error + radial_error) / fitted.support.max(1) as f32;
     fitted
 }
 
@@ -8331,6 +9317,278 @@ impl EyeMotionRegion {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RadialLimbusProfile {
+    normalized: [f32; RADIAL_LIMBUS_SAMPLES],
+    gradients: [f32; RADIAL_LIMBUS_GRADIENTS],
+    signed_step: f32,
+    quality: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RadialLimbusFlow {
+    previous: [f32; 2],
+    current: [f32; 2],
+    normal: [f32; 2],
+    phase_rad: f32,
+    radial_shift_px: f32,
+    profile_cost: f32,
+    confidence: f32,
+    fused: bool,
+}
+
+fn eye_region_boundary(region: EyeMotionRegion, phase: f32) -> [f32; 2] {
+    let (phase_sine, phase_cosine) = phase.sin_cos();
+    let (axis_sine, axis_cosine) = region.angle.sin_cos();
+    let local_x = region.major * phase_cosine;
+    let local_y = region.minor * phase_sine;
+    [
+        region.center[0] + axis_cosine * local_x - axis_sine * local_y,
+        region.center[1] + axis_sine * local_x + axis_cosine * local_y,
+    ]
+}
+
+fn radial_limbus_profile(
+    frame: &RawFrame,
+    point_sensor: [f32; 2],
+    normal: [f32; 2],
+) -> Option<RadialLimbusProfile> {
+    let normal = normalized_vector(normal);
+    if normal[0].hypot(normal[1]) < 0.5 {
+        return None;
+    }
+    let tangent = [-normal[1], normal[0]];
+    let local = [
+        point_sensor[0] - frame.sensor_x as f32,
+        point_sensor[1] - frame.sensor_y as f32,
+    ];
+    let mut samples = [0.0f32; RADIAL_LIMBUS_SAMPLES];
+    for (sample_index, sample) in samples.iter_mut().enumerate() {
+        let radial_offset = (sample_index as f32 - RADIAL_LIMBUS_HALF_SAMPLES as f32)
+            * RADIAL_LIMBUS_SAMPLE_SPACING_PX;
+        let radial_point = [
+            local[0] + normal[0] * radial_offset,
+            local[1] + normal[1] * radial_offset,
+        ];
+        // A narrow three-lane average suppresses individual iris fibres and
+        // residual CFA phase while retaining the native radial transition.
+        // It reads the existing RAW allocation directly; no band image or
+        // resized representation is materialized.
+        let mut sum = 0.0f32;
+        for lateral in [-1.25f32, 0.0, 1.25] {
+            sum += sample_native_raw_bilinear(
+                frame,
+                radial_point[0] + tangent[0] * lateral,
+                radial_point[1] + tangent[1] * lateral,
+            )?;
+        }
+        *sample = sum / 3.0;
+    }
+    let mean = samples.iter().sum::<f32>() / RADIAL_LIMBUS_SAMPLES as f32;
+    let variance = samples
+        .iter()
+        .map(|sample| (sample - mean).powi(2))
+        .sum::<f32>()
+        / RADIAL_LIMBUS_SAMPLES as f32;
+    let deviation = variance.sqrt();
+    if !deviation.is_finite() || deviation < 2.0 {
+        return None;
+    }
+    let mut normalized = [0.0f32; RADIAL_LIMBUS_SAMPLES];
+    for (destination, sample) in normalized.iter_mut().zip(samples) {
+        *destination = (sample - mean) / deviation;
+    }
+    let inner_mean = normalized[..RADIAL_LIMBUS_HALF_SAMPLES].iter().sum::<f32>()
+        / RADIAL_LIMBUS_HALF_SAMPLES as f32;
+    let outer_mean = normalized[RADIAL_LIMBUS_HALF_SAMPLES + 1..]
+        .iter()
+        .sum::<f32>()
+        / RADIAL_LIMBUS_HALF_SAMPLES as f32;
+    let signed_step = outer_mean - inner_mean;
+    // Iris-to-sclera evidence is a dark-to-bright outward transition. A very
+    // weak positive step is retained because oblique semi-opaque tissue can
+    // make it broad and gray, but a polarity reversal is usually lid/lash.
+    if !signed_step.is_finite() || signed_step < 0.05 {
+        return None;
+    }
+    let mut gradients = [0.0f32; RADIAL_LIMBUS_GRADIENTS];
+    for index in 0..RADIAL_LIMBUS_GRADIENTS {
+        gradients[index] = normalized[index + 1] - normalized[index];
+    }
+    let gradient_energy = gradients.iter().map(|value| value * value).sum::<f32>();
+    if gradient_energy < 0.025 {
+        return None;
+    }
+    let inverse_gradient_norm = gradient_energy.sqrt().recip();
+    for gradient in &mut gradients {
+        *gradient *= inverse_gradient_norm;
+    }
+    let positive_peak = normalized
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .fold(0.0f32, f32::max);
+    let contrast_quality = ((deviation - 2.0) / 24.0).clamp(0.0, 1.0);
+    let step_quality = ((signed_step - 0.05) / 0.75).clamp(0.0, 1.0);
+    let peak_quality = ((positive_peak - 0.05) / 0.70).clamp(0.0, 1.0);
+    let quality = contrast_quality.sqrt() * (0.20 + 0.50 * step_quality + 0.30 * peak_quality);
+    Some(RadialLimbusProfile {
+        normalized,
+        gradients,
+        signed_step,
+        quality: quality.clamp(0.0, 1.0),
+    })
+}
+
+fn radial_limbus_profile_cost(
+    reference: RadialLimbusProfile,
+    candidate: RadialLimbusProfile,
+) -> f32 {
+    let gradient_correlation = reference
+        .gradients
+        .iter()
+        .zip(candidate.gradients)
+        .map(|(left, right)| left * right)
+        .sum::<f32>()
+        .clamp(-1.0, 1.0);
+    let gradient_cost = 0.5 * (1.0 - gradient_correlation);
+    let shape_rms = (reference
+        .normalized
+        .iter()
+        .zip(candidate.normalized)
+        .map(|(left, right)| (left - right).powi(2))
+        .sum::<f32>()
+        / RADIAL_LIMBUS_SAMPLES as f32)
+        .sqrt();
+    let step_cost = (reference.signed_step - candidate.signed_step).abs() / 2.5;
+    (0.68 * gradient_cost + 0.22 * (shape_rms / 2.0).min(1.0) + 0.10 * step_cost.min(1.0))
+        .clamp(0.0, 1.0)
+}
+
+fn radial_limbus_flows(
+    previous: &RawFrame,
+    current: &RawFrame,
+    previous_region: EyeMotionRegion,
+    current_region: EyeMotionRegion,
+) -> (Vec<RadialLimbusFlow>, usize, u64) {
+    let started = Instant::now();
+    let valid_region = |region: EyeMotionRegion| {
+        region.center[0].is_finite()
+            && region.center[1].is_finite()
+            && region.major.is_finite()
+            && region.minor.is_finite()
+            && region.major >= 12.0
+            && region.minor >= 8.0
+    };
+    if !valid_region(previous_region) || !valid_region(current_region) {
+        return (Vec::new(), 0, started.elapsed().as_micros() as u64);
+    }
+    let mut flows = Vec::with_capacity(RADIAL_LIMBUS_SECTORS);
+    let mut evaluations = 0usize;
+    for sector in 0..RADIAL_LIMBUS_SECTORS {
+        let phase = std::f32::consts::TAU * sector as f32 / RADIAL_LIMBUS_SECTORS as f32;
+        let previous_base = eye_region_boundary(previous_region, phase);
+        let previous_normal = previous_region.outward_normal(previous_base);
+        let mut reference = None::<([f32; 2], RadialLimbusProfile, f32)>;
+        for shift in -RADIAL_LIMBUS_REFERENCE_SEARCH_PX..=RADIAL_LIMBUS_REFERENCE_SEARCH_PX {
+            let point = [
+                previous_base[0] + previous_normal[0] * shift as f32,
+                previous_base[1] + previous_normal[1] * shift as f32,
+            ];
+            let Some(profile) = radial_limbus_profile(previous, point, previous_normal) else {
+                continue;
+            };
+            let rank = profile.quality - 0.012 * shift.abs() as f32;
+            if reference.is_none_or(|prior| rank > prior.2) {
+                reference = Some((point, profile, rank));
+            }
+        }
+        let Some((previous_point, reference_profile, _)) = reference else {
+            continue;
+        };
+        if reference_profile.quality < RADIAL_LIMBUS_MIN_QUALITY {
+            continue;
+        }
+        let current_base = eye_region_boundary(current_region, phase);
+        let current_normal = current_region.outward_normal(current_base);
+        let current_tangent = [-current_normal[1], current_normal[0]];
+        let mut candidates = Vec::<(f32, f32, f32, [f32; 2], RadialLimbusProfile)>::new();
+        for tangent_shift in [-2.0f32, 0.0, 2.0] {
+            for radial_shift in -RADIAL_LIMBUS_CURRENT_SEARCH_PX..=RADIAL_LIMBUS_CURRENT_SEARCH_PX {
+                let point = [
+                    current_base[0]
+                        + current_normal[0] * radial_shift as f32
+                        + current_tangent[0] * tangent_shift,
+                    current_base[1]
+                        + current_normal[1] * radial_shift as f32
+                        + current_tangent[1] * tangent_shift,
+                ];
+                let Some(profile) = radial_limbus_profile(current, point, current_normal) else {
+                    continue;
+                };
+                evaluations += 1;
+                if profile.quality < RADIAL_LIMBUS_MIN_QUALITY * 0.70 {
+                    continue;
+                }
+                let appearance = radial_limbus_profile_cost(reference_profile, profile);
+                let search_penalty = 0.012
+                    * (radial_shift as f32 / RADIAL_LIMBUS_CURRENT_SEARCH_PX as f32).powi(2)
+                    + 0.006 * (tangent_shift / 2.0).powi(2);
+                candidates.push((
+                    appearance + search_penalty,
+                    radial_shift as f32,
+                    tangent_shift,
+                    point,
+                    profile,
+                ));
+            }
+        }
+        candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
+        let Some(best) = candidates.first().copied() else {
+            continue;
+        };
+        if best.0 > RADIAL_LIMBUS_MAX_PROFILE_COST {
+            continue;
+        }
+        let second = candidates
+            .iter()
+            .find(|candidate| {
+                (candidate.1 - best.1).abs() >= 2.0 || (candidate.2 - best.2).abs() >= 2.0
+            })
+            .map_or(1.0, |candidate| candidate.0);
+        let margin = (second - best.0).max(0.0);
+        let appearance_confidence = (1.0 - best.0 / RADIAL_LIMBUS_MAX_PROFILE_COST).clamp(0.0, 1.0);
+        let quality = (reference_profile.quality * best.4.quality).sqrt();
+        let confidence = (0.58 * appearance_confidence
+            + 0.16 * (margin / 0.10).clamp(0.0, 1.0)
+            + 0.26 * quality)
+            .clamp(0.0, 1.0);
+        if confidence < 0.26 {
+            continue;
+        }
+        let mut combined_normal = current_normal;
+        if previous_normal[0] * current_normal[0] + previous_normal[1] * current_normal[1] > 0.0 {
+            combined_normal = normalized_vector([
+                previous_normal[0] + current_normal[0],
+                previous_normal[1] + current_normal[1],
+            ]);
+        }
+        flows.push(RadialLimbusFlow {
+            previous: previous_point,
+            current: best.3,
+            normal: combined_normal,
+            phase_rad: phase,
+            radial_shift_px: best.1,
+            profile_cost: best.0,
+            confidence,
+            fused: false,
+        });
+    }
+    if flows.len() < RADIAL_LIMBUS_MIN_JOINT_SUPPORT {
+        flows.clear();
+    }
+    (flows, evaluations, started.elapsed().as_micros() as u64)
+}
+
 fn blend_ellipse_angle(previous: f32, current: f32, alpha: f32) -> f32 {
     let previous_vector = [(2.0 * previous).cos(), (2.0 * previous).sin()];
     let current_vector = [(2.0 * current).cos(), (2.0 * current).sin()];
@@ -8757,6 +10015,7 @@ fn update_semantic_layer(
     object: usize,
     point_indices: &[usize],
     normal_indices: &[usize],
+    radial_constraints: &[RadialLimbusFlow],
     matches: &[Match],
     tracks: &[FeatureTrack],
     motions: &mut [SimilarityMotion; OBJECTS],
@@ -8773,24 +10032,33 @@ fn update_semantic_layer(
     motions[object] = fit_similarity_with_normal_constraints(
         point_indices,
         normal_indices,
+        radial_constraints,
         matches,
         tracks,
         center,
     );
-    let evidence_count = point_indices.len() + normal_indices.len();
+    let evidence_count = point_indices.len() + normal_indices.len() + radial_constraints.len();
     let inverse_evidence = 1.0 / evidence_count.max(1) as f32;
     layers[object].centroid = [
         (point_indices
             .iter()
             .chain(normal_indices)
             .map(|index| matches[*index].current[0])
-            .sum::<f32>())
+            .sum::<f32>()
+            + radial_constraints
+                .iter()
+                .map(|flow| flow.current[0])
+                .sum::<f32>())
             * inverse_evidence,
         (point_indices
             .iter()
             .chain(normal_indices)
             .map(|index| matches[*index].current[1])
-            .sum::<f32>())
+            .sum::<f32>()
+            + radial_constraints
+                .iter()
+                .map(|flow| flow.current[1])
+                .sum::<f32>())
             * inverse_evidence,
     ];
     let residuals = selected
@@ -8851,6 +10119,8 @@ fn cluster_semantic_eye_layers(
     parallax_axis: &mut [f32; 2],
     semantic_eye_center: &mut Option<[f32; 2]>,
     semantic_eye_region_state: &mut Option<EyeMotionRegion>,
+    radial_limbus_flows: &mut [RadialLimbusFlow],
+    radial_limbus_fused: &mut usize,
     center: [f32; 2],
     global: SimilarityMotion,
     relations: &mut MotionRelationFrame,
@@ -9077,6 +10347,39 @@ fn cluster_semantic_eye_layers(
                     <= MAX_LIMBUS_NORMAL_SIGNATURE_ERROR
         })
         .collect::<Vec<_>>();
+    for flow in radial_limbus_flows.iter_mut() {
+        flow.fused = false;
+    }
+    let mut radial_ranked = radial_limbus_flows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, flow)| {
+            let predicted = pupil_prior.predict(flow.previous, center);
+            let normal_error = ((flow.current[0] - predicted[0]) * flow.normal[0]
+                + (flow.current[1] - predicted[1]) * flow.normal[1])
+                .abs();
+            (normal_error <= RADIAL_LIMBUS_MAX_PRIOR_NORMAL_ERROR_PX)
+                .then_some((index, flow.confidence * (-normal_error / 3.5).exp()))
+        })
+        .collect::<Vec<_>>();
+    radial_ranked.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    radial_ranked.truncate(RADIAL_LIMBUS_MAX_FUSED);
+    if radial_ranked.len() < RADIAL_LIMBUS_MIN_JOINT_SUPPORT {
+        radial_ranked.clear();
+    }
+    for (index, _) in &radial_ranked {
+        radial_limbus_flows[*index].fused = true;
+    }
+    let radial_normal_flow = radial_ranked
+        .iter()
+        .map(|(index, _)| radial_limbus_flows[*index])
+        .collect::<Vec<_>>();
+    *radial_limbus_fused = radial_normal_flow.len();
 
     for (match_index, item) in matches.iter_mut().enumerate() {
         item.layer_evidence = false;
@@ -9113,6 +10416,7 @@ fn cluster_semantic_eye_layers(
         GENERAL_LAYER,
         &general_candidates,
         &[],
+        &[],
         matches,
         tracks,
         motions,
@@ -9126,6 +10430,7 @@ fn cluster_semantic_eye_layers(
         PUPIL_LAYER,
         &pupil,
         &pupil_normal_flow,
+        &radial_normal_flow,
         matches,
         tracks,
         motions,
@@ -9138,6 +10443,7 @@ fn cluster_semantic_eye_layers(
     update_semantic_layer(
         REFLECTION_LAYER,
         &reflection,
+        &[],
         &[],
         matches,
         tracks,
@@ -9374,6 +10680,7 @@ fn cluster_relation_motion_layers(
         update_semantic_layer(
             *object,
             &component.members,
+            &[],
             &[],
             matches,
             tracks,
@@ -9977,6 +11284,9 @@ impl FourMotionOctrees {
             self.previous = None;
             self.tracks.clear();
             self.nautilus_banks.clear();
+            self.horizontal_light_field = HorizontalLightFieldStatus::default();
+            self.radial_limbus_region = None;
+            self.radial_limbus_flows.clear();
             self.motions = [SimilarityMotion::default(); OBJECTS];
             self.layers = [MotionLayerStatus::default(); OBJECTS];
             self.layer_signatures = Default::default();
@@ -10056,7 +11366,22 @@ impl FourMotionOctrees {
         let preprocess_micros = preprocess_started.elapsed().as_micros() as u64;
         let Some(previous) = self.previous.as_ref() else {
             self.previous = Some(current.clone());
-            let seeds = seed_points(&current, canny.as_ref(), &[], MAX_FEATURES);
+            self.horizontal_light_field = HorizontalLightFieldStatus::default();
+            self.radial_limbus_region =
+                iris_seed.map(|seed| EyeMotionRegion::from_local_seed(seed, &current));
+            self.radial_limbus_flows.clear();
+            let feature_iris_seed = iris_seed.or_else(|| {
+                self.semantic_eye_region
+                    .map(|region| region.local_seed(&current))
+            });
+            let seeds = seed_points(
+                &current,
+                canny.as_ref(),
+                &edges,
+                feature_iris_seed,
+                &[],
+                MAX_FEATURES,
+            );
             for (point, score) in seeds {
                 let edge_normal = canny.as_ref().map_or([0.0; 2], |field| {
                     local_canny_normal(
@@ -10075,6 +11400,7 @@ impl FourMotionOctrees {
                     ]]),
                     object: 0,
                     age: 0,
+                    last_seen_timestamp_ns: timestamp_ns,
                     score,
                     motion_ema: [0.0; 2],
                     motion_variance: 0.0,
@@ -10151,6 +11477,10 @@ impl FourMotionOctrees {
         if previous.width != width || previous.height != height {
             self.tracks.clear();
             self.nautilus_banks.clear();
+            self.horizontal_light_field = HorizontalLightFieldStatus::default();
+            self.radial_limbus_region =
+                iris_seed.map(|seed| EyeMotionRegion::from_local_seed(seed, &current));
+            self.radial_limbus_flows.clear();
             self.motions = [SimilarityMotion::default(); OBJECTS];
             self.layers = [MotionLayerStatus::default(); OBJECTS];
             self.layer_signatures = Default::default();
@@ -10205,6 +11535,55 @@ impl FourMotionOctrees {
             sensor_x as f32 + width as f32 * 0.5,
             sensor_y as f32 + height as f32 * 0.5,
         ];
+        let horizontal_light_field = if use_canny_features && prediction_cadence_contiguous {
+            horizontal_light_field_tree(previous, &current, self.motions[GENERAL_LAYER])
+        } else {
+            HorizontalLightFieldStatus::default()
+        };
+        let previous_radial_region = self.radial_limbus_region.or(self.semantic_eye_region);
+        let current_radial_region = iris_seed
+            .map(|seed| EyeMotionRegion::from_local_seed(seed, &current))
+            .or_else(|| {
+                previous_radial_region.map(|region| {
+                    let prior = if self.motions[PUPIL_LAYER].support >= 3
+                        && self.motions[PUPIL_LAYER].residual <= 3.0
+                    {
+                        self.motions[PUPIL_LAYER]
+                    } else if self.motions[GENERAL_LAYER].support >= 3
+                        && self.motions[GENERAL_LAYER].residual <= 3.0
+                    {
+                        self.motions[GENERAL_LAYER]
+                    } else if horizontal_light_field.reliable {
+                        SimilarityMotion {
+                            translation: [horizontal_light_field.horizontal_translation_px, 0.0],
+                            scale_delta: horizontal_light_field.horizontal_scale_delta,
+                            support: horizontal_light_field.leaf_nodes,
+                            residual: horizontal_light_field.residual_px,
+                            ..SimilarityMotion::default()
+                        }
+                    } else {
+                        SimilarityMotion::default()
+                    };
+                    let scale = (1.0 + prior.scale_delta).clamp(0.88, 1.12);
+                    EyeMotionRegion {
+                        center: prior.predict(region.center, center),
+                        major: region.major * scale,
+                        minor: region.minor * scale,
+                        angle: (region.angle + prior.rotation).rem_euclid(std::f32::consts::PI),
+                    }
+                })
+            });
+        let (mut radial_limbus_flows, radial_limbus_evaluations, radial_limbus_micros) =
+            if use_canny_features && prediction_cadence_contiguous {
+                previous_radial_region.zip(current_radial_region).map_or(
+                    (Vec::new(), 0, 0),
+                    |(previous_region, current_region)| {
+                        radial_limbus_flows(previous, &current, previous_region, current_region)
+                    },
+                )
+            } else {
+                (Vec::new(), 0, 0)
+            };
         if let Some(probe) = focus_probe {
             if probe.sweeping && !self.focus_sweep_seen {
                 self.focus_sfm.begin();
@@ -10262,6 +11641,14 @@ impl FourMotionOctrees {
             canny_texture_simd_evaluated,
             preprocess_micros,
             pyramid_micros,
+            light_field_micros: horizontal_light_field.elapsed_micros,
+            light_field_nodes: horizontal_light_field.nodes.len(),
+            light_field_leaves: horizontal_light_field.leaf_nodes,
+            light_field_evaluations: horizontal_light_field.evaluations,
+            light_field_reliable: horizontal_light_field.reliable,
+            radial_limbus_evaluations,
+            radial_limbus_accepted: radial_limbus_flows.len(),
+            radial_limbus_micros,
             ..MatchDiagnostics::default()
         };
         for (track_index, track) in self.tracks.iter().enumerate() {
@@ -10296,7 +11683,9 @@ impl FourMotionOctrees {
                 && layer.stable_frames >= MIN_LAYER_STABLE_FRAMES
                 && layer.coherence >= 0.20
                 && track.assignment_confidence >= 0.12;
-            let predicted_sensor = if layer_prediction_usable && track_prediction_usable {
+            let established_prediction =
+                layer_prediction_usable || track_prediction_usable || model_usable;
+            let mut predicted_sensor = if layer_prediction_usable && track_prediction_usable {
                 // Cross-validated on both lossless eye streams: the robust
                 // layer similarity has the best tail error, while a damped
                 // same-ID feature EMA has the best median during snappy local
@@ -10324,6 +11713,24 @@ impl FourMotionOctrees {
             } else {
                 [last[0], last[1]]
             };
+            // The walk field has already compared this exact adjacent RAW
+            // pair, so it may center the gross horizontal search even before
+            // a point has been assigned an identity in `current`.  When an
+            // point/model prediction exists, keep its identity-bearing
+            // estimate. The broad walk is deliberately a gross fallback for
+            // an otherwise unpredicted feature, not a force that can pull a
+            // mature track away from its patch basin.
+            let field_sensor_x = horizontal_light_field_sensor_prediction(
+                &horizontal_light_field,
+                previous,
+                &current,
+                [last[0], last[1]],
+            );
+            if let Some(field_x) = field_sensor_x {
+                if !established_prediction {
+                    predicted_sensor[0] = field_x;
+                }
+            }
             let predicted = [
                 predicted_sensor[0] - sensor_x as f32,
                 predicted_sensor[1] - sensor_y as f32,
@@ -10426,38 +11833,74 @@ impl FourMotionOctrees {
                 PYRAMID_PATCH_RADIUS
             };
             let search_diameter = (2 * pyramid_search + 1) as usize;
-            let mut coarse_candidates = Vec::with_capacity(search_diameter * search_diameter);
-            for dy in -pyramid_search..=pyramid_search {
-                for dx in -pyramid_search..=pyramid_search {
-                    let candidate_half =
-                        [predicted_half[0] + dx as f32, predicted_half[1] + dy as f32];
-                    let candidate = [candidate_half[0] * 2.0, candidate_half[1] * 2.0];
-                    if !candidate_is_valid(candidate) {
-                        continue;
+            let mut coarse_searches = Vec::<([f32; 2], i32, bool)>::with_capacity(2);
+            coarse_searches.push((predicted_half, pyramid_search, false));
+            if established_prediction
+                && horizontal_light_field.reliable
+                && horizontal_light_field.confidence >= 0.32
+                && horizontal_light_field.residual_px <= 2.5
+                && horizontal_light_field.horizontal_coverage >= 0.42
+                && horizontal_light_field.leaf_nodes >= 4
+            {
+                if let Some(field_x) = field_sensor_x {
+                    let field_local_x = field_x - sensor_x as f32;
+                    let primary_reach_px = 2.0 * pyramid_search as f32;
+                    let disagreement = (field_local_x - predicted[0]).abs();
+                    if field_local_x.is_finite()
+                        && disagreement > primary_reach_px + 1.0
+                        && disagreement <= 56.0
+                    {
+                        let rescue_radius = ((horizontal_light_field.residual_px + 2.0) * 0.5)
+                            .ceil()
+                            .clamp(2.0, 4.0) as i32;
+                        coarse_searches.push((
+                            [field_local_x * 0.5, predicted_half[1]],
+                            rescue_radius,
+                            true,
+                        ));
+                        match_diagnostics.light_field_rescue_tracks += 1;
                     }
-                    let cost = patch_cost_with_integral_moments(
-                        &previous_pyramid,
-                        &current_pyramid,
-                        &previous_pyramid_moments,
-                        &current_pyramid_moments,
-                        previous_half,
-                        candidate_half,
-                        pyramid_patch_radius,
-                    );
-                    match_diagnostics.coarse_patch_evaluations += 1;
-                    if cost.is_finite() {
-                        coarse_candidates.push((cost, candidate));
+                }
+            }
+            let rescue_capacity = coarse_searches
+                .get(1)
+                .map_or(0, |(_, radius, _)| (2 * *radius + 1).pow(2) as usize);
+            let mut coarse_candidates =
+                Vec::with_capacity(search_diameter * search_diameter + rescue_capacity);
+            for (search_center, search_radius, field_guided) in coarse_searches {
+                for dy in -search_radius..=search_radius {
+                    for dx in -search_radius..=search_radius {
+                        let candidate_half =
+                            [search_center[0] + dx as f32, search_center[1] + dy as f32];
+                        let candidate = [candidate_half[0] * 2.0, candidate_half[1] * 2.0];
+                        if !candidate_is_valid(candidate) {
+                            continue;
+                        }
+                        let cost = patch_cost_with_integral_moments(
+                            &previous_pyramid,
+                            &current_pyramid,
+                            &previous_pyramid_moments,
+                            &current_pyramid_moments,
+                            previous_half,
+                            candidate_half,
+                            pyramid_patch_radius,
+                        );
+                        match_diagnostics.coarse_patch_evaluations += 1;
+                        match_diagnostics.light_field_rescue_evaluations +=
+                            usize::from(field_guided);
+                        if cost.is_finite() {
+                            coarse_candidates.push((cost, candidate, field_guided));
+                        }
                     }
                 }
             }
             coarse_candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
-            let mut basins = Vec::<[f32; 2]>::new();
-            for (_, candidate) in coarse_candidates {
-                if basins
-                    .iter()
-                    .all(|basin| (basin[0] - candidate[0]).hypot(basin[1] - candidate[1]) >= 5.0)
-                {
-                    basins.push(candidate);
+            let mut basins = Vec::<([f32; 2], bool)>::new();
+            for (_, candidate, field_guided) in coarse_candidates {
+                if basins.iter().all(|(basin, _)| {
+                    (basin[0] - candidate[0]).hypot(basin[1] - candidate[1]) >= 5.0
+                }) {
+                    basins.push((candidate, field_guided));
                 }
                 if basins.len() >= maximum_basins {
                     break;
@@ -10468,7 +11911,7 @@ impl FourMotionOctrees {
                 continue;
             }
             let mut candidates = Vec::with_capacity(196);
-            for basin in basins {
+            for (basin, field_guided) in basins {
                 for dy in -refinement_radius..=refinement_radius {
                     for dx in -refinement_radius..=refinement_radius {
                         let candidate = [basin[0] + dx as f32, basin[1] + dy as f32];
@@ -10495,7 +11938,11 @@ impl FourMotionOctrees {
                             pyramid_patch_radius,
                         );
                         if full_cost.is_finite() && half_cost.is_finite() {
-                            candidates.push((0.22 * full_cost + 0.78 * half_cost, candidate));
+                            candidates.push((
+                                0.22 * full_cost + 0.78 * half_cost,
+                                candidate,
+                                field_guided,
+                            ));
                         }
                     }
                 }
@@ -10514,7 +11961,7 @@ impl FourMotionOctrees {
             // spatially distinct alternative for the ambiguity margin.
             let second = candidates
                 .iter()
-                .filter(|(_, candidate)| {
+                .filter(|(_, candidate, _)| {
                     (candidate[0] - best.1[0]).hypot(candidate[1] - best.1[1])
                         >= MATCH_EXCLUSION_RADIUS
                 })
@@ -10566,6 +12013,7 @@ impl FourMotionOctrees {
                 match_diagnostics.temporal_rejected += 1;
             }
             if cost_accepted && margin_accepted && backward_consistent && temporally_coherent {
+                match_diagnostics.light_field_rescue_accepted += usize::from(best.2);
                 match_diagnostics.subpixel_attempted += 1;
                 let subpixel = refine_native_zncc_subpixel(
                     previous,
@@ -10614,10 +12062,17 @@ impl FourMotionOctrees {
         match_diagnostics.destination_collision_rejected =
             enforce_unique_match_destinations(&mut matches, &track_priorities);
         match_diagnostics.accepted = matches.len();
+        let extended_gap_recovery_ready = iris_seed.is_some()
+            && horizontal_light_field.reliable
+            && horizontal_light_field.confidence >= 0.28
+            && horizontal_light_field.residual_px <= 3.5
+            && horizontal_light_field.horizontal_coverage >= 0.38
+            && horizontal_light_field.leaf_nodes >= 4;
         let nautilus_needed = !self.disable_nautilus_for_replay
             && use_canny_features
             && self.tracks.iter().enumerate().any(|(track_index, track)| {
                 !matches.iter().any(|item| item.track_index == track_index)
+                    && (track.age <= MAX_AGE || extended_gap_recovery_ready)
                     && self.nautilus_banks.get(&track.id).is_some_and(|bank| {
                         bank.observations.len() >= NAUTILUS_MIN_BANK_OBSERVATIONS
                     })
@@ -10631,7 +12086,7 @@ impl FourMotionOctrees {
         match_diagnostics.nautilus_build_micros = nautilus_started.elapsed().as_micros() as u64;
         match_diagnostics.nautilus_candidates = nautilus_tree.candidates.len();
         match_diagnostics.nautilus_tree_nodes = nautilus_tree.nodes.len();
-        let nautilus_relocations = propose_nautilus_relocations(
+        let mut nautilus_relocations = propose_nautilus_relocations(
             &current,
             &nautilus_tree,
             &self.tracks,
@@ -10642,8 +12097,110 @@ impl FourMotionOctrees {
             center,
             [sensor_x as f32, sensor_y as f32],
             prediction_cadence_contiguous,
+            extended_gap_recovery_ready,
             &mut match_diagnostics,
         );
+        // The extra dormant cache must not turn the 80-point live graph into
+        // a 104-point graph on the re-entry frame. Established adjacent
+        // matches and ordinary short-gap relocations keep their slots; only
+        // the highest-confidence extended relocations fill the remainder.
+        let established_regular = matches
+            .iter()
+            .filter(|item| {
+                let track = &self.tracks[item.track_index];
+                track.points.len() > 1 || track.matched_streak > 0
+            })
+            .count();
+        let ordinary_relocations = nautilus_relocations
+            .iter()
+            .filter(|relocation| self.tracks[relocation.track_index].age <= MAX_AGE)
+            .count();
+        let maximum_extended = MAX_FEATURES
+            .saturating_sub(established_regular)
+            .saturating_sub(ordinary_relocations);
+        let mut retained_extended = 0usize;
+        let mut dropped_extended = Vec::new();
+        nautilus_relocations.retain(|relocation| {
+            if self.tracks[relocation.track_index].age <= MAX_AGE {
+                return true;
+            }
+            if retained_extended < maximum_extended {
+                retained_extended += 1;
+                true
+            } else {
+                dropped_extended.push(*relocation);
+                false
+            }
+        });
+        for relocation in dropped_extended {
+            match_diagnostics.nautilus_relocated =
+                match_diagnostics.nautilus_relocated.saturating_sub(1);
+            match_diagnostics.nautilus_gap_relocated =
+                match_diagnostics.nautilus_gap_relocated.saturating_sub(1);
+            match_diagnostics.nautilus_margin_sum =
+                (match_diagnostics.nautilus_margin_sum - relocation.margin).max(0.0);
+        }
+        let extended_reentry_points = nautilus_relocations
+            .iter()
+            .filter(|relocation| self.tracks[relocation.track_index].age > MAX_AGE)
+            .map(|relocation| relocation.current)
+            .collect::<Vec<_>>();
+        if !extended_reentry_points.is_empty() {
+            let before = matches.len();
+            matches.retain(|item| {
+                let track = &self.tracks[item.track_index];
+                let provisional = track.points.len() <= 1 && track.matched_streak == 0;
+                !provisional
+                    || extended_reentry_points.iter().all(|point| {
+                        (point[0] - item.current[0]).hypot(point[1] - item.current[1])
+                            >= MIN_MATCH_DESTINATION_SEPARATION
+                    })
+            });
+            match_diagnostics.destination_collision_rejected += before - matches.len();
+        }
+        // If a returning established ID did not spatially overlap its
+        // one-frame duplicate, retire the weakest other provisional seeds so
+        // matches plus relocations remain within the invariant live budget.
+        let regular_budget = MAX_FEATURES.saturating_sub(nautilus_relocations.len());
+        if matches.len() > regular_budget {
+            let fixed = matches
+                .iter()
+                .filter(|item| {
+                    let track = &self.tracks[item.track_index];
+                    track.points.len() > 1 || track.matched_streak > 0
+                })
+                .count();
+            let provisional_budget = regular_budget.saturating_sub(fixed);
+            let mut provisional = matches
+                .iter()
+                .filter(|item| {
+                    let track = &self.tracks[item.track_index];
+                    track.points.len() <= 1 && track.matched_streak == 0
+                })
+                .map(|item| (item.track_index, item.score))
+                .collect::<Vec<_>>();
+            provisional.sort_by(|left, right| {
+                right
+                    .1
+                    .total_cmp(&left.1)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            provisional.truncate(provisional_budget);
+            let retained_provisional = provisional
+                .into_iter()
+                .map(|candidate| candidate.0)
+                .collect::<BTreeSet<_>>();
+            let before = matches.len();
+            matches.retain(|item| {
+                let track = &self.tracks[item.track_index];
+                track.points.len() > 1
+                    || track.matched_streak > 0
+                    || retained_provisional.contains(&item.track_index)
+            });
+            match_diagnostics.destination_collision_rejected += before - matches.len();
+        }
+        debug_assert!(matches.len() + nautilus_relocations.len() <= MAX_FEATURES);
+        match_diagnostics.accepted = matches.len();
         match_diagnostics.matching_micros = matching_started.elapsed().as_micros() as u64;
         let layering_started = Instant::now();
         let global = robust_global_similarity(&matches, center);
@@ -10679,6 +12236,7 @@ impl FourMotionOctrees {
                 );
             }
         }
+        let mut radial_limbus_fused = 0usize;
         let semantic_layers = cluster_semantic_eye_layers(
             &mut matches,
             &self.tracks,
@@ -10691,11 +12249,14 @@ impl FourMotionOctrees {
             &mut self.parallax_axis,
             &mut self.semantic_eye_center,
             &mut self.semantic_eye_region,
+            &mut radial_limbus_flows,
+            &mut radial_limbus_fused,
             center,
             global,
             &mut motion_relations,
             Some(&self.relation_iris_identity),
         );
+        match_diagnostics.radial_limbus_fused = radial_limbus_fused;
         if !semantic_layers {
             let relation_layers = cluster_relation_motion_layers(
                 &mut matches,
@@ -10792,7 +12353,8 @@ impl FourMotionOctrees {
         let limbus_normal_flow_support = matches
             .iter()
             .filter(|item| item.normal_flow_evidence)
-            .count();
+            .count()
+            + radial_limbus_fused;
         let iris_geometry = self.semantic_eye_region.map(|region| {
             let pupil_layer = self.layers[PUPIL_LAYER];
             let track_support = (pupil_layer.persistent_tracks as f64 / 8.0).clamp(0.0, 1.0);
@@ -10870,6 +12432,7 @@ impl FourMotionOctrees {
             };
             track.object = item.object;
             track.age = 0;
+            track.last_seen_timestamp_ns = timestamp_ns;
             track.score = item.score;
             let specularity_alpha = if track.matched_streak == 0 { 1.0 } else { 0.35 };
             track.specularity = track.specularity * (1.0 - specularity_alpha)
@@ -10937,6 +12500,7 @@ impl FourMotionOctrees {
             }
             let candidate = nautilus_tree.candidates[relocation.candidate_index];
             let track = &mut self.tracks[relocation.track_index];
+            let crossed_extended_gap = track.age > MAX_AGE;
             let previous = track.points.back().copied().unwrap_or([
                 relocation.current[0],
                 relocation.current[1],
@@ -10956,8 +12520,12 @@ impl FourMotionOctrees {
             track.motion_variance =
                 0.88 * track.motion_variance + 0.12 * motion_error * motion_error;
             track.age = 0;
+            track.last_seen_timestamp_ns = timestamp_ns;
             track.score = (1.0 - relocation.distance / NAUTILUS_MAX_DISTANCE).clamp(0.0, 1.0);
-            track.matched_streak = 1;
+            // This is an exact current observation of the same identity, but
+            // it is not adjacent motion. Start a fresh visible trail segment;
+            // the next ordinary match establishes continuity again.
+            track.matched_streak = 0;
             track.layer_evidence = false;
             track.normal_flow_evidence = false;
             track.assignment_confidence =
@@ -10991,6 +12559,7 @@ impl FourMotionOctrees {
                 .entry(track_id)
                 .or_default()
                 .observe(relocation.fingerprint);
+            match_diagnostics.extended_gap_relocated += usize::from(crossed_extended_gap);
         }
         for (index, track) in self.tracks.iter_mut().enumerate() {
             if !seen.get(index).copied().unwrap_or(false) {
@@ -11002,7 +12571,52 @@ impl FourMotionOctrees {
                 track.residual_history.clear();
             }
         }
-        self.tracks.retain(|track| track.age <= MAX_AGE);
+        self.tracks.retain(|track| {
+            track.age <= MAX_FEATURE_DORMANT_AGE
+                && timestamp_ns.saturating_sub(track.last_seen_timestamp_ns)
+                    <= MAX_FEATURE_DORMANT_NS
+        });
+        // Extended dormancy is an identity cache, not part of the live
+        // detector population. Only fingerprints with enough independent
+        // observations can ever pass the Nautilus identity gate, so discard
+        // weaker long-gap tracks and bound the cache by maturity/quality.
+        let mut extended_dormant = self
+            .tracks
+            .iter()
+            .filter(|track| track.age > MAX_AGE)
+            .filter_map(|track| {
+                let bank_observations = self
+                    .nautilus_banks
+                    .get(&track.id)
+                    .map_or(0, |bank| bank.observations.len());
+                (bank_observations >= NAUTILUS_MIN_BANK_OBSERVATIONS).then_some((
+                    track.id,
+                    bank_observations,
+                    track.points.len(),
+                    track.assignment_confidence,
+                    track.score,
+                    track.age,
+                ))
+            })
+            .collect::<Vec<_>>();
+        extended_dormant.sort_by(|left, right| {
+            right
+                .1
+                .cmp(&left.1)
+                .then_with(|| right.2.cmp(&left.2))
+                .then_with(|| right.3.total_cmp(&left.3))
+                .then_with(|| right.4.total_cmp(&left.4))
+                .then_with(|| left.5.cmp(&right.5))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        extended_dormant.truncate(MAX_EXTENDED_DORMANT_FEATURES);
+        let retained_extended_ids = extended_dormant
+            .into_iter()
+            .map(|candidate| candidate.0)
+            .collect::<BTreeSet<_>>();
+        self.tracks
+            .retain(|track| track.age <= MAX_AGE || retained_extended_ids.contains(&track.id));
+        match_diagnostics.dormant_tracks = self.tracks.iter().filter(|track| track.age > 0).count();
         let retained_ids = self.tracks.iter().map(|track| track.id).collect::<Vec<_>>();
         self.nautilus_banks
             .retain(|id, _| retained_ids.contains(id));
@@ -11012,8 +12626,27 @@ impl FourMotionOctrees {
             .filter_map(|track| track.points.back())
             .map(|point| [point[0] - sensor_x as f32, point[1] - sensor_y as f32])
             .collect::<Vec<_>>();
-        let wanted = MAX_FEATURES.saturating_sub(self.tracks.len());
-        for (point, score) in seed_points(&current, canny.as_ref(), &existing, wanted) {
+        // Long-gap identities live in a separate bounded cache. They must not
+        // consume all eighty current/recent detector slots after an unrelated
+        // patch loss; otherwise no fresh evidence can enter the motion graph.
+        let current_or_recent = self
+            .tracks
+            .iter()
+            .filter(|track| track.age <= MAX_AGE)
+            .count();
+        let wanted = MAX_FEATURES.saturating_sub(current_or_recent);
+        let feature_iris_seed = iris_seed.or_else(|| {
+            self.semantic_eye_region
+                .map(|region| region.local_seed(&current))
+        });
+        for (point, score) in seed_points(
+            &current,
+            canny.as_ref(),
+            &edges,
+            feature_iris_seed,
+            &existing,
+            wanted,
+        ) {
             let edge_normal = canny.as_ref().map_or([0.0; 2], |field| {
                 local_canny_normal(
                     field,
@@ -11031,6 +12664,7 @@ impl FourMotionOctrees {
                 ]]),
                 object: 0,
                 age: 0,
+                last_seen_timestamp_ns: timestamp_ns,
                 score,
                 motion_ema: [0.0; 2],
                 motion_variance: 0.0,
@@ -11087,6 +12721,12 @@ impl FourMotionOctrees {
                 )
             });
         self.generation = self.generation.saturating_add(1);
+        self.horizontal_light_field = horizontal_light_field;
+        self.radial_limbus_region = iris_seed
+            .map(|seed| EyeMotionRegion::from_local_seed(seed, &current))
+            .or(self.semantic_eye_region)
+            .or(current_radial_region);
+        self.radial_limbus_flows = radial_limbus_flows;
         self.previous = Some(current);
         match_diagnostics.maintenance_micros = maintenance_started.elapsed().as_micros() as u64;
         self.match_diagnostics = match_diagnostics;
@@ -11112,33 +12752,45 @@ impl FourMotionOctrees {
         let trails = self
             .tracks
             .iter()
-            .filter(|track| track.points.len() >= 2)
-            .map(|track| OverlayTrail {
-                id: track.id,
-                object: track.object,
-                match_score: track.score,
-                matched_streak: track.matched_streak,
-                layer_evidence: track.layer_evidence,
-                normal_flow_evidence: track.normal_flow_evidence,
-                specularity: track.specularity,
-                assignment_confidence: track.assignment_confidence,
-                motion_ema: track.motion_ema,
-                motion_variance: track.motion_variance,
-                residual_history: track.residual_history.iter().copied().collect(),
-                points: track
-                    .points
-                    .iter()
-                    .map(|point| TrailPoint {
-                        x: point[0] - sensor_x as f32,
-                        y: point[1] - sensor_y as f32,
-                        z: point[2],
-                    })
-                    .collect(),
+            .filter(|track| track.age == 0 && track.points.len() >= 2)
+            .map(|track| {
+                // Never render or semantically consume a stale endpoint as
+                // though it were measured in this exposure. After a Nautilus
+                // cross-gap re-identification `matched_streak == 0`, so only
+                // its exact current point is exported and no fictitious line
+                // is drawn across the occluded interval.
+                let visible_points = usize::from(track.matched_streak)
+                    .saturating_add(1)
+                    .min(track.points.len());
+                OverlayTrail {
+                    id: track.id,
+                    object: track.object,
+                    match_score: track.score,
+                    matched_streak: track.matched_streak,
+                    layer_evidence: track.layer_evidence,
+                    normal_flow_evidence: track.normal_flow_evidence,
+                    specularity: track.specularity,
+                    assignment_confidence: track.assignment_confidence,
+                    motion_ema: track.motion_ema,
+                    motion_variance: track.motion_variance,
+                    residual_history: track.residual_history.iter().copied().collect(),
+                    points: track
+                        .points
+                        .iter()
+                        .skip(track.points.len() - visible_points)
+                        .map(|point| TrailPoint {
+                            x: point[0] - sensor_x as f32,
+                            y: point[1] - sensor_y as f32,
+                            z: point[2],
+                        })
+                        .collect(),
+                }
             })
             .collect::<Vec<_>>();
         let latest = self
             .tracks
             .iter()
+            .filter(|track| track.age == 0)
             .filter_map(|track| {
                 track.points.back().map(|point| {
                     (
@@ -11155,7 +12807,7 @@ impl FourMotionOctrees {
         let provisional_features = self
             .tracks
             .iter()
-            .filter(|track| track.points.len() == 1)
+            .filter(|track| track.age == 0 && track.points.len() == 1)
             .filter_map(|track| track.points.back())
             .map(|point| (point[0] - sensor_x as f32, point[1] - sensor_y as f32))
             .collect::<Vec<_>>();
@@ -11175,6 +12827,22 @@ impl FourMotionOctrees {
             minor_radius: region.minor as f64,
             angle: region.angle as f64,
         });
+        let radial_limbus_probes = self
+            .radial_limbus_flows
+            .iter()
+            .map(|flow| RadialLimbusProbe {
+                point: [
+                    flow.current[0] - sensor_x as f32,
+                    flow.current[1] - sensor_y as f32,
+                ],
+                normal: flow.normal,
+                phase_rad: flow.phase_rad,
+                radial_shift_px: flow.radial_shift_px,
+                profile_cost: flow.profile_cost,
+                confidence: flow.confidence,
+                fused: flow.fused,
+            })
+            .collect::<Vec<_>>();
         MotionOctreeOverlay {
             generation: self.generation,
             matched_features: trails.len(),
@@ -11205,6 +12873,8 @@ impl FourMotionOctrees {
             edges,
             edge_high_threshold,
             motion_shadow_edges_downweighted,
+            horizontal_light_field: self.horizontal_light_field.clone(),
+            radial_limbus_probes,
             semantic_iris,
             focus_sfm: self.focus_sfm.status,
             coupled_motion: self
@@ -11218,6 +12888,359 @@ impl FourMotionOctrees {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_translucent_limbus_frame(
+        width: usize,
+        height: usize,
+        sensor_x: u32,
+        sensor_y: u32,
+        region: EyeMotionRegion,
+        gain: f32,
+        offset: f32,
+    ) -> RawFrame {
+        let (axis_sine, axis_cosine) = region.angle.sin_cos();
+        let pixels = (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| {
+                    let sensor_point = [x as f32 + sensor_x as f32, y as f32 + sensor_y as f32];
+                    let dx = sensor_point[0] - region.center[0];
+                    let dy = sensor_point[1] - region.center[1];
+                    let local_x = axis_cosine * dx + axis_sine * dy;
+                    let local_y = -axis_sine * dx + axis_cosine * dy;
+                    let normalized_radius = (local_x / region.major).hypot(local_y / region.minor);
+                    let phase = (local_y / region.minor).atan2(local_x / region.major);
+                    // A broad sigmoid models the gray, semi-opaque transition;
+                    // two angular/radial carriers model iris material that
+                    // changes visibility under an oblique projection.
+                    let transition =
+                        (1.0 + (-(normalized_radius - 1.0) * region.minor / 3.2).exp()).recip();
+                    let iris_texture = (1.0 - transition)
+                        * (18.0 * (7.0 * phase + 0.11 * local_x).sin()
+                            + 10.0 * (0.19 * local_y - 3.0 * phase).cos());
+                    let layered_haze = (1.0 - transition)
+                        * 20.0
+                        * (0.5 + 0.5 * phase.cos()).powi(2)
+                        * (0.08 * local_x).sin();
+                    let value =
+                        gain * (230.0 + 245.0 * transition + iris_texture + layered_haze) + offset;
+                    value.round().clamp(0.0, 1023.0) as u16
+                })
+            })
+            .collect::<Vec<_>>();
+        RawFrame {
+            sensor_x,
+            sensor_y,
+            width,
+            height,
+            pixels,
+        }
+    }
+
+    #[test]
+    fn radial_limbus_bands_survive_exposure_and_affine_perspective_change() {
+        let width = 220;
+        let height = 170;
+        let sensor_x = 4_000;
+        let sensor_y = 3_000;
+        let previous_region = EyeMotionRegion {
+            center: [sensor_x as f32 + 108.0, sensor_y as f32 + 84.0],
+            major: 55.0,
+            minor: 37.0,
+            angle: -0.04,
+        };
+        let current_region = EyeMotionRegion {
+            center: [sensor_x as f32 + 113.0, sensor_y as f32 + 81.5],
+            major: 58.0,
+            minor: 33.5,
+            angle: 0.085,
+        };
+        let previous = synthetic_translucent_limbus_frame(
+            width,
+            height,
+            sensor_x,
+            sensor_y,
+            previous_region,
+            1.0,
+            0.0,
+        );
+        let current = synthetic_translucent_limbus_frame(
+            width,
+            height,
+            sensor_x,
+            sensor_y,
+            current_region,
+            1.28,
+            37.0,
+        );
+        let (flows, evaluations, micros) =
+            radial_limbus_flows(&previous, &current, previous_region, current_region);
+        assert!(flows.len() >= 16, "flows={} {flows:#?}", flows.len());
+        assert!(evaluations >= flows.len() * 12, "evaluations={evaluations}");
+        let mut boundary_errors = flows
+            .iter()
+            .map(|flow| {
+                let expected = eye_region_boundary(current_region, flow.phase_rad);
+                (flow.current[0] - expected[0]).hypot(flow.current[1] - expected[1])
+            })
+            .collect::<Vec<_>>();
+        let boundary_error = median(&mut boundary_errors);
+        assert!(
+            boundary_error <= 2.5,
+            "median={boundary_error} flows={flows:#?}"
+        );
+        assert!(
+            flows
+                .iter()
+                .all(|flow| flow.profile_cost <= RADIAL_LIMBUS_MAX_PROFILE_COST),
+            "{flows:#?}"
+        );
+        assert!(micros < 50_000, "radial matcher took {micros}us");
+    }
+
+    #[test]
+    fn radial_normal_flows_add_scale_without_claiming_tangential_identity() {
+        let center = [100.0f32, 80.0f32];
+        let truth = SimilarityMotion {
+            translation: [2.0, -1.5],
+            scale_delta: 0.035,
+            // A radial band contributes normal flow. It should sharpen
+            // translation/scale, but must not invent tangential identity or
+            // angular motion on an otherwise featureless circular contour.
+            rotation: 0.0,
+            ..SimilarityMotion::default()
+        };
+        let matches = [[-5.0f32, -4.0], [5.0, -4.0], [5.0, 4.0], [-5.0, 4.0]]
+            .into_iter()
+            .enumerate()
+            .map(|(track_index, offset)| {
+                let previous = [center[0] + offset[0], center[1] + offset[1]];
+                Match {
+                    track_index,
+                    previous,
+                    current: [previous[0] + 2.0, previous[1] - 1.5],
+                    score: 1.0,
+                    object: PUPIL_LAYER,
+                    z: 0.0,
+                    assignment_margin: 1.0,
+                    layer_evidence: true,
+                    normal_flow_evidence: false,
+                    specularity: 0.0,
+                }
+            })
+            .collect::<Vec<_>>();
+        let radial = (0..12)
+            .map(|index| {
+                let phase = std::f32::consts::TAU * index as f32 / 12.0;
+                let normal = [phase.cos(), phase.sin()];
+                let previous = [center[0] + 50.0 * normal[0], center[1] + 38.0 * normal[1]];
+                RadialLimbusFlow {
+                    previous,
+                    current: truth.predict(previous, center),
+                    normal,
+                    phase_rad: phase,
+                    radial_shift_px: 0.0,
+                    profile_cost: 0.08,
+                    confidence: 0.9,
+                    fused: true,
+                }
+            })
+            .collect::<Vec<_>>();
+        let fitted = fit_similarity_with_normal_constraints(
+            &[0, 1, 2, 3],
+            &[],
+            &radial,
+            &matches,
+            &[],
+            center,
+        );
+        assert!(
+            (fitted.translation[0] - truth.translation[0]).abs() <= 0.25,
+            "{fitted:#?}"
+        );
+        assert!(
+            (fitted.translation[1] - truth.translation[1]).abs() <= 0.25,
+            "{fitted:#?}"
+        );
+        assert!(
+            (fitted.scale_delta - truth.scale_delta).abs() <= 0.010,
+            "{fitted:#?}"
+        );
+        assert!(
+            (fitted.rotation - truth.rotation).abs() <= 0.010,
+            "{fitted:#?}"
+        );
+        assert_eq!(fitted.support, 16);
+    }
+
+    #[test]
+    #[ignore = "set BUTTERCUP_RADIAL_LIMBUS_REPLAY to a lossless RAW replay directory containing report.json"]
+    fn radial_limbus_bands_replay_consecutive_lossless_raw() {
+        use std::fs;
+        use std::path::PathBuf;
+
+        let root = std::env::var_os("BUTTERCUP_RADIAL_LIMBUS_REPLAY")
+            .map(PathBuf::from)
+            .expect("BUTTERCUP_RADIAL_LIMBUS_REPLAY is required");
+        let report: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.join("report.json")).expect("read report.json"),
+        )
+        .expect("parse report.json");
+        let records = report["frames"].as_array().expect("report frames");
+        let mut raw_paths = fs::read_dir(&root)
+            .expect("read replay directory")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "raw10")
+            })
+            .collect::<Vec<_>>();
+        raw_paths.sort();
+        let replay_frames = raw_paths
+            .into_iter()
+            .filter_map(|path| {
+                let ordinal = path
+                    .file_stem()?
+                    .to_str()?
+                    .strip_prefix("frame-")?
+                    .parse::<usize>()
+                    .ok()?;
+                records.get(ordinal).map(|record| (ordinal, path, record))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            replay_frames.len() >= 8,
+            "mapped replay frames={}",
+            replay_frames.len()
+        );
+
+        let region_for = |record: &serde_json::Value| {
+            let seed = record.get("semantic_iris")?;
+            (!seed.is_null()).then(|| {
+                let origin = record["sensor_origin"].as_array().expect("sensor origin");
+                let sensor_x = origin[0].as_u64().expect("sensor x") as u32;
+                let sensor_y = origin[1].as_u64().expect("sensor y") as u32;
+                let center = seed["center"].as_array().expect("iris center");
+                let ellipse = IrisEllipseSeed {
+                    center: (
+                        center[0].as_f64().expect("iris center x"),
+                        center[1].as_f64().expect("iris center y"),
+                    ),
+                    major_radius: seed["major_radius"].as_f64().expect("iris major"),
+                    minor_radius: seed["minor_radius"].as_f64().expect("iris minor"),
+                    angle: seed["angle"].as_f64().expect("iris angle"),
+                };
+                (
+                    sensor_x,
+                    sensor_y,
+                    EyeMotionRegion::from_local_seed(
+                        ellipse,
+                        &RawFrame {
+                            sensor_x,
+                            sensor_y,
+                            width: 384,
+                            height: 256,
+                            pixels: Vec::new(),
+                        },
+                    ),
+                )
+            })
+        };
+
+        let mut attempted_pairs = 0usize;
+        let mut accepted_pairs = 0usize;
+        let mut accepted_spokes = Vec::<usize>::new();
+        let mut boundary_errors = Vec::<f32>::new();
+        let mut profile_costs = Vec::<f32>::new();
+        let mut timings = Vec::<u64>::new();
+        let mut search_limit_spokes = 0usize;
+        for pair in replay_frames.windows(2) {
+            let [(previous_ordinal, previous_path, previous_record), (current_ordinal, current_path, current_record)] =
+                pair
+            else {
+                unreachable!();
+            };
+            if *current_ordinal != previous_ordinal + 1 {
+                continue;
+            }
+            let Some((previous_x, previous_y, previous_region)) = region_for(previous_record)
+            else {
+                continue;
+            };
+            let Some((current_x, current_y, current_region)) = region_for(current_record) else {
+                continue;
+            };
+            let previous_payload = fs::read(previous_path).expect("read previous RAW");
+            let current_payload = fs::read(current_path).expect("read current RAW");
+            let previous_pixels = crate::raw10::unpack_raw10(&previous_payload, 384, 256, 480);
+            let current_pixels = crate::raw10::unpack_raw10(&current_payload, 384, 256, 480);
+            let previous = RawFrame {
+                sensor_x: previous_x,
+                sensor_y: previous_y,
+                width: 384,
+                height: 256,
+                pixels: cfa_neutral_raw(&previous_pixels, 384, 256),
+            };
+            let current = RawFrame {
+                sensor_x: current_x,
+                sensor_y: current_y,
+                width: 384,
+                height: 256,
+                pixels: cfa_neutral_raw(&current_pixels, 384, 256),
+            };
+            attempted_pairs += 1;
+            let (flows, _, micros) =
+                radial_limbus_flows(&previous, &current, previous_region, current_region);
+            timings.push(micros);
+            if !flows.is_empty() {
+                accepted_pairs += 1;
+                accepted_spokes.push(flows.len());
+            }
+            for flow in flows {
+                search_limit_spokes += usize::from(
+                    flow.radial_shift_px.abs() >= RADIAL_LIMBUS_CURRENT_SEARCH_PX as f32 - 0.5,
+                );
+                let expected = eye_region_boundary(current_region, flow.phase_rad);
+                boundary_errors
+                    .push((flow.current[0] - expected[0]).hypot(flow.current[1] - expected[1]));
+                profile_costs.push(flow.profile_cost);
+            }
+        }
+        let quantile = |values: &mut Vec<f32>, fraction: f32| {
+            values.sort_by(f32::total_cmp);
+            values
+                .get(((values.len().saturating_sub(1)) as f32 * fraction).round() as usize)
+                .copied()
+                .unwrap_or(0.0)
+        };
+        let timing_quantile = |values: &mut Vec<u64>, fraction: f32| {
+            values.sort_unstable();
+            values
+                .get(((values.len().saturating_sub(1)) as f32 * fraction).round() as usize)
+                .copied()
+                .unwrap_or(0)
+        };
+        let spokes_mean =
+            accepted_spokes.iter().sum::<usize>() as f32 / accepted_spokes.len().max(1) as f32;
+        let boundary_p50 = quantile(&mut boundary_errors, 0.50);
+        let boundary_p90 = quantile(&mut boundary_errors, 0.90);
+        let cost_p50 = quantile(&mut profile_costs, 0.50);
+        let cost_p90 = quantile(&mut profile_costs, 0.90);
+        let timing_p50 = timing_quantile(&mut timings, 0.50);
+        let timing_p99 = timing_quantile(&mut timings, 0.99);
+        let search_limit_fraction =
+            search_limit_spokes as f32 / boundary_errors.len().max(1) as f32;
+        eprintln!(
+            "radial limbus RAW replay pairs={attempted_pairs} accepted-pairs={accepted_pairs} mean-spokes={spokes_mean:.2} boundary-p50/p90={boundary_p50:.2}/{boundary_p90:.2}px search-limit={search_limit_fraction:.3} cost-p50/p90={cost_p50:.3}/{cost_p90:.3} timing-us-p50/p99={timing_p50}/{timing_p99}"
+        );
+        assert!(attempted_pairs >= 8, "attempted pairs={attempted_pairs}");
+        assert!(
+            accepted_pairs * 2 >= attempted_pairs,
+            "accepted pairs={accepted_pairs}/{attempted_pairs}"
+        );
+        assert!(boundary_p50 <= 5.0, "boundary p50={boundary_p50}");
+        assert!(boundary_p90 <= 8.5, "boundary p90={boundary_p90}");
+    }
 
     fn synthetic_shared_similarity_frame(
         width: usize,
@@ -11244,6 +13267,404 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    fn raw_frame_from_shared(pixels: Arc<Vec<u16>>, width: usize, height: usize) -> RawFrame {
+        RawFrame {
+            sensor_x: 4_000,
+            sensor_y: 3_000,
+            width,
+            height,
+            pixels: Arc::unwrap_or_clone(pixels),
+        }
+    }
+
+    #[test]
+    fn horizontal_light_field_walk_tree_recovers_translation_and_expansion() {
+        let width = 384;
+        let height = 256;
+        let previous = raw_frame_from_shared(
+            synthetic_shared_similarity_frame(width, height, 1.0, (0.0, 0.0)),
+            width,
+            height,
+        );
+        let mut current = raw_frame_from_shared(
+            synthetic_shared_similarity_frame(width, height, 1.028, (5.0, -2.0)),
+            width,
+            height,
+        );
+        // Correlation, rather than absolute brightness, is the walk score.
+        // Exercise that contract with a large global exposure change.
+        for pixel in &mut current.pixels {
+            *pixel = (f32::from(*pixel) * 1.17 + 19.0).round().clamp(0.0, 1023.0) as u16;
+        }
+        let field = horizontal_light_field_tree(&previous, &current, SimilarityMotion::default());
+        assert!(field.reliable, "{field:#?}");
+        assert!(field.nodes.len() >= 3, "{field:#?}");
+        assert!(field.leaf_nodes >= 2, "{field:#?}");
+        assert!(
+            (field.horizontal_translation_px - 5.0).abs() <= 2.0,
+            "{field:#?}"
+        );
+        assert!(
+            (field.horizontal_scale_delta - 0.028).abs() <= 0.018,
+            "{field:#?}"
+        );
+        assert!(field.evaluations < 8_000, "{field:#?}");
+    }
+
+    #[test]
+    fn horizontal_light_field_walk_tree_keeps_static_exposure_change_static() {
+        let width = 384;
+        let height = 256;
+        let previous = raw_frame_from_shared(
+            synthetic_shared_similarity_frame(width, height, 1.0, (0.0, 0.0)),
+            width,
+            height,
+        );
+        let mut current = previous.clone();
+        for pixel in &mut current.pixels {
+            *pixel = (f32::from(*pixel) * 0.74 + 83.0).round().clamp(0.0, 1023.0) as u16;
+        }
+        let field = horizontal_light_field_tree(&previous, &current, SimilarityMotion::default());
+        assert!(field.reliable, "{field:#?}");
+        assert!(field.horizontal_translation_px.abs() <= 1.0, "{field:#?}");
+        assert!(field.horizontal_scale_delta.abs() <= 0.008, "{field:#?}");
+    }
+
+    #[test]
+    fn horizontal_light_field_rescue_keeps_ids_through_a_fast_reversal() {
+        use std::collections::BTreeSet;
+
+        let width = 384;
+        let height = 256;
+        let mut tracker = FourMotionOctrees::default();
+        let seed_for = |translation_x: f64| IrisEllipseSeed {
+            center: (192.0 + translation_x, 128.0),
+            major_radius: 72.0,
+            minor_radius: 58.0,
+            angle: 0.0,
+        };
+        let mut before_reversal = BTreeSet::<u64>::new();
+        let mut reversed = MotionOctreeOverlay::default();
+        for (index, translation_x) in [0.0, 4.0, 8.0, 12.0, -8.0].into_iter().enumerate() {
+            let raw = synthetic_shared_similarity_frame(width, height, 1.0, (translation_x, 0.0));
+            let overlay = tracker.observe_with_iris_seed_at(
+                raw.as_slice(),
+                width,
+                height,
+                4_000,
+                3_000,
+                1_000_000_000 + index as u64 * 100_000_000,
+                None,
+                true,
+                Some(seed_for(translation_x)),
+            );
+            if index == 3 {
+                before_reversal = tracker
+                    .tracks
+                    .iter()
+                    .filter(|track| track.age == 0 && track.matched_streak >= 2)
+                    .map(|track| track.id)
+                    .collect();
+            }
+            if index == 4 {
+                reversed = overlay;
+            }
+        }
+        let after_reversal = tracker
+            .tracks
+            .iter()
+            .filter(|track| track.age == 0)
+            .map(|track| track.id)
+            .collect::<BTreeSet<_>>();
+        let retained = before_reversal.intersection(&after_reversal).count();
+        assert!(before_reversal.len() >= 12, "before={before_reversal:?}");
+        assert!(
+            reversed.match_diagnostics.light_field_rescue_tracks >= 4,
+            "diagnostics={:#?}",
+            reversed.match_diagnostics
+        );
+        assert!(
+            reversed.match_diagnostics.light_field_rescue_accepted >= 3,
+            "diagnostics={:#?}",
+            reversed.match_diagnostics
+        );
+        assert!(
+            retained * 2 >= before_reversal.len(),
+            "retained={retained}/{} diagnostics={:#?}",
+            before_reversal.len(),
+            reversed.match_diagnostics,
+        );
+    }
+
+    #[test]
+    fn dormant_nautilus_ids_reenter_after_a_blink_without_stale_overlay_points() {
+        use std::collections::BTreeSet;
+
+        let width = 384;
+        let height = 256;
+        let seed = IrisEllipseSeed {
+            center: (192.0, 128.0),
+            major_radius: 72.0,
+            minor_radius: 58.0,
+            angle: 0.0,
+        };
+        let mut tracker = FourMotionOctrees::default();
+        let mut timestamp_ns = 1_000_000_000u64;
+        for frame_index in 0..6usize {
+            let mut raw = Arc::unwrap_or_clone(synthetic_shared_similarity_frame(
+                width,
+                height,
+                1.0 + frame_index as f64 * 0.0015,
+                (frame_index as f64 * 0.35, 0.0),
+            ));
+            // A moving compact glint gives the bounded appearance bank honest
+            // pre-blink diversity while leaving the underlying identity and
+            // large-scale light field unchanged.
+            let glint_x = 150 + frame_index * 3;
+            for y in 108..124 {
+                for x in glint_x..(glint_x + 12) {
+                    raw[y * width + x] = (raw[y * width + x] + 130).min(1023);
+                }
+            }
+            let _ = tracker.observe_with_iris_seed_at(
+                &raw,
+                width,
+                height,
+                4_000,
+                3_000,
+                timestamp_ns,
+                None,
+                true,
+                Some(seed),
+            );
+            timestamp_ns += 100_000_000;
+        }
+        let before_blink = tracker
+            .tracks
+            .iter()
+            .filter(|track| {
+                track.age == 0
+                    && track.matched_streak >= 2
+                    && tracker
+                        .nautilus_banks
+                        .get(&track.id)
+                        .is_some_and(|bank| bank.observations.len() >= 2)
+            })
+            .map(|track| track.id)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            before_blink.len() >= 4,
+            "banks={:?}",
+            tracker.nautilus_banks
+        );
+
+        let closed = vec![512u16; width * height];
+        for _ in 0..5 {
+            let overlay = tracker.observe_with_iris_seed_at(
+                &closed,
+                width,
+                height,
+                4_000,
+                3_000,
+                timestamp_ns,
+                None,
+                true,
+                None,
+            );
+            timestamp_ns += 100_000_000;
+            assert!(
+                overlay.trails.is_empty(),
+                "a dormant coordinate must not masquerade as current: {overlay:#?}"
+            );
+        }
+        let reopened = Arc::unwrap_or_clone(synthetic_shared_similarity_frame(
+            width,
+            height,
+            1.0075,
+            (1.75, 0.0),
+        ));
+        let _ = tracker.observe_with_iris_seed_at(
+            &reopened,
+            width,
+            height,
+            4_000,
+            3_000,
+            timestamp_ns,
+            None,
+            true,
+            Some(seed),
+        );
+        timestamp_ns += 100_000_000;
+        let recovered = tracker.observe_with_iris_seed_at(
+            &reopened,
+            width,
+            height,
+            4_000,
+            3_000,
+            timestamp_ns,
+            None,
+            true,
+            Some(seed),
+        );
+        let after_blink = tracker
+            .tracks
+            .iter()
+            .filter(|track| track.age == 0)
+            .map(|track| track.id)
+            .collect::<BTreeSet<_>>();
+        let retained = before_blink.intersection(&after_blink).count();
+        assert!(
+            recovered.match_diagnostics.extended_gap_relocated >= 1,
+            "retained={retained} diagnostics={:#?}",
+            recovered.match_diagnostics,
+        );
+        assert!(
+            retained >= 1,
+            "before={before_blink:?} after={after_blink:?}"
+        );
+        assert!(recovered
+            .trails
+            .iter()
+            .all(|trail| trail.points.len() == 1 || trail.matched_streak > 0));
+        assert!(
+            recovered.trails.len() <= MAX_FEATURES,
+            "re-entry exceeded live graph budget: {}",
+            recovered.trails.len(),
+        );
+    }
+
+    #[test]
+    #[ignore = "lossless consecutive RAW corpus replay; optionally set BUTTERCUP_LIGHT_FIELD_CORPUS_FRAMES"]
+    fn horizontal_light_field_walk_tree_tracks_consecutive_raw_corpus() {
+        use std::fs;
+        use std::path::PathBuf;
+
+        let root = std::env::var_os("BUTTERCUP_NAUTILUS_CORPUS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(
+                    "/mnt/bulk_data/osbot-drv-data/outputs/native-limbus-session-20260813/corpus",
+                )
+            });
+        let maximum_frames = std::env::var("BUTTERCUP_LIGHT_FIELD_CORPUS_FRAMES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(160);
+        let mut archives = fs::read_dir(&root)
+            .unwrap_or_else(|error| panic!("read {}: {error}", root.display()))
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        archives.sort();
+        let mut processed = 0usize;
+        let mut attempts = 0usize;
+        let mut reliable = 0usize;
+        let mut joint_reference = 0usize;
+        let mut translation_agreement = 0usize;
+        let mut scale_agreement = 0usize;
+        let mut timings = Vec::<u64>::new();
+        for archive in archives {
+            if processed >= maximum_frames {
+                break;
+            }
+            let records = fs::read_to_string(archive.join("frames.jsonl"))
+                .unwrap_or_else(|error| panic!("read {} index: {error}", archive.display()));
+            let stream = fs::read(archive.join("subject-right.raw10"))
+                .unwrap_or_else(|error| panic!("read {} RAW: {error}", archive.display()));
+            let mut previous = None::<RawFrame>;
+            let mut prior = SimilarityMotion::default();
+            let mut independent = NativeGlobalSimilarityTracker::default();
+            for record in records
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|record| {
+                    record.get("label").and_then(serde_json::Value::as_str) == Some("subject-right")
+                })
+            {
+                if processed >= maximum_frames {
+                    break;
+                }
+                let offset = record["offset"].as_u64().expect("offset") as usize;
+                let length = record["length"].as_u64().expect("length") as usize;
+                let raw =
+                    crate::raw10::unpack_raw10(&stream[offset..offset + length], 384, 256, 480);
+                let sensor_x = record["sensor_x"].as_u64().expect("sensor_x") as u32;
+                let sensor_y = record["sensor_y"].as_u64().expect("sensor_y") as u32;
+                let reference =
+                    independent.observe(Arc::new(raw.clone()), 384, 256, sensor_x, sensor_y);
+                let current = RawFrame {
+                    sensor_x,
+                    sensor_y,
+                    width: 384,
+                    height: 256,
+                    pixels: cfa_neutral_raw(&raw, 384, 256),
+                };
+                if let Some(previous) = previous.as_ref() {
+                    attempts += 1;
+                    let field = horizontal_light_field_tree(previous, &current, prior);
+                    timings.push(field.elapsed_micros);
+                    if field.reliable {
+                        reliable += 1;
+                        prior = SimilarityMotion {
+                            translation: [field.horizontal_translation_px, 0.0],
+                            scale_delta: field.horizontal_scale_delta,
+                            residual: field.residual_px,
+                            support: field.leaf_nodes,
+                            ..SimilarityMotion::default()
+                        };
+                        if reference.reliable {
+                            joint_reference += 1;
+                            translation_agreement += usize::from(
+                                (field.horizontal_translation_px - reference.motion.translation[0])
+                                    .abs()
+                                    <= 4.0,
+                            );
+                            scale_agreement += usize::from(
+                                (field.horizontal_scale_delta - reference.motion.scale_delta).abs()
+                                    <= 0.030,
+                            );
+                        }
+                    } else {
+                        prior = SimilarityMotion::default();
+                    }
+                }
+                previous = Some(current);
+                processed += 1;
+            }
+        }
+        timings.sort_unstable();
+        let percentile = |fraction: f32| {
+            timings
+                .get(((timings.len().saturating_sub(1)) as f32 * fraction).round() as usize)
+                .copied()
+                .unwrap_or(0)
+        };
+        eprintln!(
+            "horizontal light-field RAW corpus frames={processed} attempts={attempts} reliable={reliable} joint-reference={joint_reference} translation-agreement={translation_agreement} scale-agreement={scale_agreement} timing-us-p50/p90/p99={}/{}/{}",
+            percentile(0.50),
+            percentile(0.90),
+            percentile(0.99),
+        );
+        assert!(processed >= maximum_frames.min(80), "processed={processed}");
+        assert!(
+            attempts >= processed.saturating_sub(16),
+            "attempts={attempts}"
+        );
+        assert!(reliable * 20 >= attempts, "reliable={reliable}/{attempts}");
+        assert!(percentile(0.99) <= 20_000, "timings={timings:?}");
+        if joint_reference >= 10 {
+            assert!(
+                translation_agreement * 2 >= joint_reference,
+                "translation agreement={translation_agreement}/{joint_reference}"
+            );
+            assert!(
+                scale_agreement * 2 >= joint_reference,
+                "scale agreement={scale_agreement}/{joint_reference}"
+            );
+        }
     }
 
     #[test]
@@ -11839,6 +14260,7 @@ mod tests {
                 points: VecDeque::from([[48.0, 36.0, 0.0]]),
                 object: GENERAL_LAYER,
                 age: 0,
+                last_seen_timestamp_ns: 1_000_000_000,
                 score: 1.0,
                 motion_ema: [1.0, 0.0],
                 motion_variance: 0.0,
@@ -12072,6 +14494,7 @@ mod tests {
                 points: VecDeque::from([[point[0], point[1], 0.0]]),
                 object: PUPIL_LAYER,
                 age: 0,
+                last_seen_timestamp_ns: 0,
                 score: 1.0,
                 motion_ema: translation,
                 motion_variance: 0.0,
@@ -12111,6 +14534,7 @@ mod tests {
         let fitted = fit_similarity_with_normal_constraints(
             &[0, 1, 2],
             &[3, 4, 5, 6],
+            &[],
             &matches,
             &tracks,
             center,
@@ -12218,6 +14642,7 @@ mod tests {
                 points: VecDeque::from([[previous[0], previous[1], 0.0]]),
                 object: GENERAL_LAYER,
                 age: 0,
+                last_seen_timestamp_ns: 0,
                 score: 1.0,
                 motion_ema: [
                     global.translation[0] + local[0],
@@ -12673,6 +15098,7 @@ mod tests {
                 points: VecDeque::from([[previous[0], previous[1], 0.0]]),
                 object,
                 age: 0,
+                last_seen_timestamp_ns: 0,
                 score: 1.0,
                 motion_ema: [global.translation[0] + residual[0], residual[1]],
                 motion_variance: 0.01,
@@ -12715,6 +15141,8 @@ mod tests {
         let mut axis = [0.0; 2];
         let mut eye_center = None;
         let mut eye_region = None;
+        let mut radial_limbus_flows = Vec::new();
+        let mut radial_limbus_fused = 0usize;
         let mut relation_graph = PersistentMotionRelationGraph::default();
         for _ in 0..2 {
             let mut relations = relation_graph.observe(&matches, &tracks, [50.0, 50.0], global);
@@ -12730,6 +15158,8 @@ mod tests {
                 &mut axis,
                 &mut eye_center,
                 &mut eye_region,
+                &mut radial_limbus_flows,
+                &mut radial_limbus_fused,
                 [50.0, 50.0],
                 global,
                 &mut relations,
@@ -12774,6 +15204,7 @@ mod tests {
                 ]),
                 object,
                 age: 0,
+                last_seen_timestamp_ns: 0,
                 score: 1.0,
                 motion_ema: velocity,
                 motion_variance: 0.02,
@@ -13348,6 +15779,252 @@ mod tests {
     }
 
     #[test]
+    fn limbus_feature_budget_affinity_prefers_a_radial_raw_material_transition() {
+        let seed = IrisEllipseSeed {
+            center: (96.0, 72.0),
+            major_radius: 44.0,
+            minor_radius: 31.0,
+            angle: 0.23,
+        };
+        let ellipse = seed.ellipse();
+        let phase = 0.71f64;
+        let (angle_sine, angle_cosine) = ellipse.angle.sin_cos();
+        let local_x = ellipse.major * phase.cos();
+        let local_y = ellipse.minor * phase.sin();
+        let point = [
+            (ellipse.center.0 + angle_cosine * local_x - angle_sine * local_y) as f32,
+            (ellipse.center.1 + angle_sine * local_x + angle_cosine * local_y) as f32,
+        ];
+        let normal = normalized_vector([
+            (angle_cosine * local_x / ellipse.major.powi(2)
+                - angle_sine * local_y / ellipse.minor.powi(2)) as f32,
+            (angle_sine * local_x / ellipse.major.powi(2)
+                + angle_cosine * local_y / ellipse.minor.powi(2)) as f32,
+        ]);
+        let good = EdgeEvidence {
+            x: point[0],
+            y: point[1],
+            gradient_x: normal[0],
+            gradient_y: normal[1],
+            strength: 1.4,
+            multiscale_consistency: 0.94,
+            signed_step_persistence: 0.91,
+            dark_side_texture: 0.92,
+            bright_side_texture: 0.10,
+            ..EdgeEvidence::default()
+        };
+        let (good_affinity, _) =
+            limbus_feature_budget_affinity(good, seed).expect("radial limbus edge");
+        assert!(good_affinity >= 0.72, "affinity={good_affinity}");
+
+        let balanced = EdgeEvidence {
+            dark_side_texture: 0.51,
+            bright_side_texture: 0.49,
+            ..good
+        };
+        let (balanced_affinity, _) =
+            limbus_feature_budget_affinity(balanced, seed).expect("same geometric edge");
+        assert!(
+            good_affinity > balanced_affinity + 0.18,
+            "split={good_affinity} balanced={balanced_affinity}"
+        );
+
+        let tangential = EdgeEvidence {
+            gradient_x: -normal[1],
+            gradient_y: normal[0],
+            ..good
+        };
+        assert!(limbus_feature_budget_affinity(tangential, seed).is_none());
+        let off_ring = EdgeEvidence {
+            x: (seed.center.0 + 0.60 * (point[0] as f64 - seed.center.0)) as f32,
+            y: (seed.center.1 + 0.60 * (point[1] as f64 - seed.center.1)) as f32,
+            ..good
+        };
+        assert!(limbus_feature_budget_affinity(off_ring, seed).is_none());
+    }
+
+    #[test]
+    fn limbus_feature_reserve_keeps_distributed_opposing_raw_edges() {
+        let width = 192usize;
+        let height = 144usize;
+        let seed = IrisEllipseSeed {
+            center: (96.0, 72.0),
+            major_radius: 49.0,
+            minor_radius: 35.0,
+            angle: 0.16,
+        };
+        let ellipse = seed.ellipse();
+        let (angle_sine, angle_cosine) = ellipse.angle.sin_cos();
+        let mut raw = vec![0u16; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let radius = normalized_ellipse_radius(ellipse, (x as f64, y as f64));
+                let texture = ((x * 17 + y * 29) % 31) as u16;
+                raw[y * width + x] = if radius < 1.0 {
+                    260 + 3 * texture
+                } else {
+                    720 + texture
+                };
+            }
+        }
+        let frame = RawFrame {
+            sensor_x: 0,
+            sensor_y: 0,
+            width,
+            height,
+            pixels: raw,
+        };
+        let canny = canny_field(&frame);
+        let edges = (0..LIMBUS_FEATURE_SECTORS)
+            .map(|sector| {
+                let phase = std::f64::consts::TAU * sector as f64 / LIMBUS_FEATURE_SECTORS as f64;
+                let local_x = ellipse.major * phase.cos();
+                let local_y = ellipse.minor * phase.sin();
+                let point = [
+                    (ellipse.center.0 + angle_cosine * local_x - angle_sine * local_y) as f32,
+                    (ellipse.center.1 + angle_sine * local_x + angle_cosine * local_y) as f32,
+                ];
+                let normal = normalized_vector([
+                    (angle_cosine * local_x / ellipse.major.powi(2)
+                        - angle_sine * local_y / ellipse.minor.powi(2)) as f32,
+                    (angle_sine * local_x / ellipse.major.powi(2)
+                        + angle_cosine * local_y / ellipse.minor.powi(2))
+                        as f32,
+                ]);
+                EdgeEvidence {
+                    x: point[0],
+                    y: point[1],
+                    gradient_x: normal[0],
+                    gradient_y: normal[1],
+                    strength: 1.5,
+                    multiscale_consistency: 0.95,
+                    signed_step_persistence: 0.93,
+                    dark_side_texture: 0.88,
+                    bright_side_texture: 0.12,
+                    ..EdgeEvidence::default()
+                }
+            })
+            .collect::<Vec<_>>();
+        let selected = seed_points(&frame, Some(&canny), &edges, Some(seed), &[], 40);
+        let retained_limbus = selected
+            .iter()
+            .filter(|(point, _)| {
+                (normalized_ellipse_radius(ellipse, (point[0] as f64, point[1] as f64)) - 1.0).abs()
+                    <= 0.025
+            })
+            .count();
+        assert!(
+            retained_limbus >= 12,
+            "retained only {retained_limbus} of {} selected features: {selected:?}",
+            selected.len()
+        );
+        assert!(selected.len() <= 40);
+    }
+
+    #[test]
+    #[ignore = "set BUTTERCUP_LIMBUS_FEATURE_LABEL and BUTTERCUP_LIMBUS_FEATURE_RAW"]
+    fn limbus_feature_budget_replays_a_human_labeled_lossless_raw() {
+        let label_path = std::env::var("BUTTERCUP_LIMBUS_FEATURE_LABEL")
+            .expect("set BUTTERCUP_LIMBUS_FEATURE_LABEL to a reviewed labels JSON");
+        let raw_path = std::env::var("BUTTERCUP_LIMBUS_FEATURE_RAW")
+            .expect("set BUTTERCUP_LIMBUS_FEATURE_RAW to the corresponding RAW10 export");
+        let document: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&label_path).expect("read human limbus labels JSON"),
+        )
+        .expect("parse human limbus labels JSON");
+        assert_eq!(
+            document.get("reviewed").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "the corpus replay must not treat an unreviewed algorithm proposal as truth"
+        );
+        let width = document
+            .get("frame_width")
+            .and_then(serde_json::Value::as_u64)
+            .expect("frame_width") as usize;
+        let height = document
+            .get("frame_height")
+            .and_then(serde_json::Value::as_u64)
+            .expect("frame_height") as usize;
+        let fit = document.get("ellipse_fit").expect("human ellipse fit");
+        let center = fit
+            .get("center")
+            .and_then(serde_json::Value::as_array)
+            .expect("ellipse center");
+        let radii = fit
+            .get("radii")
+            .and_then(serde_json::Value::as_array)
+            .expect("ellipse radii");
+        let seed = IrisEllipseSeed {
+            center: (
+                center[0].as_f64().expect("center x"),
+                center[1].as_f64().expect("center y"),
+            ),
+            major_radius: radii[0].as_f64().expect("radius 0"),
+            minor_radius: radii[1].as_f64().expect("radius 1"),
+            angle: fit
+                .get("angle_degrees")
+                .and_then(serde_json::Value::as_f64)
+                .expect("ellipse angle")
+                .to_radians(),
+        };
+        let packed = std::fs::read(&raw_path).expect("read lossless RAW10");
+        let raw = crate::raw10::unpack_raw10(&packed, width, height, width * 5 / 4);
+        assert_eq!(raw.len(), width * height);
+        let frame = RawFrame {
+            sensor_x: 0,
+            sensor_y: 0,
+            width,
+            height,
+            pixels: cfa_neutral_raw(&raw, width, height),
+        };
+        let mut canny = canny_field(&frame);
+        let edges = edge_evidence(&mut canny, width, height).edges;
+        let baseline = seed_points(&frame, Some(&canny), &edges, None, &[], MAX_FEATURES);
+        let discounted = seed_points(
+            &frame,
+            Some(&canny),
+            &edges,
+            Some(seed),
+            &[],
+            MAX_FEATURES,
+        );
+        let ellipse = seed.ellipse();
+        let near_limbus = |point: [f32; 2]| {
+            (normalized_ellipse_radius(ellipse, (point[0] as f64, point[1] as f64)) - 1.0)
+                .abs()
+                * ellipse.minor
+                <= 4.0
+        };
+        let baseline_limbus = baseline
+            .iter()
+            .filter(|(point, _)| near_limbus(*point))
+            .count();
+        let discounted_limbus = discounted
+            .iter()
+            .filter(|(point, _)| near_limbus(*point))
+            .count();
+        let discounted_affine_edges = edges
+            .iter()
+            .filter(|edge| {
+                limbus_feature_budget_affinity(**edge, seed)
+                    .is_some_and(|(affinity, _)| affinity >= LIMBUS_FEATURE_MIN_AFFINITY)
+            })
+            .count();
+        eprintln!(
+            "limbus-feature-budget label={label_path} raw={raw_path} edges={} eligible={} baseline={baseline_limbus}/{} discounted={discounted_limbus}/{}",
+            edges.len(),
+            discounted_affine_edges,
+            baseline.len(),
+            discounted.len(),
+        );
+        assert!(discounted.len() <= MAX_FEATURES);
+        assert!(
+            discounted_limbus >= baseline_limbus,
+            "discount removed human-limbus features: baseline={baseline_limbus} discounted={discounted_limbus}"
+        );
+    }
+
+    #[test]
     fn canny_work_is_scoped_to_the_cluster_feature_mode() {
         let width = 64usize;
         let height = 48usize;
@@ -13654,6 +16331,7 @@ mod tests {
                 source.center,
                 current_sensor_origin,
                 true,
+                false,
                 &mut diagnostics,
             );
             stats.production_relocations += relocations.len();
