@@ -8057,6 +8057,29 @@ fn control_status_json(state: &SharedState) -> String {
             matching.subpixel_rejected,
             subpixel_mean,
         );
+        let nautilus_mean_margin = if matching.nautilus_relocated > 0 {
+            matching.nautilus_margin_sum / matching.nautilus_relocated as f32
+        } else {
+            0.0
+        };
+        let nautilus = format!(
+            "{{\"build_micros\":{},\"candidates\":{},\"tree_nodes\":{},\"queries\":{},\"nodes_visited\":{},\"descriptor_evaluations\":{},\"refinement_evaluations\":{},\"distance_rejected\":{},\"spatial_rejected\":{},\"ambiguous_location\":{},\"ambiguous_identity\":{},\"collision_rejected\":{},\"relocated\":{},\"gap_relocated\":{},\"mean_acceptance_margin\":{:.4}}}",
+            matching.nautilus_build_micros,
+            matching.nautilus_candidates,
+            matching.nautilus_tree_nodes,
+            matching.nautilus_queries,
+            matching.nautilus_nodes_visited,
+            matching.nautilus_descriptor_evaluations,
+            matching.nautilus_refinement_evaluations,
+            matching.nautilus_distance_rejected,
+            matching.nautilus_spatial_rejected,
+            matching.nautilus_ambiguous,
+            matching.nautilus_reverse_ambiguous,
+            matching.nautilus_collision_rejected,
+            matching.nautilus_relocated,
+            matching.nautilus_gap_relocated,
+            nautilus_mean_margin,
+        );
         let relation_origin = if matching.relation_origin_valid {
             format!(
                 "[{:.3},{:.3}]",
@@ -8231,7 +8254,7 @@ fn control_status_json(state: &SharedState) -> String {
             coupled.micro_motion_likelihood,
         );
         format!(
-            "{{\"sequence\":{},\"timestamp_ns\":{},\"sensor_x\":{},\"sensor_y\":{},\"width\":{},\"height\":{},\"focus_score\":{:.6},\"focus_points\":{},\"focus_center\":{},\"eye_basin_valid\":{},\"anatomy_valid\":{},\"virtual_contact\":{},\"motion_octrees\":{{\"generation\":{},\"active_objects\":{},\"feature_trails\":{},\"nodes\":{},\"objects\":[{}],\"subpixel\":{},\"relation_graph\":{},\"coupled_motion\":{},\"focus_sfm\":{}}}}}",
+            "{{\"sequence\":{},\"timestamp_ns\":{},\"sensor_x\":{},\"sensor_y\":{},\"width\":{},\"height\":{},\"focus_score\":{:.6},\"focus_points\":{},\"focus_center\":{},\"eye_basin_valid\":{},\"anatomy_valid\":{},\"virtual_contact\":{},\"motion_octrees\":{{\"generation\":{},\"active_objects\":{},\"feature_trails\":{},\"nodes\":{},\"objects\":[{}],\"subpixel\":{},\"nautilus_fingerprint_tree\":{},\"relation_graph\":{},\"coupled_motion\":{},\"focus_sfm\":{}}}}}",
             frame.sequence,
             frame.timestamp_ns,
             frame.sensor_x,
@@ -8250,6 +8273,7 @@ fn control_status_json(state: &SharedState) -> String {
             frame.motion_octrees.nodes.len(),
             octrees,
             subpixel,
+            nautilus,
             relation_graph,
             coupled_motion,
             focus_sfm,
@@ -37569,7 +37593,7 @@ fn draw_motion_octree_overlay(
         }
     }
     let status = format!(
-        "CANNY3D G{} E{} SH{} P{} L{} T{} SP{}/{} RG{}/{}/{}/{} I{} {}us AX{:+.2},{:+.2}",
+        "CANNY3D G{} E{} SH{} P{} L{} T{} SP{}/{} NF{}/{} A{} RG{}/{}/{}/{} I{} {}us AX{:+.2},{:+.2}",
         overlay.generation,
         overlay.edges.len(),
         overlay.motion_shadow_edges_downweighted,
@@ -37578,6 +37602,10 @@ fn draw_motion_octree_overlay(
         overlay.matched_features,
         overlay.match_diagnostics.subpixel_accepted,
         overlay.match_diagnostics.subpixel_attempted,
+        overlay.match_diagnostics.nautilus_relocated,
+        overlay.match_diagnostics.nautilus_queries,
+        overlay.match_diagnostics.nautilus_ambiguous
+            + overlay.match_diagnostics.nautilus_reverse_ambiguous,
         overlay.match_diagnostics.relation_nodes,
         overlay.match_diagnostics.relation_edges,
         overlay.match_diagnostics.relation_coherent_edges,

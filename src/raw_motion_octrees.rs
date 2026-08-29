@@ -6,7 +6,7 @@
 //! differential/parallax motion as the third octree coordinate.  It does not
 //! claim metric depth or semantic object identity.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -174,6 +174,31 @@ const MIN_PERSISTENT_CANNY_SUPPORT: f32 = 0.055;
 const EDGE_TILE_SIZE: usize = 24;
 const EDGES_PER_TILE: usize = 18;
 const FEATURE_SEED_TILE_SIZE: usize = 48;
+// A nautilus fingerprint follows four slowly rotating, opposed branches over
+// four outward shells.  Pair means retain the regional material while signed
+// pair differences retain direction; z-normalization makes the 32-byte result
+// insensitive to affine exposure/gain changes.  A short per-ID observation
+// bank permits honest re-identification after a missed exposure without
+// pretending the old point belongs to the immediately previous RAW frame.
+const NAUTILUS_SHELLS: usize = 6;
+const NAUTILUS_BRANCH_PAIRS: usize = 8;
+const NAUTILUS_COMPONENTS: usize = NAUTILUS_SHELLS * NAUTILUS_BRANCH_PAIRS * 2;
+const NAUTILUS_BANK_CAPACITY: usize = 5;
+const NAUTILUS_TREE_LEAF_CAPACITY: usize = 16;
+const NAUTILUS_MAX_CANDIDATES: usize = 2048;
+const NAUTILUS_CANDIDATE_SEPARATION: f32 = 1.5;
+const NAUTILUS_MIN_BANK_OBSERVATIONS: usize = 2;
+const NAUTILUS_MAX_DISTANCE: f32 = 0.78;
+const NAUTILUS_MIN_ABSOLUTE_MARGIN: f32 = 0.08;
+const NAUTILUS_MAX_DISTANCE_RATIO: f32 = 0.84;
+const NAUTILUS_MIN_REVERSE_MARGIN: f32 = 0.04;
+const NAUTILUS_MIN_ACCEPTANCE_CONFIDENCE: f32 = 0.85;
+const NAUTILUS_IDENTITY_RADIUS_BASE: f32 = 2.0;
+const NAUTILUS_IDENTITY_RADIUS_PER_GAP: f32 = 0.5;
+const NAUTILUS_ANCHOR_PRIOR_DISAGREEMENT_BASE: f32 = 6.0;
+const NAUTILUS_ANCHOR_PRIOR_DISAGREEMENT_PER_GAP: f32 = 4.0;
+const NAUTILUS_ANCHOR_RESIDUAL_BASE: f32 = 2.5;
+const NAUTILUS_ANCHOR_RESIDUAL_PER_GAP: f32 = 0.75;
 const ELLIPSE_ANGLE_BINS: usize = 24;
 const MOTION_SIGNATURE_LEN: usize = 8;
 const MIN_MOTION_SIGNATURE: usize = 4;
@@ -486,6 +511,24 @@ pub struct MatchDiagnostics {
     pub temporal_rejected: usize,
     pub destination_collision_rejected: usize,
     pub accepted: usize,
+    /// Multi-shell descriptor hierarchy built from current-frame native RAW
+    /// edge points. These counters deliberately distinguish a withheld
+    /// ambiguous identity from a confident but incorrect reconnection.
+    pub nautilus_build_micros: u64,
+    pub nautilus_candidates: usize,
+    pub nautilus_tree_nodes: usize,
+    pub nautilus_queries: usize,
+    pub nautilus_nodes_visited: usize,
+    pub nautilus_descriptor_evaluations: usize,
+    pub nautilus_refinement_evaluations: usize,
+    pub nautilus_distance_rejected: usize,
+    pub nautilus_spatial_rejected: usize,
+    pub nautilus_ambiguous: usize,
+    pub nautilus_reverse_ambiguous: usize,
+    pub nautilus_collision_rejected: usize,
+    pub nautilus_relocated: usize,
+    pub nautilus_gap_relocated: usize,
+    pub nautilus_margin_sum: f32,
     /// Mature subpixel tracks admitted as nodes to the pairwise motion graph.
     pub relation_nodes: usize,
     /// Pairwise similarity tensors retained after baseline/finite checks.
@@ -573,6 +616,89 @@ struct FeatureTrack {
     residual_history: VecDeque<[f32; 2]>,
     focus_bins: Vec<FocusBin>,
     focus_peak: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NautilusFingerprint {
+    values: [i8; NAUTILUS_COMPONENTS],
+    quality: f32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct NautilusFingerprintBank {
+    observations: VecDeque<NautilusFingerprint>,
+}
+
+impl NautilusFingerprintBank {
+    fn observe(&mut self, fingerprint: NautilusFingerprint) {
+        // Near-identical consecutive observations add no appearance coverage;
+        // replace the newest one so the bounded bank spans a longer interval.
+        if self
+            .observations
+            .back()
+            .is_some_and(|previous| nautilus_fingerprint_distance(previous, &fingerprint) <= 0.035)
+        {
+            self.observations.pop_back();
+        }
+        self.observations.push_back(fingerprint);
+        while self.observations.len() > NAUTILUS_BANK_CAPACITY {
+            self.observations.pop_front();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NautilusCandidate {
+    point: [f32; 2],
+    normal: [f32; 2],
+    fingerprint: NautilusFingerprint,
+    evidence: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NautilusRefinedCandidate {
+    candidate_index: usize,
+    point: [f32; 2],
+    normal: [f32; 2],
+    fingerprint: NautilusFingerprint,
+    score: f32,
+}
+
+#[derive(Clone, Debug)]
+struct NautilusTreeNode {
+    spatial_bounds: [f32; 4],
+    descriptor_min: [i8; NAUTILUS_COMPONENTS],
+    descriptor_max: [i8; NAUTILUS_COMPONENTS],
+    split_dimension: usize,
+    split_value: i8,
+    left: Option<usize>,
+    right: Option<usize>,
+    candidates: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct NautilusFingerprintTree {
+    candidates: Vec<NautilusCandidate>,
+    nodes: Vec<NautilusTreeNode>,
+    root: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NautilusRelocation {
+    track_index: usize,
+    candidate_index: usize,
+    current: [f32; 2],
+    fingerprint: NautilusFingerprint,
+    distance: f32,
+    margin: f32,
+    distance_ratio: f32,
+    prediction_distance: f32,
+    identity_radius: f32,
+    reverse_margin: f32,
+    normal_alignment: f32,
+    anchor_conditioned: bool,
+    confidence: f32,
+    crossed_gap: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -4134,6 +4260,10 @@ pub struct FourMotionOctrees {
     canny_features: bool,
     learning_canny_profile: LearningCannyProfile,
     tracks: Vec<FeatureTrack>,
+    /// Several native-RAW observations per persistent feature ID. The bank is
+    /// separate from `previous`: it is expressly for identity recovery across
+    /// a missed frame, while ordinary motion remains adjacent-frame evidence.
+    nautilus_banks: BTreeMap<u64, NautilusFingerprintBank>,
     motions: [SimilarityMotion; OBJECTS],
     layers: [MotionLayerStatus; OBJECTS],
     layer_signatures: [LayerMotionSignature; OBJECTS],
@@ -4163,6 +4293,10 @@ pub struct FourMotionOctrees {
     // predictor; replay can force the legacy exhaustive corridor to quantify
     // speed and stability against identical RAW frames.
     exhaustive_search_for_replay: bool,
+    /// Offline oracle control. When set, strict adjacent-frame ZNCC tracks can
+    /// be harvested as an independent correspondence reference for evaluating
+    /// nautilus retrieval without letting retrieval label its own answers.
+    disable_nautilus_for_replay: bool,
     coupled_kinematics: CoupledEyeKinematics,
     fallback_timestamp_ns: u64,
     /// Timestamp of the RAW allocation backing `previous`. A motion learned
@@ -6385,6 +6519,889 @@ fn local_canny_support(edges: &CannyField, width: usize, x: usize, y: usize) -> 
 
 fn local_canny_normal(edges: &CannyField, width: usize, x: usize, y: usize) -> [f32; 2] {
     local_canny_peak(edges, width, x, y).1
+}
+
+fn sample_native_raw_bilinear(frame: &RawFrame, x: f32, y: f32) -> Option<f32> {
+    if !x.is_finite()
+        || !y.is_finite()
+        || x < 0.0
+        || y < 0.0
+        || x + 1.0 >= frame.width as f32
+        || y + 1.0 >= frame.height as f32
+    {
+        return None;
+    }
+    let x0 = x.floor() as usize;
+    let y0 = y.floor() as usize;
+    let tx = x - x0 as f32;
+    let ty = y - y0 as f32;
+    let row0 = y0 * frame.width;
+    let row1 = (y0 + 1) * frame.width;
+    let top = frame.pixels[row0 + x0] as f32 * (1.0 - tx) + frame.pixels[row0 + x0 + 1] as f32 * tx;
+    let bottom =
+        frame.pixels[row1 + x0] as f32 * (1.0 - tx) + frame.pixels[row1 + x0 + 1] as f32 * tx;
+    Some(top * (1.0 - ty) + bottom * ty)
+}
+
+fn nautilus_fingerprint(
+    frame: &RawFrame,
+    point: [f32; 2],
+    _normal: [f32; 2],
+) -> Option<NautilusFingerprint> {
+    const RADII: [f32; NAUTILUS_SHELLS] = [1.5, 3.0, 5.5, 9.0, 14.0, 21.0];
+    // Keep the sparse texture walk in sensor axes. Canny normals are useful
+    // geometric evidence, but rotating the outer 21 px shell by a noisy
+    // per-frame normal estimate moves samples several pixels and destroys the
+    // very temporal identity this descriptor is meant to preserve. Normal
+    // agreement is therefore evaluated separately by the candidate gate.
+    let base_angle = 0.0f32;
+    let mut opposed_samples = [(0.0f32, 0.0f32); NAUTILUS_SHELLS * NAUTILUS_BRANCH_PAIRS];
+    let mut raw_samples = [0.0f32; NAUTILUS_SHELLS * NAUTILUS_BRANCH_PAIRS * 2];
+    let mut raw_index = 0usize;
+    for (shell, radius) in RADII.into_iter().enumerate() {
+        // The outward phase drift is the nautilus walk: adjacent shells do not
+        // repeatedly sample one straight ridge, so a long eyelid edge cannot
+        // look unique merely because every radius hit the same line.
+        let shell_twist = shell as f32 * 0.17;
+        for branch in 0..NAUTILUS_BRANCH_PAIRS {
+            let angle = base_angle
+                + branch as f32 * std::f32::consts::PI / NAUTILUS_BRANCH_PAIRS as f32
+                + shell_twist;
+            let offset = [radius * angle.cos(), radius * angle.sin()];
+            let positive =
+                sample_native_raw_bilinear(frame, point[0] + offset[0], point[1] + offset[1])?;
+            let negative =
+                sample_native_raw_bilinear(frame, point[0] - offset[0], point[1] - offset[1])?;
+            opposed_samples[shell * NAUTILUS_BRANCH_PAIRS + branch] = (positive, negative);
+            raw_samples[raw_index] = positive;
+            raw_samples[raw_index + 1] = negative;
+            raw_index += 2;
+        }
+    }
+    let mean = raw_samples.iter().sum::<f32>() / raw_samples.len() as f32;
+    let variance = raw_samples
+        .iter()
+        .map(|sample| (sample - mean) * (sample - mean))
+        .sum::<f32>()
+        / raw_samples.len() as f32;
+    let deviation = variance.sqrt();
+    if !deviation.is_finite() || deviation < 4.0 {
+        return None;
+    }
+    let mut values = [0i8; NAUTILUS_COMPONENTS];
+    for (pair_index, (positive, negative)) in opposed_samples.into_iter().enumerate() {
+        let pair_mean = 0.5 * (positive + negative);
+        let signed_difference = 0.5 * (positive - negative);
+        values[pair_index * 2] = (((pair_mean - mean) / deviation) * 42.0)
+            .round()
+            .clamp(-127.0, 127.0) as i8;
+        values[pair_index * 2 + 1] = ((signed_difference / deviation) * 34.0)
+            .round()
+            .clamp(-127.0, 127.0) as i8;
+    }
+    Some(NautilusFingerprint {
+        values,
+        quality: (deviation / 72.0).clamp(0.0, 1.0),
+    })
+}
+
+fn nautilus_fingerprint_distance(left: &NautilusFingerprint, right: &NautilusFingerprint) -> f32 {
+    // Fixed-width arithmetic is intentionally simple so LLVM can vectorize
+    // the embarrassingly parallel descriptor comparison on the host CPU.
+    let squared = left
+        .values
+        .iter()
+        .zip(right.values.iter())
+        .map(|(left, right)| {
+            let difference = *left as f32 - *right as f32;
+            difference * difference
+        })
+        .sum::<f32>();
+    let rms = (squared / NAUTILUS_COMPONENTS as f32).sqrt() / 64.0;
+    rms + 0.035 * (1.0 - left.quality.min(right.quality))
+}
+
+fn nautilus_descriptor_box_distance(
+    fingerprint: &NautilusFingerprint,
+    minimum: &[i8; NAUTILUS_COMPONENTS],
+    maximum: &[i8; NAUTILUS_COMPONENTS],
+) -> f32 {
+    let squared = fingerprint
+        .values
+        .iter()
+        .zip(minimum.iter().zip(maximum.iter()))
+        .map(|(value, (minimum, maximum))| {
+            let difference = if value < minimum {
+                *minimum as f32 - *value as f32
+            } else if value > maximum {
+                *value as f32 - *maximum as f32
+            } else {
+                0.0
+            };
+            difference * difference
+        })
+        .sum::<f32>();
+    (squared / NAUTILUS_COMPONENTS as f32).sqrt() / 64.0
+}
+
+fn point_to_bounds_distance(point: [f32; 2], bounds: [f32; 4]) -> f32 {
+    let dx = if point[0] < bounds[0] {
+        bounds[0] - point[0]
+    } else if point[0] > bounds[2] {
+        point[0] - bounds[2]
+    } else {
+        0.0
+    };
+    let dy = if point[1] < bounds[1] {
+        bounds[1] - point[1]
+    } else if point[1] > bounds[3] {
+        point[1] - bounds[3]
+    } else {
+        0.0
+    };
+    dx.hypot(dy)
+}
+
+impl NautilusFingerprintTree {
+    fn from_edges(frame: &RawFrame, edges: &[EdgeEvidence]) -> Self {
+        let mut ranked = edges
+            .iter()
+            .filter_map(|edge| {
+                let point = [edge.x, edge.y];
+                let border = 24.0;
+                if point[0] < border
+                    || point[1] < border
+                    || point[0] + border >= frame.width as f32
+                    || point[1] + border >= frame.height as f32
+                {
+                    return None;
+                }
+                let normal = normalized_vector([edge.gradient_x, edge.gradient_y]);
+                let fingerprint = nautilus_fingerprint(frame, point, normal)?;
+                let material = 0.35
+                    + 0.35 * edge.multiscale_consistency.clamp(0.0, 1.0)
+                    + 0.30 * edge.signed_step_persistence.clamp(0.0, 1.0);
+                let texture = (0.55
+                    + 0.12 * (edge.dark_side_texture + edge.bright_side_texture).clamp(0.0, 3.0))
+                .clamp(0.55, 1.0);
+                let evidence = edge.strength.max(0.0)
+                    * material
+                    * texture
+                    * (0.55 + 0.45 * fingerprint.quality);
+                Some(NautilusCandidate {
+                    point,
+                    normal,
+                    fingerprint,
+                    evidence,
+                })
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| right.evidence.total_cmp(&left.evidence));
+
+        // Keep the search global but spatially balanced. A dense brow or lid
+        // may be strong, yet it must not consume every descriptor leaf.
+        let tile_columns = frame.width.div_ceil(EDGE_TILE_SIZE);
+        let tile_rows = frame.height.div_ceil(EDGE_TILE_SIZE);
+        let mut tile_counts = vec![0u8; tile_columns * tile_rows];
+        let mut candidates = Vec::<NautilusCandidate>::new();
+        for candidate in ranked {
+            let tile_x = (candidate.point[0] as usize / EDGE_TILE_SIZE).min(tile_columns - 1);
+            let tile_y = (candidate.point[1] as usize / EDGE_TILE_SIZE).min(tile_rows - 1);
+            let tile = tile_y * tile_columns + tile_x;
+            if tile_counts[tile] >= 18
+                || candidates.iter().any(|selected| {
+                    (selected.point[0] - candidate.point[0])
+                        .hypot(selected.point[1] - candidate.point[1])
+                        < NAUTILUS_CANDIDATE_SEPARATION
+                })
+            {
+                continue;
+            }
+            tile_counts[tile] = tile_counts[tile].saturating_add(1);
+            candidates.push(candidate);
+            if candidates.len() >= NAUTILUS_MAX_CANDIDATES {
+                break;
+            }
+        }
+        let mut tree = Self {
+            candidates,
+            ..Self::default()
+        };
+        if !tree.candidates.is_empty() {
+            let indices = (0..tree.candidates.len()).collect::<Vec<_>>();
+            tree.root = Some(tree.append_node(indices));
+        }
+        tree
+    }
+
+    fn append_node(&mut self, mut candidates: Vec<usize>) -> usize {
+        let mut spatial_bounds = [
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        let mut descriptor_min = [i8::MAX; NAUTILUS_COMPONENTS];
+        let mut descriptor_max = [i8::MIN; NAUTILUS_COMPONENTS];
+        for candidate_index in &candidates {
+            let candidate = self.candidates[*candidate_index];
+            spatial_bounds[0] = spatial_bounds[0].min(candidate.point[0]);
+            spatial_bounds[1] = spatial_bounds[1].min(candidate.point[1]);
+            spatial_bounds[2] = spatial_bounds[2].max(candidate.point[0]);
+            spatial_bounds[3] = spatial_bounds[3].max(candidate.point[1]);
+            for dimension in 0..NAUTILUS_COMPONENTS {
+                descriptor_min[dimension] =
+                    descriptor_min[dimension].min(candidate.fingerprint.values[dimension]);
+                descriptor_max[dimension] =
+                    descriptor_max[dimension].max(candidate.fingerprint.values[dimension]);
+            }
+        }
+        let split_dimension = (0..NAUTILUS_COMPONENTS)
+            .max_by_key(|dimension| {
+                descriptor_max[*dimension] as i16 - descriptor_min[*dimension] as i16
+            })
+            .unwrap_or(0);
+        let node_index = self.nodes.len();
+        self.nodes.push(NautilusTreeNode {
+            spatial_bounds,
+            descriptor_min,
+            descriptor_max,
+            split_dimension,
+            split_value: 0,
+            left: None,
+            right: None,
+            candidates: Vec::new(),
+        });
+        let descriptor_range =
+            descriptor_max[split_dimension] as i16 - descriptor_min[split_dimension] as i16;
+        if candidates.len() <= NAUTILUS_TREE_LEAF_CAPACITY || descriptor_range == 0 {
+            self.nodes[node_index].candidates = candidates;
+            return node_index;
+        }
+        candidates.sort_by_key(|candidate_index| {
+            self.candidates[*candidate_index].fingerprint.values[split_dimension]
+        });
+        let right_candidates = candidates.split_off(candidates.len() / 2);
+        let split_value = self.candidates[right_candidates[0]].fingerprint.values[split_dimension];
+        let left = self.append_node(candidates);
+        let right = self.append_node(right_candidates);
+        self.nodes[node_index].split_value = split_value;
+        self.nodes[node_index].left = Some(left);
+        self.nodes[node_index].right = Some(right);
+        node_index
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn query_nearest(
+        &self,
+        fingerprint: &NautilusFingerprint,
+        predicted: [f32; 2],
+        radius: f32,
+        prior_normal: [f32; 2],
+        excluded: &[[f32; 2]],
+        maximum_results: usize,
+        diagnostics: &mut MatchDiagnostics,
+    ) -> Vec<(f32, usize)> {
+        let mut results = Vec::<(f32, usize)>::new();
+        if let Some(root) = self.root {
+            self.query_node(
+                root,
+                fingerprint,
+                predicted,
+                radius,
+                prior_normal,
+                excluded,
+                maximum_results,
+                diagnostics,
+                &mut results,
+            );
+        }
+        results.sort_by(|left, right| left.0.total_cmp(&right.0));
+        results.truncate(maximum_results);
+        results
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn query_node(
+        &self,
+        node_index: usize,
+        fingerprint: &NautilusFingerprint,
+        predicted: [f32; 2],
+        radius: f32,
+        prior_normal: [f32; 2],
+        excluded: &[[f32; 2]],
+        maximum_results: usize,
+        diagnostics: &mut MatchDiagnostics,
+        results: &mut Vec<(f32, usize)>,
+    ) {
+        let node = &self.nodes[node_index];
+        diagnostics.nautilus_nodes_visited += 1;
+        if point_to_bounds_distance(predicted, node.spatial_bounds) > radius {
+            return;
+        }
+        if results.len() >= maximum_results {
+            let worst = results
+                .iter()
+                .map(|result| result.0)
+                .max_by(f32::total_cmp)
+                .unwrap_or(f32::INFINITY);
+            if nautilus_descriptor_box_distance(
+                fingerprint,
+                &node.descriptor_min,
+                &node.descriptor_max,
+            ) > worst
+            {
+                return;
+            }
+        }
+        if node.left.is_none() {
+            for candidate_index in &node.candidates {
+                let candidate = self.candidates[*candidate_index];
+                if (candidate.point[0] - predicted[0]).hypot(candidate.point[1] - predicted[1])
+                    > radius
+                    || excluded.iter().any(|point| {
+                        (candidate.point[0] - point[0]).hypot(candidate.point[1] - point[1])
+                            < MIN_MATCH_DESTINATION_SEPARATION
+                    })
+                {
+                    continue;
+                }
+                if prior_normal[0].hypot(prior_normal[1]) > 0.5
+                    && (prior_normal[0] * candidate.normal[0]
+                        + prior_normal[1] * candidate.normal[1])
+                        .abs()
+                        < 0.08
+                {
+                    continue;
+                }
+                diagnostics.nautilus_descriptor_evaluations += 1;
+                let distance = nautilus_fingerprint_distance(fingerprint, &candidate.fingerprint);
+                results.push((distance, *candidate_index));
+                results.sort_by(|left, right| left.0.total_cmp(&right.0));
+                results.truncate(maximum_results);
+            }
+            return;
+        }
+        let (first, second) = if fingerprint.values[node.split_dimension] < node.split_value {
+            (node.left, node.right)
+        } else {
+            (node.right, node.left)
+        };
+        if let Some(first) = first {
+            self.query_node(
+                first,
+                fingerprint,
+                predicted,
+                radius,
+                prior_normal,
+                excluded,
+                maximum_results,
+                diagnostics,
+                results,
+            );
+        }
+        if let Some(second) = second {
+            self.query_node(
+                second,
+                fingerprint,
+                predicted,
+                radius,
+                prior_normal,
+                excluded,
+                maximum_results,
+                diagnostics,
+                results,
+            );
+        }
+    }
+}
+
+fn nautilus_track_prediction(
+    track: &FeatureTrack,
+    motions: &[SimilarityMotion; OBJECTS],
+    layers: &[MotionLayerStatus; OBJECTS],
+    center: [f32; 2],
+    cadence_contiguous: bool,
+) -> ([f32; 2], f32) {
+    let last = track
+        .points
+        .back()
+        .copied()
+        .unwrap_or([center[0], center[1], 0.0]);
+    let steps = track.age as f32 + 1.0;
+    let model = motions[track.object];
+    let layer = layers[track.object];
+    let model_usable = cadence_contiguous
+        && model.support >= 3
+        && model.residual <= 3.0
+        && layer.stable_frames >= MIN_LAYER_STABLE_FRAMES
+        && layer.coherence >= 0.20;
+    let track_usable = cadence_contiguous
+        && track.motion_ema[0].hypot(track.motion_ema[1]) <= SEARCH_RADIUS as f32 * 1.5;
+    let track_displacement = track.motion_ema;
+    let modeled = model.predict([last[0], last[1]], center);
+    let model_displacement = [modeled[0] - last[0], modeled[1] - last[1]];
+    let displacement = if model_usable && track_usable {
+        [
+            0.5 * (track_displacement[0] + model_displacement[0]),
+            0.5 * (track_displacement[1] + model_displacement[1]),
+        ]
+    } else if model_usable {
+        model_displacement
+    } else if track_usable {
+        track_displacement
+    } else {
+        [0.0; 2]
+    };
+    let uncertainty = 20.0
+        + track.age as f32 * 11.0
+        + 1.5 * track.motion_variance.max(0.0).sqrt()
+        + if model_usable || track_usable {
+            0.0
+        } else {
+            10.0
+        };
+    (
+        [
+            last[0] + displacement[0] * steps,
+            last[1] + displacement[1] * steps,
+        ],
+        uncertainty.clamp(20.0, 58.0),
+    )
+}
+
+fn nautilus_identity_acceptance_radius(track: &FeatureTrack) -> f32 {
+    (7.0 + track.age as f32 * 4.0 + 1.5 * track.motion_variance.max(0.0).sqrt()).clamp(7.0, 20.0)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NautilusAnchorPrediction {
+    point: [f32; 2],
+    search_radius: f32,
+    identity_radius: f32,
+    fallback_disagreement: f32,
+    residual: f32,
+    same_object_support: usize,
+}
+
+/// Predict a temporarily missing point from the ordinary tracks which did
+/// survive into the current frame. For a two-frame gap, an anchor's point one
+/// observation behind its latest point is paired with its current match; this
+/// keeps every correspondence on the same temporal baseline as the missing
+/// point instead of comparing a stale location with a one-frame velocity.
+fn nautilus_anchor_conditioned_prediction(
+    track_index: usize,
+    track: &FeatureTrack,
+    tracks: &[FeatureTrack],
+    matches: &[Match],
+    fallback: [f32; 2],
+) -> Option<NautilusAnchorPrediction> {
+    let source = track.points.back().copied()?;
+    let history_index = track.age as usize;
+    let mut anchors = matches
+        .iter()
+        .filter_map(|item| {
+            if item.track_index == track_index {
+                return None;
+            }
+            let anchor_track = tracks.get(item.track_index)?;
+            let historical = anchor_track.points.iter().rev().nth(history_index)?;
+            let previous = [historical[0], historical[1]];
+            let distance = (previous[0] - source[0]).hypot(previous[1] - source[1]);
+            let same_object = item.object == track.object;
+            let inverse_steps = 1.0 / (track.age as f32 + 1.0);
+            let anchor_velocity = [
+                (item.current[0] - previous[0]) * inverse_steps,
+                (item.current[1] - previous[1]) * inverse_steps,
+            ];
+            let motion_error = (anchor_velocity[0] - track.motion_ema[0])
+                .hypot(anchor_velocity[1] - track.motion_ema[1]);
+            Some((
+                same_object,
+                distance,
+                motion_error,
+                Match { previous, ..*item },
+            ))
+        })
+        .collect::<Vec<_>>();
+    if anchors.len() < 2 {
+        return None;
+    }
+    let same_object_support = anchors.iter().filter(|anchor| anchor.0).count();
+    if same_object_support >= 4 {
+        anchors.retain(|anchor| anchor.0);
+    }
+    let motion_tolerance = (2.0 + 1.5 * track.motion_variance.max(0.0).sqrt()).clamp(2.0, 5.0);
+    if anchors
+        .iter()
+        .filter(|anchor| anchor.2 <= motion_tolerance)
+        .count()
+        >= 4
+    {
+        anchors.retain(|anchor| anchor.2 <= motion_tolerance);
+    }
+    anchors.sort_by(|left, right| left.1.total_cmp(&right.1));
+    let local = anchors
+        .into_iter()
+        .take(12)
+        .map(|anchor| anchor.3)
+        .collect::<Vec<_>>();
+    if local.len() < 2 {
+        return None;
+    }
+    let source_xy = [source[0], source[1]];
+    let model = robust_global_similarity(&local, source_xy);
+    let point = model.predict(source_xy, source_xy);
+    if !point[0].is_finite()
+        || !point[1].is_finite()
+        || (point[0] - fallback[0]).hypot(point[1] - fallback[1]) > 18.0 + 8.0 * track.age as f32
+    {
+        return None;
+    }
+    let mut residuals = local
+        .iter()
+        .map(|item| {
+            let predicted = model.predict(item.previous, source_xy);
+            (predicted[0] - item.current[0]).hypot(predicted[1] - item.current[1])
+        })
+        .collect::<Vec<_>>();
+    let residual = median(&mut residuals).max(0.20);
+    Some(NautilusAnchorPrediction {
+        point,
+        search_radius: (5.0 + 2.0 * residual + 1.5 * track.age as f32).clamp(6.0, 16.0),
+        identity_radius: (2.0 + 1.5 * residual + 0.75 * track.age as f32).clamp(2.5, 7.0),
+        fallback_disagreement: (point[0] - fallback[0]).hypot(point[1] - fallback[1]),
+        residual,
+        same_object_support,
+    })
+}
+
+fn nautilus_bank_descriptor_score(
+    bank: &NautilusFingerprintBank,
+    candidate: &NautilusFingerprint,
+) -> f32 {
+    let Some(newest) = bank.observations.back() else {
+        return f32::INFINITY;
+    };
+    let newest_distance = nautilus_fingerprint_distance(newest, candidate);
+    let historical_distance = bank
+        .observations
+        .iter()
+        .map(|observation| nautilus_fingerprint_distance(observation, candidate))
+        .min_by(f32::total_cmp)
+        .unwrap_or(newest_distance);
+    // Most recent appearance is the causal reference. A historical exemplar
+    // can soften a transient glint, but cannot win an identity on its own.
+    0.72 * newest_distance + 0.28 * historical_distance
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nautilus_rank_bank_candidates(
+    tree: &NautilusFingerprintTree,
+    bank: &NautilusFingerprintBank,
+    predicted: [f32; 2],
+    radius: f32,
+    prior_normal: [f32; 2],
+    excluded: &[[f32; 2]],
+    diagnostics: &mut MatchDiagnostics,
+) -> Vec<(usize, f32)> {
+    let mut candidate_indices = BTreeMap::<usize, ()>::new();
+    for observation in &bank.observations {
+        for (_, candidate_index) in tree.query_nearest(
+            observation,
+            predicted,
+            radius,
+            prior_normal,
+            excluded,
+            24,
+            diagnostics,
+        ) {
+            candidate_indices.insert(candidate_index, ());
+        }
+    }
+    let mut ranked = candidate_indices
+        .into_keys()
+        .map(|candidate_index| {
+            let candidate = tree.candidates[candidate_index];
+            let descriptor = nautilus_bank_descriptor_score(bank, &candidate.fingerprint);
+            let spatial =
+                (candidate.point[0] - predicted[0]).hypot(candidate.point[1] - predicted[1]);
+            let spatial_penalty = 0.80 * (spatial / radius.max(1.0)).powi(2);
+            (candidate_index, descriptor + spatial_penalty)
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| left.1.total_cmp(&right.1));
+    ranked
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nautilus_refine_ranked_candidates(
+    frame: &RawFrame,
+    tree: &NautilusFingerprintTree,
+    bank: &NautilusFingerprintBank,
+    predicted: [f32; 2],
+    radius: f32,
+    prior_normal: [f32; 2],
+    excluded: &[[f32; 2]],
+    diagnostics: &mut MatchDiagnostics,
+) -> Vec<NautilusRefinedCandidate> {
+    let coarse = nautilus_rank_bank_candidates(
+        tree,
+        bank,
+        predicted,
+        radius,
+        prior_normal,
+        excluded,
+        diagnostics,
+    );
+    let mut refined = Vec::<NautilusRefinedCandidate>::new();
+    for (candidate_index, _) in coarse.into_iter().take(10) {
+        let candidate = tree.candidates[candidate_index];
+        let mut best = None::<NautilusRefinedCandidate>;
+        for dy in -2..=2 {
+            for dx in -2..=2 {
+                let point = [
+                    candidate.point[0] + dx as f32,
+                    candidate.point[1] + dy as f32,
+                ];
+                let spatial = (point[0] - predicted[0]).hypot(point[1] - predicted[1]);
+                if spatial > radius
+                    || excluded.iter().any(|excluded_point| {
+                        (point[0] - excluded_point[0]).hypot(point[1] - excluded_point[1])
+                            < MIN_MATCH_DESTINATION_SEPARATION
+                    })
+                {
+                    continue;
+                }
+                let Some(fingerprint) = nautilus_fingerprint(frame, point, candidate.normal) else {
+                    continue;
+                };
+                diagnostics.nautilus_refinement_evaluations += 1;
+                let score = nautilus_bank_descriptor_score(bank, &fingerprint)
+                    + 0.80 * (spatial / radius.max(1.0)).powi(2);
+                let proposal = NautilusRefinedCandidate {
+                    candidate_index,
+                    point,
+                    normal: candidate.normal,
+                    fingerprint,
+                    score,
+                };
+                if best.is_none_or(|previous| proposal.score < previous.score) {
+                    best = Some(proposal);
+                }
+            }
+        }
+        if let Some(best) = best {
+            refined.push(best);
+        }
+    }
+    refined.sort_by(|left, right| left.score.total_cmp(&right.score));
+    let mut distinct = Vec::<NautilusRefinedCandidate>::new();
+    for candidate in refined {
+        if distinct.iter().all(|previous| {
+            (candidate.point[0] - previous.point[0]).hypot(candidate.point[1] - previous.point[1])
+                >= MIN_MATCH_DESTINATION_SEPARATION
+        }) {
+            distinct.push(candidate);
+        }
+    }
+    distinct
+}
+
+#[allow(clippy::too_many_arguments)]
+fn propose_nautilus_relocations(
+    current: &RawFrame,
+    tree: &NautilusFingerprintTree,
+    tracks: &[FeatureTrack],
+    banks: &BTreeMap<u64, NautilusFingerprintBank>,
+    matches: &[Match],
+    motions: &[SimilarityMotion; OBJECTS],
+    layers: &[MotionLayerStatus; OBJECTS],
+    center: [f32; 2],
+    sensor_origin: [f32; 2],
+    cadence_contiguous: bool,
+    diagnostics: &mut MatchDiagnostics,
+) -> Vec<NautilusRelocation> {
+    if tree.candidates.is_empty() {
+        return Vec::new();
+    }
+    let mut matched = vec![false; tracks.len()];
+    let regular_destinations = matches
+        .iter()
+        .map(|item| {
+            matched[item.track_index] = true;
+            [
+                item.current[0] - sensor_origin[0],
+                item.current[1] - sensor_origin[1],
+            ]
+        })
+        .collect::<Vec<_>>();
+    let mut proposals = Vec::<NautilusRelocation>::new();
+    for (track_index, track) in tracks.iter().enumerate() {
+        if matched[track_index] {
+            continue;
+        }
+        let Some(bank) = banks.get(&track.id) else {
+            continue;
+        };
+        if bank.observations.len() < NAUTILUS_MIN_BANK_OBSERVATIONS {
+            continue;
+        }
+        diagnostics.nautilus_queries += 1;
+        let (fallback_prediction, fallback_radius) =
+            nautilus_track_prediction(track, motions, layers, center, cadence_contiguous);
+        let anchor_prediction = nautilus_anchor_conditioned_prediction(
+            track_index,
+            track,
+            tracks,
+            matches,
+            fallback_prediction,
+        );
+        if anchor_prediction.is_some_and(|prediction| {
+            prediction.fallback_disagreement
+                > NAUTILUS_ANCHOR_PRIOR_DISAGREEMENT_BASE
+                    + NAUTILUS_ANCHOR_PRIOR_DISAGREEMENT_PER_GAP * track.age as f32
+                || prediction.residual
+                    > NAUTILUS_ANCHOR_RESIDUAL_BASE
+                        + NAUTILUS_ANCHOR_RESIDUAL_PER_GAP * track.age as f32
+        }) {
+            diagnostics.nautilus_spatial_rejected += 1;
+            continue;
+        }
+        let predicted_sensor = anchor_prediction
+            .map(|prediction| prediction.point)
+            .unwrap_or(fallback_prediction);
+        let radius = anchor_prediction
+            .map(|prediction| prediction.search_radius)
+            .unwrap_or(fallback_radius);
+        let physical_identity_radius =
+            NAUTILUS_IDENTITY_RADIUS_BASE + NAUTILUS_IDENTITY_RADIUS_PER_GAP * track.age as f32;
+        let identity_radius = anchor_prediction
+            .map(|prediction| prediction.identity_radius)
+            .unwrap_or_else(|| nautilus_identity_acceptance_radius(track))
+            .min(physical_identity_radius);
+        let predicted = [
+            predicted_sensor[0] - sensor_origin[0],
+            predicted_sensor[1] - sensor_origin[1],
+        ];
+        let ranked = nautilus_refine_ranked_candidates(
+            current,
+            tree,
+            bank,
+            predicted,
+            radius,
+            track.edge_normal,
+            &regular_destinations,
+            diagnostics,
+        );
+        let Some(&candidate) = ranked.first() else {
+            diagnostics.nautilus_distance_rejected += 1;
+            continue;
+        };
+        let candidate_index = candidate.candidate_index;
+        let best_distance = candidate.score;
+        let best_spatial_distance =
+            (candidate.point[0] - predicted[0]).hypot(candidate.point[1] - predicted[1]);
+        if best_spatial_distance > identity_radius {
+            diagnostics.nautilus_spatial_rejected += 1;
+            continue;
+        }
+        if best_distance > NAUTILUS_MAX_DISTANCE {
+            diagnostics.nautilus_distance_rejected += 1;
+            continue;
+        }
+        let second_distance = ranked
+            .get(1)
+            .map_or(f32::INFINITY, |candidate| candidate.score);
+        let margin = if second_distance.is_finite() {
+            second_distance - best_distance
+        } else {
+            1.0
+        };
+        let ratio = if second_distance.is_finite() {
+            best_distance / second_distance.max(1.0e-5)
+        } else {
+            0.0
+        };
+        if margin < NAUTILUS_MIN_ABSOLUTE_MARGIN || ratio > NAUTILUS_MAX_DISTANCE_RATIO {
+            diagnostics.nautilus_ambiguous += 1;
+            continue;
+        }
+
+        // Reverse identity check: the selected current fingerprint must also
+        // prefer this historical ID over every other live track bank,
+        // including IDs which the ordinary adjacent matcher already found.
+        // Motion may explain where to search, but it cannot make a repeated
+        // eyelid/limbus texture globally unique.
+        let own_identity_distance = nautilus_bank_descriptor_score(bank, &candidate.fingerprint);
+        let mut competing_identity_distance = f32::INFINITY;
+        for (other_index, other_track) in tracks.iter().enumerate() {
+            if other_index == track_index {
+                continue;
+            }
+            let Some(other_bank) = banks.get(&other_track.id) else {
+                continue;
+            };
+            competing_identity_distance = competing_identity_distance.min(
+                nautilus_bank_descriptor_score(other_bank, &candidate.fingerprint),
+            );
+        }
+        let reverse_margin = competing_identity_distance - own_identity_distance;
+        if competing_identity_distance.is_finite() && reverse_margin < NAUTILUS_MIN_REVERSE_MARGIN {
+            diagnostics.nautilus_reverse_ambiguous += 1;
+            continue;
+        }
+        let confidence = (0.45 * (1.0 - best_distance / NAUTILUS_MAX_DISTANCE)
+            + 0.35 * (margin / 0.30).clamp(0.0, 1.0)
+            + 0.20 * (reverse_margin / 0.25).clamp(0.0, 1.0))
+        .clamp(0.0, 1.0);
+        if confidence < NAUTILUS_MIN_ACCEPTANCE_CONFIDENCE {
+            diagnostics.nautilus_ambiguous += 1;
+            continue;
+        }
+        proposals.push(NautilusRelocation {
+            track_index,
+            candidate_index,
+            current: [
+                candidate.point[0] + sensor_origin[0],
+                candidate.point[1] + sensor_origin[1],
+            ],
+            fingerprint: candidate.fingerprint,
+            distance: best_distance,
+            margin,
+            distance_ratio: ratio,
+            prediction_distance: best_spatial_distance,
+            identity_radius,
+            reverse_margin,
+            normal_alignment: (track.edge_normal[0] * candidate.normal[0]
+                + track.edge_normal[1] * candidate.normal[1])
+                .abs(),
+            anchor_conditioned: anchor_prediction.is_some(),
+            confidence,
+            crossed_gap: track.age > 0,
+        });
+    }
+    proposals.sort_by(|left, right| right.confidence.total_cmp(&left.confidence));
+    let mut accepted = Vec::<NautilusRelocation>::new();
+    let mut used_candidates = vec![false; tree.candidates.len()];
+    for proposal in proposals {
+        if used_candidates[proposal.candidate_index]
+            || accepted.iter().any(|previous| {
+                (previous.current[0] - proposal.current[0])
+                    .hypot(previous.current[1] - proposal.current[1])
+                    < MIN_MATCH_DESTINATION_SEPARATION
+            })
+        {
+            diagnostics.nautilus_collision_rejected += 1;
+            continue;
+        }
+        used_candidates[proposal.candidate_index] = true;
+        diagnostics.nautilus_relocated += 1;
+        diagnostics.nautilus_gap_relocated += usize::from(proposal.crossed_gap);
+        diagnostics.nautilus_margin_sum += proposal.margin;
+        accepted.push(proposal);
+    }
+    accepted
 }
 
 fn seed_points(
@@ -8806,6 +9823,11 @@ impl FourMotionOctrees {
         self.exhaustive_search_for_replay = exhaustive;
     }
 
+    #[cfg(test)]
+    fn set_nautilus_disabled_for_replay(&mut self, disabled: bool) {
+        self.disable_nautilus_for_replay = disabled;
+    }
+
     /// Drop all mode-specific temporal state when the UI leaves Clusters.
     /// This prevents the global patch matcher and its full RAW backing frame
     /// from remaining resident while another segmentation submode is active.
@@ -8954,6 +9976,7 @@ impl FourMotionOctrees {
             prediction_cadence_contiguous = false;
             self.previous = None;
             self.tracks.clear();
+            self.nautilus_banks.clear();
             self.motions = [SimilarityMotion::default(); OBJECTS];
             self.layers = [MotionLayerStatus::default(); OBJECTS];
             self.layer_signatures = Default::default();
@@ -9035,6 +10058,14 @@ impl FourMotionOctrees {
             self.previous = Some(current.clone());
             let seeds = seed_points(&current, canny.as_ref(), &[], MAX_FEATURES);
             for (point, score) in seeds {
+                let edge_normal = canny.as_ref().map_or([0.0; 2], |field| {
+                    local_canny_normal(
+                        field,
+                        width,
+                        point[0].round() as usize,
+                        point[1].round() as usize,
+                    )
+                });
                 let mut track = FeatureTrack {
                     id: self.next_id,
                     points: VecDeque::from([[
@@ -9052,14 +10083,7 @@ impl FourMotionOctrees {
                     normal_flow_evidence: false,
                     specularity: feature_specularity(&current, point),
                     assignment_confidence: 0.0,
-                    edge_normal: canny.as_ref().map_or([0.0; 2], |field| {
-                        local_canny_normal(
-                            field,
-                            width,
-                            point[0].round() as usize,
-                            point[1].round() as usize,
-                        )
-                    }),
+                    edge_normal,
                     residual_history: VecDeque::new(),
                     focus_bins: Vec::new(),
                     focus_peak: None,
@@ -9073,6 +10097,12 @@ impl FourMotionOctrees {
                     if !probe.sweeping {
                         self.last_stable_focus = Some(probe.position);
                     }
+                }
+                if let Some(fingerprint) = nautilus_fingerprint(&current, point, edge_normal) {
+                    self.nautilus_banks
+                        .entry(track.id)
+                        .or_default()
+                        .observe(fingerprint);
                 }
                 self.tracks.push(track);
                 self.next_id += 1;
@@ -9120,6 +10150,7 @@ impl FourMotionOctrees {
         };
         if previous.width != width || previous.height != height {
             self.tracks.clear();
+            self.nautilus_banks.clear();
             self.motions = [SimilarityMotion::default(); OBJECTS];
             self.layers = [MotionLayerStatus::default(); OBJECTS];
             self.layer_signatures = Default::default();
@@ -9235,6 +10266,13 @@ impl FourMotionOctrees {
         };
         for (track_index, track) in self.tracks.iter().enumerate() {
             match_diagnostics.considered += 1;
+            // An aged track's last observation predates `previous`; comparing
+            // that point against the adjacent-frame buffer would manufacture
+            // a false source patch. Only its historical nautilus bank may
+            // reconnect the ID across that gap.
+            if track.age > 0 {
+                continue;
+            }
             let Some(last) = track.points.back() else {
                 continue;
             };
@@ -9565,8 +10603,6 @@ impl FourMotionOctrees {
                 });
             }
         }
-        match_diagnostics.matching_micros = matching_started.elapsed().as_micros() as u64;
-        let layering_started = Instant::now();
         let track_priorities = self
             .tracks
             .iter()
@@ -9578,6 +10614,38 @@ impl FourMotionOctrees {
         match_diagnostics.destination_collision_rejected =
             enforce_unique_match_destinations(&mut matches, &track_priorities);
         match_diagnostics.accepted = matches.len();
+        let nautilus_needed = !self.disable_nautilus_for_replay
+            && use_canny_features
+            && self.tracks.iter().enumerate().any(|(track_index, track)| {
+                !matches.iter().any(|item| item.track_index == track_index)
+                    && self.nautilus_banks.get(&track.id).is_some_and(|bank| {
+                        bank.observations.len() >= NAUTILUS_MIN_BANK_OBSERVATIONS
+                    })
+            });
+        let nautilus_started = Instant::now();
+        let nautilus_tree = if nautilus_needed {
+            NautilusFingerprintTree::from_edges(&current, &edges)
+        } else {
+            NautilusFingerprintTree::default()
+        };
+        match_diagnostics.nautilus_build_micros = nautilus_started.elapsed().as_micros() as u64;
+        match_diagnostics.nautilus_candidates = nautilus_tree.candidates.len();
+        match_diagnostics.nautilus_tree_nodes = nautilus_tree.nodes.len();
+        let nautilus_relocations = propose_nautilus_relocations(
+            &current,
+            &nautilus_tree,
+            &self.tracks,
+            &self.nautilus_banks,
+            &matches,
+            &self.motions,
+            &self.layers,
+            center,
+            [sensor_x as f32, sensor_y as f32],
+            prediction_cadence_contiguous,
+            &mut match_diagnostics,
+        );
+        match_diagnostics.matching_micros = matching_started.elapsed().as_micros() as u64;
+        let layering_started = Instant::now();
         let global = robust_global_similarity(&matches, center);
         let relation_started = Instant::now();
         let mut motion_relations =
@@ -9845,7 +10913,84 @@ impl FourMotionOctrees {
             while track.points.len() > MAX_TRAIL {
                 track.points.pop_front();
             }
+            let fingerprint_point = [
+                item.current[0] - sensor_x as f32,
+                item.current[1] - sensor_y as f32,
+            ];
+            let fingerprint = nautilus_fingerprint(&current, fingerprint_point, track.edge_normal);
+            let track_id = track.id;
             seen[item.track_index] = true;
+            if let Some(fingerprint) = fingerprint {
+                self.nautilus_banks
+                    .entry(track_id)
+                    .or_default()
+                    .observe(fingerprint);
+            }
+        }
+        // Re-identified observations preserve the feature ID but are kept out
+        // of this frame's global/layer fit: a displacement spanning two or
+        // more exposures is not a one-frame velocity tensor. The next normal
+        // adjacent match can again contribute motion evidence.
+        for relocation in nautilus_relocations {
+            if seen.get(relocation.track_index).copied().unwrap_or(true) {
+                continue;
+            }
+            let candidate = nautilus_tree.candidates[relocation.candidate_index];
+            let track = &mut self.tracks[relocation.track_index];
+            let previous = track.points.back().copied().unwrap_or([
+                relocation.current[0],
+                relocation.current[1],
+                0.0,
+            ]);
+            let elapsed_frames = track.age as f32 + 1.0;
+            let instantaneous = [
+                (relocation.current[0] - previous[0]) / elapsed_frames,
+                (relocation.current[1] - previous[1]) / elapsed_frames,
+            ];
+            let motion_error = (instantaneous[0] - track.motion_ema[0])
+                .hypot(instantaneous[1] - track.motion_ema[1]);
+            track.motion_ema = [
+                0.82 * track.motion_ema[0] + 0.18 * instantaneous[0],
+                0.82 * track.motion_ema[1] + 0.18 * instantaneous[1],
+            ];
+            track.motion_variance =
+                0.88 * track.motion_variance + 0.12 * motion_error * motion_error;
+            track.age = 0;
+            track.score = (1.0 - relocation.distance / NAUTILUS_MAX_DISTANCE).clamp(0.0, 1.0);
+            track.matched_streak = 1;
+            track.layer_evidence = false;
+            track.normal_flow_evidence = false;
+            track.assignment_confidence =
+                0.60 * track.assignment_confidence + 0.40 * relocation.confidence;
+            track.residual_history.clear();
+            let mut observed_normal = candidate.normal;
+            if observed_normal[0] * track.edge_normal[0] + observed_normal[1] * track.edge_normal[1]
+                < 0.0
+            {
+                observed_normal = [-observed_normal[0], -observed_normal[1]];
+            }
+            track.edge_normal = normalized_vector([
+                0.72 * track.edge_normal[0] + 0.28 * observed_normal[0],
+                0.72 * track.edge_normal[1] + 0.28 * observed_normal[1],
+            ]);
+            let local = [
+                relocation.current[0] - sensor_x as f32,
+                relocation.current[1] - sensor_y as f32,
+            ];
+            track.specularity =
+                0.65 * track.specularity + 0.35 * feature_specularity(&current, local);
+            track
+                .points
+                .push_back([relocation.current[0], relocation.current[1], previous[2]]);
+            while track.points.len() > MAX_TRAIL {
+                track.points.pop_front();
+            }
+            let track_id = track.id;
+            seen[relocation.track_index] = true;
+            self.nautilus_banks
+                .entry(track_id)
+                .or_default()
+                .observe(relocation.fingerprint);
         }
         for (index, track) in self.tracks.iter_mut().enumerate() {
             if !seen.get(index).copied().unwrap_or(false) {
@@ -9858,6 +11003,9 @@ impl FourMotionOctrees {
             }
         }
         self.tracks.retain(|track| track.age <= MAX_AGE);
+        let retained_ids = self.tracks.iter().map(|track| track.id).collect::<Vec<_>>();
+        self.nautilus_banks
+            .retain(|id, _| retained_ids.contains(id));
         let existing = self
             .tracks
             .iter()
@@ -9866,6 +11014,14 @@ impl FourMotionOctrees {
             .collect::<Vec<_>>();
         let wanted = MAX_FEATURES.saturating_sub(self.tracks.len());
         for (point, score) in seed_points(&current, canny.as_ref(), &existing, wanted) {
+            let edge_normal = canny.as_ref().map_or([0.0; 2], |field| {
+                local_canny_normal(
+                    field,
+                    width,
+                    point[0].round() as usize,
+                    point[1].round() as usize,
+                )
+            });
             let mut track = FeatureTrack {
                 id: self.next_id,
                 points: VecDeque::from([[
@@ -9883,14 +11039,7 @@ impl FourMotionOctrees {
                 normal_flow_evidence: false,
                 specularity: feature_specularity(&current, point),
                 assignment_confidence: 0.0,
-                edge_normal: canny.as_ref().map_or([0.0; 2], |field| {
-                    local_canny_normal(
-                        field,
-                        width,
-                        point[0].round() as usize,
-                        point[1].round() as usize,
-                    )
-                }),
+                edge_normal,
                 residual_history: VecDeque::new(),
                 focus_bins: Vec::new(),
                 focus_peak: None,
@@ -9901,6 +11050,12 @@ impl FourMotionOctrees {
                     probe.position,
                     feature_sharpness(&current, point),
                 );
+            }
+            if let Some(fingerprint) = nautilus_fingerprint(&current, point, edge_normal) {
+                self.nautilus_banks
+                    .entry(track.id)
+                    .or_default()
+                    .observe(fingerprint);
             }
             self.tracks.push(track);
             self.next_id += 1;
@@ -12213,6 +13368,744 @@ mod tests {
     }
 
     #[test]
+    fn nautilus_fingerprint_is_affine_exposure_invariant() {
+        let width = 160usize;
+        let height = 120usize;
+        let pixels =
+            synthetic_native_similarity_texture(width, height, (80.0, 60.0), 1.0, (0.0, 0.0));
+        let exposed = pixels
+            .iter()
+            .map(|value| (0.68 * *value as f32 + 137.0).round().clamp(0.0, 1023.0) as u16)
+            .collect::<Vec<_>>();
+        let first = RawFrame {
+            sensor_x: 0,
+            sensor_y: 0,
+            width,
+            height,
+            pixels,
+        };
+        let second = RawFrame {
+            sensor_x: 0,
+            sensor_y: 0,
+            width,
+            height,
+            pixels: exposed,
+        };
+        let point = [73.25, 54.75];
+        let normal = normalized_vector([0.78, -0.63]);
+        let left = nautilus_fingerprint(&first, point, normal).expect("textured fingerprint");
+        let right = nautilus_fingerprint(&second, point, normal).expect("exposed fingerprint");
+        assert!(
+            nautilus_fingerprint_distance(&left, &right) <= 0.035,
+            "left={left:?} right={right:?} distance={}",
+            nautilus_fingerprint_distance(&left, &right),
+        );
+    }
+
+    #[test]
+    fn nautilus_tree_uniquely_relocates_a_shifted_native_raw_point() {
+        let width = 160usize;
+        let height = 120usize;
+        let translation = [4.0f32, -3.0f32];
+        let previous = RawFrame {
+            sensor_x: 0,
+            sensor_y: 0,
+            width,
+            height,
+            pixels: synthetic_native_similarity_texture(
+                width,
+                height,
+                (80.0, 60.0),
+                1.0,
+                (0.0, 0.0),
+            ),
+        };
+        let current = RawFrame {
+            sensor_x: 0,
+            sensor_y: 0,
+            width,
+            height,
+            pixels: synthetic_native_similarity_texture(
+                width,
+                height,
+                (80.0, 60.0),
+                1.0,
+                (translation[0] as f64, translation[1] as f64),
+            ),
+        };
+        let source = [71.0f32, 57.0f32];
+        let target = [source[0] + translation[0], source[1] + translation[1]];
+        let normal = normalized_vector([0.83, 0.56]);
+        let query = nautilus_fingerprint(&previous, source, normal).expect("source fingerprint");
+        let mut edges = vec![EdgeEvidence {
+            x: target[0],
+            y: target[1],
+            gradient_x: normal[0],
+            gradient_y: normal[1],
+            strength: 4.0,
+            ..EdgeEvidence::default()
+        }];
+        for y in [22.0f32, 40.0, 76.0, 96.0] {
+            for x in [24.0f32, 48.0, 102.0, 132.0] {
+                edges.push(EdgeEvidence {
+                    x,
+                    y,
+                    gradient_x: normal[0],
+                    gradient_y: normal[1],
+                    strength: 2.0,
+                    ..EdgeEvidence::default()
+                });
+            }
+        }
+        let tree = NautilusFingerprintTree::from_edges(&current, &edges);
+        let mut diagnostics = MatchDiagnostics::default();
+        let ranked = tree.query_nearest(&query, target, 58.0, normal, &[], 4, &mut diagnostics);
+        assert!(ranked.len() >= 2, "ranked={ranked:?}");
+        let best = tree.candidates[ranked[0].1];
+        assert!(
+            (best.point[0] - target[0]).hypot(best.point[1] - target[1]) < 0.1,
+            "target={target:?} best={best:?} ranked={ranked:?}",
+        );
+        assert!(ranked[1].0 - ranked[0].0 >= NAUTILUS_MIN_ABSOLUTE_MARGIN);
+        assert!(diagnostics.nautilus_descriptor_evaluations < tree.candidates.len());
+    }
+
+    #[test]
+    fn nautilus_reidentification_withholds_duplicate_fingerprints() {
+        let fingerprint = NautilusFingerprint {
+            values: std::array::from_fn(|index| (index as i32 * 3 - 120).clamp(-127, 127) as i8),
+            quality: 1.0,
+        };
+        let mut tree = NautilusFingerprintTree {
+            candidates: vec![
+                NautilusCandidate {
+                    point: [30.0, 30.0],
+                    normal: [1.0, 0.0],
+                    fingerprint,
+                    evidence: 1.0,
+                },
+                NautilusCandidate {
+                    point: [42.0, 30.0],
+                    normal: [1.0, 0.0],
+                    fingerprint,
+                    evidence: 1.0,
+                },
+            ],
+            ..NautilusFingerprintTree::default()
+        };
+        tree.root = Some(tree.append_node(vec![0, 1]));
+        let bank = NautilusFingerprintBank {
+            observations: VecDeque::from([fingerprint, fingerprint]),
+        };
+        let mut diagnostics = MatchDiagnostics::default();
+        let ranked = nautilus_rank_bank_candidates(
+            &tree,
+            &bank,
+            [36.0, 30.0],
+            20.0,
+            [1.0, 0.0],
+            &[],
+            &mut diagnostics,
+        );
+        assert_eq!(ranked.len(), 2);
+        let margin = ranked[1].1 - ranked[0].1;
+        let ratio = ranked[0].1 / ranked[1].1.max(1.0e-5);
+        assert!(
+            margin < NAUTILUS_MIN_ABSOLUTE_MARGIN || ratio > NAUTILUS_MAX_DISTANCE_RATIO,
+            "duplicate candidates unexpectedly passed the ambiguity gate: {ranked:?}",
+        );
+    }
+
+    #[derive(Clone)]
+    struct NautilusCorpusSnapshot {
+        tracks: BTreeMap<u64, FeatureTrack>,
+        banks: BTreeMap<u64, NautilusFingerprintBank>,
+        motions: [SimilarityMotion; OBJECTS],
+        layers: [MotionLayerStatus; OBJECTS],
+        center: [f32; 2],
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct NautilusCorpusScore {
+        correct: bool,
+        best_distance: f32,
+        margin: f32,
+        ratio: f32,
+        selected_prediction_distance: f32,
+        target_prediction_distance: f32,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct NautilusProductionScore {
+        correct: bool,
+        object: usize,
+        distance: f32,
+        margin: f32,
+        ratio: f32,
+        prediction_distance: f32,
+        target_prediction_distance: f32,
+        anchor_fallback_disagreement: f32,
+        anchor_residual: f32,
+        same_object_support: usize,
+        identity_radius: f32,
+        reverse_margin: f32,
+        normal_alignment: f32,
+        confidence: f32,
+        anchor_conditioned: bool,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct NautilusCorpusStats {
+        oracle_correspondences: usize,
+        prediction_misses: usize,
+        candidate_covered: usize,
+        top_one_correct: usize,
+        accepted_correct: usize,
+        accepted_wrong: usize,
+        withheld_ambiguous: usize,
+        ranked_queries: usize,
+        target_error_sum: f32,
+        descriptor_evaluations: usize,
+        production_accepted_correct: usize,
+        production_accepted_wrong: usize,
+        production_accepted_unverified: usize,
+        production_relocations: usize,
+        production_reverse_ambiguous: usize,
+        production_collisions: usize,
+        scores: Vec<NautilusCorpusScore>,
+        production_scores: Vec<NautilusProductionScore>,
+    }
+
+    fn evaluate_nautilus_production_gap(
+        gap: usize,
+        source: &NautilusCorpusSnapshot,
+        current_tracks: &BTreeMap<u64, FeatureTrack>,
+        current_frame: &RawFrame,
+        current_tree: &NautilusFingerprintTree,
+        current_sensor_origin: [f32; 2],
+        stats: &mut NautilusCorpusStats,
+    ) {
+        let common_ids = source
+            .tracks
+            .keys()
+            .filter(|id| {
+                current_tracks.contains_key(id)
+                    && source.banks.get(id).is_some_and(|bank| {
+                        bank.observations.len() >= NAUTILUS_MIN_BANK_OBSERVATIONS
+                    })
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        // Five-fold leave-out replay: four fifths of the independently
+        // tracked points act as the ordinary adjacent-frame anchors while the
+        // remaining fifth must be relocated solely by its historical bank.
+        // Every oracle ID is queried exactly once, and no target point is
+        // exposed as an anchor in the fold where that ID is scored.
+        for fold in 0..5usize {
+            let mut tracks = Vec::<FeatureTrack>::new();
+            let mut matches = Vec::<Match>::new();
+            for (ordinal, id) in common_ids.iter().copied().enumerate() {
+                let query = ordinal % 5 == fold;
+                let target_track = &current_tracks[&id];
+                let Some(target) = target_track.points.back().copied() else {
+                    continue;
+                };
+                let track_index = tracks.len();
+                if query {
+                    let mut track = source.tracks[&id].clone();
+                    track.age = gap.saturating_sub(1) as u8;
+                    tracks.push(track);
+                } else {
+                    // Reconstruct the state immediately before the current
+                    // observation: the current endpoint belongs in `Match`,
+                    // while the retained history ends on the previous frame.
+                    let mut track = target_track.clone();
+                    track.points.pop_back();
+                    let Some(previous) = track.points.back().copied() else {
+                        continue;
+                    };
+                    track.age = 0;
+                    let object = track.object;
+                    let z = previous[2];
+                    tracks.push(track);
+                    matches.push(Match {
+                        track_index,
+                        previous: [previous[0], previous[1]],
+                        current: [target[0], target[1]],
+                        score: 1.0,
+                        object,
+                        z,
+                        assignment_margin: 1.0,
+                        layer_evidence: true,
+                        normal_flow_evidence: false,
+                        specularity: 0.0,
+                    });
+                }
+            }
+            let mut diagnostics = MatchDiagnostics::default();
+            let relocations = propose_nautilus_relocations(
+                current_frame,
+                current_tree,
+                &tracks,
+                &source.banks,
+                &matches,
+                &source.motions,
+                &source.layers,
+                source.center,
+                current_sensor_origin,
+                true,
+                &mut diagnostics,
+            );
+            stats.production_relocations += relocations.len();
+            stats.production_reverse_ambiguous += diagnostics.nautilus_reverse_ambiguous;
+            stats.production_collisions += diagnostics.nautilus_collision_rejected;
+            for relocation in relocations {
+                let track = &tracks[relocation.track_index];
+                let Some(target) = current_tracks
+                    .get(&track.id)
+                    .and_then(|target_track| target_track.points.back())
+                else {
+                    stats.production_accepted_unverified += 1;
+                    continue;
+                };
+                let error =
+                    (relocation.current[0] - target[0]).hypot(relocation.current[1] - target[1]);
+                let (fallback, _) = nautilus_track_prediction(
+                    track,
+                    &source.motions,
+                    &source.layers,
+                    source.center,
+                    true,
+                );
+                let prediction = nautilus_anchor_conditioned_prediction(
+                    relocation.track_index,
+                    track,
+                    &tracks,
+                    &matches,
+                    fallback,
+                )
+                .unwrap_or(NautilusAnchorPrediction {
+                    point: fallback,
+                    search_radius: 0.0,
+                    identity_radius: 0.0,
+                    fallback_disagreement: 0.0,
+                    residual: f32::INFINITY,
+                    same_object_support: 0,
+                });
+                if error <= 4.0 {
+                    stats.production_accepted_correct += 1;
+                } else {
+                    stats.production_accepted_wrong += 1;
+                }
+                stats.production_scores.push(NautilusProductionScore {
+                    correct: error <= 4.0,
+                    object: track.object,
+                    distance: relocation.distance,
+                    margin: relocation.margin,
+                    ratio: relocation.distance_ratio,
+                    prediction_distance: relocation.prediction_distance,
+                    target_prediction_distance: (prediction.point[0] - target[0])
+                        .hypot(prediction.point[1] - target[1]),
+                    anchor_fallback_disagreement: prediction.fallback_disagreement,
+                    anchor_residual: prediction.residual,
+                    same_object_support: prediction.same_object_support,
+                    identity_radius: relocation.identity_radius,
+                    reverse_margin: relocation.reverse_margin,
+                    normal_alignment: relocation.normal_alignment,
+                    confidence: relocation.confidence,
+                    anchor_conditioned: relocation.anchor_conditioned,
+                });
+            }
+        }
+    }
+
+    fn evaluate_nautilus_corpus_gap(
+        gap: usize,
+        source: &NautilusCorpusSnapshot,
+        current_tracks: &BTreeMap<u64, FeatureTrack>,
+        current_frame: &RawFrame,
+        current_tree: &NautilusFingerprintTree,
+        current_sensor_origin: [f32; 2],
+        stats: &mut NautilusCorpusStats,
+    ) {
+        for (id, source_track) in &source.tracks {
+            let Some(target_track) = current_tracks.get(id) else {
+                continue;
+            };
+            let Some(bank) = source.banks.get(id) else {
+                continue;
+            };
+            if bank.observations.len() < NAUTILUS_MIN_BANK_OBSERVATIONS {
+                continue;
+            }
+            let Some(target_sensor) = target_track.points.back() else {
+                continue;
+            };
+            stats.oracle_correspondences += 1;
+            let mut missing_track = source_track.clone();
+            missing_track.age = gap.saturating_sub(1) as u8;
+            let (predicted_sensor, radius) = nautilus_track_prediction(
+                &missing_track,
+                &source.motions,
+                &source.layers,
+                source.center,
+                true,
+            );
+            let predicted = [
+                predicted_sensor[0] - current_sensor_origin[0],
+                predicted_sensor[1] - current_sensor_origin[1],
+            ];
+            let target = [
+                target_sensor[0] - current_sensor_origin[0],
+                target_sensor[1] - current_sensor_origin[1],
+            ];
+            if (target[0] - predicted[0]).hypot(target[1] - predicted[1]) > radius {
+                stats.prediction_misses += 1;
+                continue;
+            }
+            let target_covered = current_tree.candidates.iter().any(|candidate| {
+                (candidate.point[0] - target[0]).hypot(candidate.point[1] - target[1]) <= 6.0
+            });
+            stats.candidate_covered += usize::from(target_covered);
+            let mut diagnostics = MatchDiagnostics::default();
+            let ranked = nautilus_refine_ranked_candidates(
+                current_frame,
+                current_tree,
+                bank,
+                predicted,
+                radius,
+                source_track.edge_normal,
+                &[],
+                &mut diagnostics,
+            );
+            stats.descriptor_evaluations += diagnostics.nautilus_descriptor_evaluations
+                + diagnostics.nautilus_refinement_evaluations;
+            let Some(best) = ranked.first() else {
+                stats.withheld_ambiguous += 1;
+                continue;
+            };
+            let best_distance = best.score;
+            let best_point = best.point;
+            let target_error = (best_point[0] - target[0]).hypot(best_point[1] - target[1]);
+            stats.ranked_queries += 1;
+            stats.target_error_sum += target_error;
+            let correct = target_error <= 4.0;
+            stats.top_one_correct += usize::from(correct);
+            let second_distance = ranked
+                .get(1)
+                .map_or(f32::INFINITY, |candidate| candidate.score);
+            let margin = if second_distance.is_finite() {
+                second_distance - best_distance
+            } else {
+                1.0
+            };
+            let ratio = if second_distance.is_finite() {
+                best_distance / second_distance.max(1.0e-5)
+            } else {
+                0.0
+            };
+            let accepted = best_distance <= NAUTILUS_MAX_DISTANCE
+                && margin >= NAUTILUS_MIN_ABSOLUTE_MARGIN
+                && ratio <= NAUTILUS_MAX_DISTANCE_RATIO
+                && (best_point[0] - predicted[0]).hypot(best_point[1] - predicted[1])
+                    <= nautilus_identity_acceptance_radius(&missing_track);
+            stats.scores.push(NautilusCorpusScore {
+                correct,
+                best_distance,
+                margin,
+                ratio,
+                selected_prediction_distance: (best_point[0] - predicted[0])
+                    .hypot(best_point[1] - predicted[1]),
+                target_prediction_distance: (target[0] - predicted[0])
+                    .hypot(target[1] - predicted[1]),
+            });
+            if accepted && correct {
+                stats.accepted_correct += 1;
+            } else if accepted {
+                stats.accepted_wrong += 1;
+            } else {
+                stats.withheld_ambiguous += 1;
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "lossless RAW corpus replay; optionally set BUTTERCUP_NAUTILUS_CORPUS"]
+    fn nautilus_fingerprint_tree_recovers_unique_points_in_raw_roi_corpus() {
+        use std::fs;
+        use std::path::PathBuf;
+
+        let root = std::env::var_os("BUTTERCUP_NAUTILUS_CORPUS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(
+                    "/mnt/bulk_data/osbot-drv-data/outputs/native-limbus-session-20260813/corpus",
+                )
+            });
+        let mut archives = fs::read_dir(&root)
+            .unwrap_or_else(|error| panic!("read {}: {error}", root.display()))
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        archives.sort();
+        let mut stats: [NautilusCorpusStats; 3] = std::array::from_fn(|_| Default::default());
+        let mut total_frames = 0usize;
+        for archive in archives {
+            let records = fs::read_to_string(archive.join("frames.jsonl"))
+                .unwrap_or_else(|error| panic!("read {} index: {error}", archive.display()));
+            let stream = fs::read(archive.join("subject-right.raw10"))
+                .unwrap_or_else(|error| panic!("read {} RAW: {error}", archive.display()));
+            let mut tracker = FourMotionOctrees::default();
+            tracker.set_nautilus_disabled_for_replay(true);
+            let mut history = VecDeque::<NautilusCorpusSnapshot>::new();
+            for record in records
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|record| {
+                    record.get("label").and_then(serde_json::Value::as_str) == Some("subject-right")
+                })
+            {
+                let offset = record["offset"].as_u64().expect("offset") as usize;
+                let length = record["length"].as_u64().expect("length") as usize;
+                assert_eq!(length, 480 * 256);
+                let raw =
+                    crate::raw10::unpack_raw10(&stream[offset..offset + length], 384, 256, 480);
+                let sensor_x = record["sensor_x"].as_u64().expect("sensor_x") as u32;
+                let sensor_y = record["sensor_y"].as_u64().expect("sensor_y") as u32;
+                let timestamp_ns = record["timestamp_ns"].as_u64().expect("timestamp_ns");
+                let overlay = tracker.observe_with_iris_seed_at(
+                    &raw,
+                    384,
+                    256,
+                    sensor_x,
+                    sensor_y,
+                    timestamp_ns,
+                    None,
+                    true,
+                    None,
+                );
+                total_frames += 1;
+                let current_frame = tracker.previous.as_ref().expect("current frame");
+                let current_tree =
+                    NautilusFingerprintTree::from_edges(current_frame, &overlay.edges);
+                let current_tracks = tracker
+                    .tracks
+                    .iter()
+                    .filter(|track| track.age == 0 && track.matched_streak > 0)
+                    .cloned()
+                    .map(|track| (track.id, track))
+                    .collect::<BTreeMap<_, _>>();
+                let current_sensor_origin = [sensor_x as f32, sensor_y as f32];
+                for gap in 1..=3 {
+                    if let Some(source) = history.iter().rev().nth(gap - 1) {
+                        evaluate_nautilus_corpus_gap(
+                            gap,
+                            source,
+                            &current_tracks,
+                            current_frame,
+                            &current_tree,
+                            current_sensor_origin,
+                            &mut stats[gap - 1],
+                        );
+                        evaluate_nautilus_production_gap(
+                            gap,
+                            source,
+                            &current_tracks,
+                            current_frame,
+                            &current_tree,
+                            current_sensor_origin,
+                            &mut stats[gap - 1],
+                        );
+                    }
+                }
+                let center = [sensor_x as f32 + 192.0, sensor_y as f32 + 128.0];
+                history.push_back(NautilusCorpusSnapshot {
+                    tracks: current_tracks,
+                    banks: tracker.nautilus_banks.clone(),
+                    motions: tracker.motions,
+                    layers: tracker.layers,
+                    center,
+                });
+                while history.len() > 3 {
+                    history.pop_front();
+                }
+            }
+        }
+        eprintln!("nautilus RAW corpus frames={total_frames}");
+        for (index, result) in stats.iter().enumerate() {
+            let mean_error = if result.ranked_queries > 0 {
+                result.target_error_sum / result.ranked_queries as f32
+            } else {
+                0.0
+            };
+            eprintln!(
+                "gap={} oracle={} prediction-miss={} coverage={}/{} top1-correct={} ranked-gate-correct={} ranked-gate-wrong={} withheld={} production-correct={} production-wrong={} production-unverified={} production-total={} reverse-ambiguous={} collisions={} mean-target-error={:.3}px descriptor-evals={}",
+                index + 1,
+                result.oracle_correspondences,
+                result.prediction_misses,
+                result.candidate_covered,
+                result.oracle_correspondences,
+                result.top_one_correct,
+                result.accepted_correct,
+                result.accepted_wrong,
+                result.withheld_ambiguous,
+                result.production_accepted_correct,
+                result.production_accepted_wrong,
+                result.production_accepted_unverified,
+                result.production_relocations,
+                result.production_reverse_ambiguous,
+                result.production_collisions,
+                mean_error,
+                result.descriptor_evaluations,
+            );
+            let quantiles = |correct: bool, field: fn(&NautilusCorpusScore) -> f32| {
+                let mut values = result
+                    .scores
+                    .iter()
+                    .filter(|score| score.correct == correct)
+                    .map(field)
+                    .collect::<Vec<_>>();
+                values.sort_by(f32::total_cmp);
+                let at = |fraction: f32| {
+                    values
+                        .get(((values.len().saturating_sub(1)) as f32 * fraction).round() as usize)
+                        .copied()
+                        .unwrap_or(0.0)
+                };
+                [at(0.10), at(0.50), at(0.90)]
+            };
+            for correct in [true, false] {
+                eprintln!(
+                    "  {} distance-p10/50/90={:?} margin={:?} ratio={:?} selected-prediction-px={:?} target-prediction-px={:?}",
+                    if correct { "correct" } else { "wrong" },
+                    quantiles(correct, |score| score.best_distance),
+                    quantiles(correct, |score| score.margin),
+                    quantiles(correct, |score| score.ratio),
+                    quantiles(correct, |score| score.selected_prediction_distance),
+                    quantiles(correct, |score| score.target_prediction_distance),
+                );
+            }
+            let production_quantiles =
+                |correct: bool, field: fn(&NautilusProductionScore) -> f32| {
+                    let mut values = result
+                        .production_scores
+                        .iter()
+                        .filter(|score| score.correct == correct)
+                        .map(field)
+                        .collect::<Vec<_>>();
+                    values.sort_by(f32::total_cmp);
+                    let at = |fraction: f32| {
+                        values
+                            .get(((values.len().saturating_sub(1)) as f32 * fraction).round()
+                                as usize)
+                            .copied()
+                            .unwrap_or(0.0)
+                    };
+                    [at(0.10), at(0.50), at(0.90)]
+                };
+            for correct in [true, false] {
+                eprintln!(
+                    "  production-{} distance={:?} margin={:?} ratio={:?} selected-prediction-px={:?} target-prediction-px={:?} anchor-vs-prior-px={:?} anchor-residual={:?} same-object-support={:?} identity-radius={:?} reverse-margin={:?} normal-alignment={:?} confidence={:?} anchor={}/{}",
+                    if correct { "correct" } else { "wrong" },
+                    production_quantiles(correct, |score| score.distance),
+                    production_quantiles(correct, |score| score.margin),
+                    production_quantiles(correct, |score| score.ratio),
+                    production_quantiles(correct, |score| score.prediction_distance),
+                    production_quantiles(correct, |score| score.target_prediction_distance),
+                    production_quantiles(correct, |score| score.anchor_fallback_disagreement),
+                    production_quantiles(correct, |score| score.anchor_residual),
+                    production_quantiles(correct, |score| score.same_object_support as f32),
+                    production_quantiles(correct, |score| score.identity_radius),
+                    production_quantiles(correct, |score| score.reverse_margin),
+                    production_quantiles(correct, |score| score.normal_alignment),
+                    production_quantiles(correct, |score| score.confidence),
+                    result.production_scores.iter().filter(|score| score.correct == correct && score.anchor_conditioned).count(),
+                    result.production_scores.iter().filter(|score| score.correct == correct).count(),
+                );
+            }
+            for object in 0..OBJECTS {
+                let correct = result
+                    .production_scores
+                    .iter()
+                    .filter(|score| score.object == object && score.correct)
+                    .count();
+                let wrong = result
+                    .production_scores
+                    .iter()
+                    .filter(|score| score.object == object && !score.correct)
+                    .count();
+                eprintln!("  production-object={object} correct={correct} wrong={wrong}");
+            }
+            let false_budget = result.oracle_correspondences / 100;
+            let mut best_stricter = None::<(usize, usize, f32, f32, f32, f32, f32)>;
+            for spatial in [1.0f32, 1.5, 2.0, 2.5, 3.0] {
+                for margin in [0.08f32, 0.10, 0.12, 0.15, 0.20] {
+                    for ratio in [0.84f32, 0.78, 0.72, 0.66] {
+                        for confidence in [0.0f32, 0.55, 0.65, 0.75, 0.85] {
+                            for prior_agreement in [1.0f32, 2.0, 3.0, 4.0, 6.0, 10.0] {
+                                let mut correct_count = 0usize;
+                                let mut wrong_count = 0usize;
+                                for score in &result.production_scores {
+                                    let accepted = score.prediction_distance <= spatial
+                                        && score.margin >= margin
+                                        && score.ratio <= ratio
+                                        && score.confidence >= confidence
+                                        && score.anchor_fallback_disagreement <= prior_agreement;
+                                    correct_count += usize::from(accepted && score.correct);
+                                    wrong_count += usize::from(accepted && !score.correct);
+                                }
+                                if wrong_count <= false_budget
+                                    && best_stricter.is_none_or(|best| correct_count > best.0)
+                                {
+                                    best_stricter = Some((
+                                        correct_count,
+                                        wrong_count,
+                                        spatial,
+                                        margin,
+                                        ratio,
+                                        confidence,
+                                        prior_agreement,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            eprintln!("  best-stricter-one-percent={best_stricter:?}");
+            for spatial_limit in [2.0f32, 3.0, 4.0, 5.0, 6.0, 8.0] {
+                let mut correct = 0usize;
+                let mut wrong = 0usize;
+                for score in &result.scores {
+                    let accepted = score.best_distance <= NAUTILUS_MAX_DISTANCE
+                        && score.margin >= NAUTILUS_MIN_ABSOLUTE_MARGIN
+                        && score.ratio <= NAUTILUS_MAX_DISTANCE_RATIO
+                        && score.selected_prediction_distance <= spatial_limit;
+                    correct += usize::from(accepted && score.correct);
+                    wrong += usize::from(accepted && !score.correct);
+                }
+                eprintln!(
+                    "  spatial-limit={spatial_limit:.1}px accepted-correct={correct} accepted-wrong={wrong}"
+                );
+            }
+        }
+        assert_eq!(total_frames, 635, "lossless corpus frame count changed");
+        assert!(stats[0].oracle_correspondences >= 1_000);
+        // The production gate is deliberately precision-first. A wrong
+        // accepted identity is materially worse than an ambiguous point that
+        // remains withheld and is freshly seeded nearby.
+        for result in &stats {
+            assert!(
+                result.production_accepted_wrong * 100 <= result.oracle_correspondences.max(1),
+                "accepted false reconnections exceeded one percent: wrong={} oracle={}",
+                result.production_accepted_wrong,
+                result.oracle_correspondences,
+            );
+        }
+    }
+
+    #[test]
     fn clearing_cluster_tracker_releases_temporal_raw_state() {
         let width = 32usize;
         let height = 24usize;
@@ -12225,6 +14118,7 @@ mod tests {
 
         assert!(tracker.previous.is_none());
         assert!(tracker.tracks.is_empty());
+        assert!(tracker.nautilus_banks.is_empty());
         assert!(!tracker.canny_features);
         assert_eq!(tracker.generation, 0);
     }
