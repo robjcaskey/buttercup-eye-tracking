@@ -25,3 +25,7 @@ codegen-units = 1
 [[bin]]
 name = "buttercup-eye-viewer"
 path = "src/main.rs"
+
+[[bin]]
+name = "buttercup-screen-reflection-raw-decode"
+path = "src/bin/buttercup_screen_reflection_raw_decode.rs"

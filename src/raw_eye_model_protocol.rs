@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+use std::sync::Arc;
 
 pub const MODEL_STREAM_HEADER_BYTES: usize = 96;
 pub const MODEL_STREAM_MAGIC: &[u8; 4] = b"OIR1";
@@ -34,7 +35,7 @@ pub struct RawModelFrame {
     pub axis_ratio: f32,
     pub axis_angle: f32,
     pub point_count: u32,
-    pub payload: Vec<u8>,
+    pub payload: Arc<Vec<u8>>,
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
@@ -101,7 +102,7 @@ impl RawModelFrame {
         let header = self.header()?;
         output
             .write_all(&header)
-            .and_then(|()| output.write_all(&self.payload))
+            .and_then(|()| output.write_all(self.payload.as_slice()))
             .map_err(|error| format!("write RAW model frame: {error}"))
     }
 
@@ -145,7 +146,7 @@ impl RawModelFrame {
             axis_ratio: read_f32(&header, 84),
             axis_angle: read_f32(&header, 88),
             point_count: read_u32(&header, 92),
-            payload,
+            payload: Arc::new(payload),
         };
         frame.validate()?;
         Ok(frame)
@@ -226,7 +227,7 @@ mod tests {
             axis_ratio: 1.0,
             axis_angle: 0.0,
             point_count: 12,
-            payload: vec![1, 2, 3, 4, 5],
+            payload: Arc::new(vec![1, 2, 3, 4, 5]),
         }
     }
 
@@ -238,7 +239,7 @@ mod tests {
         let decoded = RawModelFrame::read_from(&mut Cursor::new(bytes)).unwrap();
         assert_eq!(decoded.sequence, 42);
         assert_eq!(decoded.sensor_x, 1000);
-        assert_eq!(decoded.payload, vec![1, 2, 3, 4, 5]);
+        assert_eq!(decoded.payload.as_slice(), [1, 2, 3, 4, 5]);
     }
 
     #[test]

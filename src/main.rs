@@ -9,7 +9,13 @@ mod raw10;
 mod raw_eye_model_protocol;
 mod raw_iris_focus;
 mod raw_motion_octrees;
+mod raw_sclera_red_canny;
 mod sam31_outer;
+mod screen_reflection_clock;
+mod screen_reflection_code;
+mod screen_reflection_live;
+mod screen_reflection_raw;
+mod screen_reflection_stimulus;
 mod specular_map;
 mod visible_lighthouse_control;
 
@@ -933,6 +939,9 @@ enum SegmentationMode {
     Sam31,
     Clusters,
     Driving,
+    /// Track red-opponent line structure on bright sclera without fitting or
+    /// publishing an iris, pupil, globe, or gaze ray.
+    ScleraRedCanny,
 }
 
 /// How much full-sensor MediaPipe activity an iris segmenter can tolerate
@@ -1068,6 +1077,12 @@ impl RoughPupilCenterMode {
     }
 
     fn compatibility(self, segmentation: SegmentationMode) -> Result<(), &'static str> {
+        // Sclera Red-Canny does not consume a rough pupil center. Preserve the
+        // selected Y mode for a later iris mode, but never let that dormant
+        // dependency make the scleral tracker unreachable from G.
+        if segmentation == SegmentationMode::ScleraRedCanny {
+            return Ok(());
+        }
         if self
             .requires_segmentation()
             .is_some_and(|required| required != segmentation)
@@ -1187,14 +1202,15 @@ enum SegmentationEyelidOverlay {
 
 /// The selected segmentation submode is the authority for both expensive
 /// mode-specific work and the diagnostic layers painted over the lossless
-/// ROI. Acquisition, identity, autofocus, and the final published pupil/
-/// limbus remain common to every mode.
+/// ROI. Acquisition, identity, and autofocus remain common. A mode may
+/// explicitly withhold pupil/limbus publication, as Sclera Red-Canny does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SegmentationModeProfile {
     motion_work: SegmentationMotionWork,
     show_native_diagnostics: bool,
     show_censored_limbus: bool,
     show_driving_diagnostics: bool,
+    show_sclera_red_canny: bool,
     show_rotation_meridians: bool,
     eyelid_overlay: SegmentationEyelidOverlay,
 }
@@ -1206,6 +1222,8 @@ impl SegmentationModeProfile {
 }
 
 impl SegmentationMode {
+    const COUNT: usize = 5;
+
     fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().replace(['_', '-'], "").as_str() {
             "native" => Some(Self::Native),
@@ -1215,6 +1233,8 @@ impl SegmentationMode {
             "sam31pupil" | "sam3.1pupil" | "sampupil" | "pupilvoid" => Some(Self::Sam31),
             "clusters" | "cluster" | "features" | "grain" | "irisgrain" => Some(Self::Clusters),
             "driving" | "drive" | "steering" | "affine3d" => Some(Self::Driving),
+            "sclera" | "sclerared" | "scleraredcanny" | "redcanny" | "vessels"
+            | "scleravessels" => Some(Self::ScleraRedCanny),
             _ => None,
         }
     }
@@ -1225,6 +1245,7 @@ impl SegmentationMode {
             Self::Sam31 => "sam31",
             Self::Clusters => "clusters",
             Self::Driving => "driving",
+            Self::ScleraRedCanny => "sclera-red-canny",
         }
     }
 
@@ -1236,7 +1257,9 @@ impl SegmentationMode {
             // These modes own multi-frame RAW evidence or fine sensor-ROI
             // steering. They may consume one global acquisition, then retain
             // uninterrupted fine control until the lock is explicitly lost.
-            Self::Sam31 | Self::Clusters | Self::Driving => MediaPipeCadence::GlobalAcquireOnly,
+            Self::Sam31 | Self::Clusters | Self::Driving | Self::ScleraRedCanny => {
+                MediaPipeCadence::GlobalAcquireOnly
+            }
         }
     }
 
@@ -1245,13 +1268,14 @@ impl SegmentationMode {
             Self::Native => Self::Sam31,
             Self::Sam31 => Self::Clusters,
             Self::Clusters => Self::Driving,
-            Self::Driving => Self::Native,
+            Self::Driving => Self::ScleraRedCanny,
+            Self::ScleraRedCanny => Self::Native,
         }
     }
 
     fn cycled_compatible(self, rough_center: RoughPupilCenterMode) -> Self {
         let mut candidate = self;
-        for _ in 0..4 {
+        for _ in 0..Self::COUNT {
             candidate = candidate.cycled();
             if rough_center.compatibility(candidate).is_ok() {
                 return candidate;
@@ -1267,6 +1291,7 @@ impl SegmentationMode {
                 show_native_diagnostics: true,
                 show_censored_limbus: true,
                 show_driving_diagnostics: false,
+                show_sclera_red_canny: false,
                 show_rotation_meridians: true,
                 eyelid_overlay: SegmentationEyelidOverlay::NativeMargins,
             },
@@ -1275,6 +1300,7 @@ impl SegmentationMode {
                 show_native_diagnostics: false,
                 show_censored_limbus: false,
                 show_driving_diagnostics: false,
+                show_sclera_red_canny: false,
                 show_rotation_meridians: false,
                 eyelid_overlay: SegmentationEyelidOverlay::None,
             },
@@ -1283,6 +1309,7 @@ impl SegmentationMode {
                 show_native_diagnostics: false,
                 show_censored_limbus: false,
                 show_driving_diagnostics: false,
+                show_sclera_red_canny: false,
                 // Clusters owns the temporal pivot estimate. Keep its
                 // presentation-only virtual contact visible while the
                 // current anatomy gate is temporarily weak.
@@ -1294,11 +1321,21 @@ impl SegmentationMode {
                 show_native_diagnostics: false,
                 show_censored_limbus: true,
                 show_driving_diagnostics: true,
+                show_sclera_red_canny: false,
                 // The projected meridian/longitude globe is presentation-only:
                 // it consumes Driving's admitted sphere geometry without
                 // enabling Native segmentation work or deforming the RAW ROI.
                 show_rotation_meridians: true,
                 eyelid_overlay: SegmentationEyelidOverlay::DrivingScene,
+            },
+            Self::ScleraRedCanny => SegmentationModeProfile {
+                motion_work: SegmentationMotionWork::None,
+                show_native_diagnostics: false,
+                show_censored_limbus: false,
+                show_driving_diagnostics: false,
+                show_sclera_red_canny: true,
+                show_rotation_meridians: false,
+                eyelid_overlay: SegmentationEyelidOverlay::None,
             },
         }
     }
@@ -1308,6 +1345,12 @@ fn sam31_target_for_modes(
     segmentation: SegmentationMode,
     rough_center: RoughPupilCenterMode,
 ) -> Option<sam31_outer::Target> {
+    // This mode intentionally owns no iris or pupil product. The Y selection
+    // is retained for whichever G mode the operator selects next, but it must
+    // not wake the SAM worker while red scleral vessels are being tracked.
+    if segmentation == SegmentationMode::ScleraRedCanny {
+        return None;
+    }
     match (
         segmentation == SegmentationMode::Sam31,
         rough_center == RoughPupilCenterMode::Sam31,
@@ -2619,10 +2662,11 @@ struct LockedRayOrigin {
     last_timestamp_ns: u64,
 }
 
-/// Presentation-only memory of the last independently published anatomical
-/// globe pivot. It lives in the UI rather than `SharedState`: a held marker
-/// can survive a weak frame, but can never re-enter segmentation, gaze
-/// publication, mouse control, or the temporal anatomy estimator.
+/// Presentation-only copy of an independently published anatomical globe
+/// pivot for the current frame. Weak frames deliberately clear this copy: a
+/// stale or merely latent pivot is not useful enough to put on screen and can
+/// never re-enter segmentation, gaze publication, mouse control, or the
+/// temporal anatomy estimator.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PresentationPivotContact {
     eye: usize,
@@ -6624,6 +6668,9 @@ struct EyeFrame {
     /// segmentation, or pupil state.
     virtual_contact_surface_gaze: Option<SurfaceGazeSample>,
     motion_octrees: Arc<raw_motion_octrees::MotionOctreeOverlay>,
+    /// Exact-current-frame red-opponent Canny lines on bright scleral
+    /// material. This overlay deliberately contains no iris/pupil geometry.
+    sclera_red_canny: Arc<raw_sclera_red_canny::ScleraRedCannyOverlay>,
     inner_iris_points: Arc<Vec<(f64, f64)>>,
     /// Qualified nested-polar pupil hypothesis. Orange perimeter and green
     /// supporting fragment markers are presentation-only during rollout;
@@ -6751,7 +6798,7 @@ enum RawExportKind {
 #[derive(Clone)]
 struct PendingRawExportFrame {
     header: PacketHeader,
-    payload: Vec<u8>,
+    payload: Arc<Vec<u8>>,
     arrival_generation: u64,
 }
 
@@ -7046,6 +7093,9 @@ fn set_segmentation_mode(
             state.driving_submode.short_label(),
             state.rough_pupil_center_mode.short_label(),
         ),
+        SegmentationMode::ScleraRedCanny => {
+            format!("SCLERA RED-CANNY WARMING ({source}); NO IRIS/PUPIL  G CYCLE")
+        }
     };
     Ok(())
 }
@@ -7060,6 +7110,20 @@ fn set_rough_pupil_center_mode(
     if state.rough_pupil_center_mode != mode {
         state.rough_pupil_center_mode = mode;
         bump_rough_pupil_center_generation(state);
+    }
+    if state.segmentation_mode == SegmentationMode::ScleraRedCanny {
+        if state
+            .reacquire_request
+            .as_deref()
+            .is_some_and(|request| request.contains("rough-center mode requires"))
+        {
+            state.reacquire_request = None;
+        }
+        state.segmentation_status = format!(
+            "SCLERA RED-CANNY ({source}); CENTER {} DORMANT; NO IRIS/PUPIL  G METHOD",
+            mode.short_label(),
+        );
+        return Ok(());
     }
     if state
         .reacquire_request
@@ -7087,13 +7151,13 @@ fn set_rough_pupil_center_mode(
         && state.mediapipe_reacquisition_disabled
     {
         format!(
-            "IRIS {} + CENTER {} HELD BY R ({source}); R RESUME  G IRIS  Y CENTER",
+            "IRIS {} + CENTER {} HELD BY R ({source}); R RESUME  G METHOD  Y CENTER",
             state.segmentation_mode.label().to_ascii_uppercase(),
             mode.short_label(),
         )
     } else {
         format!(
-            "IRIS {} + CENTER {} WARMING ({source}); G IRIS  Y CENTER",
+            "IRIS {} + CENTER {} WARMING ({source}); G METHOD  Y CENTER",
             state.segmentation_mode.label().to_ascii_uppercase(),
             mode.short_label(),
         )
@@ -7336,6 +7400,7 @@ fn selected_limbus_focus_geometry_verified(
             raw_eye_anatomy_confirmed && (cluster_boundary_selected || native_boundary_ready)
         }
         SegmentationMode::Driving => driving_boundary_selected,
+        SegmentationMode::ScleraRedCanny => false,
     }
 }
 
@@ -8652,7 +8717,7 @@ fn handle_control_command(command: &str, shared: &Arc<Mutex<SharedState>>) -> St
             let legacy_sam31_pupil = is_legacy_sam31_pupil_mode(requested);
             let Some(mode) = SegmentationMode::parse(requested) else {
                 return control_error(
-                    "SEGMENTATION must be NATIVE, SAM31, CLUSTERS, or DRIVING",
+                    "SEGMENTATION must be NATIVE, SAM31, CLUSTERS, DRIVING, or SCLERA-RED-CANNY",
                 );
             };
             let requested_rough = if legacy_sam31_pupil {
@@ -9204,7 +9269,7 @@ fn handle_control_command(command: &str, shared: &Arc<Mutex<SharedState>>) -> St
             }
         }
         [help] if help.eq_ignore_ascii_case("HELP") => {
-            "{\"ok\":true,\"commands\":[\"PING\",\"STATUS\",\"CHECKERBOARD START|STOP|RESET|STATUS\",\"SEGMENTATION NATIVE|SAM31|CLUSTERS|DRIVING\",\"SEGMENTATION STATUS\",\"IRIS STATUS\",\"IRIS BOUNDS MINIMUM|MAXIMUM +|-\",\"IRIS BOUNDS AUTO\",\"PUPIL STATUS\",\"PUPIL BOUNDS MINIMUM|MAXIMUM +|-\",\"PUPIL BOUNDS DEFAULT\",\"PUPIL CENTER IRIS-GUIDED|RAW-FOCUS|SAM31-CENTER|MEDIAPIPE-ACQUIRE|MEDIAPIPE-CONTINUOUS|DRIVING-TOPOLOGY\",\"PUPIL|IRIS RETICLE OFF|STATIC|PROJECTED|ON|TOGGLE\",\"EYE LASER ON|OFF|TOGGLE|STATUS\",\"DRIVING NORMAL|DOUBLE-SCLERA-10DEG|STATUS\",\"LEASE CLAIM OWNER TTL_MS\",\"LEASE RENEW TOKEN TTL_MS\",\"LEASE RELEASE TOKEN\",\"LEASE STATUS\",\"WITH TOKEN REACQUIRE\",\"WITH TOKEN LINEAR SNAPSHOT\",\"WITH TOKEN ROI HOLD RIGHT_X RIGHT_Y LEFT_X LEFT_Y\",\"WITH TOKEN ROI AUTO\",\"WITH TOKEN FOCUS EYE RIGHT|LEFT\",\"WITH TOKEN FOCUS SET N\",\"WITH TOKEN FOCUS AUTO\",\"WITH TOKEN EXPORT RAW RIGHT /absolute/path.raw10\",\"WITH TOKEN EXPORT RAW BOTH /absolute/prefix\",\"WITH TOKEN RECORD RAW BOTH SECONDS /absolute/file.tar\",\"RECORD STATUS\",\"EXPORT PRESENTATION /absolute/path.ppm\",\"EXPORT ANNOTATED RIGHT|LEFT|BOTH /absolute/path.ppm\",\"EXPORT ANNOTATED RIGHT|LEFT|BOTH QUAD_COLOR|RAW_COLOR|BLUE_FILTER|RED_FILTER|GREEN_FILTER|SPECULAR_MAP|CROSS_POLARIZED|DIFFUSE|QUAD_LUMA|RAW_LUMA|CANNY /absolute/path.ppm\",\"EXPORT STATUS\"]}".to_string()
+            "{\"ok\":true,\"commands\":[\"PING\",\"STATUS\",\"CHECKERBOARD START|STOP|RESET|STATUS\",\"SEGMENTATION NATIVE|SAM31|CLUSTERS|DRIVING|SCLERA-RED-CANNY\",\"SEGMENTATION STATUS\",\"IRIS STATUS\",\"IRIS BOUNDS MINIMUM|MAXIMUM +|-\",\"IRIS BOUNDS AUTO\",\"PUPIL STATUS\",\"PUPIL BOUNDS MINIMUM|MAXIMUM +|-\",\"PUPIL BOUNDS DEFAULT\",\"PUPIL CENTER IRIS-GUIDED|RAW-FOCUS|SAM31-CENTER|MEDIAPIPE-ACQUIRE|MEDIAPIPE-CONTINUOUS|DRIVING-TOPOLOGY\",\"PUPIL|IRIS RETICLE OFF|STATIC|PROJECTED|ON|TOGGLE\",\"EYE LASER ON|OFF|TOGGLE|STATUS\",\"DRIVING NORMAL|DOUBLE-SCLERA-10DEG|STATUS\",\"LEASE CLAIM OWNER TTL_MS\",\"LEASE RENEW TOKEN TTL_MS\",\"LEASE RELEASE TOKEN\",\"LEASE STATUS\",\"WITH TOKEN REACQUIRE\",\"WITH TOKEN LINEAR SNAPSHOT\",\"WITH TOKEN ROI HOLD RIGHT_X RIGHT_Y LEFT_X LEFT_Y\",\"WITH TOKEN ROI AUTO\",\"WITH TOKEN FOCUS EYE RIGHT|LEFT\",\"WITH TOKEN FOCUS SET N\",\"WITH TOKEN FOCUS AUTO\",\"WITH TOKEN EXPORT RAW RIGHT /absolute/path.raw10\",\"WITH TOKEN EXPORT RAW BOTH /absolute/prefix\",\"WITH TOKEN RECORD RAW BOTH SECONDS /absolute/file.tar\",\"RECORD STATUS\",\"EXPORT PRESENTATION /absolute/path.ppm\",\"EXPORT ANNOTATED RIGHT|LEFT|BOTH /absolute/path.ppm\",\"EXPORT ANNOTATED RIGHT|LEFT|BOTH QUAD_COLOR|RAW_COLOR|BLUE_FILTER|RED_FILTER|GREEN_FILTER|SPECULAR_MAP|CROSS_POLARIZED|DIFFUSE|QUAD_LUMA|RAW_LUMA|CANNY /absolute/path.ppm\",\"EXPORT STATUS\"]}".to_string()
         }
         [] => control_error("empty command"),
         _ => control_error("unknown command; send HELP"),
@@ -9389,6 +9454,22 @@ impl EdgeMapVariant {
             Self::Laplacian => "LAPLACIAN",
             Self::DifferenceOfGaussians => "DOG BANDPASS",
             Self::GradientCompass => "GRADIENT COMPASS",
+        }
+    }
+
+    fn learning_canny_profile(self) -> raw_motion_octrees::LearningCannyProfile {
+        match self {
+            Self::CannyBalanced => raw_motion_octrees::LearningCannyProfile::CannyBalanced,
+            Self::CannySensitive => raw_motion_octrees::LearningCannyProfile::CannySensitive,
+            Self::CannyStrict => raw_motion_octrees::LearningCannyProfile::CannyStrict,
+            Self::SobelSharp => raw_motion_octrees::LearningCannyProfile::SobelSharp,
+            Self::SobelSmooth => raw_motion_octrees::LearningCannyProfile::SobelSmooth,
+            Self::ScharrCanny => raw_motion_octrees::LearningCannyProfile::ScharrCanny,
+            Self::Laplacian => raw_motion_octrees::LearningCannyProfile::Laplacian,
+            Self::DifferenceOfGaussians => {
+                raw_motion_octrees::LearningCannyProfile::DifferenceOfGaussians
+            }
+            Self::GradientCompass => raw_motion_octrees::LearningCannyProfile::GradientCompass,
         }
     }
 
@@ -24260,6 +24341,7 @@ struct ReceivedPacket {
     header: PacketHeader,
     payload: Vec<u8>,
     arrived: Instant,
+    host_arrival_unix_ns: u64,
     read_elapsed: Duration,
 }
 
@@ -24448,6 +24530,12 @@ impl RawPacketReader {
                         return;
                     }
                     let arrived = Instant::now();
+                    let host_arrival_unix_ns = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                        .min(u128::from(u64::MAX))
+                        as u64;
                     let cadence_result = match header.kind {
                         PacketKind::Eye(eye_id) => {
                             cadence.observe(header.sequence, eye_id, arrived)
@@ -24465,6 +24553,7 @@ impl RawPacketReader {
                         header,
                         payload,
                         arrived,
+                        host_arrival_unix_ns,
                         read_elapsed: arrived.duration_since(read_started),
                     };
                     match sender.try_send(Ok(packet)) {
@@ -25825,6 +25914,27 @@ fn edge_map_preview(
         }
         EdgeMapVariant::GradientCompass => gradient_compass_edge_preview(source, width, height),
     }
+}
+
+fn learning_canny_mask_preview(
+    mask: &[u8],
+    width: usize,
+    height: usize,
+    variant: EdgeMapVariant,
+) -> Vec<u32> {
+    let pixel_count = width.saturating_mul(height);
+    if mask.len() != pixel_count {
+        return vec![0; pixel_count];
+    }
+    let edge_color = match variant {
+        EdgeMapVariant::Laplacian => 0x00ff_b020,
+        EdgeMapVariant::DifferenceOfGaussians => 0x0000_efff,
+        EdgeMapVariant::GradientCompass => 0x00ff_e040,
+        _ => 0x00ff_ffff,
+    };
+    mask.iter()
+        .map(|accepted| if *accepted != 0 { edge_color } else { 0 })
+        .collect()
 }
 
 fn raw10_color_preview(
@@ -28967,6 +29077,7 @@ fn receive(
         .cloned()
         .map(RawModelPublisher::start)
         .collect::<Result<Vec<_>, _>>()?;
+    let screen_clock_analyzer = screen_reflection_live::LiveScreenClockAnalyzer::start()?;
     let checkerboard_output = env::var_os("BUTTERCUP_CHECKERBOARD_CALIBRATION_OUTPUT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("outputs/checkerboard-calibration/live"));
@@ -29083,6 +29194,7 @@ fn receive(
     let mut runtime_segmentation_mode = config.segmentation;
     let mut driving_mode_session = 0u64;
     let mut temporal_canny_mode_session = 0u64;
+    let mut runtime_learning_canny_variant = EdgeMapVariant::default();
     let mut inner_iris_radius_limiters: [RadiusRateLimiter; 2] =
         std::array::from_fn(|_| RadiusRateLimiter::default());
     let mut pupil_size_trackers: [PupilSizeTracker; 2] =
@@ -29100,6 +29212,8 @@ fn receive(
         std::array::from_fn(|_| raw_iris_focus::OuterIrisTracker::default());
     let mut motion_octree_trackers: [raw_motion_octrees::FourMotionOctrees; 2] =
         std::array::from_fn(|_| raw_motion_octrees::FourMotionOctrees::default());
+    let mut sclera_red_canny_trackers: [raw_sclera_red_canny::ScleraRedCannyTracker; 2] =
+        std::array::from_fn(|_| raw_sclera_red_canny::ScleraRedCannyTracker::default());
     let mut temporal_feature_limbus_center_gates: [TemporalFeatureLimbusCenterGate; 2] =
         std::array::from_fn(|_| TemporalFeatureLimbusCenterGate::default());
     let mut shared_global_scale_trackers: [raw_motion_octrees::NativeGlobalSimilarityTracker; 2] =
@@ -29630,6 +29744,7 @@ fn receive(
                     header,
                     payload,
                     arrived: packet_arrived,
+                    host_arrival_unix_ns,
                     read_elapsed,
                 } = packet;
                 let queue_age = Instant::now().saturating_duration_since(packet_arrived);
@@ -29672,6 +29787,7 @@ fn receive(
                 }
                 host_telemetry.observe_packet_arrival(packet_arrived);
                 host_telemetry.record(HOST_STAGE_PACKET_READ, read_elapsed);
+                let payload = Arc::new(payload);
                 if header.kind == PacketKind::Telemetry {
                     let snapshot = parse_telemetry_payload(&payload)?;
                     if let Ok(mut state) = shared.lock() {
@@ -30113,6 +30229,19 @@ fn receive(
                     }
                 }
                 let index = eye_id as usize - 1;
+                if index == 0 {
+                    screen_clock_analyzer.submit(screen_reflection_live::LiveRawClockFrame {
+                        sequence: header.sequence,
+                        sensor_timestamp_ns: header.timestamp_ns,
+                        host_arrival_unix_ns,
+                        sensor_x: header.sensor_x,
+                        sensor_y: header.sensor_y,
+                        width: header.width,
+                        height: header.height,
+                        stride: header.stride,
+                        payload: Arc::clone(&payload),
+                    });
+                }
                 let raw_export = shared.lock().ok().and_then(|mut state| {
                     state.raw_arrival_generations[index] =
                         state.raw_arrival_generations[index].saturating_add(1);
@@ -30601,6 +30730,7 @@ fn receive(
                     segmentation_mode,
                     rough_pupil_center_mode,
                     driving_submode,
+                    edge_map_variant,
                     iris_radius_bounds_recompute,
                     operator_iris_radius_limits_px,
                     pupil_radius_bounds_recompute,
@@ -30616,6 +30746,7 @@ fn receive(
                             state.segmentation_mode,
                             state.rough_pupil_center_mode,
                             state.driving_submode,
+                            state.edge_map_variant,
                             state.iris_radius_bounds_recompute,
                             iris_radius_operator_limits(&state),
                             state.pupil_radius_bounds_recompute,
@@ -30630,6 +30761,7 @@ fn receive(
                         SegmentationMode::Native,
                         config.rough_pupil_center,
                         config.driving_submode,
+                        EdgeMapVariant::default(),
                         true,
                         None,
                         true,
@@ -30653,29 +30785,35 @@ fn receive(
                 // every synchronous outer segmenter uses the identical shared
                 // tracker here. A MediaPipe relocation therefore transports
                 // the common posterior regardless of which G mode is active.
-                let selected_scale_prediction = (segmentation_mode != SegmentationMode::Driving)
-                    .then(|| {
-                        select_current_limbus_scale_prediction(
-                            pending_coarse_limbus_scale_predictions[index].take(),
-                            shared_global_scale_prediction,
-                        )
-                    })
-                    .flatten();
-                let selected_iris_radius_prior = (segmentation_mode != SegmentationMode::Driving)
-                    .then(|| {
-                        shared_iris_radius_trackers[index]
-                            .lock()
-                            .ok()
-                            .and_then(|mut tracker| {
-                                tracker.begin_frame_controlled(
-                                    now,
-                                    selected_scale_prediction,
-                                    iris_radius_bounds_recompute,
-                                    operator_iris_radius_limits_px,
-                                )
-                            })
-                    })
-                    .flatten();
+                let selected_scale_prediction = (!matches!(
+                    segmentation_mode,
+                    SegmentationMode::Driving | SegmentationMode::ScleraRedCanny
+                ))
+                .then(|| {
+                    select_current_limbus_scale_prediction(
+                        pending_coarse_limbus_scale_predictions[index].take(),
+                        shared_global_scale_prediction,
+                    )
+                })
+                .flatten();
+                let selected_iris_radius_prior = (!matches!(
+                    segmentation_mode,
+                    SegmentationMode::Driving | SegmentationMode::ScleraRedCanny
+                ))
+                .then(|| {
+                    shared_iris_radius_trackers[index]
+                        .lock()
+                        .ok()
+                        .and_then(|mut tracker| {
+                            tracker.begin_frame_controlled(
+                                now,
+                                selected_scale_prediction,
+                                iris_radius_bounds_recompute,
+                                operator_iris_radius_limits_px,
+                            )
+                        })
+                })
+                .flatten();
                 let selected_iris_radius_limits_px = selected_iris_radius_prior
                     .map(|prior| (prior.minimum_px, prior.maximum_px))
                     .or(operator_iris_radius_limits_px);
@@ -30711,6 +30849,13 @@ fn receive(
                     if segmentation_mode == SegmentationMode::Clusters {
                         temporal_canny_mode_session = temporal_canny_mode_session.wrapping_add(1);
                     }
+                    if previous_mode == SegmentationMode::ScleraRedCanny
+                        || segmentation_mode == SegmentationMode::ScleraRedCanny
+                    {
+                        for tracker in &mut sclera_red_canny_trackers {
+                            tracker.clear();
+                        }
+                    }
                     runtime_segmentation_mode = segmentation_mode;
                     eprintln!(
                         "iris runtime transition {} -> {} rough-center={} sam-resident={} driving-session={}",
@@ -30721,7 +30866,46 @@ fn receive(
                         driving_mode_session,
                     );
                 }
+                if edge_map_variant != runtime_learning_canny_variant {
+                    let previous_variant = runtime_learning_canny_variant;
+                    runtime_learning_canny_variant = edge_map_variant;
+                    // Tracks, layer identities, and asynchronous geometry
+                    // results learned under a different edge definition are
+                    // not commensurate. Keep the shared anatomical size
+                    // posteriors, but begin a fresh temporal-Canny epoch.
+                    temporal_canny_mode_session = temporal_canny_mode_session.wrapping_add(1);
+                    for tracker in &mut motion_octree_trackers {
+                        tracker.clear();
+                    }
+                    for gate in &mut temporal_feature_limbus_center_gates {
+                        *gate = TemporalFeatureLimbusCenterGate::default();
+                    }
+                    for handoff in &mut temporal_feature_presence_handoffs {
+                        handoff.clear();
+                    }
+                    eprintln!(
+                        "learning Canny calculation changed by K from {}/{} {} to {}/{} {}; temporal edge tracks reset",
+                        previous_variant.ordinal(),
+                        EdgeMapVariant::COUNT,
+                        previous_variant.label(),
+                        edge_map_variant.ordinal(),
+                        EdgeMapVariant::COUNT,
+                        edge_map_variant.label(),
+                    );
+                }
                 let segmentation_profile = segmentation_mode.profile();
+                let sclera_red_canny = if segmentation_profile.show_sclera_red_canny {
+                    sclera_red_canny_trackers[index].observe(
+                        raw.as_slice(),
+                        header.width,
+                        header.height,
+                        header.sensor_x,
+                        header.sensor_y,
+                        header.timestamp_ns,
+                    )
+                } else {
+                    raw_sclera_red_canny::ScleraRedCannyOverlay::default()
+                };
                 let sam31_target =
                     sam31_target_for_modes(segmentation_mode, rough_pupil_center_mode);
                 let sam31_requested = sam31_target.is_some();
@@ -31170,7 +31354,7 @@ fn receive(
                     segmentation_profile.motion_work == SegmentationMotionWork::TemporalClusters;
                 let temporal_match_started = Instant::now();
                 let mut motion_overlay = if temporal_clusters_active {
-                    motion_octree_trackers[index].observe_with_iris_seed_at(
+                    motion_octree_trackers[index].observe_with_iris_seed_at_with_canny_profile(
                         raw.as_slice(),
                         header.width,
                         header.height,
@@ -31178,7 +31362,7 @@ fn receive(
                         header.sensor_y,
                         header.timestamp_ns,
                         motion_focus_probe,
-                        true,
+                        edge_map_variant.learning_canny_profile(),
                         cluster_ellipse_seed,
                     )
                 } else {
@@ -31873,7 +32057,10 @@ fn receive(
                     // is absent, publish no iris instead of locking a native
                     // hair/forehead ellipse into the gaze and cursor paths.
                     raw_iris_focus::OuterIrisBoundary::default()
-                } else if segmentation_mode == SegmentationMode::Clusters {
+                } else if matches!(
+                    segmentation_mode,
+                    SegmentationMode::Clusters | SegmentationMode::ScleraRedCanny
+                ) {
                     // The native conic seeds the temporal-feature search, but
                     // it is not a fallback result for this independently
                     // selected model.  A cold or rejected 2D candidate must
@@ -31907,7 +32094,8 @@ fn receive(
                         .map(|hypothesis| hypothesis.score),
                     SegmentationMode::Driving
                     | SegmentationMode::Sam31
-                    | SegmentationMode::Native => None,
+                    | SegmentationMode::Native
+                    | SegmentationMode::ScleraRedCanny => None,
                 };
                 if let Some(confidence) = selected_iris_measurement_confidence {
                     if !outer_iris.points.is_empty() {
@@ -31936,7 +32124,9 @@ fn receive(
                 } else {
                     selected_iris_radius_prior
                 };
-                let observed_iris_radius_px = [
+                let observed_iris_radius_px = (segmentation_mode
+                    != SegmentationMode::ScleraRedCanny)
+                    .then(|| [
                     (!outer_iris.points.is_empty())
                         .then(|| {
                             raw_iris_focus::FrontoParallelLimbusRadiusPrior::fronto_parallel_radius_px(
@@ -31953,10 +32143,8 @@ fn receive(
                             partial.minor_radius,
                         )
                     }),
-                ]
-                .into_iter()
-                .flatten()
-                .next();
+                    ])
+                    .and_then(|observations| observations.into_iter().flatten().next());
                 // Eyelid scene discovery is deliberately downstream of the
                 // completed Driving topology.  The accepted limbus and pupil
                 // anchor two canthus-to-canthus nautilus walks, while a held
@@ -32388,6 +32576,16 @@ fn receive(
                                     )
                                 },
                             ),
+                            SegmentationMode::ScleraRedCanny => format!(
+                                "SCLERA RED-CANNY EXACT-FRAME EDGE-CELLS {} SEGMENTS {} ANCHORS {} TRACKS {} STABLE {} THR {:.4} {}US  NO IRIS/PUPIL  G CYCLE",
+                                sclera_red_canny.accepted_edge_cells,
+                                sclera_red_canny.segments.len(),
+                                sclera_red_canny.anchors.len(),
+                                sclera_red_canny.persistent_tracks,
+                                sclera_red_canny.stable_tracks,
+                                sclera_red_canny.high_threshold,
+                                sclera_red_canny.elapsed_us,
+                            ),
                         };
                     }
                 }
@@ -32403,14 +32601,19 @@ fn receive(
                     || partial_frame_recovery_ready)
                     .then(|| border_focus.pupil_hint.or(raw_focus_center))
                     .flatten();
-                let frame_rough_pupil_center = select_rough_pupil_center(
-                    rough_pupil_center_mode,
-                    &outer_iris,
-                    raw_pupil_center,
-                    sam_pupil_center,
-                    (header.width, header.height),
-                    driving_pupil,
-                );
+                let frame_rough_pupil_center = (segmentation_mode
+                    != SegmentationMode::ScleraRedCanny)
+                    .then(|| {
+                        select_rough_pupil_center(
+                            rough_pupil_center_mode,
+                            &outer_iris,
+                            raw_pupil_center,
+                            sam_pupil_center,
+                            (header.width, header.height),
+                            driving_pupil,
+                        )
+                    })
+                    .flatten();
                 let rough_pupil_center_runtime_state =
                     rough_pupil_center_runtime_state_label(rough_pupil_center_mode, r_frozen);
                 // Center acquisition and the affine scale/search envelope are
@@ -32418,23 +32621,34 @@ fn receive(
                 // drive the pupil solver when the selected outer segmenter is
                 // temporarily withholding its limbus, but only when current
                 // eye anatomy independently supplies a bounded projection.
-                let raw_eye_anatomy_confirmed = focus_anatomy_valid
-                    || border_focus.eye_basin_valid
-                    || (native_presence_trusted && partial_frame_recovery_ready);
-                let pupil_projection = select_pupil_projection_reference(
-                    &outer_iris,
-                    bounded_roi_truncated_limbus,
-                    &border_focus,
-                    raw_eye_anatomy_confirmed,
-                );
-                let pupil_center_prediction = pupil_center_trackers[index].begin_frame(
-                    now,
-                    (header.sensor_x, header.sensor_y),
-                    (header.width, header.height),
-                    pupil_projection,
-                    frame_rough_pupil_center,
-                    &motion_overlay,
-                );
+                let raw_eye_anatomy_confirmed = segmentation_mode
+                    != SegmentationMode::ScleraRedCanny
+                    && (focus_anatomy_valid
+                        || border_focus.eye_basin_valid
+                        || (native_presence_trusted && partial_frame_recovery_ready));
+                let pupil_projection = (segmentation_mode != SegmentationMode::ScleraRedCanny)
+                    .then(|| {
+                        select_pupil_projection_reference(
+                            &outer_iris,
+                            bounded_roi_truncated_limbus,
+                            &border_focus,
+                            raw_eye_anatomy_confirmed,
+                        )
+                    })
+                    .flatten();
+                let pupil_center_prediction = (segmentation_mode
+                    != SegmentationMode::ScleraRedCanny)
+                    .then(|| {
+                        pupil_center_trackers[index].begin_frame(
+                            now,
+                            (header.sensor_x, header.sensor_y),
+                            (header.width, header.height),
+                            pupil_projection,
+                            frame_rough_pupil_center,
+                            &motion_overlay,
+                        )
+                    })
+                    .flatten();
                 // Downstream pupil size, margin, gaze, and reticle consumers
                 // see the one transported center authority. The selected Y
                 // producer remains visible only as the current-frame proposal
@@ -32447,14 +32661,18 @@ fn receive(
                     size_reticle_mode,
                     (header.width, header.height),
                 );
-                let pupil_size_support = pupil_size_trackers[index].begin_frame(
-                    now,
-                    selected_rough_pupil_center,
-                    pupil_projection,
-                    pupil_radius_bounds_recompute,
-                    pupil_radius_lower_fraction,
-                    pupil_radius_upper_fraction,
-                );
+                let pupil_size_support = (segmentation_mode != SegmentationMode::ScleraRedCanny)
+                    .then(|| {
+                        pupil_size_trackers[index].begin_frame(
+                            now,
+                            selected_rough_pupil_center,
+                            pupil_projection,
+                            pupil_radius_bounds_recompute,
+                            pupil_radius_lower_fraction,
+                            pupil_radius_upper_fraction,
+                        )
+                    })
+                    .flatten();
                 let pupil_size_geometry = pupil_size_trackers[index].active_geometry();
                 let limbus_optical_focus = raw_iris_focus::measure_limbus_optical_focus(
                     &raw,
@@ -32626,12 +32844,16 @@ fn receive(
                     pupil_size_admission.limbus_geometry_qualified,
                     pupil_observation_confidence,
                 );
-                let surface_gaze = surface_gaze_trackers[index].observe(
-                    now,
-                    (header.sensor_x, header.sensor_y),
-                    measured_gaze_feature,
-                    &outer_iris,
-                );
+                let surface_gaze = (segmentation_mode != SegmentationMode::ScleraRedCanny)
+                    .then(|| {
+                        surface_gaze_trackers[index].observe(
+                            now,
+                            (header.sensor_x, header.sensor_y),
+                            measured_gaze_feature,
+                            &outer_iris,
+                        )
+                    })
+                    .flatten();
                 // The final presentation can work one rung backward from a
                 // fully admitted topology. Driving's diagnostic boundary is
                 // a refit sampled from this exact RAW frame and can therefore
@@ -32664,28 +32886,39 @@ fn receive(
                     })
                     .flatten()
                     .map(FrontoParallelCircleRadiusPx::value);
-                let published_pupil_size_support =
-                    pupil_size_reticle_for_publication(pupil_size_support, &inner_iris);
+                let published_pupil_size_support = (segmentation_mode
+                    != SegmentationMode::ScleraRedCanny)
+                    .then(|| pupil_size_reticle_for_publication(pupil_size_support, &inner_iris))
+                    .flatten();
                 if index == 0 {
                     if let Ok(mut state) = shared.lock() {
-                        state.pupil_size_runtime = PupilSizeRuntimeStatus {
-                            rough_center_available: selected_rough_pupil_center.is_some(),
-                            inner_boundary_locked: !inner_iris.points.is_empty(),
-                            observed_fronto_parallel_radius_px: published_pupil_radius,
-                            observation_confidence: pupil_observation_confidence,
-                            observation_rate_limited: pupil_size_admission.rate_limited,
-                            observation_focus_size_qualified: pupil_size_admission
-                                .focus_size_qualified,
-                            observation_limbus_geometry_qualified: pupil_size_admission
-                                .limbus_geometry_qualified,
-                            observation_raw_diameter_qualified: pupil_size_admission
-                                .raw_diameter_qualified,
-                            observation_trajectory_updated: pupil_size_admission.trajectory_updated,
-                            observation_trained_posterior: pupil_size_admission.trained_posterior,
-                            evidence_condition: pupil_evidence_condition,
-                            support: published_pupil_size_support,
-                        };
-                        let size_support = published_pupil_size_support.map_or_else(
+                        if segmentation_mode == SegmentationMode::ScleraRedCanny {
+                            // This G mode intentionally has no dormant pupil
+                            // product. Clear the shared readout rather than
+                            // appending stale iris/center diagnostics to its
+                            // vessel-tracking status line.
+                            state.pupil_size_runtime = PupilSizeRuntimeStatus::default();
+                        } else {
+                            state.pupil_size_runtime = PupilSizeRuntimeStatus {
+                                rough_center_available: selected_rough_pupil_center.is_some(),
+                                inner_boundary_locked: !inner_iris.points.is_empty(),
+                                observed_fronto_parallel_radius_px: published_pupil_radius,
+                                observation_confidence: pupil_observation_confidence,
+                                observation_rate_limited: pupil_size_admission.rate_limited,
+                                observation_focus_size_qualified: pupil_size_admission
+                                    .focus_size_qualified,
+                                observation_limbus_geometry_qualified: pupil_size_admission
+                                    .limbus_geometry_qualified,
+                                observation_raw_diameter_qualified: pupil_size_admission
+                                    .raw_diameter_qualified,
+                                observation_trajectory_updated: pupil_size_admission
+                                    .trajectory_updated,
+                                observation_trained_posterior: pupil_size_admission
+                                    .trained_posterior,
+                                evidence_condition: pupil_evidence_condition,
+                                support: published_pupil_size_support,
+                            };
+                            let size_support = published_pupil_size_support.map_or_else(
                             || "PUPIL-SIZE FP SUPPORT WAIT".to_string(),
                             |support| {
                                 let state = if support.frozen {
@@ -32726,18 +32959,19 @@ fn receive(
                                 )
                             },
                         );
-                        let iris_radius_status = iris_radius_support_status(&state);
-                        let pupil_center_pending =
-                            (pupil_center_track_diagnostics.pending_relocation_frames > 0)
-                                .then(|| {
-                                    format!(
-                                        " P{}",
-                                        pupil_center_track_diagnostics.pending_relocation_frames
-                                    )
-                                })
-                                .unwrap_or_default();
-                        state.segmentation_status.push_str(&format!(
-                            "  {}  CENTER {} {} CTR {}/{} D{:.1} S{:.2} J{:.0}{}  PUPIL {} Q{:.2}{}{}{}{}{}{}  FOCUS {} R{} CUE{:.2}  {}  G IRIS Y CENTER []/LR IRIS-MIN -=/DU IRIS-MAX 0 IRIS-AUTO U PUPIL+IRIS-RETICLES",
+                            let iris_radius_status = iris_radius_support_status(&state);
+                            let pupil_center_pending = (pupil_center_track_diagnostics
+                                .pending_relocation_frames
+                                > 0)
+                            .then(|| {
+                                format!(
+                                    " P{}",
+                                    pupil_center_track_diagnostics.pending_relocation_frames
+                                )
+                            })
+                            .unwrap_or_default();
+                            state.segmentation_status.push_str(&format!(
+                            "  {}  CENTER {} {} CTR {}/{} D{:.1} S{:.2} J{:.0}{}  PUPIL {} Q{:.2}{}{}{}{}{}{}  FOCUS {} R{} CUE{:.2}  {}  G METHOD Y CENTER []/LR IRIS-MIN -=/DU IRIS-MAX 0 IRIS-AUTO U PUPIL+IRIS-RETICLES",
                             iris_radius_status,
                             rough_pupil_center_mode.short_label(),
                             if rough_pupil_center_runtime_state == "held-by-r" {
@@ -32797,35 +33031,42 @@ fn receive(
                             pupil_evidence_condition.cue_reliability,
                             size_support,
                         ));
-                        if let Some(ratio) = pupil_polar_diagnostics.ratio {
-                            state.segmentation_status.push_str(&format!(
-                                "  POLAR {} R{ratio:.3} E{} RAW{} F{}/S{} {:.1}MS/H{}{}",
-                                if pupil_polar_diagnostics.qualified {
-                                    "LOCK"
-                                } else {
-                                    "PROVISIONAL"
-                                },
-                                pupil_polar_diagnostics
-                                    .evidence_selected_ratio
-                                    .map_or_else(|| "?".to_string(), |value| format!("{value:.3}")),
-                                pupil_polar_diagnostics
-                                    .raw_best_ratio
-                                    .map_or_else(|| "?".to_string(), |value| format!("{value:.3}")),
-                                pupil_polar_diagnostics.supporting_frames,
-                                pupil_polar_diagnostics.unique_sectors,
-                                pupil_polar_diagnostics.elapsed_us as f64 / 1_000.0,
-                                pupil_polar_diagnostics.evaluated_radius_hypotheses,
-                                if pupil_polar_diagnostics.legacy_radius_vetoed {
-                                    " VETO-OLD"
-                                } else {
-                                    ""
-                                },
-                            ));
+                            if let Some(ratio) = pupil_polar_diagnostics.ratio {
+                                state.segmentation_status.push_str(&format!(
+                                    "  POLAR {} R{ratio:.3} E{} RAW{} F{}/S{} {:.1}MS/H{}{}",
+                                    if pupil_polar_diagnostics.qualified {
+                                        "LOCK"
+                                    } else {
+                                        "PROVISIONAL"
+                                    },
+                                    pupil_polar_diagnostics.evidence_selected_ratio.map_or_else(
+                                        || "?".to_string(),
+                                        |value| format!("{value:.3}")
+                                    ),
+                                    pupil_polar_diagnostics.raw_best_ratio.map_or_else(
+                                        || "?".to_string(),
+                                        |value| format!("{value:.3}")
+                                    ),
+                                    pupil_polar_diagnostics.supporting_frames,
+                                    pupil_polar_diagnostics.unique_sectors,
+                                    pupil_polar_diagnostics.elapsed_us as f64 / 1_000.0,
+                                    pupil_polar_diagnostics.evaluated_radius_hypotheses,
+                                    if pupil_polar_diagnostics.legacy_radius_vetoed {
+                                        " VETO-OLD"
+                                    } else {
+                                        ""
+                                    },
+                                ));
+                            }
                         }
                     }
                 }
                 let (projected_rotation_center, projected_gaze_pole) =
-                    published_projected_globe_projection(motion_overlay.coupled_motion);
+                    if segmentation_mode == SegmentationMode::ScleraRedCanny {
+                        (None, None)
+                    } else {
+                        published_projected_globe_projection(motion_overlay.coupled_motion)
+                    };
                 let provisional_focus_score =
                     raw_iris_focus::provisional_focus_score(&raw, header.width, header.height);
                 let valid_focus_target = border_focus
@@ -33538,10 +33779,10 @@ fn receive(
                     HOST_STAGE_TRACK_AUTOFOCUS,
                     tracking_autofocus_started.elapsed(),
                 );
-                let (contrast_percent, edge_map_variant) = shared
+                let contrast_percent = shared
                     .lock()
-                    .map(|state| (state.contrast_percent, state.edge_map_variant))
-                    .unwrap_or((100, EdgeMapVariant::default()));
+                    .map(|state| state.contrast_percent)
+                    .unwrap_or(100);
                 let quad_luma = Arc::new(quad_luma_preview(
                     &raw,
                     header.width,
@@ -33558,12 +33799,26 @@ fn receive(
                     contrast_percent,
                     Some(&mut display_color_balance),
                 ));
-                let canny = Arc::new(edge_map_preview(
-                    quad_luma.as_ref(),
-                    header.width,
-                    header.height,
-                    edge_map_variant,
-                ));
+                let learning_mask_is_current = temporal_clusters_active
+                    && motion_overlay.learning_canny_profile
+                        == edge_map_variant.learning_canny_profile()
+                    && motion_overlay.learning_canny_mask.len()
+                        == header.width.saturating_mul(header.height);
+                let canny = Arc::new(if learning_mask_is_current {
+                    learning_canny_mask_preview(
+                        &motion_overlay.learning_canny_mask,
+                        header.width,
+                        header.height,
+                        edge_map_variant,
+                    )
+                } else {
+                    edge_map_preview(
+                        quad_luma.as_ref(),
+                        header.width,
+                        header.height,
+                        edge_map_variant,
+                    )
+                });
                 let raw_color = Arc::new(raw10_color_preview(
                     &raw,
                     header.width,
@@ -33648,6 +33903,7 @@ fn receive(
                     surface_gaze,
                     virtual_contact_surface_gaze,
                     motion_octrees,
+                    sclera_red_canny: Arc::new(sclera_red_canny),
                     inner_iris_points: Arc::new(
                         inner_iris
                             .points
@@ -33939,7 +34195,7 @@ fn receive(
                         axis_ratio: border_focus.axis_ratio as f32,
                         axis_angle: border_focus.axis_angle as f32,
                         point_count: border_focus.points.len().min(u32::MAX as usize) as u32,
-                        payload,
+                        payload: Arc::clone(&payload),
                     });
                     for publisher in &model_publishers {
                         publisher.submit(Arc::clone(&model_frame));
@@ -35946,6 +36202,77 @@ fn draw_iris_radius_reticle(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn draw_sclera_red_canny_overlay(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    origin_x: i32,
+    origin_y: i32,
+    pixel_scale: usize,
+    frame_timestamp_ns: u64,
+    overlay: &raw_sclera_red_canny::ScleraRedCannyOverlay,
+) {
+    // A temporal track may span frames, but every red line and yellow anchor
+    // rendered here must have been re-observed on the exact displayed RAW
+    // exposure.
+    if overlay.timestamp_ns != frame_timestamp_ns {
+        return;
+    }
+    let scale = pixel_scale.max(1) as f32;
+    let screen_point = |point: [f32; 2]| {
+        (
+            origin_x + (point[0] * scale).round() as i32,
+            origin_y + (point[1] * scale).round() as i32,
+        )
+    };
+    for trail in &overlay.trails {
+        let color = if trail.stable {
+            0x00ff_d43d
+        } else {
+            0x00ff_8a28
+        };
+        for pair in trail.points.windows(2) {
+            let start = screen_point(pair[0]);
+            let end = screen_point(pair[1]);
+            draw_line_clipped(pixels, width, height, start.0, start.1, end.0, end.1, color);
+        }
+    }
+    for segment in &overlay.segments {
+        let start = screen_point(segment.start);
+        let end = screen_point(segment.end);
+        let color = if segment.strength >= 1.25 {
+            0x00ff_3030
+        } else {
+            0x00b8_2828
+        };
+        draw_line_clipped(pixels, width, height, start.0, start.1, end.0, end.1, color);
+    }
+    for anchor in &overlay.anchors {
+        let point = screen_point(anchor.point);
+        let radius = if anchor.stable {
+            pixel_scale.max(2) as i32 + 1
+        } else if anchor.persistent {
+            pixel_scale.max(2) as i32
+        } else {
+            1
+        };
+        let color = if anchor.stable {
+            0x00ff_ff40
+        } else if anchor.persistent {
+            0x00ff_b020
+        } else {
+            0x00c8_4848
+        };
+        for (start, end) in [
+            ((point.0 - radius, point.1), (point.0 + radius, point.1)),
+            ((point.0, point.1 - radius), (point.0, point.1 + radius)),
+        ] {
+            draw_line_clipped(pixels, width, height, start.0, start.1, end.0, end.1, color);
+        }
+    }
+}
+
 fn draw_eye(
     pixels: &mut [u32],
     width: usize,
@@ -36036,7 +36363,10 @@ fn draw_eye(
             );
         }
     }
-    if let Some(reticle) = frame.iris_radius_reticle {
+    if let Some(reticle) = frame
+        .iris_radius_reticle
+        .filter(|_| !segmentation_profile.show_sclera_red_canny)
+    {
         draw_iris_radius_reticle(
             pixels,
             width,
@@ -36049,7 +36379,10 @@ fn draw_eye(
             reticle,
         );
     }
-    if let Some(reticle) = frame.pupil_size_reticle {
+    if let Some(reticle) = frame
+        .pupil_size_reticle
+        .filter(|_| !segmentation_profile.show_sclera_red_canny)
+    {
         draw_pupil_size_reticle(
             pixels,
             width,
@@ -36062,7 +36395,7 @@ fn draw_eye(
             reticle,
         );
     }
-    if frame.size_reticle_mode.enabled() {
+    if frame.size_reticle_mode.enabled() && !segmentation_profile.show_sclera_red_canny {
         let nominal_label = if frame
             .iris_radius_reticle
             .is_some_and(|reticle| reticle.nominal_cold_start)
@@ -36094,6 +36427,18 @@ fn draw_eye(
             y,
             pixel_scale,
             frame.motion_octrees.as_ref(),
+        );
+    }
+    if segmentation_profile.show_sclera_red_canny {
+        draw_sclera_red_canny_overlay(
+            pixels,
+            width,
+            height,
+            x,
+            y,
+            pixel_scale,
+            frame.timestamp_ns,
+            frame.sclera_red_canny.as_ref(),
         );
     }
     if focus_target {
@@ -37933,25 +38278,19 @@ fn presentation_pivot_contact_from_frame(
     eye: usize,
     frame: &EyeFrame,
 ) -> Option<PresentationPivotContact> {
-    // A directly published pivot is authoritative. For debugging, retain the
-    // anatomy-authorized latent candidate too, but mark it separately all the
-    // way through presentation. Neither path uses a pupil/limbus center as a
-    // substitute for the estimator's actual pivot hypothesis.
+    // Only a directly published pivot is authoritative enough to display.
+    // Do not turn a latent candidate, pupil center, or limbus center into a
+    // visible globe origin.
     let globe = frame.motion_octrees.coupled_motion.projected_globe;
     if !frame.presentation_contact_boundary.is_empty()
         || !frame.eye_identity_present
         || !globe.anatomy_authorized
+        || !globe.publishable
         || globe.temporally_bridged
     {
         return None;
     }
-    let directly_published = globe.publishable && frame.projected_rotation_center.is_some();
-    let pivot = frame.projected_rotation_center.or_else(|| {
-        globe.projected_pivot.and_then(|point| {
-            let point = (f64::from(point[0]), f64::from(point[1]));
-            (point.0.is_finite() && point.1.is_finite()).then_some(point)
-        })
-    })?;
+    let pivot = frame.projected_rotation_center?;
     let pole = frame.projected_gaze_pole.or_else(|| {
         globe.projected_pole.and_then(|vector| {
             let vector = (f64::from(vector[0]), f64::from(vector[1]));
@@ -37996,7 +38335,7 @@ fn presentation_pivot_contact_from_frame(
     )?;
     Some(PresentationPivotContact {
         eye,
-        directly_published,
+        directly_published: true,
         sensor_xyz: (
             frame.sensor_x as f64 + geometry.rotation_center.0,
             frame.sensor_y as f64 + geometry.rotation_center.1,
@@ -38030,76 +38369,13 @@ fn update_presentation_pivot_contact(
         if duplicate {
             return false;
         }
-        // Once a direct pivot exists, a merely anatomy-supported candidate
-        // cannot drag it elsewhere. Transport the direct point until another
-        // direct publication supersedes it.
-        let preserve_direct = contact.as_ref().is_some_and(|current| {
-            current.eye == eye && current.directly_published && !measured.directly_published
-        });
-        if !preserve_direct {
-            *contact = Some(measured);
-            return true;
-        }
-    }
-    if contact.as_ref().is_some_and(|current| current.eye != eye) {
-        *contact = None;
-        return false;
-    }
-    let Some(contact) = contact.as_mut() else {
-        return false;
-    };
-    if contact.last_frame_timestamp_ns == frame.timestamp_ns {
-        return false;
+        *contact = Some(measured);
+        return true;
     }
 
-    let global_motion = frame.motion_octrees.motions[raw_motion_octrees::GENERAL_LAYER];
-    let global_layer = frame.motion_octrees.layers[raw_motion_octrees::GENERAL_LAYER];
-    let global_reliable = global_motion.support >= 4
-        && global_layer.persistent_tracks >= 3
-        && global_layer.stable_frames >= 2
-        && global_layer.coherence >= 0.10
-        && global_motion.residual.is_finite()
-        && global_motion.residual <= 4.0
-        && global_motion.translation[0].hypot(global_motion.translation[1]) <= 64.0
-        && global_motion.rotation.abs() <= 0.14
-        && global_motion.scale_delta.abs() <= 0.10;
-    if global_reliable {
-        let analysis_center = (
-            frame.sensor_x as f64 + frame.width as f64 * 0.5,
-            frame.sensor_y as f64 + frame.height as f64 * 0.5,
-        );
-        let scale = (1.0 + f64::from(global_motion.scale_delta)).clamp(0.90, 1.10);
-        let rotation = f64::from(global_motion.rotation);
-        let translation = (
-            f64::from(global_motion.translation[0]),
-            f64::from(global_motion.translation[1]),
-        );
-        let transform_point = |point: (f64, f64)| {
-            let local = (point.0 - analysis_center.0, point.1 - analysis_center.1);
-            (
-                analysis_center.0 + scale * local.0 - rotation * local.1 + translation.0,
-                analysis_center.1 + rotation * local.0 + scale * local.1 + translation.1,
-            )
-        };
-        let pivot_xy = transform_point((contact.sensor_xyz.0, contact.sensor_xyz.1));
-        contact.sensor_xyz.0 = pivot_xy.0;
-        contact.sensor_xyz.1 = pivot_xy.1;
-        contact.sensor_xyz.2 *= scale;
-        contact.boundary_sensor_center = transform_point(contact.boundary_sensor_center);
-        contact.boundary_radius *= scale;
-        contact.sphere_radius *= scale;
-        let pole = contact.projected_gaze_pole;
-        contact.projected_gaze_pole = (
-            scale * pole.0 - rotation * pole.1,
-            rotation * pole.0 + scale * pole.1,
-        );
-    }
-    // Without a trustworthy global transform, retaining absolute sensor
-    // coordinates is safer than following a semantic iris/pupil guess. ROI
-    // relocation still projects this sensor-fixed marker correctly.
-    contact.last_frame_timestamp_ns = frame.timestamp_ns;
-    contact.held_frames = contact.held_frames.saturating_add(1);
-    true
+    // No current publication means no marker. In particular, do not keep a
+    // plausible-looking UI estimate alive after its evidence has disappeared.
+    contact.take().is_some()
 }
 
 fn apply_presentation_pivot_contact(
@@ -38649,6 +38925,7 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
         .map(|state| state.segmentation_mode)
         .unwrap_or(SegmentationMode::Native);
     let driving_mode = segmentation_mode == SegmentationMode::Driving;
+    let sclera_red_canny_mode = segmentation_mode == SegmentationMode::ScleraRedCanny;
     if let Some(backdrop) = app.backdrop.as_ref() {
         let backdrop_y = if status_panel_width == 0 { 168 } else { 28 };
         let backdrop_height = start_y.saturating_sub(backdrop_y + 28);
@@ -39041,7 +39318,7 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
         ),
         (
             format!(
-                "R REACQ+SIZE-FREEZE {}  G IRIS  Y CENTER  U RETICLE 3-STATE  X LIGHTHOUSE",
+                "R REACQ+SIZE-FREEZE {}  G METHOD  Y CENTER  U RETICLE 3-STATE",
                 if mediapipe_enabled { "ON" } else { "OFF" }
             ),
             if mediapipe_enabled {
@@ -39051,8 +39328,12 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
             },
         ),
         (
+            "X LIGHTHOUSE  Z OPTICAL SCREEN CLOCK (Z/ESC RETURNS)".to_string(),
+            core_background,
+        ),
+        (
             format!(
-                "K EDGE {}/{} {}",
+                "K LEARN-CANNY+VIEW {}/{} {}",
                 app.edge_map_variant.ordinal(),
                 EdgeMapVariant::COUNT,
                 app.edge_map_variant.label(),
@@ -39174,7 +39455,16 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
             ),
         );
     }
-    if size_reticle_mode.enabled() {
+    if sclera_red_canny_mode {
+        rows.insert(
+            2,
+            (
+                "SCLERA RED-CANNY: RED CURRENT RAW LINE  ORANGE TRAIL  YELLOW STABLE".to_string(),
+                0x0058_2929,
+            ),
+        );
+    }
+    if size_reticle_mode.enabled() && !sclera_red_canny_mode {
         rows.splice(
             1..2,
             [
@@ -39449,6 +39739,11 @@ impl ApplicationHandler for App {
                             visible_lighthouse_control::toggle_or_start_async("X hotkey");
                         }
                     }
+                    PhysicalKey::Code(KeyCode::KeyZ) => {
+                        if !event.repeat {
+                            screen_reflection_stimulus::toggle_or_start_async("Z hotkey");
+                        }
+                    }
                     PhysicalKey::Code(KeyCode::KeyK) => {
                         if !event.repeat {
                             let selected = self.shared.lock().ok().map(|mut shared| {
@@ -39460,7 +39755,7 @@ impl ApplicationHandler for App {
                                 self.edge_map_variant = variant;
                                 self.mode = ViewMode::Canny;
                                 eprintln!(
-                                    "edge-map diagnostic cycled by K to {}/{} {}",
+                                    "learning Canny calculation and diagnostic view cycled by K to {}/{} {}",
                                     variant.ordinal(),
                                     EdgeMapVariant::COUNT,
                                     variant.label(),
@@ -39492,19 +39787,19 @@ impl ApplicationHandler for App {
                                     .cycled_compatible(shared.rough_pupil_center_mode);
                                 if mode == previous {
                                     eprintln!(
-                                        "iris segmentation held at {}; rough-center={} permits no other iris mode (Y changes center)",
+                                        "segmentation method held at {}; rough-center={} permits no other method (Y changes center)",
                                         mode.label(),
                                         shared.rough_pupil_center_mode.label(),
                                     );
                                 } else {
                                     match set_segmentation_mode(&mut shared, mode, "G hotkey") {
                                         Ok(()) => eprintln!(
-                                            "iris segmentation cycled to {} by G with rough-center={}",
+                                            "segmentation method cycled to {} by G with rough-center={}",
                                             mode.label(),
                                             shared.rough_pupil_center_mode.label(),
                                         ),
                                         Err(error) => eprintln!(
-                                            "iris segmentation cycle refused for rough-center={}: {error}",
+                                            "segmentation method cycle refused for rough-center={}: {error}",
                                             shared.rough_pupil_center_mode.label(),
                                         ),
                                     }
@@ -40055,7 +40350,8 @@ fn parse_config() -> Result<Config, String> {
             "--segmentation" => {
                 let requested = value()?;
                 config.segmentation = SegmentationMode::parse(requested).ok_or_else(|| {
-                    "--segmentation must be native, sam31, clusters, or driving".to_string()
+                    "--segmentation must be native, sam31, clusters, driving, or sclera-red-canny"
+                        .to_string()
                 })?;
                 if is_legacy_sam31_pupil_mode(requested) {
                     config.rough_pupil_center = RoughPupilCenterMode::Sam31;
@@ -40105,7 +40401,7 @@ fn parse_config() -> Result<Config, String> {
             }
             "-h" | "--help" => {
                 println!(
-                    "usage: buttercup-eye-viewer [OPTIONS]\n\nNo options are required for the standard Podbay camera. The default view uses a low-bandwidth GRAY16 sensor overview, two native RAW10 eye ROIs, Native segmentation, and automatic focus-eye selection.\n\noptional overrides: --camera HOST:PORT --vcm HOST:PORT --control PATH.sock --origin SENSOR_BAND_X,Y --left ABS_SENSOR_X,Y --right ABS_SENSOR_X,Y --eye WxH --window WxH --focus-eye auto|left|right --tracking FRAME.ppm --record FILE.tar --autofocus-armed --segmentation native|sam31|clusters|driving --rough-center iris-guided|raw-focus|sam31-center|mediapipe-acquire|mediapipe-continuous|driving-topology --driving-submode normal|double-sclera-10deg --global-format gray16|raw10 --model-stream PATH.sock --sam31-model FILE.pt\n\ncontrol commands: STATUS | SEGMENTATION NATIVE|SAM31|CLUSTERS|DRIVING | SEGMENTATION STATUS | IRIS STATUS | IRIS BOUNDS MINIMUM|MAXIMUM +/- | IRIS BOUNDS AUTO | PUPIL STATUS | PUPIL BOUNDS MINIMUM|MAXIMUM +/- | PUPIL BOUNDS DEFAULT | PUPIL CENTER MODE | PUPIL|IRIS RETICLE OFF|STATIC|PROJECTED|ON|TOGGLE | DRIVING NORMAL|DOUBLE-SCLERA-10DEG|STATUS | LEASE CLAIM OWNER TTL_MS | LEASE RENEW TOKEN TTL_MS | LEASE RELEASE TOKEN | LEASE STATUS | WITH TOKEN REACQUIRE | WITH TOKEN LINEAR SNAPSHOT | WITH TOKEN FOCUS EYE RIGHT|LEFT | WITH TOKEN FOCUS SET N | WITH TOKEN FOCUS AUTO | WITH TOKEN EXPORT RAW RIGHT /absolute/path.raw10 | EXPORT PRESENTATION /absolute/path.ppm | EXPORT STATUS"
+                    "usage: buttercup-eye-viewer [OPTIONS]\n\nNo options are required for the standard Podbay camera. The default view uses a low-bandwidth GRAY16 sensor overview, two native RAW10 eye ROIs, Native segmentation, and automatic focus-eye selection.\n\noptional overrides: --camera HOST:PORT --vcm HOST:PORT --control PATH.sock --origin SENSOR_BAND_X,Y --left ABS_SENSOR_X,Y --right ABS_SENSOR_X,Y --eye WxH --window WxH --focus-eye auto|left|right --tracking FRAME.ppm --record FILE.tar --autofocus-armed --segmentation native|sam31|clusters|driving|sclera-red-canny --rough-center iris-guided|raw-focus|sam31-center|mediapipe-acquire|mediapipe-continuous|driving-topology --driving-submode normal|double-sclera-10deg --global-format gray16|raw10 --model-stream PATH.sock --sam31-model FILE.pt\n\ncontrol commands: STATUS | SEGMENTATION NATIVE|SAM31|CLUSTERS|DRIVING|SCLERA-RED-CANNY | SEGMENTATION STATUS | IRIS STATUS | IRIS BOUNDS MINIMUM|MAXIMUM +/- | IRIS BOUNDS AUTO | PUPIL STATUS | PUPIL BOUNDS MINIMUM|MAXIMUM +/- | PUPIL BOUNDS DEFAULT | PUPIL CENTER MODE | PUPIL|IRIS RETICLE OFF|STATIC|PROJECTED|ON|TOGGLE | DRIVING NORMAL|DOUBLE-SCLERA-10DEG|STATUS | LEASE CLAIM OWNER TTL_MS | LEASE RENEW TOKEN TTL_MS | LEASE RELEASE TOKEN | LEASE STATUS | WITH TOKEN REACQUIRE | WITH TOKEN LINEAR SNAPSHOT | WITH TOKEN FOCUS EYE RIGHT|LEFT | WITH TOKEN FOCUS SET N | WITH TOKEN FOCUS AUTO | WITH TOKEN EXPORT RAW RIGHT /absolute/path.raw10 | EXPORT PRESENTATION /absolute/path.ppm | EXPORT STATUS"
                 );
                 std::process::exit(0);
             }
@@ -40194,6 +40490,9 @@ fn run() -> Result<(), String> {
                     config.rough_pupil_center.short_label(),
                 )
             }
+            SegmentationMode::ScleraRedCanny => {
+                "SCLERA RED-CANNY WARMING (startup); NO IRIS/PUPIL  G CYCLE".to_string()
+            }
         },
         ..SharedState::default()
     }));
@@ -40275,6 +40574,9 @@ fn main() {
         }
         Some("--offline-labeled-driving-eval") => {
             offline_segmentation_replay::labeled_raw_eval(env::args().skip(2))
+        }
+        Some(screen_reflection_stimulus::SUBCOMMAND) => {
+            screen_reflection_stimulus::run(env::args().skip(2))
         }
         _ => run(),
     };
@@ -41775,7 +42077,7 @@ mod tests {
             axis_ratio: 1.12,
             axis_angle: -0.31,
             point_count: 37,
-            payload: vec![0; 480 * 256],
+            payload: Arc::new(vec![0; 480 * 256]),
         };
 
         let header = frame.header().unwrap();
@@ -41857,7 +42159,7 @@ mod tests {
             axis_ratio: 1.0,
             axis_angle: 0.0,
             point_count: 12,
-            payload: vec![1, 2, 3, 4, 5],
+            payload: Arc::new(vec![1, 2, 3, 4, 5]),
         });
 
         let first_frame_ref = Arc::clone(&frame);
@@ -44682,6 +44984,7 @@ mod tests {
             surface_gaze: None,
             virtual_contact_surface_gaze: None,
             motion_octrees: Arc::new(raw_motion_octrees::MotionOctreeOverlay::default()),
+            sclera_red_canny: Arc::new(raw_sclera_red_canny::ScleraRedCannyOverlay::default()),
             inner_iris_points: Arc::new(Vec::new()),
             pupil_polar_points: Arc::new(Vec::new()),
             pupil_polar_slice_points: Arc::new(Vec::new()),
@@ -44708,6 +45011,68 @@ mod tests {
             upper_limbus_clearance_px: None,
             lower_limbus_clearance_px: None,
         }
+    }
+
+    #[test]
+    fn sclera_red_canny_mode_draws_current_raw_lines_and_stable_tracks() {
+        let mut frame = control_eye_frame(1);
+        frame.segmentation_mode = SegmentationMode::ScleraRedCanny;
+        frame.sclera_red_canny = Arc::new(raw_sclera_red_canny::ScleraRedCannyOverlay {
+            timestamp_ns: frame.timestamp_ns,
+            segments: vec![raw_sclera_red_canny::RedCannySegment {
+                start: [0.5, 0.5],
+                end: [3.5, 0.5],
+                strength: 2.0,
+            }],
+            anchors: vec![raw_sclera_red_canny::RedCannyAnchor {
+                id: 7,
+                point: [2.0, 2.0],
+                strength: 2.0,
+                persistent: true,
+                stable: true,
+            }],
+            ..raw_sclera_red_canny::ScleraRedCannyOverlay::default()
+        });
+        let mut pixels = vec![0u32; 96 * 96];
+        draw_eye(
+            &mut pixels,
+            96,
+            96,
+            &frame,
+            12,
+            32,
+            ViewMode::QuadColor,
+            "TEST",
+            false,
+            true,
+            4,
+            None,
+        );
+        assert!(pixels.contains(&0x00ff_3030));
+        assert!(pixels.contains(&0x00ff_ff40));
+    }
+
+    #[test]
+    fn sclera_red_canny_renderer_rejects_a_stale_overlay() {
+        let overlay = raw_sclera_red_canny::ScleraRedCannyOverlay {
+            timestamp_ns: 122_999,
+            segments: vec![raw_sclera_red_canny::RedCannySegment {
+                start: [1.0, 1.0],
+                end: [3.0, 1.0],
+                strength: 2.0,
+            }],
+            anchors: vec![raw_sclera_red_canny::RedCannyAnchor {
+                id: 9,
+                point: [2.0, 2.0],
+                strength: 2.0,
+                persistent: true,
+                stable: true,
+            }],
+            ..raw_sclera_red_canny::ScleraRedCannyOverlay::default()
+        };
+        let mut pixels = vec![0u32; 32 * 32];
+        draw_sclera_red_canny_overlay(&mut pixels, 32, 32, 0, 0, 2, 123_000, &overlay);
+        assert!(pixels.iter().all(|pixel| *pixel == 0));
     }
 
     #[test]
@@ -45023,12 +45388,23 @@ mod tests {
         assert_eq!(driving.motion_work, SegmentationMotionWork::BoundedIris);
         assert!(driving.show_motion_overlay());
         assert!(driving.show_driving_diagnostics);
+        assert!(!driving.show_sclera_red_canny);
         assert!(driving.show_censored_limbus);
         assert!(driving.show_rotation_meridians);
         assert_eq!(
             driving.eyelid_overlay,
             SegmentationEyelidOverlay::DrivingScene
         );
+
+        let sclera = SegmentationMode::ScleraRedCanny.profile();
+        assert_eq!(sclera.motion_work, SegmentationMotionWork::None);
+        assert!(!sclera.show_motion_overlay());
+        assert!(!sclera.show_native_diagnostics);
+        assert!(!sclera.show_censored_limbus);
+        assert!(!sclera.show_driving_diagnostics);
+        assert!(sclera.show_sclera_red_canny);
+        assert!(!sclera.show_rotation_meridians);
+        assert_eq!(sclera.eyelid_overlay, SegmentationEyelidOverlay::None);
     }
 
     #[test]
@@ -45853,10 +46229,28 @@ mod tests {
             SegmentationMode::Clusters.cycled(),
             SegmentationMode::Driving
         );
-        assert_eq!(SegmentationMode::Driving.cycled(), SegmentationMode::Native);
+        assert_eq!(
+            SegmentationMode::Driving.cycled(),
+            SegmentationMode::ScleraRedCanny
+        );
+        assert_eq!(
+            SegmentationMode::ScleraRedCanny.cycled(),
+            SegmentationMode::Native
+        );
         assert_eq!(SegmentationMode::Driving.label(), "driving");
         assert_eq!(
+            SegmentationMode::parse("sclera-red-canny"),
+            Some(SegmentationMode::ScleraRedCanny)
+        );
+        assert_eq!(
             sam31_target_for_modes(SegmentationMode::Driving, RoughPupilCenterMode::IrisGuided,),
+            None,
+        );
+        assert_eq!(
+            sam31_target_for_modes(
+                SegmentationMode::ScleraRedCanny,
+                RoughPupilCenterMode::Sam31,
+            ),
             None,
         );
     }
@@ -45965,6 +46359,14 @@ mod tests {
             SegmentationMode::Driving
         );
         assert_eq!(
+            SegmentationMode::Driving.cycled(),
+            SegmentationMode::ScleraRedCanny
+        );
+        assert_eq!(
+            SegmentationMode::ScleraRedCanny.cycled(),
+            SegmentationMode::Native
+        );
+        assert_eq!(
             RoughPupilCenterMode::IrisGuided.cycled(),
             RoughPupilCenterMode::RawFocus,
         );
@@ -45975,6 +46377,13 @@ mod tests {
         assert_eq!(
             sam31_target_for_modes(SegmentationMode::Driving, RoughPupilCenterMode::Sam31,),
             Some(sam31_outer::Target::InnerPupilVoid),
+        );
+        assert_eq!(
+            sam31_target_for_modes(
+                SegmentationMode::ScleraRedCanny,
+                RoughPupilCenterMode::Sam31,
+            ),
+            None,
         );
         assert!(RoughPupilCenterMode::MediaPipeAcquire
             .compatibility(SegmentationMode::Driving)
@@ -45997,6 +46406,7 @@ mod tests {
             SegmentationMode::Sam31,
             SegmentationMode::Clusters,
             SegmentationMode::Driving,
+            SegmentationMode::ScleraRedCanny,
         ];
         let center_modes = [
             RoughPupilCenterMode::IrisGuided,
@@ -46009,6 +46419,7 @@ mod tests {
         for iris in iris_modes {
             for center in center_modes {
                 let expected = match center {
+                    _ if iris == SegmentationMode::ScleraRedCanny => true,
                     RoughPupilCenterMode::MediaPipeContinuous => iris == SegmentationMode::Native,
                     RoughPupilCenterMode::DrivingTopology => iris == SegmentationMode::Driving,
                     _ => true,
@@ -46024,11 +46435,11 @@ mod tests {
         }
         assert_eq!(
             SegmentationMode::Native.cycled_compatible(RoughPupilCenterMode::MediaPipeContinuous),
-            SegmentationMode::Native,
+            SegmentationMode::ScleraRedCanny,
         );
         assert_eq!(
             SegmentationMode::Driving.cycled_compatible(RoughPupilCenterMode::DrivingTopology),
-            SegmentationMode::Driving,
+            SegmentationMode::ScleraRedCanny,
         );
         assert_eq!(
             SegmentationMode::Native.cycled_compatible(RoughPupilCenterMode::RawFocus),
@@ -54612,7 +55023,7 @@ mod tests {
     }
 
     #[test]
-    fn published_pivot_persists_as_display_only_contact_through_a_weak_frame() {
+    fn published_pivot_is_removed_from_presentation_on_a_weak_frame() {
         let outer_prediction = vec![
             (20.0, 40.0),
             (26.0, 26.0),
@@ -54663,33 +55074,14 @@ mod tests {
         motion.layers[raw_motion_octrees::GENERAL_LAYER].coherence = 0.5;
         weak.motion_octrees = Arc::new(motion);
         assert!(update_presentation_pivot_contact(&mut contact, 0, &weak));
-        let held = contact.expect("weak frame retains contact");
-        assert_eq!(held.held_frames, 1);
-        assert!((held.sensor_xyz.0 - (direct.sensor_xyz.0 + 3.0)).abs() < 1.0e-9);
-        assert!((held.sensor_xyz.1 - (direct.sensor_xyz.1 - 2.0)).abs() < 1.0e-9);
-
-        let mut presented = weak.clone();
-        apply_presentation_pivot_contact(0, &mut presented, held);
-        assert!(presented.presentation_pivot_held);
-        assert_eq!(presented.presentation_contact_boundary.len(), 72);
-        assert_eq!(
-            virtual_contact_pose(&presented)
-                .expect("held virtual contact remains drawable")
-                .authority,
-            VirtualContactAuthority::MotionHeld
-        );
         assert!(
-            presentation_pivot_contact_from_frame(0, &presented).is_none(),
-            "a held UI clone must never renew its own authority"
-        );
-        assert!(
-            ray_origin_lock_from_frame(0, &presented).is_none(),
-            "a synthetic contact boundary must never enter the manual ray lock"
+            contact.is_none(),
+            "a weak frame must remove the stale presentation-only pivot"
         );
     }
 
     #[test]
-    fn anatomy_supported_unpublished_pivot_is_explicitly_a_candidate_contact() {
+    fn anatomy_supported_unpublished_pivot_is_not_presented() {
         let mut frame = control_eye_frame(1);
         frame.width = 96;
         frame.height = 96;
@@ -54706,21 +55098,10 @@ mod tests {
         motion.coupled_motion.projected_globe.publishable = false;
         frame.motion_octrees = Arc::new(motion);
 
-        let candidate = presentation_pivot_contact_from_frame(0, &frame)
-            .expect("anatomy-supported latent pivot remains inspectable");
-        assert!(!candidate.directly_published);
-        let mut presented = frame.clone();
-        apply_presentation_pivot_contact(0, &mut presented, candidate);
-        assert!(!presented.presentation_pivot_direct);
-        assert!(!presented.presentation_pivot_held);
-        assert_eq!(presented.presentation_contact_boundary.len(), 72);
-        assert_eq!(
-            virtual_contact_pose(&presented)
-                .expect("candidate virtual contact")
-                .authority,
-            VirtualContactAuthority::AnatomyCandidate
-        );
-        assert!(ray_origin_lock_from_frame(0, &presented).is_none());
+        assert!(presentation_pivot_contact_from_frame(0, &frame).is_none());
+        let mut contact = None;
+        assert!(!update_presentation_pivot_contact(&mut contact, 0, &frame));
+        assert!(contact.is_none());
     }
 
     #[test]

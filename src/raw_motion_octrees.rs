@@ -22,6 +22,121 @@ pub const GENERAL_LAYER: usize = 0;
 pub const PUPIL_LAYER: usize = 1;
 pub const REFLECTION_LAYER: usize = 2;
 pub const RESIDUAL_LAYER: usize = 3;
+
+/// Runtime-selectable native-RAW edge definition for the 2D temporal learning
+/// layers.  This is deliberately a calculation profile, not a renderer mode:
+/// changing it changes which current-frame Canny samples may seed and sustain
+/// feature tracks.  Other segmentation modes retain their established
+/// balanced Canny calculation unless they explicitly opt into this type.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LearningCannyProfile {
+    #[default]
+    CannyBalanced,
+    CannySensitive,
+    CannyStrict,
+    SobelSharp,
+    SobelSmooth,
+    ScharrCanny,
+    Laplacian,
+    DifferenceOfGaussians,
+    GradientCompass,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CannyGradientKernel {
+    Sobel,
+    Scharr,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CannyInputFilter {
+    Raw,
+    Gaussian(u8),
+    Laplacian,
+    DifferenceOfGaussians,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LearningCannySettings {
+    input: CannyInputFilter,
+    kernel: CannyGradientKernel,
+    high_quantile: f64,
+    low_ratio: f32,
+    high_floor: f32,
+}
+
+impl LearningCannyProfile {
+    fn settings(self) -> LearningCannySettings {
+        match self {
+            // Balanced is the exact historical learning-layer calculation.
+            Self::CannyBalanced => LearningCannySettings {
+                input: CannyInputFilter::Gaussian(1),
+                kernel: CannyGradientKernel::Scharr,
+                high_quantile: 0.82,
+                low_ratio: 0.36,
+                high_floor: 48.0,
+            },
+            Self::CannySensitive => LearningCannySettings {
+                input: CannyInputFilter::Gaussian(1),
+                kernel: CannyGradientKernel::Scharr,
+                high_quantile: 0.68,
+                low_ratio: 0.30,
+                high_floor: 28.0,
+            },
+            Self::CannyStrict => LearningCannySettings {
+                input: CannyInputFilter::Gaussian(1),
+                kernel: CannyGradientKernel::Scharr,
+                high_quantile: 0.92,
+                low_ratio: 0.58,
+                high_floor: 72.0,
+            },
+            Self::SobelSharp => LearningCannySettings {
+                input: CannyInputFilter::Raw,
+                kernel: CannyGradientKernel::Sobel,
+                high_quantile: 0.80,
+                low_ratio: 0.38,
+                // A Sobel response is approximately one quarter of Scharr's
+                // response for the same step on this RAW10 scale.
+                high_floor: 12.0,
+            },
+            Self::SobelSmooth => LearningCannySettings {
+                input: CannyInputFilter::Gaussian(2),
+                kernel: CannyGradientKernel::Sobel,
+                high_quantile: 0.80,
+                low_ratio: 0.40,
+                high_floor: 10.0,
+            },
+            Self::ScharrCanny => LearningCannySettings {
+                input: CannyInputFilter::Gaussian(1),
+                kernel: CannyGradientKernel::Scharr,
+                high_quantile: 0.86,
+                low_ratio: 0.42,
+                high_floor: 60.0,
+            },
+            Self::Laplacian => LearningCannySettings {
+                input: CannyInputFilter::Laplacian,
+                kernel: CannyGradientKernel::Scharr,
+                high_quantile: 0.84,
+                low_ratio: 0.42,
+                high_floor: 24.0,
+            },
+            Self::DifferenceOfGaussians => LearningCannySettings {
+                input: CannyInputFilter::DifferenceOfGaussians,
+                kernel: CannyGradientKernel::Scharr,
+                high_quantile: 0.82,
+                low_ratio: 0.35,
+                high_floor: 18.0,
+            },
+            Self::GradientCompass => LearningCannySettings {
+                input: CannyInputFilter::Raw,
+                kernel: CannyGradientKernel::Scharr,
+                high_quantile: 0.90,
+                low_ratio: 0.18,
+                high_floor: 80.0,
+            },
+        }
+    }
+}
 // Eighty spatially tiled native-RAW tracks leave ample support for four
 // independent motion layers while bounding the quadratic patch-search work.
 // Offline 112-track replays regularly saturated the budget without improving
@@ -567,6 +682,12 @@ pub struct MotionOctreeOverlay {
     /// frame. They are diagnostic proposals only and never vote in a motion
     /// layer or ellipse until promoted to a multi-point trail.
     pub provisional_features: Vec<(f32, f32)>,
+    /// Exact native-resolution hysteresis result used by this frame's 2D
+    /// temporal feature learner. One byte per sensor sample keeps the view
+    /// lossless while avoiding a second, renderer-only Canny calculation.
+    /// Empty for modes which did not run the temporal learning field.
+    pub learning_canny_mask: Vec<u8>,
+    pub learning_canny_profile: LearningCannyProfile,
     pub edges: Vec<EdgeEvidence>,
     pub edge_high_threshold: f32,
     /// Canny samples whose vote was reduced by the bounded upper-eye motion
@@ -2071,27 +2192,33 @@ fn canny_simd_disabled() -> bool {
     })
 }
 
-fn scharr_gradients_scalar(
-    blurred: &[f32],
+fn gradients_scalar(
+    source: &[f32],
     width: usize,
     height: usize,
     gradient_x: &mut [f32],
     gradient_y: &mut [f32],
     magnitude: &mut [f32],
     direction: &mut [u8],
+    kernel: CannyGradientKernel,
 ) {
+    let (corner, middle) = match kernel {
+        CannyGradientKernel::Sobel => (1.0, 2.0),
+        CannyGradientKernel::Scharr => (3.0, 10.0),
+    };
     for y in 1..height - 1 {
         for x in 1..width - 1 {
             let at = |dx: isize, dy: isize| {
-                blurred[y.saturating_add_signed(dy) * width + x.saturating_add_signed(dx)]
+                source[y.saturating_add_signed(dy) * width + x.saturating_add_signed(dx)]
             };
-            let gx = -3.0 * at(-1, -1) + 3.0 * at(1, -1) - 10.0 * at(-1, 0) + 10.0 * at(1, 0)
-                - 3.0 * at(-1, 1)
-                + 3.0 * at(1, 1);
-            let gy = -3.0 * at(-1, -1) - 10.0 * at(0, -1) - 3.0 * at(1, -1)
-                + 3.0 * at(-1, 1)
-                + 10.0 * at(0, 1)
-                + 3.0 * at(1, 1);
+            let gx = -corner * at(-1, -1) + corner * at(1, -1) - middle * at(-1, 0)
+                + middle * at(1, 0)
+                - corner * at(-1, 1)
+                + corner * at(1, 1);
+            let gy = -corner * at(-1, -1) - middle * at(0, -1) - corner * at(1, -1)
+                + corner * at(-1, 1)
+                + middle * at(0, 1)
+                + corner * at(1, 1);
             let index = y * width + x;
             let power = gx.hypot(gy);
             gradient_x[index] = gx;
@@ -2111,10 +2238,8 @@ fn scharr_gradients_scalar(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn scharr_gradients_avx2(
-    blurred: &[f32],
+fn scharr_gradients_scalar(
+    source: &[f32],
     width: usize,
     height: usize,
     gradient_x: &mut [f32],
@@ -2122,19 +2247,68 @@ unsafe fn scharr_gradients_avx2(
     magnitude: &mut [f32],
     direction: &mut [u8],
 ) {
+    gradients_scalar(
+        source,
+        width,
+        height,
+        gradient_x,
+        gradient_y,
+        magnitude,
+        direction,
+        CannyGradientKernel::Scharr,
+    );
+}
+
+fn sobel_gradients_scalar(
+    source: &[f32],
+    width: usize,
+    height: usize,
+    gradient_x: &mut [f32],
+    gradient_y: &mut [f32],
+    magnitude: &mut [f32],
+    direction: &mut [u8],
+) {
+    gradients_scalar(
+        source,
+        width,
+        height,
+        gradient_x,
+        gradient_y,
+        magnitude,
+        direction,
+        CannyGradientKernel::Sobel,
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn gradients_avx2(
+    source: &[f32],
+    width: usize,
+    height: usize,
+    gradient_x: &mut [f32],
+    gradient_y: &mut [f32],
+    magnitude: &mut [f32],
+    direction: &mut [u8],
+    kernel: CannyGradientKernel,
+) {
     use std::arch::x86_64::*;
 
     unsafe {
-        let negative_three = _mm256_set1_ps(-3.0);
-        let positive_three = _mm256_set1_ps(3.0);
-        let negative_ten = _mm256_set1_ps(-10.0);
-        let positive_ten = _mm256_set1_ps(10.0);
+        let (corner, middle) = match kernel {
+            CannyGradientKernel::Sobel => (1.0, 2.0),
+            CannyGradientKernel::Scharr => (3.0, 10.0),
+        };
+        let negative_corner = _mm256_set1_ps(-corner);
+        let positive_corner = _mm256_set1_ps(corner);
+        let negative_middle = _mm256_set1_ps(-middle);
+        let positive_middle = _mm256_set1_ps(middle);
         for y in 1..height - 1 {
             let mut x = 1usize;
             while x + 7 < width - 1 {
                 let index = y * width + x;
                 let load = |offset: isize| {
-                    _mm256_loadu_ps(blurred.as_ptr().offset(index as isize + offset))
+                    _mm256_loadu_ps(source.as_ptr().offset(index as isize + offset))
                 };
                 let top_left = load(-(width as isize) - 1);
                 let top_center = load(-(width as isize));
@@ -2145,19 +2319,19 @@ unsafe fn scharr_gradients_avx2(
                 let bottom_center = load(width as isize);
                 let bottom_right = load(width as isize + 1);
 
-                let mut gx = _mm256_mul_ps(negative_three, top_left);
-                gx = _mm256_add_ps(gx, _mm256_mul_ps(positive_three, top_right));
-                gx = _mm256_add_ps(gx, _mm256_mul_ps(negative_ten, center_left));
-                gx = _mm256_add_ps(gx, _mm256_mul_ps(positive_ten, center_right));
-                gx = _mm256_add_ps(gx, _mm256_mul_ps(negative_three, bottom_left));
-                gx = _mm256_add_ps(gx, _mm256_mul_ps(positive_three, bottom_right));
+                let mut gx = _mm256_mul_ps(negative_corner, top_left);
+                gx = _mm256_add_ps(gx, _mm256_mul_ps(positive_corner, top_right));
+                gx = _mm256_add_ps(gx, _mm256_mul_ps(negative_middle, center_left));
+                gx = _mm256_add_ps(gx, _mm256_mul_ps(positive_middle, center_right));
+                gx = _mm256_add_ps(gx, _mm256_mul_ps(negative_corner, bottom_left));
+                gx = _mm256_add_ps(gx, _mm256_mul_ps(positive_corner, bottom_right));
 
-                let mut gy = _mm256_mul_ps(negative_three, top_left);
-                gy = _mm256_add_ps(gy, _mm256_mul_ps(negative_ten, top_center));
-                gy = _mm256_add_ps(gy, _mm256_mul_ps(negative_three, top_right));
-                gy = _mm256_add_ps(gy, _mm256_mul_ps(positive_three, bottom_left));
-                gy = _mm256_add_ps(gy, _mm256_mul_ps(positive_ten, bottom_center));
-                gy = _mm256_add_ps(gy, _mm256_mul_ps(positive_three, bottom_right));
+                let mut gy = _mm256_mul_ps(negative_corner, top_left);
+                gy = _mm256_add_ps(gy, _mm256_mul_ps(negative_middle, top_center));
+                gy = _mm256_add_ps(gy, _mm256_mul_ps(negative_corner, top_right));
+                gy = _mm256_add_ps(gy, _mm256_mul_ps(positive_corner, bottom_left));
+                gy = _mm256_add_ps(gy, _mm256_mul_ps(positive_middle, bottom_center));
+                gy = _mm256_add_ps(gy, _mm256_mul_ps(positive_corner, bottom_right));
 
                 _mm256_storeu_ps(gradient_x.as_mut_ptr().add(index), gx);
                 _mm256_storeu_ps(gradient_y.as_mut_ptr().add(index), gy);
@@ -2184,15 +2358,16 @@ unsafe fn scharr_gradients_avx2(
             }
             for x in x..width - 1 {
                 let at = |dx: isize, dy: isize| {
-                    blurred[y.saturating_add_signed(dy) * width + x.saturating_add_signed(dx)]
+                    source[y.saturating_add_signed(dy) * width + x.saturating_add_signed(dx)]
                 };
-                let gx = -3.0 * at(-1, -1) + 3.0 * at(1, -1) - 10.0 * at(-1, 0) + 10.0 * at(1, 0)
-                    - 3.0 * at(-1, 1)
-                    + 3.0 * at(1, 1);
-                let gy = -3.0 * at(-1, -1) - 10.0 * at(0, -1) - 3.0 * at(1, -1)
-                    + 3.0 * at(-1, 1)
-                    + 10.0 * at(0, 1)
-                    + 3.0 * at(1, 1);
+                let gx = -corner * at(-1, -1) + corner * at(1, -1) - middle * at(-1, 0)
+                    + middle * at(1, 0)
+                    - corner * at(-1, 1)
+                    + corner * at(1, 1);
+                let gy = -corner * at(-1, -1) - middle * at(0, -1) - corner * at(1, -1)
+                    + corner * at(-1, 1)
+                    + middle * at(0, 1)
+                    + corner * at(1, 1);
                 let index = y * width + x;
                 magnitude[index] = gx.hypot(gy);
                 gradient_x[index] = gx;
@@ -2209,6 +2384,56 @@ unsafe fn scharr_gradients_avx2(
                 };
             }
         }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn scharr_gradients_avx2(
+    source: &[f32],
+    width: usize,
+    height: usize,
+    gradient_x: &mut [f32],
+    gradient_y: &mut [f32],
+    magnitude: &mut [f32],
+    direction: &mut [u8],
+) {
+    unsafe {
+        gradients_avx2(
+            source,
+            width,
+            height,
+            gradient_x,
+            gradient_y,
+            magnitude,
+            direction,
+            CannyGradientKernel::Scharr,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sobel_gradients_avx2(
+    source: &[f32],
+    width: usize,
+    height: usize,
+    gradient_x: &mut [f32],
+    gradient_y: &mut [f32],
+    magnitude: &mut [f32],
+    direction: &mut [u8],
+) {
+    unsafe {
+        gradients_avx2(
+            source,
+            width,
+            height,
+            gradient_x,
+            gradient_y,
+            magnitude,
+            direction,
+            CannyGradientKernel::Sobel,
+        )
     }
 }
 
@@ -2235,6 +2460,51 @@ fn scharr_gradients(
     scharr_gradients_scalar(
         blurred, width, height, gradient_x, gradient_y, magnitude, direction,
     );
+}
+
+fn sobel_gradients(
+    source: &[f32],
+    width: usize,
+    height: usize,
+    gradient_x: &mut [f32],
+    gradient_y: &mut [f32],
+    magnitude: &mut [f32],
+    direction: &mut [u8],
+) {
+    #[cfg(target_arch = "x86_64")]
+    if !canny_simd_disabled() && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 is runtime-verified and uses the same one-pixel halo
+        // and vector bounds as the Scharr path above.
+        unsafe {
+            sobel_gradients_avx2(
+                source, width, height, gradient_x, gradient_y, magnitude, direction,
+            )
+        };
+        return;
+    }
+    sobel_gradients_scalar(
+        source, width, height, gradient_x, gradient_y, magnitude, direction,
+    );
+}
+
+fn canny_gradients(
+    source: &[f32],
+    width: usize,
+    height: usize,
+    gradient_x: &mut [f32],
+    gradient_y: &mut [f32],
+    magnitude: &mut [f32],
+    direction: &mut [u8],
+    kernel: CannyGradientKernel,
+) {
+    match kernel {
+        CannyGradientKernel::Sobel => sobel_gradients(
+            source, width, height, gradient_x, gradient_y, magnitude, direction,
+        ),
+        CannyGradientKernel::Scharr => scharr_gradients(
+            source, width, height, gradient_x, gradient_y, magnitude, direction,
+        ),
+    }
 }
 
 fn nonmaximum_suppression_scalar(
@@ -2367,7 +2637,73 @@ fn nonmaximum_suppression(
     nonmaximum_suppression_scalar(magnitude, direction, width, height)
 }
 
+fn raw_f32(source: &[u16]) -> Vec<f32> {
+    source.iter().map(|value| *value as f32).collect()
+}
+
+fn laplacian_response(source: &[f32], width: usize, height: usize) -> Vec<f32> {
+    let mut response = vec![0.0; source.len()];
+    for y in 1..height.saturating_sub(1) {
+        for x in 1..width.saturating_sub(1) {
+            let index = y * width + x;
+            response[index] = 4.0 * source[index]
+                - source[index - 1]
+                - source[index + 1]
+                - source[index - width]
+                - source[index + width];
+        }
+    }
+    response
+}
+
+/// Return (physical intensity plane used for signed-side attributes,
+/// optional alternate calculation plane differentiated by Canny).  `None`
+/// means the physical narrow-Gaussian plane is also the calculation plane;
+/// the default profile therefore retains the historical single allocation
+/// and memory-bandwidth cost. Keeping these separate lets band-pass profiles
+/// alter edge discovery without redefining which side of a discovered edge
+/// is physically dark, bright, textured, or scleral.
+fn learning_canny_inputs(
+    frame: &RawFrame,
+    filter: CannyInputFilter,
+) -> (Vec<f32>, Option<Vec<f32>>) {
+    let narrow = gaussian5(&frame.pixels, frame.width, frame.height);
+    let calculation = match filter {
+        CannyInputFilter::Raw => Some(raw_f32(&frame.pixels)),
+        CannyInputFilter::Gaussian(passes) => {
+            if passes == 0 {
+                Some(raw_f32(&frame.pixels))
+            } else if passes == 1 {
+                None
+            } else {
+                let mut filtered = gaussian5_f32(&narrow, frame.width, frame.height);
+                for _ in 2..passes {
+                    filtered = gaussian5_f32(&filtered, frame.width, frame.height);
+                }
+                Some(filtered)
+            }
+        }
+        CannyInputFilter::Laplacian => Some(laplacian_response(&narrow, frame.width, frame.height)),
+        CannyInputFilter::DifferenceOfGaussians => {
+            let medium = gaussian5_f32(&narrow, frame.width, frame.height);
+            let broad = gaussian5_f32(&medium, frame.width, frame.height);
+            Some(
+                narrow
+                    .iter()
+                    .zip(broad.iter())
+                    .map(|(near, far)| near - far)
+                    .collect(),
+            )
+        }
+    };
+    (narrow, calculation)
+}
+
 fn canny_field(frame: &RawFrame) -> CannyField {
+    canny_field_with_profile(frame, LearningCannyProfile::default())
+}
+
+fn canny_field_with_profile(frame: &RawFrame, profile: LearningCannyProfile) -> CannyField {
     let pixel_count = frame.width.saturating_mul(frame.height);
     let mut field = CannyField {
         gradient_x: vec![0.0; pixel_count],
@@ -2388,19 +2724,22 @@ fn canny_field(frame: &RawFrame) -> CannyField {
     if frame.width < 7 || frame.height < 7 || frame.pixels.len() != pixel_count {
         return field;
     }
+    let settings = profile.settings();
     let primary_blur_started = Instant::now();
-    let blurred = gaussian5(&frame.pixels, frame.width, frame.height);
+    let (blurred, alternate_calculation) = learning_canny_inputs(frame, settings.input);
     field.primary_blur_micros = primary_blur_started.elapsed().as_micros() as u64;
     let gradient_started = Instant::now();
     let mut direction = vec![0u8; pixel_count];
-    scharr_gradients(
-        &blurred,
+    let calculation = alternate_calculation.as_deref().unwrap_or(&blurred);
+    canny_gradients(
+        calculation,
         frame.width,
         frame.height,
         &mut field.gradient_x,
         &mut field.gradient_y,
         &mut field.magnitude,
         &mut direction,
+        settings.kernel,
     );
     field.gradient_micros = gradient_started.elapsed().as_micros() as u64;
     let hysteresis_started = Instant::now();
@@ -2424,10 +2763,10 @@ fn canny_field(frame: &RawFrame) -> CannyField {
         return field;
     }
     let quantile_started = Instant::now();
-    let quantile_index = ((positive.len() - 1) as f64 * 0.82).round() as usize;
+    let quantile_index = ((positive.len() - 1) as f64 * settings.high_quantile).round() as usize;
     positive.select_nth_unstable_by(quantile_index, f32::total_cmp);
-    let high = positive[quantile_index].max(48.0);
-    let low = high * 0.36;
+    let high = positive[quantile_index].max(settings.high_floor);
+    let low = high * settings.low_ratio;
     field.high_threshold = high;
     let mut stack = suppressed
         .iter()
@@ -3793,6 +4132,7 @@ impl BoundedIrisCannyTracker {
 pub struct FourMotionOctrees {
     previous: Option<RawFrame>,
     canny_features: bool,
+    learning_canny_profile: LearningCannyProfile,
     tracks: Vec<FeatureTrack>,
     motions: [SimilarityMotion; OBJECTS],
     layers: [MotionLayerStatus; OBJECTS],
@@ -8514,6 +8854,7 @@ impl FourMotionOctrees {
             sensor_y,
             focus_probe,
             use_canny_features,
+            LearningCannyProfile::default(),
             iris_seed,
             None,
         )
@@ -8540,6 +8881,38 @@ impl FourMotionOctrees {
             sensor_y,
             focus_probe,
             use_canny_features,
+            LearningCannyProfile::default(),
+            iris_seed,
+            Some(timestamp_ns),
+        )
+    }
+
+    /// Observe one native RAW frame with an explicitly selected calculation
+    /// profile for the temporal Canny learning layers.  The ordinary entry
+    /// points above retain the historical balanced profile for callers which
+    /// are not controlled by the live K selector.
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe_with_iris_seed_at_with_canny_profile(
+        &mut self,
+        pixels: &[u16],
+        width: usize,
+        height: usize,
+        sensor_x: u32,
+        sensor_y: u32,
+        timestamp_ns: u64,
+        focus_probe: Option<FocusDepthProbe>,
+        profile: LearningCannyProfile,
+        iris_seed: Option<IrisEllipseSeed>,
+    ) -> MotionOctreeOverlay {
+        self.observe_with_iris_seed_timestamp(
+            pixels,
+            width,
+            height,
+            sensor_x,
+            sensor_y,
+            focus_probe,
+            true,
+            profile,
             iris_seed,
             Some(timestamp_ns),
         )
@@ -8555,6 +8928,7 @@ impl FourMotionOctrees {
         sensor_y: u32,
         focus_probe: Option<FocusDepthProbe>,
         use_canny_features: bool,
+        learning_canny_profile: LearningCannyProfile,
         iris_seed: Option<IrisEllipseSeed>,
         timestamp_ns: Option<u64>,
     ) -> MotionOctreeOverlay {
@@ -8572,7 +8946,11 @@ impl FourMotionOctrees {
             });
         self.previous_timestamp_ns = Some(timestamp_ns);
         let preprocess_started = Instant::now();
-        if self.previous.is_some() && self.canny_features != use_canny_features {
+        let canny_definition_changed =
+            use_canny_features && self.learning_canny_profile != learning_canny_profile;
+        if self.previous.is_some()
+            && (self.canny_features != use_canny_features || canny_definition_changed)
+        {
             prediction_cadence_contiguous = false;
             self.previous = None;
             self.tracks.clear();
@@ -8580,12 +8958,17 @@ impl FourMotionOctrees {
             self.layers = [MotionLayerStatus::default(); OBJECTS];
             self.layer_signatures = Default::default();
             self.motion_relations.clear();
+            self.relation_iris_identity = Default::default();
             self.parallax_axis = [0.0; 2];
             self.semantic_eye_center = None;
             self.semantic_eye_region = None;
+            self.focus_sfm = Default::default();
+            self.focus_sweep_seen = false;
+            self.last_stable_focus = None;
             self.coupled_kinematics.clear();
         }
         self.canny_features = use_canny_features;
+        self.learning_canny_profile = learning_canny_profile;
         let neutral_started = Instant::now();
         let current_pixels = if use_canny_features {
             cfa_neutral_raw(pixels, width, height)
@@ -8601,7 +8984,8 @@ impl FourMotionOctrees {
             pixels: current_pixels,
         };
         let canny_started = Instant::now();
-        let mut canny = use_canny_features.then(|| canny_field(&current));
+        let mut canny =
+            use_canny_features.then(|| canny_field_with_profile(&current, learning_canny_profile));
         let canny_micros = canny_started.elapsed().as_micros() as u64;
         let (
             canny_primary_blur_micros,
@@ -8626,6 +9010,16 @@ impl FourMotionOctrees {
         let edge_output = canny
             .as_mut()
             .map(|field| edge_evidence(field, width, height))
+            .unwrap_or_default();
+        let learning_canny_mask = canny
+            .as_ref()
+            .map(|field| {
+                field
+                    .accepted
+                    .iter()
+                    .map(|accepted| u8::from(*accepted))
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         let mut edges = edge_output.edges;
         let edge_micros = edge_started.elapsed().as_micros() as u64;
@@ -8715,7 +9109,14 @@ impl FourMotionOctrees {
                 false,
                 None,
             );
-            return self.overlay(sensor_x, sensor_y, edges, edge_high_threshold, 0);
+            return self.overlay(
+                sensor_x,
+                sensor_y,
+                edges,
+                edge_high_threshold,
+                0,
+                learning_canny_mask,
+            );
         };
         if previous.width != width || previous.height != height {
             self.tracks.clear();
@@ -8760,7 +9161,14 @@ impl FourMotionOctrees {
                 false,
                 None,
             );
-            return self.overlay(sensor_x, sensor_y, edges, edge_high_threshold, 0);
+            return self.overlay(
+                sensor_x,
+                sensor_y,
+                edges,
+                edge_high_threshold,
+                0,
+                learning_canny_mask,
+            );
         }
         let center = [
             sensor_x as f32 + width as f32 * 0.5,
@@ -9533,6 +9941,7 @@ impl FourMotionOctrees {
             edges,
             edge_high_threshold,
             motion_shadow_edges_downweighted,
+            learning_canny_mask,
         )
     }
 
@@ -9543,6 +9952,7 @@ impl FourMotionOctrees {
         edges: Vec<EdgeEvidence>,
         edge_high_threshold: f32,
         motion_shadow_edges_downweighted: usize,
+        learning_canny_mask: Vec<u8>,
     ) -> MotionOctreeOverlay {
         let trails = self
             .tracks
@@ -9635,6 +10045,8 @@ impl FourMotionOctrees {
             motions: self.motions,
             layers,
             parallax_axis: self.parallax_axis,
+            learning_canny_mask,
+            learning_canny_profile: self.learning_canny_profile,
             edges,
             edge_high_threshold,
             motion_shadow_edges_downweighted,
@@ -11374,6 +11786,45 @@ mod tests {
                 avx2_direction, scalar_direction,
                 "direction {width}x{height}"
             );
+            let mut sobel_scalar_x = vec![0.0f32; pixel_count];
+            let mut sobel_scalar_y = vec![0.0f32; pixel_count];
+            let mut sobel_scalar_magnitude = vec![0.0f32; pixel_count];
+            let mut sobel_scalar_direction = vec![0u8; pixel_count];
+            sobel_gradients_scalar(
+                &blur_scalar,
+                width,
+                height,
+                &mut sobel_scalar_x,
+                &mut sobel_scalar_y,
+                &mut sobel_scalar_magnitude,
+                &mut sobel_scalar_direction,
+            );
+            let mut sobel_avx2_x = vec![0.0f32; pixel_count];
+            let mut sobel_avx2_y = vec![0.0f32; pixel_count];
+            let mut sobel_avx2_magnitude = vec![0.0f32; pixel_count];
+            let mut sobel_avx2_direction = vec![0u8; pixel_count];
+            // SAFETY: runtime feature detection above proves AVX2 support.
+            unsafe {
+                sobel_gradients_avx2(
+                    &blur_avx2,
+                    width,
+                    height,
+                    &mut sobel_avx2_x,
+                    &mut sobel_avx2_y,
+                    &mut sobel_avx2_magnitude,
+                    &mut sobel_avx2_direction,
+                );
+            }
+            assert_eq!(sobel_avx2_x, sobel_scalar_x, "Sobel x {width}x{height}");
+            assert_eq!(sobel_avx2_y, sobel_scalar_y, "Sobel y {width}x{height}");
+            assert_eq!(
+                sobel_avx2_magnitude, sobel_scalar_magnitude,
+                "Sobel magnitude {width}x{height}"
+            );
+            assert_eq!(
+                sobel_avx2_direction, sobel_scalar_direction,
+                "Sobel direction {width}x{height}"
+            );
             let suppressed_scalar =
                 nonmaximum_suppression_scalar(&scalar_magnitude, &scalar_direction, width, height);
             // SAFETY: runtime feature detection above proves AVX2 support.
@@ -11392,6 +11843,121 @@ mod tests {
                 "nonmaximum suppression {width}x{height}"
             );
         }
+    }
+
+    fn learning_profile_fixture(width: usize, height: usize) -> Vec<u16> {
+        (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| {
+                    let dx = x as f64 - width as f64 * 0.52;
+                    let dy = y as f64 - height as f64 * 0.49;
+                    let radius = (dx / 28.0).hypot(dy / 21.0);
+                    let iris_fibres = (0.43 * dx.atan2(dy) + 0.19 * radius * 28.0).sin();
+                    let base = if radius < 0.48 {
+                        120.0
+                    } else if radius < 1.0 {
+                        360.0 + 54.0 * iris_fibres
+                    } else {
+                        735.0
+                    };
+                    let fine = ((x * 37 + y * 71 + x * y * 11) % 43) as f64 - 21.0;
+                    (base + fine).round().clamp(0.0, 1023.0) as u16
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn learning_canny_profiles_change_the_native_hysteresis_field() {
+        let width = 112usize;
+        let height = 84usize;
+        let frame = RawFrame {
+            sensor_x: 0,
+            sensor_y: 0,
+            width,
+            height,
+            pixels: cfa_neutral_raw(&learning_profile_fixture(width, height), width, height),
+        };
+        let profiles = [
+            LearningCannyProfile::CannyBalanced,
+            LearningCannyProfile::CannySensitive,
+            LearningCannyProfile::CannyStrict,
+            LearningCannyProfile::SobelSharp,
+            LearningCannyProfile::SobelSmooth,
+            LearningCannyProfile::ScharrCanny,
+            LearningCannyProfile::Laplacian,
+            LearningCannyProfile::DifferenceOfGaussians,
+            LearningCannyProfile::GradientCompass,
+        ];
+        let fields = profiles
+            .into_iter()
+            .map(|profile| canny_field_with_profile(&frame, profile).accepted)
+            .collect::<Vec<_>>();
+        assert!(fields
+            .iter()
+            .all(|field| field.len() == width * height && field.iter().any(|value| *value)));
+        let distinct = (0..fields.len())
+            .filter(|index| fields[*index] != fields[0])
+            .count();
+        assert!(
+            distinct >= 7,
+            "K profiles collapsed onto the balanced calculation: distinct={distinct}"
+        );
+    }
+
+    #[test]
+    fn changing_learning_canny_profile_resets_old_edge_tracks() {
+        let width = 112usize;
+        let height = 84usize;
+        let raw = learning_profile_fixture(width, height);
+        let mut tracker = FourMotionOctrees::default();
+        let _ = tracker.observe_with_iris_seed_at_with_canny_profile(
+            &raw,
+            width,
+            height,
+            0,
+            0,
+            1_000_000_000,
+            None,
+            LearningCannyProfile::CannyBalanced,
+            None,
+        );
+        let established = tracker.observe_with_iris_seed_at_with_canny_profile(
+            &raw,
+            width,
+            height,
+            0,
+            0,
+            1_020_000_000,
+            None,
+            LearningCannyProfile::CannyBalanced,
+            None,
+        );
+        assert!(
+            !established.trails.is_empty(),
+            "fixture failed to establish temporal tracks"
+        );
+        let changed = tracker.observe_with_iris_seed_at_with_canny_profile(
+            &raw,
+            width,
+            height,
+            0,
+            0,
+            1_040_000_000,
+            None,
+            LearningCannyProfile::CannyStrict,
+            None,
+        );
+        assert_eq!(
+            changed.learning_canny_profile,
+            LearningCannyProfile::CannyStrict
+        );
+        assert_eq!(changed.learning_canny_mask.len(), width * height);
+        assert!(
+            changed.trails.is_empty(),
+            "tracks learned under the old Canny definition survived K"
+        );
+        assert!(!changed.provisional_features.is_empty());
     }
 
     #[test]

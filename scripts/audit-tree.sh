@@ -21,6 +21,7 @@ mapfile -t unexpected_files < <(
       ./scripts/audit-tree.sh \
       ./scripts/run-viewer.sh \
       ./src/checkerboard_calibration.rs \
+      ./src/bin/buttercup_screen_reflection_raw_decode.rs \
       ./src/coupled_eye_kinematics.rs \
       ./src/main.rs \
       ./src/native_mediapipe.rs \
@@ -30,7 +31,13 @@ mapfile -t unexpected_files < <(
       ./src/raw_eye_model_protocol.rs \
       ./src/raw_iris_focus.rs \
       ./src/raw_motion_octrees.rs \
+      ./src/raw_sclera_red_canny.rs \
       ./src/sam31_outer.rs \
+      ./src/screen_reflection_clock.rs \
+      ./src/screen_reflection_code.rs \
+      ./src/screen_reflection_live.rs \
+      ./src/screen_reflection_raw.rs \
+      ./src/screen_reflection_stimulus.rs \
       ./src/specular_map.rs \
       ./src/visible_lighthouse_control.rs | sort)
 )
