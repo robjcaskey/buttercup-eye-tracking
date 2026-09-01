@@ -34,6 +34,13 @@ cargo build --release
 scripts/run-viewer.sh
 ```
 
+When Keyboard Peeper is running, the viewer optionally publishes its current
+hotkeys over the versioned binary KPP/1 Unix-socket protocol. Mode-dependent
+buttons are retained in the map with an enabled or disabled state, and updates
+are atomic. The registration clears as soon as the viewer loses focus. No
+peeper installation or library is required; set
+`BUTTERCUP_KEYBOARD_PEEPER=0` to disable the silent background publisher.
+
 Press `Z` in the viewer to start the full-screen optical screen clock. It
 shows a smoothly moving fixation target over a locally balanced chromatic
 frame code and writes a presentation manifest under
@@ -53,9 +60,12 @@ camera transport, and packet delivery rather than claiming to be sensor
 exposure latency alone. Rendering is paced by Wayland frame callbacks rather
 than a drifting userspace timer.
 
-For a recoverable camera run, press `H` to begin the lossless RAW recording,
-press `Z` for the stimulus, then stop the stimulus and press `H` again after
-the viewer returns.
+For a recoverable camera run, press `S` (or the legacy `H` alias) to begin the
+lossless RAW recording, press `Z` for the stimulus, then stop the stimulus and
+press `S` again after the viewer returns. Each bundle includes a
+`predictions.jsonl` trace keyed by ROI id, sensor sequence, and sensor
+timestamp; unclassified or unanalysed ROIs remain in the trace instead of
+being discarded.
 
 The matching lossless RAW decoder searches native packed-RAW recordings for
 the repeated chromatic lattice without using desktop captures, resized

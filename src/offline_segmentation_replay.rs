@@ -5,7 +5,7 @@
 
 use super::*;
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::io::{Read as IoRead, Seek as IoSeek, SeekFrom};
 
@@ -3410,6 +3410,10 @@ fn driving_multibank_limbus_json(evidence: Option<DrivingMultibankLimbusEvidence
             "edge_centroid_signed_mean_px": evidence.edge_centroid_signed_mean_px,
             "edge_centroid_absolute_mean_px": evidence.edge_centroid_absolute_mean_px,
             "edge_centroid_coherence": evidence.edge_centroid_coherence,
+            "transition_band_width_mean_px": evidence.transition_band_width_mean_px,
+            "transition_band_width_mad_px": evidence.transition_band_width_mad_px,
+            "transition_band_width_coherence": evidence.transition_band_width_coherence,
+            "transition_band_width_samples": evidence.transition_band_width_samples,
             "far_sclera_step_mean": evidence.far_sclera_step_mean,
             "outside_plateau_mean": evidence.outside_plateau_mean,
             "outside_secondary_edge_mean": evidence.outside_secondary_edge_mean,
@@ -3722,6 +3726,173 @@ fn labeled_limbus_points(document: &Value, visibility: &str) -> Vec<(f64, f64)> 
         })
         .filter_map(|point| Some((point.get("x")?.as_f64()?, point.get("y")?.as_f64()?)))
         .collect()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LabeledLimbusBandPair {
+    pair_id: u64,
+    inner: (f64, f64),
+    outer: (f64, f64),
+}
+
+/// Retain the paired annotation as an interval, rather than collapsing it to
+/// the midpoint used by the strict point-distance benchmark.  `inner` is the
+/// iris-side edge and `outer` is the sclera-side edge, so a physically ordered
+/// limbus conic should place its implicit boundary between the two.
+fn labeled_limbus_band_pairs(document: &Value, visibility: &str) -> Vec<LabeledLimbusBandPair> {
+    let mut pairs = BTreeMap::<u64, (Option<(f64, f64)>, Option<(f64, f64)>)>::new();
+    for point in document
+        .get("limbus_band_points")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|point| point.get("visibility").and_then(Value::as_str) == Some(visibility))
+    {
+        let Some(pair_id) = point.get("pair_id").and_then(Value::as_u64) else {
+            continue;
+        };
+        let Some(x) = point.get("x").and_then(Value::as_f64) else {
+            continue;
+        };
+        let Some(y) = point.get("y").and_then(Value::as_f64) else {
+            continue;
+        };
+        if !x.is_finite() || !y.is_finite() {
+            continue;
+        }
+        let pair = pairs.entry(pair_id).or_default();
+        match point.get("kind").and_then(Value::as_str) {
+            Some("limbus_inner_edge") => pair.0 = Some((x, y)),
+            Some("limbus_outer_edge") => pair.1 = Some((x, y)),
+            _ => {}
+        }
+    }
+    pairs
+        .into_iter()
+        .filter_map(|(pair_id, (inner, outer))| {
+            Some(LabeledLimbusBandPair {
+                pair_id,
+                inner: inner?,
+                outer: outer?,
+            })
+        })
+        .collect()
+}
+
+fn labeled_ellipse_implicit_coordinate(point: (f64, f64), pose: DrivingAffinePose) -> Option<f64> {
+    if !point.0.is_finite()
+        || !point.1.is_finite()
+        || !pose.center.0.is_finite()
+        || !pose.center.1.is_finite()
+        || !pose.major_radius.is_finite()
+        || !pose.minor_radius.is_finite()
+        || pose.major_radius <= 0.0
+        || pose.minor_radius <= 0.0
+    {
+        return None;
+    }
+    let delta = (point.0 - pose.center.0, point.1 - pose.center.1);
+    let (axis_sine, axis_cosine) = pose.angle.sin_cos();
+    let local = (
+        axis_cosine * delta.0 + axis_sine * delta.1,
+        -axis_sine * delta.0 + axis_cosine * delta.1,
+    );
+    let coordinate = (local.0 / pose.major_radius).powi(2) + (local.1 / pose.minor_radius).powi(2);
+    coordinate.is_finite().then_some(coordinate)
+}
+
+fn labeled_limbus_band_reference_json(pairs: &[LabeledLimbusBandPair]) -> Value {
+    if pairs.is_empty() {
+        return Value::Null;
+    }
+    let widths = pairs
+        .iter()
+        .map(|pair| (pair.inner.0 - pair.outer.0).hypot(pair.inner.1 - pair.outer.1))
+        .collect::<Vec<_>>();
+    json!({
+        "pairs": pairs.len(),
+        "band_width_px": labeled_distance_summary_json(&widths),
+        "semantics": "inner is iris-side; outer is sclera-side; a correctly oriented conic has inner implicit coordinate <= 1 <= outer implicit coordinate",
+    })
+}
+
+/// Supporting paired-edge diagnostic. This never replaces or weakens the
+/// visible midpoint gate: it tells us whether a miss lies inside the annotated
+/// uncertain transition band and whether the conic crosses that band in the
+/// anatomically correct iris-to-sclera direction.
+fn labeled_limbus_band_comparison_json(
+    pairs: &[LabeledLimbusBandPair],
+    prediction: Option<DrivingAffinePose>,
+) -> Value {
+    if pairs.is_empty() {
+        return Value::Null;
+    }
+    let Some(prediction) = prediction else {
+        return json!({
+            "prediction_available": false,
+            "pairs": pairs.len(),
+        });
+    };
+    let mut bracketed = 0usize;
+    let mut expected_order = 0usize;
+    let mut reversed_order = 0usize;
+    let mut midpoint_distances = Vec::with_capacity(pairs.len());
+    let mut band_miss_distances = Vec::with_capacity(pairs.len());
+    let mut details = Vec::with_capacity(pairs.len());
+    for pair in pairs {
+        let Some(inner_coordinate) = labeled_ellipse_implicit_coordinate(pair.inner, prediction)
+        else {
+            continue;
+        };
+        let Some(outer_coordinate) = labeled_ellipse_implicit_coordinate(pair.outer, prediction)
+        else {
+            continue;
+        };
+        let crosses = (inner_coordinate - 1.0) * (outer_coordinate - 1.0) <= 0.0;
+        let ordered = inner_coordinate <= 1.0 && outer_coordinate >= 1.0;
+        let reversed = outer_coordinate <= 1.0 && inner_coordinate >= 1.0;
+        bracketed += usize::from(crosses);
+        expected_order += usize::from(ordered);
+        reversed_order += usize::from(reversed);
+        let midpoint = (
+            0.5 * (pair.inner.0 + pair.outer.0),
+            0.5 * (pair.inner.1 + pair.outer.1),
+        );
+        let midpoint_distance = labeled_point_to_ellipse_distance(midpoint, prediction);
+        let miss_distance = if crosses {
+            0.0
+        } else {
+            labeled_point_to_ellipse_distance(pair.inner, prediction)
+                .min(labeled_point_to_ellipse_distance(pair.outer, prediction))
+        };
+        midpoint_distances.push(midpoint_distance);
+        band_miss_distances.push(miss_distance);
+        details.push(json!({
+            "pair_id": pair.pair_id,
+            "inner_implicit_coordinate": inner_coordinate,
+            "outer_implicit_coordinate": outer_coordinate,
+            "bracketed": crosses,
+            "expected_inner_to_outer_order": ordered,
+            "reversed_order": reversed,
+            "midpoint_distance_px": midpoint_distance,
+            "band_miss_distance_px": miss_distance,
+        }));
+    }
+    let evaluated = details.len();
+    json!({
+        "prediction_available": true,
+        "pairs": pairs.len(),
+        "evaluated_pairs": evaluated,
+        "bracketed_pairs": bracketed,
+        "bracketed_fraction": bracketed as f64 / evaluated.max(1) as f64,
+        "expected_inner_to_outer_order_pairs": expected_order,
+        "expected_inner_to_outer_order_fraction": expected_order as f64 / evaluated.max(1) as f64,
+        "reversed_order_pairs": reversed_order,
+        "reversed_order_fraction": reversed_order as f64 / evaluated.max(1) as f64,
+        "midpoint_distance": labeled_distance_summary_json(&midpoint_distances),
+        "distance_to_nearest_band_edge_when_not_bracketed": labeled_distance_summary_json(&band_miss_distances),
+        "details": details,
+    })
 }
 
 const LABELED_ELLIPSE_DISTANCE_PHASE_SAMPLES: usize = 1024;
@@ -4048,6 +4219,50 @@ mod labeled_ellipse_metric_tests {
         assert_eq!(reference.minor_radius, 55.8);
         assert!((reference.angle - (-0.0035f64).rem_euclid(std::f64::consts::PI)).abs() < 1.0e-12);
     }
+
+    #[test]
+    fn paired_limbus_band_requires_the_expected_iris_to_sclera_crossing() {
+        let document = json!({
+            "limbus_band_points": [
+                {"pair_id": 7, "kind": "limbus_inner_edge", "visibility": "visible", "x": 9.0, "y": 0.0},
+                {"pair_id": 7, "kind": "limbus_outer_edge", "visibility": "visible", "x": 11.0, "y": 0.0},
+                {"pair_id": 8, "kind": "limbus_inner_edge", "visibility": "visible", "x": -9.0, "y": 0.0},
+                {"pair_id": 8, "kind": "limbus_outer_edge", "visibility": "visible", "x": -11.0, "y": 0.0},
+            ]
+        });
+        let pairs = labeled_limbus_band_pairs(&document, "visible");
+        let comparison =
+            labeled_limbus_band_comparison_json(&pairs, Some(pose((0.0, 0.0), 10.0, 10.0, 0.0)));
+        assert_eq!(comparison["pairs"], 2);
+        assert_eq!(comparison["bracketed_pairs"], 2);
+        assert_eq!(comparison["expected_inner_to_outer_order_pairs"], 2);
+        assert_eq!(comparison["reversed_order_pairs"], 0);
+        assert_eq!(
+            comparison["distance_to_nearest_band_edge_when_not_bracketed"]["max_px"],
+            0.0
+        );
+    }
+
+    #[test]
+    fn paired_limbus_band_reports_a_conic_that_misses_the_uncertainty_interval() {
+        let pairs = [LabeledLimbusBandPair {
+            pair_id: 1,
+            inner: (9.0, 0.0),
+            outer: (11.0, 0.0),
+        }];
+        let comparison =
+            labeled_limbus_band_comparison_json(&pairs, Some(pose((0.0, 0.0), 6.0, 6.0, 0.0)));
+        assert_eq!(comparison["bracketed_pairs"], 0);
+        assert_eq!(comparison["expected_inner_to_outer_order_pairs"], 0);
+        assert!(
+            (comparison["distance_to_nearest_band_edge_when_not_bracketed"]["max_px"]
+                .as_f64()
+                .unwrap()
+                - 3.0)
+                .abs()
+                < 1.0e-8
+        );
+    }
 }
 
 fn labeled_pose_json(pose: Option<DrivingAffinePose>) -> Value {
@@ -4250,6 +4465,7 @@ where
         let raw = raw10::try_unpack_raw10(&packed, width, height, stride)?;
         let visible = labeled_limbus_points(&label, "visible");
         let guessed = labeled_limbus_points(&label, "guessed");
+        let visible_band_pairs = labeled_limbus_band_pairs(&label, "visible");
         let reference_pose = labeled_reference_pose(&label);
 
         let focus = raw_iris_focus::score_stream_eye(&raw, width, height);
@@ -4302,7 +4518,7 @@ where
         // A censored observation supplies fallback geometry but is not
         // promoted into fabricated perimeter points for this still audit.
         let driving_input = native.clone();
-        let seed_pose = driving_seed_pose(&driving_input, fallback);
+        let seed_pose = driving_cold_proposal_seed(&driving_input, fallback, Some(&focus));
         let radius_prior = std::env::var("BUTTERCUP_OFFLINE_IRIS_RADIUS_PRIOR_PX")
             .ok()
             .and_then(|value| value.parse::<f64>().ok())
@@ -4513,6 +4729,40 @@ where
             ));
         }
         let multibank_partial_audit = wide_shortlists.selected;
+        // Mirror the cheap, label-blind proposal chosen for three-frame
+        // censored confirmation in live Driving. This remains a proposal-only
+        // diagnostic: the still replay cannot fabricate temporal confirmation
+        // or publish eye identity.
+        let temporal_censored_proposal_selection = multibank_partial_audit
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, proposal)| {
+                driving_multibank_proposal_is_temporal_censored_candidate(
+                    *proposal,
+                    width,
+                    height,
+                    radius_prior,
+                )
+            })
+            .max_by(|(_, left), (_, right)| {
+                driving_temporal_censored_proposal_rank(*left, radius_prior).total_cmp(
+                    &driving_temporal_censored_proposal_rank(*right, radius_prior),
+                )
+            });
+        let temporal_censored_bounded_completion =
+            temporal_censored_proposal_selection.and_then(|(_, confirmed)| {
+                driving_bounded_temporal_censored_completion(
+                    &raw,
+                    width,
+                    height,
+                    sensor_origin,
+                    Some(&focus),
+                    radius_prior,
+                    confirmed,
+                    &multibank_partial_audit,
+                )
+            });
         // A candidate-independent semantic scene is anchored once at the
         // measured seed.  The partial ranker may censor sectors with this
         // scene, but no candidate is allowed to discover a bespoke lid and
@@ -4584,14 +4834,14 @@ where
                     proposal,
                     focus.pupil_hint,
                 );
-                let anatomy = score_driving_native_anatomy_from_working_pose(
+                let anatomy = score_driving_multibank_measured_anatomy(
                     &raw,
                     width,
                     height,
                     sensor_origin,
                     proposal.pose,
-                    proposal.pose,
-                    None,
+                    proposal,
+                    Some(&focus),
                     2,
                     radius_prior,
                 )?;
@@ -4623,7 +4873,12 @@ where
                     proposal,
                     anatomy,
                     semantic,
-                    rank: temporal_canny_outer_geometry_rank(anatomy, semantic, proposal),
+                    rank: temporal_canny_outer_geometry_rank(
+                        anatomy,
+                        semantic,
+                        proposal,
+                        radius_prior,
+                    ),
                     full_roi_context,
                     anatomy_admissible: driving_hypothesis_admissible(anatomy),
                     semantic_geometry,
@@ -4762,14 +5017,14 @@ where
             .and(seed_pose)
             .and_then(|frame_local_seed| {
                 let measured = production_multibank.and_then(|proposal| {
-                    score_driving_native_anatomy_from_working_pose(
+                    score_driving_multibank_measured_anatomy(
                         &raw,
                         width,
                         height,
                         sensor_origin,
                         proposal.pose,
-                        proposal.pose,
-                        None,
+                        proposal,
+                        Some(&focus),
                         2,
                         radius_prior,
                     )
@@ -5106,6 +5361,11 @@ where
                 native.angle + std::f64::consts::FRAC_PI_2
             },
         });
+        let temporal_censored_pose =
+            temporal_censored_proposal_selection.map(|(_, proposal)| proposal.pose);
+        let point_oracle_pose = multibank_wide_beam_point_oracle
+            .as_ref()
+            .map(|oracle| oracle.1);
         cases.push(json!({
             "case": format!("case-{:02}", case_index + 1),
             "label": label_path,
@@ -5117,6 +5377,42 @@ where
             "sensor_origin": [sensor_origin.0, sensor_origin.1],
             "visible_points": visible.iter().map(|point| [point.0, point.1]).collect::<Vec<_>>(),
             "guessed_points": guessed.iter().map(|point| [point.0, point.1]).collect::<Vec<_>>(),
+            "paired_limbus_band": {
+                "role": "supporting uncertainty-band diagnostic; never weakens the visible-point geometry gate",
+                "reference": labeled_limbus_band_reference_json(&visible_band_pairs),
+                "human_fitted_reference": labeled_limbus_band_comparison_json(
+                    &visible_band_pairs,
+                    reference_pose,
+                ),
+                "native_meridian": labeled_limbus_band_comparison_json(
+                    &visible_band_pairs,
+                    native_pose,
+                ),
+                "ordinary_driving": labeled_limbus_band_comparison_json(
+                    &visible_band_pairs,
+                    ordinary_pose,
+                ),
+                "production_frame_local": labeled_limbus_band_comparison_json(
+                    &visible_band_pairs,
+                    production_pose,
+                ),
+                "bounded_wide64": labeled_limbus_band_comparison_json(
+                    &visible_band_pairs,
+                    bounded_wide_pose,
+                ),
+                "two_d_current_frame": labeled_limbus_band_comparison_json(
+                    &visible_band_pairs,
+                    two_d_measured_selected_canny_pose,
+                ),
+                "temporal_censored_selection": labeled_limbus_band_comparison_json(
+                    &visible_band_pairs,
+                    temporal_censored_pose,
+                ),
+                "label_posthoc_best_search_candidate": labeled_limbus_band_comparison_json(
+                    &visible_band_pairs,
+                    point_oracle_pose,
+                ),
+            },
             "label_reference": {
                 "annotation_scope": if reference_pose.is_some() { "fitted_full_ellipse" } else { "visible_arc_points_only" },
                 "pose": labeled_pose_json(reference_pose),
@@ -5340,6 +5636,41 @@ where
                 })
             }),
             "multibank_search_ms": multibank_search_ms,
+            "temporal_censored_proposal_selection": temporal_censored_proposal_selection.map(
+                |(index, proposal)| {
+                    let distances = labeled_ellipse_residuals(&visible, Some(proposal.pose));
+                    json!({
+                        "index": index,
+                        "rank": driving_temporal_censored_proposal_rank(proposal, radius_prior),
+                        "pose": labeled_pose_json(Some(proposal.pose)),
+                        "visible_point_distance": labeled_distance_summary_json(&distances),
+                        "transition_band_scale_affinity":
+                            driving_limbus_transition_band_scale_affinity(proposal),
+                        "temporal_confirmation_required": true,
+                    })
+                }
+            ),
+            "temporal_censored_bounded_completion": temporal_censored_bounded_completion.map(
+                |(proposal, hypothesis)| {
+                    let distances = labeled_ellipse_residuals(&visible, Some(hypothesis.pose));
+                    let semantic = driving_semantic_eye_evidence(
+                        &raw,
+                        width,
+                        height,
+                        sensor_origin,
+                        hypothesis,
+                    );
+                    json!({
+                        "proposal_pose": labeled_pose_json(Some(proposal.pose)),
+                        "completed_pose": labeled_pose_json(Some(hypothesis.pose)),
+                        "visible_point_distance": labeled_distance_summary_json(&distances),
+                        "anatomy_admissible": driving_hypothesis_admissible(hypothesis),
+                        "semantic_authorizes_cold_identity": semantic
+                            .is_some_and(|evidence| evidence.authorizes_cold_identity),
+                        "temporal_confirmation_assumed_for_audit": true,
+                    })
+                }
+            ),
             "bounded_wide64_recovery": {
                 "policy": "64 full-resolution RAW proposals; union of direct top-4 and independent material/lid top-4 receives complete anatomy; label-blind final-rank plus semantic hysteresis arbitrates against incumbent",
                 "elapsed_ms": bounded_wide_elapsed_ms,
@@ -5688,6 +6019,10 @@ where
                         "edge_centroid_absolute_mean_px": proposal.evidence.edge_centroid_absolute_mean_px,
                         "edge_centroid_coherence": proposal.evidence.edge_centroid_coherence,
                         "edge_centroid_samples": proposal.evidence.edge_centroid_samples,
+                        "transition_band_width_mean_px": proposal.evidence.transition_band_width_mean_px,
+                        "transition_band_width_mad_px": proposal.evidence.transition_band_width_mad_px,
+                        "transition_band_width_coherence": proposal.evidence.transition_band_width_coherence,
+                        "transition_band_width_samples": proposal.evidence.transition_band_width_samples,
                         "far_sclera_step_mean": proposal.evidence.far_sclera_step_mean,
                         "outside_plateau_mean": proposal.evidence.outside_plateau_mean,
                         "outside_secondary_edge_mean": proposal.evidence.outside_secondary_edge_mean,
@@ -5762,6 +6097,10 @@ where
                         "edge_centroid_absolute_mean_px": proposal.evidence.edge_centroid_absolute_mean_px,
                         "edge_centroid_coherence": proposal.evidence.edge_centroid_coherence,
                         "edge_centroid_samples": proposal.evidence.edge_centroid_samples,
+                        "transition_band_width_mean_px": proposal.evidence.transition_band_width_mean_px,
+                        "transition_band_width_mad_px": proposal.evidence.transition_band_width_mad_px,
+                        "transition_band_width_coherence": proposal.evidence.transition_band_width_coherence,
+                        "transition_band_width_samples": proposal.evidence.transition_band_width_samples,
                         "far_sclera_step_mean": proposal.evidence.far_sclera_step_mean,
                         "outside_plateau_mean": proposal.evidence.outside_plateau_mean,
                         "outside_secondary_edge_mean": proposal.evidence.outside_secondary_edge_mean,
@@ -5919,6 +6258,10 @@ where
                         "edge_centroid_signed_mean_px": evidence.edge_centroid_signed_mean_px,
                         "edge_centroid_absolute_mean_px": evidence.edge_centroid_absolute_mean_px,
                         "edge_centroid_coherence": evidence.edge_centroid_coherence,
+                        "transition_band_width_mean_px": evidence.transition_band_width_mean_px,
+                        "transition_band_width_mad_px": evidence.transition_band_width_mad_px,
+                        "transition_band_width_coherence": evidence.transition_band_width_coherence,
+                        "transition_band_width_samples": evidence.transition_band_width_samples,
                         "edge_centroid_samples": evidence.edge_centroid_samples,
                         "far_sclera_step_mean": evidence.far_sclera_step_mean,
                         "outside_plateau_mean": evidence.outside_plateau_mean,
@@ -7158,6 +7501,30 @@ where
             global_similarity,
         );
 
+        // Classify the ellipse hemisphere from the probe's outward normal,
+        // not from a separately fitted current-frame center.  The radial
+        // sampler may deliberately retain its temporally authorized ellipse
+        // while a noisy nested-boundary measurement jumps; comparing the
+        // resulting point to that unrelated center can relabel an actual
+        // image-left probe as image-right (or vice versa).  For an ellipse,
+        // the outward normal's x sign is the exact image-side definition.
+        let cluster_radial_left = cluster_overlay
+            .radial_limbus_probes
+            .iter()
+            .filter(|probe| probe.normal[0] < 0.0)
+            .count();
+        let cluster_radial_left_fused = cluster_overlay
+            .radial_limbus_probes
+            .iter()
+            .filter(|probe| probe.normal[0] < 0.0 && probe.fused)
+            .count();
+        let cluster_radial_right = cluster_overlay.radial_limbus_probes.len() - cluster_radial_left;
+        let cluster_radial_right_fused = cluster_overlay
+            .radial_limbus_probes
+            .iter()
+            .filter(|probe| probe.normal[0] >= 0.0 && probe.fused)
+            .count();
+
         frames.push(json!({
             "index": local_index,
             "source_record_index": start + local_index,
@@ -7287,6 +7654,37 @@ where
                 "matched_features": cluster_overlay.matched_features,
                 "canny_edges": cluster_overlay.edges.len(),
                 "temporal_trails": cluster_overlay.trails.len(),
+                "radial_limbus": {
+                    "accepted": cluster_overlay.radial_limbus_probes.len(),
+                    "fused": cluster_overlay.radial_limbus_probes.iter().filter(|probe| probe.fused).count(),
+                    "image_left": cluster_radial_left,
+                    "image_left_fused": cluster_radial_left_fused,
+                    "image_right": cluster_radial_right,
+                    "image_right_fused": cluster_radial_right_fused,
+                    "evaluations": cluster_overlay.match_diagnostics.radial_limbus_evaluations,
+                    "elapsed_us": cluster_overlay.match_diagnostics.radial_limbus_micros,
+                    "independent_candidate": cluster_overlay.match_diagnostics.radial_limbus_independent_candidate,
+                    "independent_global_ready": cluster_overlay.match_diagnostics.radial_limbus_independent_global_ready,
+                    "independent_nested_ready": cluster_overlay.match_diagnostics.radial_limbus_independent_nested_ready,
+                    "independent_support_ready": cluster_overlay.match_diagnostics.radial_limbus_independent_support_ready,
+                    "independent_applied": cluster_overlay.match_diagnostics.radial_limbus_independent_applied,
+                    "sampling_region": cluster_overlay.radial_limbus_region.map(|ellipse| ellipse_json(
+                        ellipse.center,
+                        ellipse.major_radius,
+                        ellipse.minor_radius,
+                        ellipse.angle,
+                    )),
+                },
+                "nested_eye_boundaries": cluster_overlay.nested_eye_boundaries.as_ref().map(|pair| json!({
+                    "pupil": ellipse_json(pair.pupil.center, pair.pupil.major_radius, pair.pupil.minor_radius, pair.pupil.angle),
+                    "limbus": ellipse_json(pair.limbus.center, pair.limbus.major_radius, pair.limbus.minor_radius, pair.limbus.angle),
+                    "confidence": pair.confidence,
+                    "pupil_to_limbus_radius_ratio": pair.pupil_to_limbus_radius_ratio,
+                    "pupil_support": pair.pupil_support,
+                    "limbus_support": pair.limbus_support,
+                    "paired_support": pair.paired_support,
+                    "input_seed_was_pupil_like": pair.input_seed_was_pupil_like,
+                })),
                 "layers": motion_layers_json(&cluster_overlay),
                 "semantic_iris": cluster_overlay.semantic_iris.map(|ellipse| ellipse_json(
                     ellipse.center,

@@ -23,6 +23,7 @@ mapfile -t unexpected_files < <(
       ./src/checkerboard_calibration.rs \
       ./src/bin/buttercup_screen_reflection_raw_decode.rs \
       ./src/coupled_eye_kinematics.rs \
+      ./src/keyboard_peeper.rs \
       ./src/main.rs \
       ./src/native_mediapipe.rs \
       ./src/offline_segmentation_replay.rs \

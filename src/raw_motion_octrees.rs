@@ -195,6 +195,17 @@ const LIMBUS_FEATURE_MAX_PER_TILE: u8 = 3;
 const LIMBUS_FEATURE_MAX_PER_SECTOR: u8 = 2;
 const LIMBUS_FEATURE_MIN_AFFINITY: f32 = 0.30;
 const LIMBUS_FEATURE_MAX_COST_DISCOUNT: f32 = 0.45;
+// A directly measured lid margin may replace part of the apparent limbus with
+// a much flatter chord (the familiar "flat tire" failure).  Detection is
+// deliberately scale-relative and current-frame: a coherent margin must
+// intrude into the supplied iris conic, span several native samples, remain
+// substantially flatter than that conic, and coincide with this Canny field.
+const LID_OCCLUSION_MIN_MARGIN_POINTS: usize = 5;
+const LID_OCCLUSION_MIN_CANNY_POINTS: usize = 3;
+const LID_OCCLUSION_MIN_SPAN_FRACTION: f64 = 0.24;
+const LID_OCCLUSION_MAX_SAGITTA_RATIO: f64 = 0.68;
+const LID_OCCLUSION_MASK_MARGIN_PX: f32 = 3.0;
+const LID_OCCLUSION_CURVE_SAMPLES: usize = 33;
 // A nautilus fingerprint follows four slowly rotating, opposed branches over
 // four outward shells.  Pair means retain the regional material while signed
 // pair differences retain direction; z-normalization makes the 32-byte result
@@ -241,12 +252,16 @@ const LIGHT_FIELD_VERTICAL_STEP: [f32; 4] = [4.0, 2.0, 1.0, 1.0];
 const LIGHT_FIELD_MIN_CORRELATION: f32 = 0.58;
 const LIGHT_FIELD_MIN_TEXTURE: f32 = 0.010;
 const LIGHT_FIELD_BRANCH_CONFIDENCE: f32 = 0.24;
-// Twenty-four angular lanes provide opposing-meridian leverage without
-// turning the limbus into a dense contour tracer. Every lane samples the
+// The ordered nested-boundary solver retains its validated twenty-four-sector
+// anatomical lattice. Temporal flow uses a denser thirty-six-lane lattice:
+// the extra lanes matter most on the oblique image-left boundary, where the
+// translucent iris-to-sclera step is broad enough that a sparse fifteen-degree
+// lattice can repeatedly land between its strongest profiles. Every lane samples the
 // native RAW field at the boundary plus five points inward and five outward.
 // The descriptor compares normalized gradients, so exposure/gain changes do
 // not erase a broad translucent iris-to-sclera transition.
 const RADIAL_LIMBUS_SECTORS: usize = 24;
+const RADIAL_LIMBUS_FLOW_SECTORS: usize = 36;
 pub const RADIAL_LIMBUS_HALF_SAMPLES: usize = 5;
 const RADIAL_LIMBUS_SAMPLES: usize = RADIAL_LIMBUS_HALF_SAMPLES * 2 + 1;
 const RADIAL_LIMBUS_GRADIENTS: usize = RADIAL_LIMBUS_SAMPLES - 1;
@@ -257,7 +272,44 @@ const RADIAL_LIMBUS_MIN_QUALITY: f32 = 0.10;
 const RADIAL_LIMBUS_MAX_PROFILE_COST: f32 = 0.46;
 const RADIAL_LIMBUS_MAX_PRIOR_NORMAL_ERROR_PX: f32 = 5.0;
 const RADIAL_LIMBUS_MIN_JOINT_SUPPORT: usize = 5;
-const RADIAL_LIMBUS_MAX_FUSED: usize = 12;
+const RADIAL_LIMBUS_MAX_FUSED: usize = 24;
+// Select the best valid lane in each thirty-degree interval before globally
+// filling the remaining slots.  This prevents a sharp boundary on one side
+// from consuming the whole fusion budget while a broad but independently
+// valid boundary on the opposite side disappears from the motion solve.
+const RADIAL_LIMBUS_FUSION_COVERAGE_BINS: usize = 18;
+const RADIAL_LIMBUS_CONSENSUS_MIN_SUPPORT: usize = 6;
+const RADIAL_LIMBUS_CONSENSUS_MIN_HEMISPHERE_SUPPORT: usize = 2;
+const RADIAL_LIMBUS_CONSENSUS_MIN_ANGULAR_BINS: usize = 6;
+const RADIAL_LIMBUS_CONSENSUS_MAX_FIT_RESIDUAL_PX: f32 = 2.8;
+const RADIAL_LIMBUS_CONSENSUS_MAX_TRANSLATION_PX: f32 = 12.0;
+const RADIAL_LIMBUS_CONSENSUS_MAX_NORMAL_ERROR_PX: f32 = 3.2;
+const RADIAL_LIMBUS_INDEPENDENT_MIN_SUPPORT: usize = 10;
+const RADIAL_LIMBUS_INDEPENDENT_MIN_HEMISPHERE_SUPPORT: usize = 4;
+const RADIAL_LIMBUS_INDEPENDENT_MIN_ANGULAR_BINS: usize = 8;
+const RADIAL_LIMBUS_INDEPENDENT_MAX_MEDIAN_PROFILE_COST: f32 = 0.35;
+const RADIAL_LIMBUS_INDEPENDENT_MIN_MEAN_CONFIDENCE: f32 = 0.42;
+const RADIAL_LIMBUS_INDEPENDENT_MIN_NESTED_CONFIDENCE: f32 = 0.52;
+const RADIAL_LIMBUS_INDEPENDENT_MIN_NESTED_PUPIL_SUPPORT: usize = 8;
+const RADIAL_LIMBUS_INDEPENDENT_MIN_NESTED_OUTER_SUPPORT: usize = 10;
+const RADIAL_LIMBUS_INDEPENDENT_MIN_NESTED_PAIRED_SUPPORT: usize = 6;
+// A single outward dark-to-bright transition is ambiguous: it can be either
+// pupil->iris or iris->sclera. Resolve that ambiguity by fitting an ordered,
+// coaxial pair in the same projected affine frame. The limits are deliberately
+// broad enough for physiological dilation and oblique projection; their job is
+// only to forbid one edge from impersonating both nested boundaries.
+const NESTED_BOUNDARY_COARSE_MIN_SCALE: f32 = 0.18;
+const NESTED_BOUNDARY_COARSE_MAX_SCALE: f32 = 3.80;
+const NESTED_BOUNDARY_COARSE_STEP: f32 = 0.10;
+const NESTED_BOUNDARY_FINE_RADIUS: f32 = 0.14;
+const NESTED_BOUNDARY_FINE_STEP: f32 = 0.02;
+const NESTED_PUPIL_TO_LIMBUS_MIN_RATIO: f32 = 0.16;
+const NESTED_PUPIL_TO_LIMBUS_MAX_RATIO: f32 = 0.74;
+const NESTED_BOUNDARY_MIN_GAP_PX: f32 = 7.0;
+const NESTED_BOUNDARY_MIN_INNER_SUPPORT: usize = 3;
+const NESTED_BOUNDARY_MIN_OUTER_SUPPORT: usize = 4;
+const NESTED_BOUNDARY_MIN_PAIRED_SUPPORT: usize = 3;
+const NESTED_BOUNDARY_MIN_CONFIDENCE: f32 = 0.25;
 const ELLIPSE_ANGLE_BINS: usize = 24;
 const MOTION_SIGNATURE_LEN: usize = 8;
 const MIN_MOTION_SIGNATURE: usize = 4;
@@ -612,7 +664,25 @@ pub struct MatchDiagnostics {
     /// Accepted radial transitions actually admitted as one-dimensional
     /// normal-flow constraints to the iris similarity solve.
     pub radial_limbus_fused: usize,
+    pub radial_limbus_independent_candidate: usize,
+    pub radial_limbus_independent_global_ready: bool,
+    pub radial_limbus_independent_nested_ready: bool,
+    pub radial_limbus_independent_support_ready: bool,
+    pub radial_limbus_independent_applied: bool,
     pub radial_limbus_micros: u64,
+    /// Native-RAW scale hypotheses evaluated while separating the inner
+    /// pupillary aperture from the outer limbus in one affine frame.
+    pub nested_boundary_evaluations: usize,
+    pub nested_boundary_micros: u64,
+    /// Current-frame upper/lower palpebral-margin curves which passed the
+    /// affine flat-tire test and therefore censor limbus evidence.
+    pub lid_occlusion_curves: usize,
+    pub lid_occlusion_micros: u64,
+    /// Exact current Canny samples on the skin side of those measured curves.
+    pub lid_occlusion_censored_edges: usize,
+    /// Persistent feature identities removed in this frame rather than being
+    /// allowed to age slowly on an occluding lid chord.
+    pub lid_occlusion_extinguished_tracks: usize,
     /// Historical IDs retained without pretending their last observation is
     /// present in the current exposure.
     pub dormant_tracks: usize,
@@ -883,6 +953,91 @@ impl Default for EdgeEvidence {
     }
 }
 
+/// One directly measured sample of a palpebral (eyelid) margin in the exact
+/// RAW ROI consumed by the temporal learner.  The caller supplies only native
+/// coordinates; the temporal module independently requires its own Canny and
+/// curvature evidence before the margin gains censoring authority.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LidMarginPoint {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// A current-frame gentle curve fitted through a coherent flat-tire run.
+/// `points` is the sampled curve used for lossless-ROI presentation, while
+/// `support_points` are exact Canny locations which justified it.  The hidden
+/// normalized polynomial/reference conic is retained so every consumer uses
+/// exactly the same bounded censor rather than re-fitting renderer pixels.
+#[derive(Clone, Debug)]
+pub struct LidOcclusionCurve {
+    pub upper: bool,
+    pub confidence: f32,
+    pub points: Vec<(f32, f32)>,
+    pub support_points: Vec<(f32, f32)>,
+    pub censored_edges: usize,
+    pub extinguished_tracks: usize,
+    reference_seed: IrisEllipseSeed,
+    reference_center: [f32; 2],
+    reference_scale: [f32; 2],
+    coefficients: [f32; 3],
+    x_range: [f32; 2],
+    mask_margin_px: f32,
+}
+
+impl Default for LidOcclusionCurve {
+    fn default() -> Self {
+        Self {
+            upper: false,
+            confidence: 0.0,
+            points: Vec::new(),
+            support_points: Vec::new(),
+            censored_edges: 0,
+            extinguished_tracks: 0,
+            reference_seed: IrisEllipseSeed::circle((0.0, 0.0), 0.0),
+            reference_center: [0.0; 2],
+            reference_scale: [1.0; 2],
+            coefficients: [0.0; 3],
+            x_range: [0.0; 2],
+            mask_margin_px: LID_OCCLUSION_MASK_MARGIN_PX,
+        }
+    }
+}
+
+impl LidOcclusionCurve {
+    fn y_at_x(&self, x: f32) -> Option<f32> {
+        if !x.is_finite()
+            || x < self.x_range[0] - self.mask_margin_px
+            || x > self.x_range[1] + self.mask_margin_px
+        {
+            return None;
+        }
+        let normalized_x = (x - self.reference_center[0]) / self.reference_scale[0].max(1.0);
+        let normalized_y = self.coefficients[0]
+            + self.coefficients[1] * normalized_x
+            + self.coefficients[2] * normalized_x * normalized_x;
+        Some(self.reference_center[1] + self.reference_scale[1].max(1.0) * normalized_y)
+    }
+
+    fn masks_limbus_point(&self, point: [f32; 2], extra_margin_px: f32) -> bool {
+        let radius = normalized_ellipse_radius(
+            self.reference_seed.ellipse(),
+            (point[0] as f64, point[1] as f64),
+        );
+        if !radius.is_finite() || !(0.42..=1.38).contains(&radius) {
+            return false;
+        }
+        let Some(curve_y) = self.y_at_x(point[0]) else {
+            return false;
+        };
+        let margin = self.mask_margin_px + extra_margin_px.max(0.0);
+        if self.upper {
+            point[1] <= curve_y + margin
+        } else {
+            point[1] >= curve_y - margin
+        }
+    }
+}
+
 /// One accepted region in the coarse-to-fine horizontal RAW walk tree.
 /// Bounds and local translation are expressed on the previous/current ROI
 /// lattices; `sensor_translation_px` removes any camera-side ROI relocation
@@ -938,6 +1093,27 @@ pub struct RadialLimbusProbe {
     pub fused: bool,
 }
 
+/// Exact-current-frame ordered eye boundaries recovered from untouched native
+/// RAW samples. `pupil` is the pupillary-aperture margin and `limbus` is the
+/// outer iris/sclera boundary. They share one affine projection (center,
+/// aspect, and angle) during this disambiguation pass, so their scale ratio is
+/// meaningful even before formal camera calibration. This is diagnostic
+/// evidence until the independent anatomy/publication gates agree.
+#[derive(Clone, Debug)]
+pub struct NestedEyeBoundaryPair {
+    pub pupil: IrisEllipseSeed,
+    pub limbus: IrisEllipseSeed,
+    pub confidence: f32,
+    pub pupil_to_limbus_radius_ratio: f32,
+    pub pupil_support: usize,
+    pub limbus_support: usize,
+    pub paired_support: usize,
+    pub paired_phases_rad: Vec<f32>,
+    /// True when the supplied single-boundary seed was geometrically closer
+    /// to the recovered pupil than to the recovered limbus.
+    pub input_seed_was_pupil_like: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct MotionOctreeOverlay {
     pub generation: u64,
@@ -972,10 +1148,21 @@ pub struct MotionOctreeOverlay {
     /// on this exact exposure pair. These are normal-flow constraints, not
     /// claims of tangential point identity along a smooth limbus.
     pub radial_limbus_probes: Vec<RadialLimbusProbe>,
+    /// The temporally authorized projected region on which the radial probes
+    /// were actually sampled.  Keep this distinct from `semantic_iris`: the
+    /// latter belongs to the persistent point-motion layer and may lag or be
+    /// unavailable while distributed normal-flow evidence remains useful.
+    pub radial_limbus_region: Option<IrisEllipseSeed>,
     /// Current label-free/seeded outer-iris motion region in ROI-local pixels.
     /// It is exported so lossless reviews can audit exactly which Canny tracks
     /// were considered possible limbus normal-flow constraints.
     pub semantic_iris: Option<IrisEllipseSeed>,
+    /// Ordered inner/outer RAW transitions used to prevent a pupil edge from
+    /// being mistaken for the limbus merely because both brighten outward.
+    pub nested_eye_boundaries: Option<NestedEyeBoundaryPair>,
+    /// Current-frame palpebral margins which were proven to replace a section
+    /// of the expected limbus with a flatter occluding chord.
+    pub lid_occlusions: Vec<LidOcclusionCurve>,
     pub focus_sfm: FocusSfmStatus,
     pub coupled_motion: CoupledMotionStatus,
 }
@@ -1181,6 +1368,16 @@ fn score_edge_ellipse(
     seed: ((f64, f64), f64),
     collect_inliers: bool,
 ) -> EllipseEvidence {
+    score_edge_ellipse_with_occlusions(ellipse, edges, seed, collect_inliers, &[])
+}
+
+fn score_edge_ellipse_with_occlusions(
+    ellipse: EdgeEllipse,
+    edges: &[EdgeEvidence],
+    seed: ((f64, f64), f64),
+    collect_inliers: bool,
+    lid_occlusions: &[LidOcclusionCurve],
+) -> EllipseEvidence {
     let cosine = ellipse.angle.cos();
     let sine = ellipse.angle.sin();
     let residual_limit = (ellipse.minor * 0.035).clamp(1.8, 3.4);
@@ -1189,6 +1386,9 @@ fn score_edge_ellipse(
     let mut quality_sum = 0.0f64;
     let mut inlier_count = 0usize;
     for (index, edge) in edges.iter().enumerate() {
+        if point_is_lid_censored([edge.x, edge.y], lid_occlusions) {
+            continue;
+        }
         let dx = edge.x as f64 - ellipse.center.0;
         let dy = edge.y as f64 - ellipse.center.1;
         let local_x = cosine * dx + sine * dy;
@@ -1272,6 +1472,16 @@ fn fit_edge_ellipse(
     width: usize,
     height: usize,
 ) -> Option<(EdgeEllipse, EllipseEvidence, EllipseEvidence, usize)> {
+    fit_edge_ellipse_with_occlusions(edges, ellipse_seed, width, height, &[])
+}
+
+fn fit_edge_ellipse_with_occlusions(
+    edges: &[EdgeEvidence],
+    ellipse_seed: IrisEllipseSeed,
+    width: usize,
+    height: usize,
+    lid_occlusions: &[LidOcclusionCurve],
+) -> Option<(EdgeEllipse, EllipseEvidence, EllipseEvidence, usize)> {
     let seed = ellipse_seed.area_seed();
     let seed_radius = seed.1.clamp(20.0, width.min(height) as f64 * 0.48);
     let radial_edge_indices = edges
@@ -1279,6 +1489,9 @@ fn fit_edge_ellipse(
         .enumerate()
         .filter(|edge| {
             let edge = edge.1;
+            if point_is_lid_censored([edge.x, edge.y], lid_occlusions) {
+                return false;
+            }
             let dx = edge.x as f64 - seed.0 .0;
             let dy = edge.y as f64 - seed.0 .1;
             let distance = dx.hypot(dy);
@@ -1306,13 +1519,15 @@ fn fit_edge_ellipse(
         angle: 0.0,
     };
     let shaped_seed = ellipse_seed.ellipse();
-    let seed_evidence = score_edge_ellipse(shaped_seed, &radial_edges, seed, false);
+    let seed_evidence =
+        score_edge_ellipse_with_occlusions(shaped_seed, &radial_edges, seed, false, lid_occlusions);
     let mut best = if ellipse_is_bounded(shaped_seed, seed, width, height) {
         shaped_seed
     } else {
         circular_seed
     };
-    let mut best_evidence = score_edge_ellipse(best, &radial_edges, seed, false);
+    let mut best_evidence =
+        score_edge_ellipse_with_occlusions(best, &radial_edges, seed, false, lid_occlusions);
     let mut evaluations = 1usize;
     for offset_y in [-0.07, 0.0, 0.07] {
         for offset_x in [-0.07, 0.0, 0.07] {
@@ -1333,7 +1548,13 @@ fn fit_edge_ellipse(
                         if !ellipse_is_bounded(candidate, seed, width, height) {
                             continue;
                         }
-                        let evidence = score_edge_ellipse(candidate, &radial_edges, seed, false);
+                        let evidence = score_edge_ellipse_with_occlusions(
+                            candidate,
+                            &radial_edges,
+                            seed,
+                            false,
+                            lid_occlusions,
+                        );
                         evaluations += 1;
                         if evidence.objective > best_evidence.objective {
                             best = candidate;
@@ -1367,7 +1588,13 @@ fn fit_edge_ellipse(
                 if !ellipse_is_bounded(candidate, seed, width, height) {
                     continue;
                 }
-                let evidence = score_edge_ellipse(candidate, &radial_edges, seed, false);
+                let evidence = score_edge_ellipse_with_occlusions(
+                    candidate,
+                    &radial_edges,
+                    seed,
+                    false,
+                    lid_occlusions,
+                );
                 evaluations += 1;
                 if evidence.objective > best_evidence.objective {
                     best = candidate;
@@ -1379,7 +1606,8 @@ fn fit_edge_ellipse(
             *step *= 0.56;
         }
     }
-    let mut evidence = score_edge_ellipse(best, &radial_edges, seed, true);
+    let mut evidence =
+        score_edge_ellipse_with_occlusions(best, &radial_edges, seed, true, lid_occlusions);
     if evidence.confidence < 0.18
         || evidence.inliers.len() < 20
         || evidence.angular_coverage < 10
@@ -1404,8 +1632,13 @@ pub fn current_frame_canny_ellipse_proposal(
     height: usize,
     seed: IrisEllipseSeed,
 ) -> Option<CannyEllipseProposal> {
-    let (ellipse, evidence, seed_evidence, iterations) =
-        fit_edge_ellipse(&overlay.edges, seed, width, height)?;
+    let (ellipse, evidence, seed_evidence, iterations) = fit_edge_ellipse_with_occlusions(
+        &overlay.edges,
+        seed,
+        width,
+        height,
+        &overlay.lid_occlusions,
+    )?;
     Some(CannyEllipseProposal {
         center: ellipse.center,
         major_radius: ellipse.major,
@@ -1450,7 +1683,13 @@ pub fn measured_seed_canny_support_proposal(
     if !ellipse_is_bounded(ellipse, seed.area_seed(), width, height) {
         return None;
     }
-    let evidence = score_edge_ellipse(ellipse, &overlay.edges, seed.area_seed(), true);
+    let evidence = score_edge_ellipse_with_occlusions(
+        ellipse,
+        &overlay.edges,
+        seed.area_seed(),
+        true,
+        &overlay.lid_occlusions,
+    );
     if evidence.confidence < 0.18
         || evidence.inliers.len() < 20
         || evidence.angular_coverage < 10
@@ -1492,6 +1731,432 @@ fn normalized_ellipse_radius(ellipse: EdgeEllipse, point: (f64, f64)) -> f64 {
     (local_x / ellipse.major).hypot(local_y / ellipse.minor)
 }
 
+fn solve_lid_quadratic_system(mut matrix: [[f64; 3]; 3], mut vector: [f64; 3]) -> Option<[f64; 3]> {
+    for pivot in 0..3 {
+        let row = (pivot..3).max_by(|left, right| {
+            matrix[*left][pivot]
+                .abs()
+                .total_cmp(&matrix[*right][pivot].abs())
+        })?;
+        if !matrix[row][pivot].is_finite() || matrix[row][pivot].abs() < 1.0e-9 {
+            return None;
+        }
+        if row != pivot {
+            matrix.swap(row, pivot);
+            vector.swap(row, pivot);
+        }
+        let inverse = 1.0 / matrix[pivot][pivot];
+        for column in pivot..3 {
+            matrix[pivot][column] *= inverse;
+        }
+        vector[pivot] *= inverse;
+        for row in 0..3 {
+            if row == pivot {
+                continue;
+            }
+            let factor = matrix[row][pivot];
+            for column in pivot..3 {
+                matrix[row][column] -= factor * matrix[pivot][column];
+            }
+            vector[row] -= factor * vector[pivot];
+        }
+    }
+    vector
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(vector)
+}
+
+fn fit_lid_quadratic(
+    samples: &[(f64, f64, f64)],
+    center: [f64; 2],
+    scale: [f64; 2],
+) -> Option<[f64; 3]> {
+    if samples.len() < 3 || scale[0] <= 1.0 || scale[1] <= 1.0 {
+        return None;
+    }
+    let mut matrix = [[0.0f64; 3]; 3];
+    let mut vector = [0.0f64; 3];
+    for &(x, y, weight) in samples {
+        if !x.is_finite() || !y.is_finite() || !weight.is_finite() || weight <= 0.0 {
+            continue;
+        }
+        let normalized_x = (x - center[0]) / scale[0];
+        let normalized_y = (y - center[1]) / scale[1];
+        let row = [1.0, normalized_x, normalized_x * normalized_x];
+        for column in 0..3 {
+            vector[column] += weight * row[column] * normalized_y;
+            for other in 0..3 {
+                matrix[column][other] += weight * row[column] * row[other];
+            }
+        }
+    }
+    solve_lid_quadratic_system(matrix, vector)
+}
+
+fn lid_curve_y(coefficients: [f64; 3], center: [f64; 2], scale: [f64; 2], x: f64) -> f64 {
+    let normalized_x = (x - center[0]) / scale[0].max(1.0);
+    center[1]
+        + scale[1].max(1.0)
+            * (coefficients[0]
+                + coefficients[1] * normalized_x
+                + coefficients[2] * normalized_x * normalized_x)
+}
+
+fn robust_lid_quadratic(
+    samples: &[(f64, f64, f64)],
+    center: [f64; 2],
+    scale: [f64; 2],
+) -> Option<[f64; 3]> {
+    let mut retained = samples.to_vec();
+    let mut fit = fit_lid_quadratic(&retained, center, scale)?;
+    for _ in 0..2 {
+        let mut residuals = retained
+            .iter()
+            .map(|sample| (sample.1 - lid_curve_y(fit, center, scale, sample.0)).abs())
+            .collect::<Vec<_>>();
+        if residuals.len() < 4 {
+            break;
+        }
+        residuals.sort_by(f64::total_cmp);
+        let median_residual = residuals[residuals.len() / 2];
+        let threshold = (2.8 * median_residual).clamp(1.25, 4.5);
+        let next = samples
+            .iter()
+            .copied()
+            .filter(|sample| {
+                (sample.1 - lid_curve_y(fit, center, scale, sample.0)).abs() <= threshold
+            })
+            .collect::<Vec<_>>();
+        if next.len() < 3 || next.len() == retained.len() {
+            break;
+        }
+        retained = next;
+        fit = fit_lid_quadratic(&retained, center, scale)?;
+    }
+    Some(fit)
+}
+
+fn ellipse_vertical_intersection(ellipse: EdgeEllipse, x: f64, upper: bool) -> Option<f64> {
+    if ellipse.major <= 1.0 || ellipse.minor <= 1.0 || !x.is_finite() {
+        return None;
+    }
+    let dx = x - ellipse.center.0;
+    let (sine, cosine) = ellipse.angle.sin_cos();
+    let inverse_major = 1.0 / (ellipse.major * ellipse.major);
+    let inverse_minor = 1.0 / (ellipse.minor * ellipse.minor);
+    let quadratic = sine * sine * inverse_major + cosine * cosine * inverse_minor;
+    let linear = 2.0 * dx * sine * cosine * (inverse_major - inverse_minor);
+    let constant = dx * dx * (cosine * cosine * inverse_major + sine * sine * inverse_minor) - 1.0;
+    let discriminant = linear * linear - 4.0 * quadratic * constant;
+    if quadratic <= 1.0e-12 || discriminant < 0.0 || !discriminant.is_finite() {
+        return None;
+    }
+    let root = discriminant.sqrt();
+    let first = ellipse.center.1 + (-linear - root) / (2.0 * quadratic);
+    let second = ellipse.center.1 + (-linear + root) / (2.0 * quadratic);
+    Some(if upper {
+        first.min(second)
+    } else {
+        first.max(second)
+    })
+}
+
+fn point_line_distance(point: (f64, f64), start: (f64, f64), end: (f64, f64)) -> f64 {
+    let chord = (end.0 - start.0, end.1 - start.1);
+    let length = chord.0.hypot(chord.1);
+    if length < 1.0e-9 {
+        f64::INFINITY
+    } else {
+        ((point.0 - start.0) * chord.1 - (point.1 - start.1) * chord.0).abs() / length
+    }
+}
+
+fn lid_curve_sagitta_ratio(
+    ellipse: EdgeEllipse,
+    upper: bool,
+    coefficients: [f64; 3],
+    center: [f64; 2],
+    scale: [f64; 2],
+    x_range: [f64; 2],
+) -> Option<(f64, f64, f64)> {
+    let curve_start = (
+        x_range[0],
+        lid_curve_y(coefficients, center, scale, x_range[0]),
+    );
+    let curve_end = (
+        x_range[1],
+        lid_curve_y(coefficients, center, scale, x_range[1]),
+    );
+    let expected_start = (
+        x_range[0],
+        ellipse_vertical_intersection(ellipse, x_range[0], upper)?,
+    );
+    let expected_end = (
+        x_range[1],
+        ellipse_vertical_intersection(ellipse, x_range[1], upper)?,
+    );
+    let mut measured_sagitta = 0.0f64;
+    let mut expected_sagitta = 0.0f64;
+    for sample in 0..17 {
+        let phase = sample as f64 / 16.0;
+        let x = x_range[0] * (1.0 - phase) + x_range[1] * phase;
+        measured_sagitta = measured_sagitta.max(point_line_distance(
+            (x, lid_curve_y(coefficients, center, scale, x)),
+            curve_start,
+            curve_end,
+        ));
+        let expected_y = ellipse_vertical_intersection(ellipse, x, upper)?;
+        expected_sagitta = expected_sagitta.max(point_line_distance(
+            (x, expected_y),
+            expected_start,
+            expected_end,
+        ));
+    }
+    (expected_sagitta >= 1.0).then_some((
+        measured_sagitta / expected_sagitta.max(1.0e-9),
+        measured_sagitta,
+        expected_sagitta,
+    ))
+}
+
+fn detect_one_lid_occlusion(
+    edges: &[EdgeEvidence],
+    seed: IrisEllipseSeed,
+    margin: &[LidMarginPoint],
+    upper: bool,
+) -> Option<LidOcclusionCurve> {
+    let ellipse = seed.ellipse();
+    if margin.len() < LID_OCCLUSION_MIN_MARGIN_POINTS || ellipse.major < 8.0 || ellipse.minor < 8.0
+    {
+        return None;
+    }
+    let (sine, cosine) = ellipse.angle.sin_cos();
+    let projected_half_width = (ellipse.major * ellipse.major * cosine * cosine
+        + ellipse.minor * ellipse.minor * sine * sine)
+        .sqrt();
+    let intrusion_floor = (ellipse.minor * 0.025).clamp(1.5, 3.5);
+    let maximum_intrusion = ellipse.minor * 1.15;
+    let mut intrusive = margin
+        .iter()
+        .filter_map(|point| {
+            let x = point.x as f64;
+            let y = point.y as f64;
+            let boundary_y = ellipse_vertical_intersection(ellipse, x, upper)?;
+            let inward = if upper {
+                y - boundary_y
+            } else {
+                boundary_y - y
+            };
+            let correct_half = if upper {
+                y <= ellipse.center.1 + ellipse.minor * 0.30
+            } else {
+                y >= ellipse.center.1 - ellipse.minor * 0.30
+            };
+            (correct_half && (intrusion_floor..=maximum_intrusion).contains(&inward))
+                .then_some((x, y, inward))
+        })
+        .collect::<Vec<_>>();
+    intrusive.sort_by(|left, right| left.0.total_cmp(&right.0));
+    if intrusive.len() < LID_OCCLUSION_MIN_MARGIN_POINTS {
+        return None;
+    }
+
+    // Keep one contiguous intrusive chord. A discontinuous eyebrow/lash set
+    // may contain individually plausible points, but it cannot acquire a
+    // complete half-plane censor by bridging an unmeasured gap.
+    let maximum_gap = (projected_half_width * 0.18).clamp(7.0, 24.0);
+    let mut best_range = (0usize, 0usize);
+    let mut run_start = 0usize;
+    for boundary in 1..=intrusive.len() {
+        let split = boundary == intrusive.len()
+            || intrusive[boundary].0 - intrusive[boundary - 1].0 > maximum_gap;
+        if !split {
+            continue;
+        }
+        let current = (run_start, boundary);
+        let current_span = intrusive[current.1 - 1].0 - intrusive[current.0].0;
+        let best_span = if best_range.1 > best_range.0 {
+            intrusive[best_range.1 - 1].0 - intrusive[best_range.0].0
+        } else {
+            -1.0
+        };
+        if current_span > best_span
+            || (current_span == best_span
+                && current.1 - current.0 > best_range.1.saturating_sub(best_range.0))
+        {
+            best_range = current;
+        }
+        run_start = boundary;
+    }
+    let intrusive = &intrusive[best_range.0..best_range.1];
+    if intrusive.len() < LID_OCCLUSION_MIN_MARGIN_POINTS {
+        return None;
+    }
+    let x_range = [intrusive.first()?.0, intrusive.last()?.0];
+    let span = x_range[1] - x_range[0];
+    let minimum_span =
+        (2.0 * projected_half_width * LID_OCCLUSION_MIN_SPAN_FRACTION).clamp(12.0, 44.0);
+    if span < minimum_span {
+        return None;
+    }
+    let center = [ellipse.center.0, ellipse.center.1];
+    let scale = [projected_half_width.max(1.0), ellipse.minor.max(1.0)];
+    let margin_samples = intrusive
+        .iter()
+        .map(|point| {
+            (
+                point.0,
+                point.1,
+                1.0 + (point.2 / ellipse.minor).clamp(0.0, 0.5),
+            )
+        })
+        .collect::<Vec<_>>();
+    let initial = robust_lid_quadratic(&margin_samples, center, scale)?;
+    let (initial_ratio, _, _) =
+        lid_curve_sagitta_ratio(ellipse, upper, initial, center, scale, x_range)?;
+    if initial_ratio > LID_OCCLUSION_MAX_SAGITTA_RATIO {
+        return None;
+    }
+
+    let edge_band = (ellipse.minor * 0.040).clamp(2.5, 5.0);
+    let mut canny_samples = edges
+        .iter()
+        .filter_map(|edge| {
+            let x = edge.x as f64;
+            if x < x_range[0] || x > x_range[1] {
+                return None;
+            }
+            let curve_y = lid_curve_y(initial, center, scale, x);
+            let residual = (edge.y as f64 - curve_y).abs();
+            if residual > edge_band {
+                return None;
+            }
+            let normalized_x = (x - center[0]) / scale[0];
+            let slope = scale[1] / scale[0] * (initial[1] + 2.0 * initial[2] * normalized_x);
+            let normal_length = (-slope).hypot(1.0).max(1.0e-9);
+            let normal_alignment =
+                ((-slope * edge.gradient_x as f64 + edge.gradient_y as f64) / normal_length).abs();
+            let radius = normalized_ellipse_radius(ellipse, (x, edge.y as f64));
+            let persistent = edge
+                .multiscale_consistency
+                .max(edge.signed_step_persistence) as f64;
+            if !(0.42..=1.38).contains(&radius)
+                || normal_alignment < 0.48
+                || edge.strength < 0.20
+                || persistent < 0.08
+            {
+                return None;
+            }
+            let weight = (0.55 + 0.30 * edge.strength.clamp(0.0, 2.0) as f64 + 0.15 * persistent)
+                * (1.0 - residual / (edge_band * 1.5)).clamp(0.20, 1.0);
+            Some((x, edge.y as f64, weight))
+        })
+        .collect::<Vec<_>>();
+    canny_samples.sort_by(|left, right| left.0.total_cmp(&right.0));
+    if canny_samples.len() < LID_OCCLUSION_MIN_CANNY_POINTS
+        || canny_samples.last()?.0 - canny_samples.first()?.0 < minimum_span * 0.55
+    {
+        return None;
+    }
+
+    // Current Canny locations own the visual/final curve; direct lid samples
+    // remain a low-weight stabilizer so a sparse exact edge bank cannot make
+    // three neighboring points extrapolate an implausible parabola.
+    let mut joint_samples = margin_samples
+        .iter()
+        .map(|sample| (sample.0, sample.1, sample.2 * 0.35))
+        .collect::<Vec<_>>();
+    joint_samples.extend(canny_samples.iter().copied());
+    let coefficients = robust_lid_quadratic(&joint_samples, center, scale)?;
+    let (sagitta_ratio, measured_sagitta, expected_sagitta) =
+        lid_curve_sagitta_ratio(ellipse, upper, coefficients, center, scale, x_range)?;
+    if sagitta_ratio > LID_OCCLUSION_MAX_SAGITTA_RATIO + 0.06 {
+        return None;
+    }
+    let support_points = canny_samples
+        .iter()
+        .filter(|sample| {
+            (sample.1 - lid_curve_y(coefficients, center, scale, sample.0)).abs() <= edge_band
+        })
+        .map(|sample| (sample.0 as f32, sample.1 as f32))
+        .collect::<Vec<_>>();
+    if support_points.len() < LID_OCCLUSION_MIN_CANNY_POINTS {
+        return None;
+    }
+    let mean_intrusion =
+        intrusive.iter().map(|point| point.2).sum::<f64>() / intrusive.len().max(1) as f64;
+    let flatness = (1.0 - sagitta_ratio / (LID_OCCLUSION_MAX_SAGITTA_RATIO + 0.06)).clamp(0.0, 1.0);
+    let span_score = (span / (projected_half_width * 1.10).max(1.0)).clamp(0.0, 1.0);
+    let edge_score = (support_points.len() as f64 / 9.0).clamp(0.0, 1.0);
+    let intrusion_score = (mean_intrusion / (ellipse.minor * 0.16).max(1.0)).clamp(0.0, 1.0);
+    let curvature_separation =
+        ((expected_sagitta - measured_sagitta) / expected_sagitta.max(1.0)).clamp(0.0, 1.0);
+    let confidence = (0.28 * flatness
+        + 0.24 * span_score
+        + 0.22 * edge_score
+        + 0.16 * intrusion_score
+        + 0.10 * curvature_separation)
+        .clamp(0.0, 1.0) as f32;
+    if confidence < 0.34 {
+        return None;
+    }
+    let points = (0..LID_OCCLUSION_CURVE_SAMPLES)
+        .map(|sample| {
+            let phase = sample as f64 / (LID_OCCLUSION_CURVE_SAMPLES - 1) as f64;
+            let x = x_range[0] * (1.0 - phase) + x_range[1] * phase;
+            (x as f32, lid_curve_y(coefficients, center, scale, x) as f32)
+        })
+        .collect::<Vec<_>>();
+    let mut curve = LidOcclusionCurve {
+        upper,
+        confidence,
+        points,
+        support_points,
+        censored_edges: 0,
+        extinguished_tracks: 0,
+        reference_seed: seed,
+        reference_center: [center[0] as f32, center[1] as f32],
+        reference_scale: [scale[0] as f32, scale[1] as f32],
+        coefficients: [
+            coefficients[0] as f32,
+            coefficients[1] as f32,
+            coefficients[2] as f32,
+        ],
+        x_range: [x_range[0] as f32, x_range[1] as f32],
+        mask_margin_px: LID_OCCLUSION_MASK_MARGIN_PX,
+    };
+    curve.censored_edges = edges
+        .iter()
+        .filter(|edge| curve.masks_limbus_point([edge.x, edge.y], 0.0))
+        .count();
+    Some(curve)
+}
+
+fn detect_lid_occlusions(
+    edges: &[EdgeEvidence],
+    seed: Option<IrisEllipseSeed>,
+    upper_lid_margin: &[LidMarginPoint],
+    lower_lid_margin: &[LidMarginPoint],
+) -> Vec<LidOcclusionCurve> {
+    let Some(seed) = seed else {
+        return Vec::new();
+    };
+    [
+        detect_one_lid_occlusion(edges, seed, upper_lid_margin, true),
+        detect_one_lid_occlusion(edges, seed, lower_lid_margin, false),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn point_is_lid_censored(point: [f32; 2], occlusions: &[LidOcclusionCurve]) -> bool {
+    occlusions
+        .iter()
+        .any(|curve| curve.masks_limbus_point(point, 0.0))
+}
+
 fn edges_for_motion_layer(
     overlay: &MotionOctreeOverlay,
     object: usize,
@@ -1508,6 +2173,9 @@ fn edges_for_motion_layer(
         })
         .filter_map(|trail| trail.points.last())
         .filter(|point| {
+            if point_is_lid_censored([point.x, point.y], &overlay.lid_occlusions) {
+                return false;
+            }
             let radius = normalized_ellipse_radius(seed_ellipse, (point.x as f64, point.y as f64));
             (0.62..=1.30).contains(&radius)
         })
@@ -1521,6 +2189,9 @@ fn edges_for_motion_layer(
         .iter()
         .copied()
         .filter(|edge| {
+            if point_is_lid_censored([edge.x, edge.y], &overlay.lid_occlusions) {
+                return false;
+            }
             let radius = normalized_ellipse_radius(seed_ellipse, (edge.x as f64, edge.y as f64));
             (0.55..=1.45).contains(&radius)
                 && anchors.iter().any(|anchor| {
@@ -1700,8 +2371,20 @@ fn feature_cluster_iris_hypothesis_internal(
         // allowed to move the seed.
         let measured_fit = measured_seed_geometry.then(|| {
             let ellipse = seed.ellipse();
-            let temporal_evidence = score_edge_ellipse(ellipse, &edges, seed.area_seed(), true);
-            let full_evidence = score_edge_ellipse(ellipse, &overlay.edges, seed.area_seed(), true);
+            let temporal_evidence = score_edge_ellipse_with_occlusions(
+                ellipse,
+                &edges,
+                seed.area_seed(),
+                true,
+                &overlay.lid_occlusions,
+            );
+            let full_evidence = score_edge_ellipse_with_occlusions(
+                ellipse,
+                &overlay.edges,
+                seed.area_seed(),
+                true,
+                &overlay.lid_occlusions,
+            );
             diagnostics.best_edge_confidence = diagnostics
                 .best_edge_confidence
                 .max(full_evidence.confidence);
@@ -1732,7 +2415,7 @@ fn feature_cluster_iris_hypothesis_internal(
         let direct_fit = if measured_seed_geometry {
             measured_fit.flatten()
         } else {
-            fit_edge_ellipse(&edges, seed, width, height)
+            fit_edge_ellipse_with_occlusions(&edges, seed, width, height, &overlay.lid_occlusions)
         };
         let (fit_edges, ellipse, evidence, seed_evidence, evaluations, bridged) =
             if let Some((ellipse, evidence, seed_evidence, evaluations)) = direct_fit {
@@ -1761,14 +2444,26 @@ fn feature_cluster_iris_hypothesis_internal(
                 // normals.  The completed conic still has to be seed-bounded
                 // and independently corroborated by layer-associated inliers.
                 if bridged_full_frame_fit.is_none() {
-                    bridged_full_frame_fit = fit_edge_ellipse(&overlay.edges, seed, width, height);
+                    bridged_full_frame_fit = fit_edge_ellipse_with_occlusions(
+                        &overlay.edges,
+                        seed,
+                        width,
+                        height,
+                        &overlay.lid_occlusions,
+                    );
                 }
                 let Some((ellipse, evidence, seed_evidence, evaluations)) =
                     bridged_full_frame_fit.clone()
                 else {
                     continue;
                 };
-                let temporal_evidence = score_edge_ellipse(ellipse, &edges, seed.area_seed(), true);
+                let temporal_evidence = score_edge_ellipse_with_occlusions(
+                    ellipse,
+                    &edges,
+                    seed.area_seed(),
+                    true,
+                    &overlay.lid_occlusions,
+                );
                 if temporal_evidence.inliers.len() < 7
                     || temporal_evidence.angular_coverage < 4
                     || (temporal_evidence.opposing_meridians == 0
@@ -1825,8 +2520,13 @@ fn feature_cluster_iris_hypothesis_internal(
     };
     let (ellipse, evidence, seed_evidence) = if measured_seed_geometry {
         let measured_ellipse = seed.ellipse();
-        let measured_evidence =
-            score_edge_ellipse(measured_ellipse, &layer_edges, seed.area_seed(), true);
+        let measured_evidence = score_edge_ellipse_with_occlusions(
+            measured_ellipse,
+            &layer_edges,
+            seed.area_seed(),
+            true,
+            &overlay.lid_occlusions,
+        );
         if measured_evidence.confidence < 0.15
             || measured_evidence.inliers.len() < 18
             || measured_evidence.angular_coverage < 9
@@ -4071,10 +4771,11 @@ pub fn canny_proposal_overlay(pixels: &[u16], width: usize, height: usize) -> Mo
     };
     let mut field = canny_field(&current);
     let edges = edge_evidence(&mut field, width, height).edges;
-    let provisional_features = seed_points(&current, Some(&field), &edges, None, &[], MAX_FEATURES)
-        .into_iter()
-        .map(|(point, _)| (point[0], point[1]))
-        .collect();
+    let provisional_features =
+        seed_points(&current, Some(&field), &edges, None, &[], &[], MAX_FEATURES)
+            .into_iter()
+            .map(|(point, _)| (point[0], point[1]))
+            .collect();
     MotionOctreeOverlay {
         edges,
         edge_high_threshold: field.high_threshold,
@@ -5011,7 +5712,16 @@ pub struct FourMotionOctrees {
     /// transitions. They remain separate from point-ID tracks because a
     /// smooth limbus constrains only motion along its normal.
     radial_limbus_region: Option<EyeMotionRegion>,
+    radial_limbus_temporal_region: RadialLimbusTemporalRegion,
     radial_limbus_flows: Vec<RadialLimbusFlow>,
+    /// Exact-current-frame inner/outer boundary pair. Unlike
+    /// `radial_limbus_region`, this is never temporally transported as though
+    /// both photometric transitions had been observed again.
+    nested_eye_boundaries: Option<NestedEyeBoundaryPair>,
+    /// Exact-current-frame flat-tire censor. It is deliberately not carried
+    /// as anatomy across a missing observation; every frame must re-prove the
+    /// lid margin against its own RAW Canny field.
+    lid_occlusions: Vec<LidOcclusionCurve>,
     motions: [SimilarityMotion; OBJECTS],
     layers: [MotionLayerStatus; OBJECTS],
     layer_signatures: [LayerMotionSignature; OBJECTS],
@@ -8185,6 +8895,7 @@ fn seed_points(
     canny: Option<&CannyField>,
     edge_evidence: &[EdgeEvidence],
     iris_seed: Option<IrisEllipseSeed>,
+    lid_occlusions: &[LidOcclusionCurve],
     existing: &[[f32; 2]],
     wanted: usize,
 ) -> Vec<([f32; 2], f32)> {
@@ -8201,6 +8912,9 @@ fn seed_points(
     let tile_columns = frame.width.div_ceil(FEATURE_SEED_TILE_SIZE);
     for y in (5..frame.height.saturating_sub(5)).step_by(3) {
         for x in (5..frame.width.saturating_sub(5)).step_by(3) {
+            if point_is_lid_censored([x as f32, y as f32], lid_occlusions) {
+                continue;
+            }
             let edge_support = canny
                 .map(|edges| local_canny_support(edges, frame.width, x, y))
                 .unwrap_or(1.0);
@@ -8233,6 +8947,9 @@ fn seed_points(
     if let Some(seed) = iris_seed {
         for edge in edge_evidence {
             let point = [edge.x, edge.y];
+            if point_is_lid_censored(point, lid_occlusions) {
+                continue;
+            }
             if point[0] < 5.0
                 || point[1] < 5.0
                 || point[0] + 5.0 >= frame.width as f32
@@ -9260,6 +9977,120 @@ struct EyeMotionRegion {
     angle: f32,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RadialLimbusTemporalRegion {
+    authority: Option<EyeMotionRegion>,
+    candidate: Option<EyeMotionRegion>,
+    candidate_streak: u8,
+}
+
+fn radial_limbus_regions_temporally_compatible(
+    measured: EyeMotionRegion,
+    predicted: EyeMotionRegion,
+) -> bool {
+    let center_limit = (0.18 * predicted.major.max(predicted.minor)).max(10.0);
+    let center_error =
+        (measured.center[0] - predicted.center[0]).hypot(measured.center[1] - predicted.center[1]);
+    let major_log_error = (measured.major.max(1.0) / predicted.major.max(1.0))
+        .ln()
+        .abs();
+    let minor_log_error = (measured.minor.max(1.0) / predicted.minor.max(1.0))
+        .ln()
+        .abs();
+    center_error <= center_limit
+        && major_log_error <= 1.15f32.ln()
+        && minor_log_error <= 1.35f32.ln()
+}
+
+fn blend_radial_limbus_region(
+    predicted: EyeMotionRegion,
+    measured: EyeMotionRegion,
+    measured_weight: f32,
+) -> EyeMotionRegion {
+    let measured_weight = measured_weight.clamp(0.0, 1.0);
+    let predicted_weight = 1.0 - measured_weight;
+    EyeMotionRegion {
+        center: [
+            predicted_weight * predicted.center[0] + measured_weight * measured.center[0],
+            predicted_weight * predicted.center[1] + measured_weight * measured.center[1],
+        ],
+        major: predicted_weight * predicted.major + measured_weight * measured.major,
+        minor: predicted_weight * predicted.minor + measured_weight * measured.minor,
+        angle: blend_ellipse_angle(predicted.angle, measured.angle, measured_weight),
+    }
+}
+
+impl RadialLimbusTemporalRegion {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn observe(
+        &mut self,
+        measured: EyeMotionRegion,
+        predicted: Option<EyeMotionRegion>,
+    ) -> EyeMotionRegion {
+        if let Some(authority) = self.authority {
+            let transported = predicted.unwrap_or(authority);
+            if radial_limbus_regions_temporally_compatible(measured, transported) {
+                let resolved = blend_radial_limbus_region(transported, measured, 0.42);
+                self.authority = Some(resolved);
+                self.candidate = None;
+                self.candidate_streak = 0;
+                return resolved;
+            }
+            if self.candidate.is_some_and(|candidate| {
+                radial_limbus_regions_temporally_compatible(measured, candidate)
+            }) {
+                self.candidate = self
+                    .candidate
+                    .map(|candidate| blend_radial_limbus_region(candidate, measured, 0.55));
+                self.candidate_streak = self.candidate_streak.saturating_add(1);
+            } else {
+                self.candidate = Some(measured);
+                self.candidate_streak = 1;
+            }
+            if self.candidate_streak >= 3 {
+                let replacement = self.candidate.unwrap_or(measured);
+                self.authority = Some(replacement);
+                self.candidate = None;
+                self.candidate_streak = 0;
+                return replacement;
+            }
+            self.authority = Some(transported);
+            return transported;
+        }
+
+        if self.candidate.is_some_and(|candidate| {
+            radial_limbus_regions_temporally_compatible(measured, candidate)
+        }) {
+            self.candidate = self
+                .candidate
+                .map(|candidate| blend_radial_limbus_region(candidate, measured, 0.55));
+            self.candidate_streak = self.candidate_streak.saturating_add(1);
+        } else {
+            self.candidate = Some(measured);
+            self.candidate_streak = 1;
+        }
+        if self.candidate_streak >= 2 {
+            let established = self.candidate.unwrap_or(measured);
+            self.authority = Some(established);
+            self.candidate = None;
+            self.candidate_streak = 0;
+            established
+        } else {
+            measured
+        }
+    }
+
+    fn transport_without_measurement(&mut self, predicted: EyeMotionRegion) -> EyeMotionRegion {
+        if self.authority.is_some() {
+            self.authority = Some(predicted);
+        }
+        predicted
+    }
+}
+
 impl EyeMotionRegion {
     fn contains(self, point: [f32; 2]) -> bool {
         self.normalized_radius(point) <= 1.0
@@ -9323,6 +10154,10 @@ struct RadialLimbusProfile {
     gradients: [f32; RADIAL_LIMBUS_GRADIENTS],
     signed_step: f32,
     quality: f32,
+    /// Signed displacement of the positive-transition energy from the probe
+    /// center. A profile may contain the right step while being centered on a
+    /// neighboring iris ridge; nested fits explicitly prefer zero here.
+    transition_offset_px: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -9427,15 +10262,33 @@ fn radial_limbus_profile(
         .windows(2)
         .map(|pair| pair[1] - pair[0])
         .fold(0.0f32, f32::max);
+    let mut positive_weight = 0.0f32;
+    let mut positive_offset = 0.0f32;
+    for (index, gradient) in gradients.iter().copied().enumerate() {
+        let weight = gradient.max(0.0);
+        let offset = (index as f32 + 0.5 - RADIAL_LIMBUS_HALF_SAMPLES as f32)
+            * RADIAL_LIMBUS_SAMPLE_SPACING_PX;
+        positive_weight += weight;
+        positive_offset += weight * offset;
+    }
+    let transition_offset_px = if positive_weight > 1.0e-5 {
+        positive_offset / positive_weight
+    } else {
+        0.0
+    };
     let contrast_quality = ((deviation - 2.0) / 24.0).clamp(0.0, 1.0);
     let step_quality = ((signed_step - 0.05) / 0.75).clamp(0.0, 1.0);
     let peak_quality = ((positive_peak - 0.05) / 0.70).clamp(0.0, 1.0);
-    let quality = contrast_quality.sqrt() * (0.20 + 0.50 * step_quality + 0.30 * peak_quality);
+    let centered_quality = (-transition_offset_px.abs() / 3.2).exp();
+    let quality = contrast_quality.sqrt()
+        * (0.20 + 0.50 * step_quality + 0.30 * peak_quality)
+        * (0.35 + 0.65 * centered_quality);
     Some(RadialLimbusProfile {
         normalized,
         gradients,
         signed_step,
         quality: quality.clamp(0.0, 1.0),
+        transition_offset_px,
     })
 }
 
@@ -9464,6 +10317,355 @@ fn radial_limbus_profile_cost(
         .clamp(0.0, 1.0)
 }
 
+#[derive(Clone)]
+struct NestedBoundaryScaleEvidence {
+    scale: f32,
+    profiles: [Option<RadialLimbusProfile>; RADIAL_LIMBUS_SECTORS],
+    support: usize,
+    lateral_support: usize,
+    median_quality: f32,
+}
+
+#[derive(Clone)]
+struct NestedBoundaryCandidate {
+    pupil_scale: f32,
+    limbus_scale: f32,
+    pupil_support: usize,
+    limbus_support: usize,
+    paired_phases_rad: Vec<f32>,
+    objective: f32,
+}
+
+fn scaled_eye_region(region: EyeMotionRegion, scale: f32) -> EyeMotionRegion {
+    EyeMotionRegion {
+        major: region.major * scale,
+        minor: region.minor * scale,
+        ..region
+    }
+}
+
+/// A tiny native-RAW lane average used only for the material ordering of the
+/// two fitted transitions. It borrows `RawFrame::pixels` in place; no radial
+/// strip, demosaic, or resized image is created.
+fn nested_boundary_lane_mean(
+    frame: &RawFrame,
+    region: EyeMotionRegion,
+    scale: f32,
+    phase: f32,
+) -> Option<f32> {
+    let scaled = scaled_eye_region(region, scale);
+    let point = eye_region_boundary(scaled, phase);
+    let normal = scaled.outward_normal(point);
+    let tangent = [-normal[1], normal[0]];
+    let local = [
+        point[0] - frame.sensor_x as f32,
+        point[1] - frame.sensor_y as f32,
+    ];
+    let mut sum = 0.0f32;
+    let mut count = 0usize;
+    for radial in [-1.0f32, 0.0, 1.0] {
+        for lateral in [-2.0f32, 0.0, 2.0] {
+            let x = local[0] + normal[0] * radial + tangent[0] * lateral;
+            let y = local[1] + normal[1] * radial + tangent[1] * lateral;
+            if let Some(value) = sample_native_raw_bilinear(frame, x, y) {
+                sum += value;
+                count += 1;
+            }
+        }
+    }
+    (count >= 5).then_some(sum / count.max(1) as f32)
+}
+
+fn nested_boundary_scale_evidence(
+    frame: &RawFrame,
+    region: EyeMotionRegion,
+    scale: f32,
+    lid_occlusions: &[LidOcclusionCurve],
+    evaluations: &mut usize,
+) -> NestedBoundaryScaleEvidence {
+    let scaled = scaled_eye_region(region, scale);
+    let mut profiles = [None; RADIAL_LIMBUS_SECTORS];
+    let mut qualities = Vec::with_capacity(RADIAL_LIMBUS_SECTORS);
+    let mut lateral_support = 0usize;
+    for (sector, destination) in profiles.iter_mut().enumerate() {
+        let phase = std::f32::consts::TAU * sector as f32 / RADIAL_LIMBUS_SECTORS as f32;
+        let point = eye_region_boundary(scaled, phase);
+        if point_is_lid_censored(
+            [
+                point[0] - frame.sensor_x as f32,
+                point[1] - frame.sensor_y as f32,
+            ],
+            lid_occlusions,
+        ) {
+            continue;
+        }
+        let normal = scaled.outward_normal(point);
+        *evaluations += 1;
+        let Some(profile) = radial_limbus_profile(frame, point, normal) else {
+            continue;
+        };
+        if profile.quality < RADIAL_LIMBUS_MIN_QUALITY * 0.55 {
+            continue;
+        }
+        qualities.push(profile.quality);
+        if phase.cos().abs() >= 0.50 {
+            lateral_support += 1;
+        }
+        *destination = Some(profile);
+    }
+    let support = qualities.len();
+    let median_quality = median(&mut qualities);
+    NestedBoundaryScaleEvidence {
+        scale,
+        profiles,
+        support,
+        lateral_support,
+        median_quality,
+    }
+}
+
+fn score_nested_boundary_pair(
+    frame: &RawFrame,
+    region: EyeMotionRegion,
+    pupil: &NestedBoundaryScaleEvidence,
+    limbus: &NestedBoundaryScaleEvidence,
+) -> Option<NestedBoundaryCandidate> {
+    if pupil.scale >= limbus.scale {
+        return None;
+    }
+    let ratio = pupil.scale / limbus.scale;
+    let physical_gap = (limbus.scale - pupil.scale) * region.minor.min(region.major);
+    if !(NESTED_PUPIL_TO_LIMBUS_MIN_RATIO..=NESTED_PUPIL_TO_LIMBUS_MAX_RATIO).contains(&ratio)
+        || physical_gap < NESTED_BOUNDARY_MIN_GAP_PX
+        || pupil.support < NESTED_BOUNDARY_MIN_INNER_SUPPORT
+        || limbus.support < NESTED_BOUNDARY_MIN_OUTER_SUPPORT
+        || limbus.lateral_support < 2
+    {
+        return None;
+    }
+
+    let mut paired_phases_rad = Vec::new();
+    let mut paired_quality = Vec::new();
+    let mut inner_rises = Vec::new();
+    let mut outer_rises = Vec::new();
+    let mut opposed_pairs = 0usize;
+    let sclera_padding_scale = (6.0 / region.minor.max(1.0)).clamp(0.035, 0.18);
+    for sector in 0..RADIAL_LIMBUS_SECTORS {
+        let (Some(inner_profile), Some(outer_profile)) =
+            (pupil.profiles[sector], limbus.profiles[sector])
+        else {
+            continue;
+        };
+        let phase = std::f32::consts::TAU * sector as f32 / RADIAL_LIMBUS_SECTORS as f32;
+        paired_phases_rad.push(phase);
+        paired_quality.push((inner_profile.quality * outer_profile.quality).sqrt());
+
+        let pupil_plateau_scale = pupil.scale * 0.72;
+        let iris_plateau_scale = pupil.scale + 0.48 * (limbus.scale - pupil.scale);
+        let sclera_plateau_scale = limbus.scale + sclera_padding_scale;
+        if let (Some(pupil_value), Some(iris_value), Some(sclera_value)) = (
+            nested_boundary_lane_mean(frame, region, pupil_plateau_scale, phase),
+            nested_boundary_lane_mean(frame, region, iris_plateau_scale, phase),
+            nested_boundary_lane_mean(frame, region, sclera_plateau_scale, phase),
+        ) {
+            let range = (sclera_value - pupil_value).abs().max(32.0);
+            inner_rises.push((iris_value - pupil_value) / range);
+            // The outer material test is most reliable on the lateral sclera;
+            // top/bottom sectors may legitimately terminate on a lid chord.
+            if phase.cos().abs() >= 0.45 {
+                outer_rises.push((sclera_value - iris_value) / range);
+            }
+        }
+    }
+    if paired_phases_rad.len() < NESTED_BOUNDARY_MIN_PAIRED_SUPPORT {
+        return None;
+    }
+    for sector in 0..RADIAL_LIMBUS_SECTORS / 2 {
+        let opposite = sector + RADIAL_LIMBUS_SECTORS / 2;
+        if pupil.profiles[sector].is_some()
+            && limbus.profiles[sector].is_some()
+            && pupil.profiles[opposite].is_some()
+            && limbus.profiles[opposite].is_some()
+        {
+            opposed_pairs += 1;
+        }
+    }
+    if opposed_pairs == 0 && paired_phases_rad.len() < 6 {
+        return None;
+    }
+    let reclassifies_input_as_pupil = (pupil.scale - 1.0).abs() < (limbus.scale - 1.0).abs();
+    if !reclassifies_input_as_pupil && !(0.88..=1.12).contains(&limbus.scale) {
+        // In the ordinary case this pass disambiguates the inner edge; it is
+        // not another open-ended outer-iris size search. Keep refinement
+        // local to the supplied limbus unless the much stricter branch below
+        // proves that the supplied boundary was actually pupil-like.
+        return None;
+    }
+    if reclassifies_input_as_pupil
+        && (limbus.scale < 1.55
+            || limbus.support < 12
+            || paired_phases_rad.len() < 10
+            || opposed_pairs < 2)
+    {
+        // A modest second ring beyond a supplied limbus is commonly the eye
+        // aperture, lid, glasses rim, or a brow/skin ridge. Only a broadly
+        // observed, substantially larger ordered transition may overturn the
+        // input boundary and call it pupil-like. Weak/partial evidence remains
+        // useful diagnostically but cannot move the outer radial tracker.
+        return None;
+    }
+
+    let paired_transition_quality = median(&mut paired_quality);
+    let inner_rise = median(&mut inner_rises);
+    let outer_rise = median(&mut outer_rises);
+    let inner_material = ((inner_rise + 0.04) / 0.34).clamp(0.0, 1.0);
+    let outer_material = ((outer_rise + 0.04) / 0.34).clamp(0.0, 1.0);
+    let material_score = (inner_material * outer_material).sqrt();
+    let support_score = (paired_phases_rad.len() as f32 / 8.0).clamp(0.0, 1.0);
+    let opposed_score = (opposed_pairs as f32 / 2.0).clamp(0.0, 1.0);
+    let ratio_score = (1.0 - (ratio - 0.43).abs() / 0.35).clamp(0.0, 1.0);
+    // The seed-distance term is intentionally tiny. A genuine pupil seed can
+    // require an outer scale near 3x, and photometric nesting must be allowed
+    // to overrule the single-boundary prior when it has ordered support.
+    let seed_distance_penalty = 0.012 * limbus.scale.max(1.0).ln().abs().min(2.0);
+    let objective = (0.23 * pupil.median_quality
+        + 0.27 * limbus.median_quality
+        + 0.16 * paired_transition_quality
+        + 0.20 * material_score
+        + 0.08 * support_score
+        + 0.04 * opposed_score
+        + 0.02 * ratio_score
+        - seed_distance_penalty)
+        .clamp(0.0, 1.0);
+    Some(NestedBoundaryCandidate {
+        pupil_scale: pupil.scale,
+        limbus_scale: limbus.scale,
+        pupil_support: pupil.support,
+        limbus_support: limbus.support,
+        paired_phases_rad,
+        objective,
+    })
+}
+
+fn best_nested_boundary_candidate(
+    frame: &RawFrame,
+    region: EyeMotionRegion,
+    pupil_scales: &[f32],
+    limbus_scales: &[f32],
+    lid_occlusions: &[LidOcclusionCurve],
+    evaluations: &mut usize,
+) -> Option<NestedBoundaryCandidate> {
+    let pupil_evidence = pupil_scales
+        .iter()
+        .copied()
+        .map(|scale| {
+            nested_boundary_scale_evidence(frame, region, scale, lid_occlusions, evaluations)
+        })
+        .collect::<Vec<_>>();
+    let limbus_evidence = limbus_scales
+        .iter()
+        .copied()
+        .map(|scale| {
+            nested_boundary_scale_evidence(frame, region, scale, lid_occlusions, evaluations)
+        })
+        .collect::<Vec<_>>();
+    let mut best = None::<NestedBoundaryCandidate>;
+    for pupil in &pupil_evidence {
+        for limbus in &limbus_evidence {
+            let Some(candidate) = score_nested_boundary_pair(frame, region, pupil, limbus) else {
+                continue;
+            };
+            if best
+                .as_ref()
+                .is_none_or(|prior| candidate.objective > prior.objective)
+            {
+                best = Some(candidate);
+            }
+        }
+    }
+    best
+}
+
+fn nested_eye_boundary_pair(
+    frame: &RawFrame,
+    input_region: EyeMotionRegion,
+    lid_occlusions: &[LidOcclusionCurve],
+) -> (Option<NestedEyeBoundaryPair>, usize) {
+    if !input_region.center[0].is_finite()
+        || !input_region.center[1].is_finite()
+        || !input_region.major.is_finite()
+        || !input_region.minor.is_finite()
+        || input_region.major < 8.0
+        || input_region.minor < 6.0
+    {
+        return (None, 0);
+    }
+    let mut coarse_scales = Vec::new();
+    let mut scale = NESTED_BOUNDARY_COARSE_MIN_SCALE;
+    while scale <= NESTED_BOUNDARY_COARSE_MAX_SCALE + 1.0e-4 {
+        coarse_scales.push(scale);
+        scale += NESTED_BOUNDARY_COARSE_STEP;
+    }
+    let mut evaluations = 0usize;
+    let Some(coarse) = best_nested_boundary_candidate(
+        frame,
+        input_region,
+        &coarse_scales,
+        &coarse_scales,
+        lid_occlusions,
+        &mut evaluations,
+    ) else {
+        return (None, evaluations);
+    };
+
+    let fine_scales = |center: f32| {
+        let mut scales = Vec::new();
+        let mut value =
+            (center - NESTED_BOUNDARY_FINE_RADIUS).max(NESTED_BOUNDARY_COARSE_MIN_SCALE);
+        let maximum = (center + NESTED_BOUNDARY_FINE_RADIUS).min(NESTED_BOUNDARY_COARSE_MAX_SCALE);
+        while value <= maximum + 1.0e-4 {
+            scales.push(value);
+            value += NESTED_BOUNDARY_FINE_STEP;
+        }
+        scales
+    };
+    let fine_pupil = fine_scales(coarse.pupil_scale);
+    let fine_limbus = fine_scales(coarse.limbus_scale);
+    let candidate = best_nested_boundary_candidate(
+        frame,
+        input_region,
+        &fine_pupil,
+        &fine_limbus,
+        lid_occlusions,
+        &mut evaluations,
+    )
+    .filter(|fine| fine.objective >= coarse.objective * 0.92)
+    .unwrap_or(coarse);
+    if candidate.objective < NESTED_BOUNDARY_MIN_CONFIDENCE {
+        return (None, evaluations);
+    }
+
+    let pupil_region = scaled_eye_region(input_region, candidate.pupil_scale);
+    let limbus_region = scaled_eye_region(input_region, candidate.limbus_scale);
+    let pupil_to_limbus_radius_ratio = candidate.pupil_scale / candidate.limbus_scale;
+    let input_seed_was_pupil_like =
+        (candidate.pupil_scale - 1.0).abs() < (candidate.limbus_scale - 1.0).abs();
+    (
+        Some(NestedEyeBoundaryPair {
+            pupil: pupil_region.local_seed(frame),
+            limbus: limbus_region.local_seed(frame),
+            confidence: candidate.objective,
+            pupil_to_limbus_radius_ratio,
+            pupil_support: candidate.pupil_support,
+            limbus_support: candidate.limbus_support,
+            paired_support: candidate.paired_phases_rad.len(),
+            paired_phases_rad: candidate.paired_phases_rad,
+            input_seed_was_pupil_like,
+        }),
+        evaluations,
+    )
+}
+
 fn radial_limbus_flows(
     previous: &RawFrame,
     current: &RawFrame,
@@ -9482,10 +10684,10 @@ fn radial_limbus_flows(
     if !valid_region(previous_region) || !valid_region(current_region) {
         return (Vec::new(), 0, started.elapsed().as_micros() as u64);
     }
-    let mut flows = Vec::with_capacity(RADIAL_LIMBUS_SECTORS);
+    let mut flows = Vec::with_capacity(RADIAL_LIMBUS_FLOW_SECTORS);
     let mut evaluations = 0usize;
-    for sector in 0..RADIAL_LIMBUS_SECTORS {
-        let phase = std::f32::consts::TAU * sector as f32 / RADIAL_LIMBUS_SECTORS as f32;
+    for sector in 0..RADIAL_LIMBUS_FLOW_SECTORS {
+        let phase = std::f32::consts::TAU * sector as f32 / RADIAL_LIMBUS_FLOW_SECTORS as f32;
         let previous_base = eye_region_boundary(previous_region, phase);
         let previous_normal = previous_region.outward_normal(previous_base);
         let mut reference = None::<([f32; 2], RadialLimbusProfile, f32)>;
@@ -9587,6 +10789,254 @@ fn radial_limbus_flows(
         flows.clear();
     }
     (flows, evaluations, started.elapsed().as_micros() as u64)
+}
+
+fn radial_limbus_fusion_ranking(
+    flows: &[RadialLimbusFlow],
+    mut ranked: Vec<(usize, f32)>,
+) -> Vec<(usize, f32)> {
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    if ranked.len() <= RADIAL_LIMBUS_MAX_FUSED {
+        return ranked;
+    }
+
+    let mut selected = Vec::with_capacity(RADIAL_LIMBUS_MAX_FUSED);
+    let mut used = vec![false; flows.len()];
+    for bin in 0..RADIAL_LIMBUS_FUSION_COVERAGE_BINS {
+        let candidate = ranked.iter().copied().find(|(index, _)| {
+            let normalized_phase =
+                flows[*index].phase_rad.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
+            let phase_bin = ((normalized_phase * RADIAL_LIMBUS_FUSION_COVERAGE_BINS as f32).floor()
+                as usize)
+                .min(RADIAL_LIMBUS_FUSION_COVERAGE_BINS - 1);
+            phase_bin == bin
+        });
+        if let Some(candidate) = candidate {
+            if !used[candidate.0] {
+                used[candidate.0] = true;
+                selected.push(candidate);
+            }
+        }
+    }
+    for candidate in ranked {
+        if selected.len() >= RADIAL_LIMBUS_MAX_FUSED {
+            break;
+        }
+        if !used[candidate.0] {
+            used[candidate.0] = true;
+            selected.push(candidate);
+        }
+    }
+    selected.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    selected
+}
+
+/// Rank exact-current-frame radial profiles in two passes. The first pass is
+/// the historical pupil-motion gate. Only a spatially distributed subset of
+/// those already-authorized lanes may fit the second-pass normal-flow model;
+/// consequently an isolated lid, lash, or iris ridge cannot relax its own
+/// gate. The second pass recovers broad-transition lanes which agree with that
+/// distributed model even when the point-feature prior is slightly biased.
+fn radial_limbus_motion_ranking(
+    flows: &[RadialLimbusFlow],
+    pupil_prior: SimilarityMotion,
+    center: [f32; 2],
+) -> Vec<(usize, f32)> {
+    let strict = flows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, flow)| {
+            let predicted = pupil_prior.predict(flow.previous, center);
+            let normal_error = ((flow.current[0] - predicted[0]) * flow.normal[0]
+                + (flow.current[1] - predicted[1]) * flow.normal[1])
+                .abs();
+            (normal_error <= RADIAL_LIMBUS_MAX_PRIOR_NORMAL_ERROR_PX)
+                .then_some((index, flow.confidence * (-normal_error / 3.5).exp()))
+        })
+        .collect::<Vec<_>>();
+    let strict_selected = radial_limbus_fusion_ranking(flows, strict.clone());
+    if strict_selected.len() < RADIAL_LIMBUS_CONSENSUS_MIN_SUPPORT {
+        return strict_selected;
+    }
+    let hemisphere_support = strict_selected
+        .iter()
+        .fold([0usize; 2], |mut support, item| {
+            support[usize::from(flows[item.0].phase_rad.cos() >= 0.0)] += 1;
+            support
+        });
+    if hemisphere_support
+        .iter()
+        .any(|support| *support < RADIAL_LIMBUS_CONSENSUS_MIN_HEMISPHERE_SUPPORT)
+    {
+        return strict_selected;
+    }
+    let occupied_bins = strict_selected
+        .iter()
+        .map(|(index, _)| {
+            ((flows[*index].phase_rad.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU
+                * RADIAL_LIMBUS_FUSION_COVERAGE_BINS as f32)
+                .floor() as usize)
+                .min(RADIAL_LIMBUS_FUSION_COVERAGE_BINS - 1)
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    if occupied_bins.len() < RADIAL_LIMBUS_CONSENSUS_MIN_ANGULAR_BINS {
+        return strict_selected;
+    }
+    let strict_flows = strict_selected
+        .iter()
+        .map(|(index, _)| flows[*index])
+        .collect::<Vec<_>>();
+    let consensus =
+        fit_similarity_with_normal_constraints(&[], &[], &strict_flows, &[], &[], center);
+    if !consensus.residual.is_finite()
+        || consensus.residual > RADIAL_LIMBUS_CONSENSUS_MAX_FIT_RESIDUAL_PX
+        || consensus.translation[0].hypot(consensus.translation[1])
+            > RADIAL_LIMBUS_CONSENSUS_MAX_TRANSLATION_PX
+        || consensus.scale_delta.abs() > 0.08
+        || consensus.rotation.abs() > 0.08
+    {
+        return strict_selected;
+    }
+
+    let expanded = flows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, flow)| {
+            let prior_prediction = pupil_prior.predict(flow.previous, center);
+            let prior_error = ((flow.current[0] - prior_prediction[0]) * flow.normal[0]
+                + (flow.current[1] - prior_prediction[1]) * flow.normal[1])
+                .abs();
+            if prior_error <= RADIAL_LIMBUS_MAX_PRIOR_NORMAL_ERROR_PX {
+                return Some((index, flow.confidence * (-prior_error / 3.5).exp()));
+            }
+            if flow.confidence < 0.30 {
+                return None;
+            }
+            let consensus_prediction = consensus.predict(flow.previous, center);
+            let consensus_error = ((flow.current[0] - consensus_prediction[0]) * flow.normal[0]
+                + (flow.current[1] - consensus_prediction[1]) * flow.normal[1])
+                .abs();
+            (consensus_error <= RADIAL_LIMBUS_CONSENSUS_MAX_NORMAL_ERROR_PX).then_some((
+                index,
+                0.90 * flow.confidence * (-consensus_error / 3.5).exp(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    radial_limbus_fusion_ranking(flows, expanded)
+}
+
+fn radial_limbus_robust_consensus_ranking(
+    flows: &[RadialLimbusFlow],
+    center: [f32; 2],
+) -> Vec<(usize, f32)> {
+    if flows.len() < RADIAL_LIMBUS_INDEPENDENT_MIN_SUPPORT {
+        return Vec::new();
+    }
+    let mut selected = flows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, flow)| (flow.confidence >= 0.30).then_some(index))
+        .collect::<Vec<_>>();
+    let mut fitted = SimilarityMotion::default();
+    for _ in 0..2 {
+        if selected.len() < RADIAL_LIMBUS_INDEPENDENT_MIN_SUPPORT {
+            return Vec::new();
+        }
+        let constraints = selected
+            .iter()
+            .map(|index| flows[*index])
+            .collect::<Vec<_>>();
+        fitted = fit_similarity_with_normal_constraints(&[], &[], &constraints, &[], &[], center);
+        if !fitted.residual.is_finite()
+            || fitted.translation[0].hypot(fitted.translation[1])
+                > RADIAL_LIMBUS_CONSENSUS_MAX_TRANSLATION_PX
+            || fitted.scale_delta.abs() > 0.08
+            || fitted.rotation.abs() > 0.08
+        {
+            return Vec::new();
+        }
+        let residual_for = |index: usize| {
+            let flow = flows[index];
+            let predicted = fitted.predict(flow.previous, center);
+            ((flow.current[0] - predicted[0]) * flow.normal[0]
+                + (flow.current[1] - predicted[1]) * flow.normal[1])
+                .abs()
+        };
+        let mut residuals = selected
+            .iter()
+            .map(|index| residual_for(*index))
+            .collect::<Vec<_>>();
+        let residual_median = median(&mut residuals);
+        let mut deviations = residuals
+            .iter()
+            .map(|residual| (*residual - residual_median).abs())
+            .collect::<Vec<_>>();
+        let robust_sigma = 1.4826 * median(&mut deviations);
+        let threshold = (residual_median + 2.5 * robust_sigma.max(0.25))
+            .clamp(1.0, RADIAL_LIMBUS_CONSENSUS_MAX_NORMAL_ERROR_PX);
+        selected.retain(|index| residual_for(*index) <= threshold);
+    }
+    if selected.len() < RADIAL_LIMBUS_INDEPENDENT_MIN_SUPPORT
+        || fitted.residual > RADIAL_LIMBUS_CONSENSUS_MAX_FIT_RESIDUAL_PX
+    {
+        return Vec::new();
+    }
+    let ranked = selected
+        .into_iter()
+        .filter_map(|index| {
+            let flow = flows[index];
+            let predicted = fitted.predict(flow.previous, center);
+            let error = ((flow.current[0] - predicted[0]) * flow.normal[0]
+                + (flow.current[1] - predicted[1]) * flow.normal[1])
+                .abs();
+            (error <= RADIAL_LIMBUS_CONSENSUS_MAX_NORMAL_ERROR_PX)
+                .then_some((index, flow.confidence * (-error / 3.5).exp()))
+        })
+        .collect::<Vec<_>>();
+    radial_limbus_fusion_ranking(flows, ranked)
+}
+
+fn radial_limbus_ranking_has_independent_boundary_support(
+    flows: &[RadialLimbusFlow],
+    ranked: &[(usize, f32)],
+) -> bool {
+    if ranked.len() < RADIAL_LIMBUS_INDEPENDENT_MIN_SUPPORT {
+        return false;
+    }
+    let mut hemisphere_support = [0usize; 2];
+    let mut occupied_bins = std::collections::BTreeSet::new();
+    let mut profile_costs = Vec::with_capacity(ranked.len());
+    let mut confidence_sum = 0.0f32;
+    for (index, _) in ranked {
+        let flow = flows[*index];
+        hemisphere_support[usize::from(flow.phase_rad.cos() >= 0.0)] += 1;
+        occupied_bins.insert(
+            ((flow.phase_rad.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU
+                * RADIAL_LIMBUS_FUSION_COVERAGE_BINS as f32)
+                .floor() as usize)
+                .min(RADIAL_LIMBUS_FUSION_COVERAGE_BINS - 1),
+        );
+        profile_costs.push(flow.profile_cost);
+        confidence_sum += flow.confidence;
+    }
+    let median_profile_cost = median(&mut profile_costs);
+    let mean_confidence = confidence_sum / ranked.len() as f32;
+    hemisphere_support
+        .iter()
+        .all(|support| *support >= RADIAL_LIMBUS_INDEPENDENT_MIN_HEMISPHERE_SUPPORT)
+        && occupied_bins.len() >= RADIAL_LIMBUS_INDEPENDENT_MIN_ANGULAR_BINS
+        && median_profile_cost <= RADIAL_LIMBUS_INDEPENDENT_MAX_MEDIAN_PROFILE_COST
+        && mean_confidence >= RADIAL_LIMBUS_INDEPENDENT_MIN_MEAN_CONFIDENCE
 }
 
 fn blend_ellipse_angle(previous: f32, current: f32, alpha: f32) -> f32 {
@@ -10350,25 +11800,7 @@ fn cluster_semantic_eye_layers(
     for flow in radial_limbus_flows.iter_mut() {
         flow.fused = false;
     }
-    let mut radial_ranked = radial_limbus_flows
-        .iter()
-        .enumerate()
-        .filter_map(|(index, flow)| {
-            let predicted = pupil_prior.predict(flow.previous, center);
-            let normal_error = ((flow.current[0] - predicted[0]) * flow.normal[0]
-                + (flow.current[1] - predicted[1]) * flow.normal[1])
-                .abs();
-            (normal_error <= RADIAL_LIMBUS_MAX_PRIOR_NORMAL_ERROR_PX)
-                .then_some((index, flow.confidence * (-normal_error / 3.5).exp()))
-        })
-        .collect::<Vec<_>>();
-    radial_ranked.sort_by(|left, right| {
-        right
-            .1
-            .total_cmp(&left.1)
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    radial_ranked.truncate(RADIAL_LIMBUS_MAX_FUSED);
+    let mut radial_ranked = radial_limbus_motion_ranking(radial_limbus_flows, pupil_prior, center);
     if radial_ranked.len() < RADIAL_LIMBUS_MIN_JOINT_SUPPORT {
         radial_ranked.clear();
     }
@@ -11185,6 +12617,8 @@ impl FourMotionOctrees {
             use_canny_features,
             LearningCannyProfile::default(),
             iris_seed,
+            &[],
+            &[],
             None,
         )
     }
@@ -11212,6 +12646,8 @@ impl FourMotionOctrees {
             use_canny_features,
             LearningCannyProfile::default(),
             iris_seed,
+            &[],
+            &[],
             Some(timestamp_ns),
         )
     }
@@ -11243,6 +12679,43 @@ impl FourMotionOctrees {
             true,
             profile,
             iris_seed,
+            &[],
+            &[],
+            Some(timestamp_ns),
+        )
+    }
+
+    /// Observe one temporal-Canny frame with exact current-frame palpebral
+    /// margin samples.  The supplied paths are proposals only: they acquire
+    /// censoring authority after the temporal module independently proves an
+    /// intrusive, overly flat, Canny-coherent chord against `iris_seed`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe_with_iris_seed_at_with_canny_profile_and_lids(
+        &mut self,
+        pixels: &[u16],
+        width: usize,
+        height: usize,
+        sensor_x: u32,
+        sensor_y: u32,
+        timestamp_ns: u64,
+        focus_probe: Option<FocusDepthProbe>,
+        profile: LearningCannyProfile,
+        iris_seed: Option<IrisEllipseSeed>,
+        upper_lid_margin: &[LidMarginPoint],
+        lower_lid_margin: &[LidMarginPoint],
+    ) -> MotionOctreeOverlay {
+        self.observe_with_iris_seed_timestamp(
+            pixels,
+            width,
+            height,
+            sensor_x,
+            sensor_y,
+            focus_probe,
+            true,
+            profile,
+            iris_seed,
+            upper_lid_margin,
+            lower_lid_margin,
             Some(timestamp_ns),
         )
     }
@@ -11259,6 +12732,8 @@ impl FourMotionOctrees {
         use_canny_features: bool,
         learning_canny_profile: LearningCannyProfile,
         iris_seed: Option<IrisEllipseSeed>,
+        upper_lid_margin: &[LidMarginPoint],
+        lower_lid_margin: &[LidMarginPoint],
         timestamp_ns: Option<u64>,
     ) -> MotionOctreeOverlay {
         let timestamp_ns = timestamp_ns.unwrap_or_else(|| {
@@ -11286,7 +12761,10 @@ impl FourMotionOctrees {
             self.nautilus_banks.clear();
             self.horizontal_light_field = HorizontalLightFieldStatus::default();
             self.radial_limbus_region = None;
+            self.radial_limbus_temporal_region.clear();
             self.radial_limbus_flows.clear();
+            self.nested_eye_boundaries = None;
+            self.lid_occlusions.clear();
             self.motions = [SimilarityMotion::default(); OBJECTS];
             self.layers = [MotionLayerStatus::default(); OBJECTS];
             self.layer_signatures = Default::default();
@@ -11363,14 +12841,72 @@ impl FourMotionOctrees {
         let canny_texture_micros = edge_output.texture_micros;
         let canny_texture_simd_evaluated = edge_output.texture_simd_evaluated;
         let edge_high_threshold = canny.as_ref().map_or(0.0, |field| field.high_threshold);
+        let preliminary_occlusion_seed = iris_seed.or_else(|| {
+            self.semantic_eye_region
+                .map(|region| region.local_seed(&current))
+        });
+        let lid_occlusion_started = Instant::now();
+        self.lid_occlusions = if use_canny_features {
+            detect_lid_occlusions(
+                &edges,
+                preliminary_occlusion_seed,
+                upper_lid_margin,
+                lower_lid_margin,
+            )
+        } else {
+            Vec::new()
+        };
+        let nested_boundary_started = Instant::now();
+        let (mut nested_eye_boundaries, nested_boundary_evaluations) = if use_canny_features {
+            iris_seed.map_or((None, 0), |seed| {
+                nested_eye_boundary_pair(
+                    &current,
+                    EyeMotionRegion::from_local_seed(seed, &current),
+                    &self.lid_occlusions,
+                )
+            })
+        } else {
+            (None, 0)
+        };
+        let resolved_iris_seed = nested_eye_boundaries
+            .as_ref()
+            .map(|pair| pair.limbus)
+            .or(iris_seed);
+        // If the supplied edge was actually pupil-like, its small conic was
+        // also the wrong reference for the flat-tire test. Re-evaluate the
+        // exact same current Canny field against the recovered outer limbus;
+        // neither result is temporally invented or rendered as publication.
+        if use_canny_features
+            && nested_eye_boundaries
+                .as_ref()
+                .is_some_and(|pair| pair.input_seed_was_pupil_like)
+        {
+            self.lid_occlusions = detect_lid_occlusions(
+                &edges,
+                resolved_iris_seed,
+                upper_lid_margin,
+                lower_lid_margin,
+            );
+        }
+        self.nested_eye_boundaries = nested_eye_boundaries.take();
+        let nested_boundary_micros = nested_boundary_started.elapsed().as_micros() as u64;
+        let lid_occlusion_micros = lid_occlusion_started.elapsed().as_micros() as u64;
+        let lid_occlusion_censored_edges = self
+            .lid_occlusions
+            .iter()
+            .map(|curve| curve.censored_edges)
+            .sum::<usize>();
         let preprocess_micros = preprocess_started.elapsed().as_micros() as u64;
         let Some(previous) = self.previous.as_ref() else {
             self.previous = Some(current.clone());
             self.horizontal_light_field = HorizontalLightFieldStatus::default();
-            self.radial_limbus_region =
-                iris_seed.map(|seed| EyeMotionRegion::from_local_seed(seed, &current));
+            self.radial_limbus_temporal_region.clear();
+            self.radial_limbus_region = resolved_iris_seed.map(|seed| {
+                let measured = EyeMotionRegion::from_local_seed(seed, &current);
+                self.radial_limbus_temporal_region.observe(measured, None)
+            });
             self.radial_limbus_flows.clear();
-            let feature_iris_seed = iris_seed.or_else(|| {
+            let feature_iris_seed = resolved_iris_seed.or_else(|| {
                 self.semantic_eye_region
                     .map(|region| region.local_seed(&current))
             });
@@ -11379,6 +12915,7 @@ impl FourMotionOctrees {
                 canny.as_ref(),
                 &edges,
                 feature_iris_seed,
+                &self.lid_occlusions,
                 &[],
                 MAX_FEATURES,
             );
@@ -11450,6 +12987,11 @@ impl FourMotionOctrees {
                 canny_texture_evaluated,
                 canny_texture_micros,
                 canny_texture_simd_evaluated,
+                nested_boundary_evaluations,
+                nested_boundary_micros,
+                lid_occlusion_curves: self.lid_occlusions.len(),
+                lid_occlusion_micros,
+                lid_occlusion_censored_edges,
                 preprocess_micros,
                 ..MatchDiagnostics::default()
             };
@@ -11478,9 +13020,15 @@ impl FourMotionOctrees {
             self.tracks.clear();
             self.nautilus_banks.clear();
             self.horizontal_light_field = HorizontalLightFieldStatus::default();
-            self.radial_limbus_region =
-                iris_seed.map(|seed| EyeMotionRegion::from_local_seed(seed, &current));
+            self.radial_limbus_temporal_region.clear();
+            self.radial_limbus_region = resolved_iris_seed.map(|seed| {
+                let measured = EyeMotionRegion::from_local_seed(seed, &current);
+                self.radial_limbus_temporal_region.observe(measured, None)
+            });
             self.radial_limbus_flows.clear();
+            // The pair above belongs to this exact resized frame and remains
+            // available diagnostically, while every temporal correspondence
+            // is reset below.
             self.motions = [SimilarityMotion::default(); OBJECTS];
             self.layers = [MotionLayerStatus::default(); OBJECTS];
             self.layer_signatures = Default::default();
@@ -11507,6 +13055,11 @@ impl FourMotionOctrees {
                 canny_texture_evaluated,
                 canny_texture_micros,
                 canny_texture_simd_evaluated,
+                nested_boundary_evaluations,
+                nested_boundary_micros,
+                lid_occlusion_curves: self.lid_occlusions.len(),
+                lid_occlusion_micros,
+                lid_occlusion_censored_edges,
                 preprocess_micros,
                 ..MatchDiagnostics::default()
             };
@@ -11541,36 +13094,45 @@ impl FourMotionOctrees {
             HorizontalLightFieldStatus::default()
         };
         let previous_radial_region = self.radial_limbus_region.or(self.semantic_eye_region);
-        let current_radial_region = iris_seed
-            .map(|seed| EyeMotionRegion::from_local_seed(seed, &current))
+        let predicted_radial_region = previous_radial_region.map(|region| {
+            let prior = if self.motions[PUPIL_LAYER].support >= 3
+                && self.motions[PUPIL_LAYER].residual <= 3.0
+            {
+                self.motions[PUPIL_LAYER]
+            } else if self.motions[GENERAL_LAYER].support >= 3
+                && self.motions[GENERAL_LAYER].residual <= 3.0
+            {
+                self.motions[GENERAL_LAYER]
+            } else if horizontal_light_field.reliable {
+                SimilarityMotion {
+                    translation: [horizontal_light_field.horizontal_translation_px, 0.0],
+                    scale_delta: horizontal_light_field.horizontal_scale_delta,
+                    support: horizontal_light_field.leaf_nodes,
+                    residual: horizontal_light_field.residual_px,
+                    ..SimilarityMotion::default()
+                }
+            } else {
+                SimilarityMotion::default()
+            };
+            let scale = (1.0 + prior.scale_delta).clamp(0.88, 1.12);
+            EyeMotionRegion {
+                center: prior.predict(region.center, center),
+                major: region.major * scale,
+                minor: region.minor * scale,
+                angle: (region.angle + prior.rotation).rem_euclid(std::f32::consts::PI),
+            }
+        });
+        let measured_radial_region =
+            resolved_iris_seed.map(|seed| EyeMotionRegion::from_local_seed(seed, &current));
+        let current_radial_region = measured_radial_region
+            .map(|measured| {
+                self.radial_limbus_temporal_region
+                    .observe(measured, predicted_radial_region)
+            })
             .or_else(|| {
-                previous_radial_region.map(|region| {
-                    let prior = if self.motions[PUPIL_LAYER].support >= 3
-                        && self.motions[PUPIL_LAYER].residual <= 3.0
-                    {
-                        self.motions[PUPIL_LAYER]
-                    } else if self.motions[GENERAL_LAYER].support >= 3
-                        && self.motions[GENERAL_LAYER].residual <= 3.0
-                    {
-                        self.motions[GENERAL_LAYER]
-                    } else if horizontal_light_field.reliable {
-                        SimilarityMotion {
-                            translation: [horizontal_light_field.horizontal_translation_px, 0.0],
-                            scale_delta: horizontal_light_field.horizontal_scale_delta,
-                            support: horizontal_light_field.leaf_nodes,
-                            residual: horizontal_light_field.residual_px,
-                            ..SimilarityMotion::default()
-                        }
-                    } else {
-                        SimilarityMotion::default()
-                    };
-                    let scale = (1.0 + prior.scale_delta).clamp(0.88, 1.12);
-                    EyeMotionRegion {
-                        center: prior.predict(region.center, center),
-                        major: region.major * scale,
-                        minor: region.minor * scale,
-                        angle: (region.angle + prior.rotation).rem_euclid(std::f32::consts::PI),
-                    }
+                predicted_radial_region.map(|predicted| {
+                    self.radial_limbus_temporal_region
+                        .transport_without_measurement(predicted)
                 })
             });
         let (mut radial_limbus_flows, radial_limbus_evaluations, radial_limbus_micros) =
@@ -11584,6 +13146,15 @@ impl FourMotionOctrees {
             } else {
                 (Vec::new(), 0, 0)
             };
+        radial_limbus_flows.retain(|flow| {
+            !point_is_lid_censored(
+                [
+                    flow.current[0] - sensor_x as f32,
+                    flow.current[1] - sensor_y as f32,
+                ],
+                &self.lid_occlusions,
+            )
+        });
         if let Some(probe) = focus_probe {
             if probe.sweeping && !self.focus_sweep_seen {
                 self.focus_sfm.begin();
@@ -11649,6 +13220,11 @@ impl FourMotionOctrees {
             radial_limbus_evaluations,
             radial_limbus_accepted: radial_limbus_flows.len(),
             radial_limbus_micros,
+            nested_boundary_evaluations,
+            nested_boundary_micros,
+            lid_occlusion_curves: self.lid_occlusions.len(),
+            lid_occlusion_micros,
+            lid_occlusion_censored_edges,
             ..MatchDiagnostics::default()
         };
         for (track_index, track) in self.tracks.iter().enumerate() {
@@ -12061,8 +13637,54 @@ impl FourMotionOctrees {
             .collect::<Vec<_>>();
         match_diagnostics.destination_collision_rejected =
             enforce_unique_match_destinations(&mut matches, &track_priorities);
+        let mut lid_occluded_track_ids = BTreeSet::<u64>::new();
+        let mut lid_extinguished_by_curve = vec![0usize; self.lid_occlusions.len()];
+        // A closing lid often makes the covered feature disappear before the
+        // patch matcher can produce a current-frame destination. Do not wait
+        // for that dormant identity to age out: once this frame has directly
+        // proved the lid chord, extinguish every prior identity whose last
+        // sensor-space location is now on its occluded side. The curve mask is
+        // itself confined to the seeded iris annulus, so generic face tracks
+        // outside the eye remain available for rigid-motion reckoning.
+        for track in &self.tracks {
+            let Some(last) = track.points.back() else {
+                continue;
+            };
+            let local = [last[0] - sensor_x as f32, last[1] - sensor_y as f32];
+            let Some(curve_index) = self
+                .lid_occlusions
+                .iter()
+                .position(|curve| curve.masks_limbus_point(local, 0.0))
+            else {
+                continue;
+            };
+            if lid_occluded_track_ids.insert(track.id) {
+                lid_extinguished_by_curve[curve_index] =
+                    lid_extinguished_by_curve[curve_index].saturating_add(1);
+            }
+        }
+        matches.retain(|item| {
+            let local = [
+                item.current[0] - sensor_x as f32,
+                item.current[1] - sensor_y as f32,
+            ];
+            let Some(curve_index) = self
+                .lid_occlusions
+                .iter()
+                .position(|curve| curve.masks_limbus_point(local, 0.0))
+            else {
+                return true;
+            };
+            let id = self.tracks[item.track_index].id;
+            if lid_occluded_track_ids.insert(id) {
+                lid_extinguished_by_curve[curve_index] =
+                    lid_extinguished_by_curve[curve_index].saturating_add(1);
+            }
+            false
+        });
+        match_diagnostics.lid_occlusion_extinguished_tracks = lid_occluded_track_ids.len();
         match_diagnostics.accepted = matches.len();
-        let extended_gap_recovery_ready = iris_seed.is_some()
+        let extended_gap_recovery_ready = resolved_iris_seed.is_some()
             && horizontal_light_field.reliable
             && horizontal_light_field.confidence >= 0.28
             && horizontal_light_field.residual_px <= 3.5
@@ -12100,6 +13722,32 @@ impl FourMotionOctrees {
             extended_gap_recovery_ready,
             &mut match_diagnostics,
         );
+        nautilus_relocations.retain(|relocation| {
+            let local = [
+                relocation.current[0] - sensor_x as f32,
+                relocation.current[1] - sensor_y as f32,
+            ];
+            let Some(curve_index) = self
+                .lid_occlusions
+                .iter()
+                .position(|curve| curve.masks_limbus_point(local, 0.0))
+            else {
+                return true;
+            };
+            let id = self.tracks[relocation.track_index].id;
+            if lid_occluded_track_ids.insert(id) {
+                lid_extinguished_by_curve[curve_index] =
+                    lid_extinguished_by_curve[curve_index].saturating_add(1);
+            }
+            match_diagnostics.nautilus_relocated =
+                match_diagnostics.nautilus_relocated.saturating_sub(1);
+            match_diagnostics.nautilus_gap_relocated =
+                match_diagnostics.nautilus_gap_relocated.saturating_sub(1);
+            match_diagnostics.nautilus_margin_sum =
+                (match_diagnostics.nautilus_margin_sum - relocation.margin).max(0.0);
+            false
+        });
+        match_diagnostics.lid_occlusion_extinguished_tracks = lid_occluded_track_ids.len();
         // The extra dormant cache must not turn the 80-point live graph into
         // a 104-point graph on the re-entry frame. Established adjacent
         // matches and ordinary short-gap relocations keep their slots; only
@@ -12209,7 +13857,7 @@ impl FourMotionOctrees {
             self.motion_relations
                 .observe(&matches, &self.tracks, center, global);
         match_diagnostics.relation_micros = relation_started.elapsed().as_micros() as u64;
-        let relation_eye_region = iris_seed
+        let relation_eye_region = resolved_iris_seed
             .map(|seed| EyeMotionRegion::from_local_seed(seed, &current))
             .or(self.semantic_eye_region);
         if relation_graph_has_persistent_component(&motion_relations)
@@ -12237,12 +13885,17 @@ impl FourMotionOctrees {
             }
         }
         let mut radial_limbus_fused = 0usize;
+        let limbus_structure_edges = edges
+            .iter()
+            .copied()
+            .filter(|edge| !point_is_lid_censored([edge.x, edge.y], &self.lid_occlusions))
+            .collect::<Vec<_>>();
         let semantic_layers = cluster_semantic_eye_layers(
             &mut matches,
             &self.tracks,
             &current,
-            &edges,
-            iris_seed,
+            &limbus_structure_edges,
+            resolved_iris_seed,
             &mut self.motions,
             &mut self.layers,
             &mut self.layer_signatures,
@@ -12256,7 +13909,50 @@ impl FourMotionOctrees {
             &mut motion_relations,
             Some(&self.relation_iris_identity),
         );
+        let radial_independent_global_ready =
+            global.support >= 8 && global.residual.is_finite() && global.residual <= 3.0;
+        let radial_independent_nested_ready =
+            self.nested_eye_boundaries.as_ref().is_some_and(|pair| {
+                pair.confidence >= RADIAL_LIMBUS_INDEPENDENT_MIN_NESTED_CONFIDENCE
+                    && pair.pupil_support >= RADIAL_LIMBUS_INDEPENDENT_MIN_NESTED_PUPIL_SUPPORT
+                    && pair.limbus_support >= RADIAL_LIMBUS_INDEPENDENT_MIN_NESTED_OUTER_SUPPORT
+                    && pair.paired_support >= RADIAL_LIMBUS_INDEPENDENT_MIN_NESTED_PAIRED_SUPPORT
+            });
+        let radial_independent =
+            if radial_independent_global_ready && radial_independent_nested_ready {
+                let seeded = radial_limbus_motion_ranking(&radial_limbus_flows, global, center);
+                let robust = radial_limbus_robust_consensus_ranking(&radial_limbus_flows, center);
+                if robust.len() > seeded.len() {
+                    robust
+                } else {
+                    seeded
+                }
+            } else {
+                Vec::new()
+            };
+        let radial_independent_support_ready =
+            radial_limbus_ranking_has_independent_boundary_support(
+                &radial_limbus_flows,
+                &radial_independent,
+            );
+        let radial_independent_applied =
+            radial_independent.len() > radial_limbus_fused && radial_independent_support_ready;
+        if radial_independent_applied {
+            for flow in &mut radial_limbus_flows {
+                flow.fused = false;
+            }
+            for (index, _) in &radial_independent {
+                radial_limbus_flows[*index].fused = true;
+            }
+            radial_limbus_fused = radial_independent.len();
+        }
         match_diagnostics.radial_limbus_fused = radial_limbus_fused;
+        match_diagnostics.radial_limbus_independent_candidate = radial_independent.len();
+        match_diagnostics.radial_limbus_independent_global_ready = radial_independent_global_ready;
+        match_diagnostics.radial_limbus_independent_nested_ready = radial_independent_nested_ready;
+        match_diagnostics.radial_limbus_independent_support_ready =
+            radial_independent_support_ready;
+        match_diagnostics.radial_limbus_independent_applied = radial_independent_applied;
         if !semantic_layers {
             let relation_layers = cluster_relation_motion_layers(
                 &mut matches,
@@ -12358,7 +14054,7 @@ impl FourMotionOctrees {
         let iris_geometry = self.semantic_eye_region.map(|region| {
             let pupil_layer = self.layers[PUPIL_LAYER];
             let track_support = (pupil_layer.persistent_tracks as f64 / 8.0).clamp(0.0, 1.0);
-            let edge_independence = if iris_seed.is_some() {
+            let edge_independence = if resolved_iris_seed.is_some() {
                 1.0
             } else {
                 0.35 + 0.65 * (limbus_normal_flow_support as f64 / 4.0).clamp(0.0, 1.0)
@@ -12374,7 +14070,7 @@ impl FourMotionOctrees {
                     .clamp(0.0, 1.0),
                 anatomy_authorized: semantic_layers
                     && pupil_layer.stable_frames >= 2
-                    && (iris_seed.is_some() || limbus_normal_flow_support >= 2),
+                    && (resolved_iris_seed.is_some() || limbus_normal_flow_support >= 2),
             }
         });
         self.coupled_kinematics.observe(
@@ -12571,8 +14267,16 @@ impl FourMotionOctrees {
                 track.residual_history.clear();
             }
         }
+        for (curve, count) in self
+            .lid_occlusions
+            .iter_mut()
+            .zip(lid_extinguished_by_curve.into_iter())
+        {
+            curve.extinguished_tracks = count;
+        }
         self.tracks.retain(|track| {
-            track.age <= MAX_FEATURE_DORMANT_AGE
+            !lid_occluded_track_ids.contains(&track.id)
+                && track.age <= MAX_FEATURE_DORMANT_AGE
                 && timestamp_ns.saturating_sub(track.last_seen_timestamp_ns)
                     <= MAX_FEATURE_DORMANT_NS
         });
@@ -12635,7 +14339,7 @@ impl FourMotionOctrees {
             .filter(|track| track.age <= MAX_AGE)
             .count();
         let wanted = MAX_FEATURES.saturating_sub(current_or_recent);
-        let feature_iris_seed = iris_seed.or_else(|| {
+        let feature_iris_seed = resolved_iris_seed.or_else(|| {
             self.semantic_eye_region
                 .map(|region| region.local_seed(&current))
         });
@@ -12644,6 +14348,7 @@ impl FourMotionOctrees {
             canny.as_ref(),
             &edges,
             feature_iris_seed,
+            &self.lid_occlusions,
             &existing,
             wanted,
         ) {
@@ -12722,10 +14427,11 @@ impl FourMotionOctrees {
             });
         self.generation = self.generation.saturating_add(1);
         self.horizontal_light_field = horizontal_light_field;
-        self.radial_limbus_region = iris_seed
-            .map(|seed| EyeMotionRegion::from_local_seed(seed, &current))
-            .or(self.semantic_eye_region)
-            .or(current_radial_region);
+        self.radial_limbus_region = current_radial_region
+            .or_else(|| {
+                resolved_iris_seed.map(|seed| EyeMotionRegion::from_local_seed(seed, &current))
+            })
+            .or(self.semantic_eye_region);
         self.radial_limbus_flows = radial_limbus_flows;
         self.previous = Some(current);
         match_diagnostics.maintenance_micros = maintenance_started.elapsed().as_micros() as u64;
@@ -12827,6 +14533,15 @@ impl FourMotionOctrees {
             minor_radius: region.minor as f64,
             angle: region.angle as f64,
         });
+        let radial_limbus_region = self.radial_limbus_region.map(|region| IrisEllipseSeed {
+            center: (
+                (region.center[0] - sensor_x as f32) as f64,
+                (region.center[1] - sensor_y as f32) as f64,
+            ),
+            major_radius: region.major as f64,
+            minor_radius: region.minor as f64,
+            angle: region.angle as f64,
+        });
         let radial_limbus_probes = self
             .radial_limbus_flows
             .iter()
@@ -12875,7 +14590,10 @@ impl FourMotionOctrees {
             motion_shadow_edges_downweighted,
             horizontal_light_field: self.horizontal_light_field.clone(),
             radial_limbus_probes,
+            radial_limbus_region,
             semantic_iris,
+            nested_eye_boundaries: self.nested_eye_boundaries.clone(),
+            lid_occlusions: self.lid_occlusions.clone(),
             focus_sfm: self.focus_sfm.status,
             coupled_motion: self
                 .coupled_kinematics
@@ -12934,6 +14652,230 @@ mod tests {
             height,
             pixels,
         }
+    }
+
+    fn synthetic_nested_eye_frame(
+        width: usize,
+        height: usize,
+        center: [f32; 2],
+        limbus_axes: [f32; 2],
+        angle: f32,
+        pupil_ratio: f32,
+    ) -> RawFrame {
+        let (sine, cosine) = angle.sin_cos();
+        let mut pixels = vec![0u16; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let dx = x as f32 - center[0];
+                let dy = y as f32 - center[1];
+                let local_x = cosine * dx + sine * dy;
+                let local_y = -sine * dx + cosine * dy;
+                let radius = (local_x / limbus_axes[0]).hypot(local_y / limbus_axes[1]);
+                let phase = local_y.atan2(local_x);
+                let value = if radius <= pupil_ratio {
+                    105.0 + 7.0 * (3.0 * phase).cos()
+                } else if radius <= 1.0 {
+                    390.0 + 28.0 * (7.0 * phase + 2.0 * radius).sin()
+                } else {
+                    835.0 + 12.0 * (2.0 * phase).cos()
+                };
+                pixels[y * width + x] = value.round().clamp(0.0, 1023.0) as u16;
+            }
+        }
+        RawFrame {
+            sensor_x: 0,
+            sensor_y: 0,
+            width,
+            height,
+            pixels,
+        }
+    }
+
+    #[test]
+    fn nested_raw_pair_reclassifies_a_pupil_sized_seed_as_inner_boundary() {
+        let center = [112.0, 82.0];
+        let limbus_axes = [62.0, 46.0];
+        let angle = 0.19;
+        let pupil_ratio = 0.41;
+        let frame = synthetic_nested_eye_frame(224, 164, center, limbus_axes, angle, pupil_ratio);
+        let pupil_seed = EyeMotionRegion {
+            center,
+            major: limbus_axes[0] * pupil_ratio,
+            minor: limbus_axes[1] * pupil_ratio,
+            angle,
+        };
+
+        let (pair, evaluations) = nested_eye_boundary_pair(&frame, pupil_seed, &[]);
+        let pair = pair.expect("ordered pupil/limbus pair");
+
+        assert!(evaluations > 0);
+        assert!(pair.input_seed_was_pupil_like);
+        assert!(
+            (pair.pupil_to_limbus_radius_ratio - pupil_ratio).abs() <= 0.055,
+            "ratio={} expected={} pair={pair:?}",
+            pair.pupil_to_limbus_radius_ratio,
+            pupil_ratio,
+        );
+        assert!((pair.limbus.major_radius - limbus_axes[0] as f64).abs() <= 5.5);
+        assert!((pair.limbus.minor_radius - limbus_axes[1] as f64).abs() <= 4.5);
+        assert!(pair.paired_support >= NESTED_BOUNDARY_MIN_PAIRED_SUPPORT);
+    }
+
+    #[test]
+    fn nested_raw_pair_keeps_a_limbus_sized_seed_as_outer_boundary() {
+        let center = [110.0, 80.0];
+        let limbus_axes = [60.0, 44.0];
+        let angle = -0.16;
+        let pupil_ratio = 0.37;
+        let frame = synthetic_nested_eye_frame(220, 160, center, limbus_axes, angle, pupil_ratio);
+        let limbus_seed = EyeMotionRegion {
+            center,
+            major: limbus_axes[0],
+            minor: limbus_axes[1],
+            angle,
+        };
+
+        let (pair, _) = nested_eye_boundary_pair(&frame, limbus_seed, &[]);
+        let pair = pair.expect("ordered pupil/limbus pair");
+
+        assert!(!pair.input_seed_was_pupil_like);
+        assert!(
+            (pair.pupil_to_limbus_radius_ratio - pupil_ratio).abs() <= 0.055,
+            "ratio={} expected={} pair={pair:?}",
+            pair.pupil_to_limbus_radius_ratio,
+            pupil_ratio,
+        );
+        assert!((pair.limbus.major_radius - limbus_axes[0] as f64).abs() <= 4.0);
+    }
+
+    #[test]
+    fn radial_fusion_preserves_angular_coverage_when_one_side_is_sharper() {
+        let flows = (0..RADIAL_LIMBUS_FLOW_SECTORS)
+            .map(|sector| {
+                let phase =
+                    std::f32::consts::TAU * sector as f32 / RADIAL_LIMBUS_FLOW_SECTORS as f32;
+                RadialLimbusFlow {
+                    previous: [phase.cos(), phase.sin()],
+                    current: [phase.cos(), phase.sin()],
+                    normal: [phase.cos(), phase.sin()],
+                    phase_rad: phase,
+                    radial_shift_px: 0.0,
+                    profile_cost: 0.1,
+                    confidence: if phase.cos() >= 0.0 { 0.95 } else { 0.42 },
+                    fused: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        let ranked = flows
+            .iter()
+            .enumerate()
+            .map(|(index, flow)| (index, flow.confidence))
+            .collect::<Vec<_>>();
+        let selected = radial_limbus_fusion_ranking(&flows, ranked);
+        let image_left = selected
+            .iter()
+            .filter(|(index, _)| flows[*index].normal[0] < -1.0e-4)
+            .count();
+        let image_right = selected
+            .iter()
+            .filter(|(index, _)| flows[*index].normal[0] > 1.0e-4)
+            .count();
+        let occupied_bins = selected
+            .iter()
+            .map(|(index, _)| {
+                ((flows[*index].phase_rad / std::f32::consts::TAU
+                    * RADIAL_LIMBUS_FUSION_COVERAGE_BINS as f32)
+                    .floor() as usize)
+                    .min(RADIAL_LIMBUS_FUSION_COVERAGE_BINS - 1)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(selected.len(), RADIAL_LIMBUS_MAX_FUSED);
+        // The two exactly vertical lanes have no meaningful image-left/right
+        // assignment. The remaining sixteen coverage bins guarantee eight
+        // independent sectors on each lateral hemisphere before sharper
+        // profiles consume the six globally ranked spare slots.
+        assert!(image_left >= 8, "image-left selected={image_left}");
+        assert!(image_right >= 8, "image-right selected={image_right}");
+        assert_eq!(occupied_bins.len(), RADIAL_LIMBUS_FUSION_COVERAGE_BINS);
+    }
+
+    #[test]
+    fn strict_radial_seed_recovers_distributed_consensus_but_not_an_isolated_outlier() {
+        let center = [80.0f32, 70.0f32];
+        let mut flows = (0..RADIAL_LIMBUS_FLOW_SECTORS)
+            .map(|sector| {
+                let phase =
+                    std::f32::consts::TAU * sector as f32 / RADIAL_LIMBUS_FLOW_SECTORS as f32;
+                let normal = [phase.cos(), phase.sin()];
+                let previous = [center[0] + 45.0 * normal[0], center[1] + 32.0 * normal[1]];
+                RadialLimbusFlow {
+                    previous,
+                    current: [previous[0] + 8.0, previous[1]],
+                    normal,
+                    phase_rad: phase,
+                    radial_shift_px: 0.0,
+                    profile_cost: 0.1,
+                    confidence: 0.82,
+                    fused: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        // This otherwise attractive top lane contradicts the shared normal
+        // flow and must not teach or join the recovered consensus.
+        let outlier = RADIAL_LIMBUS_FLOW_SECTORS / 4;
+        flows[outlier].current[1] += 10.0;
+
+        let selected = radial_limbus_motion_ranking(&flows, SimilarityMotion::default(), center);
+        let robust = radial_limbus_robust_consensus_ranking(&flows, center);
+
+        assert!(selected.len() >= 22, "selected={}", selected.len());
+        assert!(robust.len() >= 22, "robust={}", robust.len());
+        assert!(selected
+            .iter()
+            .any(|(index, _)| flows[*index].phase_rad.cos() >= 0.94));
+        assert!(selected
+            .iter()
+            .any(|(index, _)| flows[*index].phase_rad.cos() <= -0.94));
+        assert!(!selected.iter().any(|(index, _)| *index == outlier));
+        assert!(!robust.iter().any(|(index, _)| *index == outlier));
+        assert!(radial_limbus_ranking_has_independent_boundary_support(
+            &flows, &selected
+        ));
+        let one_sided = selected
+            .iter()
+            .copied()
+            .filter(|(index, _)| flows[*index].phase_rad.cos() >= 0.0)
+            .collect::<Vec<_>>();
+        assert!(!radial_limbus_ranking_has_independent_boundary_support(
+            &flows, &one_sided
+        ));
+    }
+
+    #[test]
+    fn radial_region_authority_holds_incompatible_inner_edge_aliases() {
+        let region = |center: [f32; 2], major: f32, minor: f32| EyeMotionRegion {
+            center,
+            major,
+            minor,
+            angle: 0.08,
+        };
+        let mut temporal = RadialLimbusTemporalRegion::default();
+        let first = temporal.observe(region([240.0, 160.0], 110.0, 86.0), None);
+        let established = temporal.observe(region([241.5, 160.5], 111.0, 85.0), Some(first));
+        let predicted = region([243.0, 160.8], established.major, established.minor);
+        let held = temporal.observe(region([221.0, 165.0], 70.0, 58.0), Some(predicted));
+        assert!((held.major - predicted.major).abs() <= 0.01);
+        assert!((held.center[0] - predicted.center[0]).abs() <= 0.01);
+
+        let predicted_again = region([244.0, 161.0], held.major, held.minor);
+        let held_again =
+            temporal.observe(region([275.0, 150.0], 82.0, 62.0), Some(predicted_again));
+        assert!((held_again.major - predicted_again.major).abs() <= 0.01);
+
+        let recovered = temporal.observe(region([245.0, 162.0], 112.0, 84.0), Some(held_again));
+        assert!(recovered.major >= 109.0);
+        assert!((recovered.center[0] - 245.0).abs() <= 2.0);
     }
 
     #[test]
@@ -13240,6 +15182,245 @@ mod tests {
         );
         assert!(boundary_p50 <= 5.0, "boundary p50={boundary_p50}");
         assert!(boundary_p90 <= 8.5, "boundary p90={boundary_p90}");
+    }
+
+    /// Quantify where the live temporal-limbus path loses image-left support.
+    /// This deliberately consumes packed RAW and reconstructs the same native
+    /// current-frame seed as the viewer; rendered recordings cannot replace
+    /// this measurement.
+    #[test]
+    #[ignore = "set BUTTERCUP_LEFT_LIMBUS_REPLAY to an extracted lossless RAW bundle"]
+    fn image_left_limbus_support_replays_lossless_raw_bundle() {
+        use std::fs;
+        use std::path::PathBuf;
+
+        let root = PathBuf::from(
+            std::env::var_os("BUTTERCUP_LEFT_LIMBUS_REPLAY")
+                .expect("BUTTERCUP_LEFT_LIMBUS_REPLAY is required"),
+        );
+        let start = std::env::var("BUTTERCUP_LEFT_LIMBUS_START")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let maximum_frames = std::env::var("BUTTERCUP_LEFT_LIMBUS_FRAMES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(240);
+        let verbose = std::env::var_os("BUTTERCUP_LEFT_LIMBUS_VERBOSE").is_some();
+        let index = fs::read_to_string(root.join("frames.jsonl")).expect("read frames.jsonl");
+        let records = index
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|record| {
+                record.get("label").and_then(serde_json::Value::as_str) == Some("subject-right")
+            })
+            .skip(start)
+            .take(maximum_frames)
+            .collect::<Vec<_>>();
+        let stream = fs::read(root.join("subject-right.raw10")).expect("read subject-right RAW");
+        let mut outer_tracker = crate::raw_iris_focus::OuterIrisTracker::default();
+        let mut previous = None::<(RawFrame, EyeMotionRegion, u64)>;
+        let mut valid_frames = 0usize;
+        let mut flow_pairs = 0usize;
+        let mut raw_flows = [0usize; 2];
+        let mut motion_eligible = [0usize; 2];
+        let mut legacy_fused = [0usize; 2];
+        let mut production_fused = [0usize; 2];
+        let mut affinity_candidates = [0usize; 2];
+        let mut affinity_eligible = [0usize; 2];
+        let mut selected_features = [0usize; 2];
+        let mut flow_timings = Vec::<u64>::new();
+        let mut nested_pairs = 0usize;
+        let mut nested_pupil_like = 0usize;
+
+        for record in records {
+            let width = record["width"].as_u64().expect("width") as usize;
+            let height = record["height"].as_u64().expect("height") as usize;
+            let stride = record["stride"].as_u64().expect("stride") as usize;
+            let offset = record["offset"].as_u64().expect("offset") as usize;
+            let length = record["length"].as_u64().expect("length") as usize;
+            let sensor_x = record["sensor_x"].as_u64().expect("sensor_x") as u32;
+            let sensor_y = record["sensor_y"].as_u64().expect("sensor_y") as u32;
+            let timestamp_ns = record["timestamp_ns"].as_u64().expect("timestamp_ns");
+            let raw =
+                crate::raw10::unpack_raw10(&stream[offset..offset + length], width, height, stride);
+            let focus = crate::raw_iris_focus::score_stream_eye(&raw, width, height);
+            let seed_usable = focus.radius >= 20.0
+                && focus.radius <= width.min(height) as f64 * 0.45
+                && focus.center.0.is_finite()
+                && focus.center.1.is_finite()
+                && (0.0..width as f64).contains(&focus.center.0)
+                && (0.0..height as f64).contains(&focus.center.1);
+            if !seed_usable {
+                previous = None;
+                continue;
+            }
+            let upper = crate::raw_iris_focus::detect_upper_eyelid_points(
+                &raw, width, height, sensor_x, sensor_y, &focus,
+            );
+            let lower = crate::raw_iris_focus::detect_lower_eyelid_points(
+                &raw, width, height, sensor_x, sensor_y, &focus,
+            );
+            let boundary =
+                crate::raw_iris_focus::detect_outer_iris_boundary_between_eyelids_tracked(
+                    &raw,
+                    width,
+                    height,
+                    sensor_x,
+                    sensor_y,
+                    &focus,
+                    &upper,
+                    &lower,
+                    &mut outer_tracker,
+                );
+            if boundary.points.len() < 8
+                || !boundary.major_radius.is_finite()
+                || !boundary.minor_radius.is_finite()
+                || boundary.major_radius < 12.0
+                || boundary.minor_radius < 8.0
+            {
+                previous = None;
+                continue;
+            }
+            valid_frames += 1;
+            let input_seed = IrisEllipseSeed {
+                center: boundary.center,
+                major_radius: boundary.major_radius,
+                minor_radius: boundary.minor_radius,
+                angle: boundary.angle,
+            };
+            let frame = RawFrame {
+                sensor_x,
+                sensor_y,
+                width,
+                height,
+                pixels: cfa_neutral_raw(&raw, width, height),
+            };
+            let mut canny = canny_field(&frame);
+            let edges = edge_evidence(&mut canny, width, height).edges;
+            let nested = nested_eye_boundary_pair(
+                &frame,
+                EyeMotionRegion::from_local_seed(input_seed, &frame),
+                &[],
+            )
+            .0;
+            nested_pairs += usize::from(nested.is_some());
+            nested_pupil_like += usize::from(
+                nested
+                    .as_ref()
+                    .is_some_and(|pair| pair.input_seed_was_pupil_like),
+            );
+            let seed = nested.as_ref().map_or(input_seed, |pair| pair.limbus);
+            let region = EyeMotionRegion::from_local_seed(seed, &frame);
+            if verbose {
+                eprintln!(
+                    "left-limbus-frame seq={} input-major={:.2} resolved-major={:.2} nested-ratio={:.3} nested-q={:.3} nested-support={}/{}/{} pupil-like={}",
+                    record["sequence"].as_u64().unwrap_or_default(),
+                    input_seed.major_radius,
+                    seed.major_radius,
+                    nested
+                        .as_ref()
+                        .map_or(0.0, |pair| pair.pupil_to_limbus_radius_ratio),
+                    nested.as_ref().map_or(0.0, |pair| pair.confidence),
+                    nested.as_ref().map_or(0, |pair| pair.pupil_support),
+                    nested.as_ref().map_or(0, |pair| pair.limbus_support),
+                    nested.as_ref().map_or(0, |pair| pair.paired_support),
+                    nested
+                        .as_ref()
+                        .is_some_and(|pair| pair.input_seed_was_pupil_like),
+                );
+            }
+
+            for edge in &edges {
+                let Some((affinity, _)) = limbus_feature_budget_affinity(*edge, seed) else {
+                    continue;
+                };
+                let side = usize::from(edge.x as f64 >= seed.center.0);
+                affinity_candidates[side] += 1;
+                affinity_eligible[side] += usize::from(affinity >= LIMBUS_FEATURE_MIN_AFFINITY);
+            }
+            let selected = seed_points(
+                &frame,
+                Some(&canny),
+                &edges,
+                Some(seed),
+                &[],
+                &[],
+                MAX_FEATURES,
+            );
+            let ellipse = seed.ellipse();
+            for (point, _) in selected {
+                let radius = normalized_ellipse_radius(ellipse, (point[0] as f64, point[1] as f64));
+                if (radius - 1.0).abs() <= 0.20 {
+                    selected_features[usize::from(point[0] as f64 >= seed.center.0)] += 1;
+                }
+            }
+
+            if let Some((previous_frame, previous_region, previous_timestamp_ns)) =
+                previous.as_ref()
+            {
+                if timestamp_ns > *previous_timestamp_ns
+                    && timestamp_ns - *previous_timestamp_ns <= 250_000_000
+                {
+                    let (flows, _, micros) =
+                        radial_limbus_flows(previous_frame, &frame, *previous_region, region);
+                    if !flows.is_empty() {
+                        flow_pairs += 1;
+                        flow_timings.push(micros);
+                    }
+                    let mut ranked = Vec::<(usize, f32)>::new();
+                    for (flow_index, flow) in flows.iter().enumerate() {
+                        let side = usize::from(flow.current[0] >= region.center[0]);
+                        raw_flows[side] += 1;
+                        let expected = eye_region_boundary(region, flow.phase_rad);
+                        let normal_error = ((flow.current[0] - expected[0]) * flow.normal[0]
+                            + (flow.current[1] - expected[1]) * flow.normal[1])
+                            .abs();
+                        if normal_error <= RADIAL_LIMBUS_MAX_PRIOR_NORMAL_ERROR_PX {
+                            motion_eligible[side] += 1;
+                            ranked
+                                .push((flow_index, flow.confidence * (-normal_error / 3.5).exp()));
+                        }
+                    }
+                    let mut legacy = ranked.clone();
+                    legacy.sort_by(|left, right| right.1.total_cmp(&left.1));
+                    legacy.truncate(12);
+                    for (index, _) in legacy {
+                        legacy_fused[usize::from(flows[index].current[0] >= region.center[0])] += 1;
+                    }
+                    for (index, _) in radial_limbus_fusion_ranking(&flows, ranked) {
+                        production_fused
+                            [usize::from(flows[index].current[0] >= region.center[0])] += 1;
+                    }
+                }
+            }
+            previous = Some((frame, region, timestamp_ns));
+        }
+
+        flow_timings.sort_unstable();
+        let timing_p90 = flow_timings
+            .get(((flow_timings.len().saturating_sub(1)) as f32 * 0.90).round() as usize)
+            .copied()
+            .unwrap_or_default();
+        eprintln!(
+            "left-limbus-replay start={start} requested={maximum_frames} valid={valid_frames} nested={nested_pairs} nested-pupil-like={nested_pupil_like} pairs={flow_pairs} raw-flow-left/right={}/{} motion-eligible-left/right={}/{} legacy-fused-left/right={}/{} production-fused-left/right={}/{} affinity-candidates-left/right={}/{} affinity-eligible-left/right={}/{} selected-features-left/right={}/{} radial-us-p90={timing_p90}",
+            raw_flows[0],
+            raw_flows[1],
+            motion_eligible[0],
+            motion_eligible[1],
+            legacy_fused[0],
+            legacy_fused[1],
+            production_fused[0],
+            production_fused[1],
+            affinity_candidates[0],
+            affinity_candidates[1],
+            affinity_eligible[0],
+            affinity_eligible[1],
+            selected_features[0],
+            selected_features[1],
+        );
+        assert!(valid_frames >= 8, "valid frames={valid_frames}");
+        assert!(flow_pairs >= 4, "flow pairs={flow_pairs}");
     }
 
     fn synthetic_shared_similarity_frame(
@@ -15905,7 +18086,7 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
-        let selected = seed_points(&frame, Some(&canny), &edges, Some(seed), &[], 40);
+        let selected = seed_points(&frame, Some(&canny), &edges, Some(seed), &[], &[], 40);
         let retained_limbus = selected
             .iter()
             .filter(|(point, _)| {
@@ -15921,6 +18102,875 @@ mod tests {
         assert!(selected.len() <= 40);
     }
 
+    fn synthetic_lid_edge(x: f32, y: f32, upper: bool) -> EdgeEvidence {
+        EdgeEvidence {
+            x,
+            y,
+            gradient_x: 0.0,
+            gradient_y: if upper { -1.0 } else { 1.0 },
+            strength: 1.4,
+            multiscale_consistency: 0.92,
+            signed_step_persistence: 0.90,
+            dark_side_texture: 0.55,
+            bright_side_texture: 0.35,
+            ..EdgeEvidence::default()
+        }
+    }
+
+    #[test]
+    fn flat_tire_detector_fits_both_palpebral_margin_censors() {
+        let seed = IrisEllipseSeed {
+            center: (160.0, 120.0),
+            major_radius: 72.0,
+            minor_radius: 58.0,
+            angle: 0.0,
+        };
+        let lower = (-6..=6)
+            .map(|sample| {
+                let x = 160.0 + sample as f32 * 8.0;
+                let offset = x - 160.0;
+                LidMarginPoint {
+                    x,
+                    y: 156.0 - 0.0002 * offset * offset,
+                }
+            })
+            .collect::<Vec<_>>();
+        let upper = (-6..=6)
+            .map(|sample| {
+                let x = 160.0 + sample as f32 * 8.0;
+                let offset = x - 160.0;
+                LidMarginPoint {
+                    x,
+                    y: 84.0 + 0.0002 * offset * offset,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut edges = lower
+            .iter()
+            .map(|point| synthetic_lid_edge(point.x, point.y, false))
+            .collect::<Vec<_>>();
+        edges.extend(
+            upper
+                .iter()
+                .map(|point| synthetic_lid_edge(point.x, point.y, true)),
+        );
+        let curves = detect_lid_occlusions(&edges, Some(seed), &upper, &lower);
+        assert_eq!(curves.len(), 2, "{curves:#?}");
+        let upper_curve = curves.iter().find(|curve| curve.upper).unwrap();
+        let lower_curve = curves.iter().find(|curve| !curve.upper).unwrap();
+        assert!(upper_curve.confidence >= 0.34, "{upper_curve:#?}");
+        assert!(lower_curve.confidence >= 0.34, "{lower_curve:#?}");
+        assert!(upper_curve.masks_limbus_point([160.0, 70.0], 0.0));
+        assert!(!upper_curve.masks_limbus_point([160.0, 101.0], 0.0));
+        assert!(lower_curve.masks_limbus_point([160.0, 170.0], 0.0));
+        assert!(!lower_curve.masks_limbus_point([160.0, 139.0], 0.0));
+    }
+
+    #[test]
+    fn visible_curved_limbus_does_not_become_a_flat_tire_censor() {
+        let seed = IrisEllipseSeed {
+            center: (160.0, 120.0),
+            major_radius: 72.0,
+            minor_radius: 58.0,
+            angle: 0.0,
+        };
+        let lower = (-6..=6)
+            .map(|sample| {
+                let x = 160.0 + sample as f64 * 8.0;
+                let normalized_x = (x - seed.center.0) / seed.major_radius;
+                let y =
+                    seed.center.1 + seed.minor_radius * (1.0 - normalized_x * normalized_x).sqrt();
+                LidMarginPoint {
+                    x: x as f32,
+                    y: y as f32,
+                }
+            })
+            .collect::<Vec<_>>();
+        let edges = lower
+            .iter()
+            .map(|point| synthetic_lid_edge(point.x, point.y, false))
+            .collect::<Vec<_>>();
+        assert!(detect_lid_occlusions(&edges, Some(seed), &[], &lower).is_empty());
+    }
+
+    #[test]
+    fn flat_tire_points_cannot_count_as_ellipse_support() {
+        let seed = IrisEllipseSeed {
+            center: (160.0, 120.0),
+            major_radius: 72.0,
+            minor_radius: 58.0,
+            angle: 0.0,
+        };
+        let lower = (-6..=6)
+            .map(|sample| LidMarginPoint {
+                x: 160.0 + sample as f32 * 8.0,
+                y: 156.0,
+            })
+            .collect::<Vec<_>>();
+        let mut edges = (0..72)
+            .map(|sample| {
+                let phase = std::f64::consts::TAU * sample as f64 / 72.0;
+                let x = seed.center.0 + seed.major_radius * phase.cos();
+                let y = seed.center.1 + seed.minor_radius * phase.sin();
+                EdgeEvidence {
+                    x: x as f32,
+                    y: y as f32,
+                    gradient_x: phase.cos() as f32,
+                    gradient_y: phase.sin() as f32,
+                    strength: 1.2,
+                    multiscale_consistency: 0.9,
+                    signed_step_persistence: 0.9,
+                    dark_side_texture: 0.7,
+                    bright_side_texture: 0.2,
+                    ..EdgeEvidence::default()
+                }
+            })
+            .collect::<Vec<_>>();
+        edges.extend(
+            lower
+                .iter()
+                .map(|point| synthetic_lid_edge(point.x, point.y, false)),
+        );
+        let curves = detect_lid_occlusions(&edges, Some(seed), &[], &lower);
+        assert_eq!(curves.len(), 1, "{curves:#?}");
+        let evidence = score_edge_ellipse_with_occlusions(
+            seed.ellipse(),
+            &edges,
+            seed.area_seed(),
+            true,
+            &curves,
+        );
+        assert!(evidence.inliers.len() >= 30, "{evidence:#?}");
+        assert!(evidence.inliers.iter().all(|index| {
+            let edge = edges[*index];
+            !point_is_lid_censored([edge.x, edge.y], &curves)
+        }));
+    }
+
+    #[test]
+    #[ignore = "set BUTTERCUP_FLAT_TIRE_CORPUS to a tree containing reviewed RAW10 limbus labels"]
+    fn flat_tire_censor_preserves_human_labeled_visible_limbus_points() {
+        fn collect_label_paths(root: &std::path::Path, output: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(root) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_label_paths(&path, output);
+                } else if path.to_string_lossy().ends_with(".labels.json") {
+                    output.push(path);
+                }
+            }
+        }
+
+        fn labeled_seed(document: &serde_json::Value) -> Option<IrisEllipseSeed> {
+            let fit = document.get("ellipse_fit")?;
+            let center = fit.get("center")?.as_array()?;
+            let center = (center.first()?.as_f64()?, center.get(1)?.as_f64()?);
+            if let (Some(major), Some(minor), Some(angle)) = (
+                fit.get("major_radius").and_then(serde_json::Value::as_f64),
+                fit.get("minor_radius").and_then(serde_json::Value::as_f64),
+                fit.get("angle").and_then(serde_json::Value::as_f64),
+            ) {
+                return Some(IrisEllipseSeed {
+                    center,
+                    major_radius: major,
+                    minor_radius: minor,
+                    angle,
+                });
+            }
+            let radii = fit.get("radii")?.as_array()?;
+            let first = radii.first()?.as_f64()?;
+            let second = radii.get(1)?.as_f64()?;
+            let mut angle = fit.get("angle_degrees")?.as_f64()?.to_radians();
+            let (major_radius, minor_radius) = if second > first {
+                angle += std::f64::consts::FRAC_PI_2;
+                (second, first)
+            } else {
+                (first, second)
+            };
+            Some(IrisEllipseSeed {
+                center,
+                major_radius,
+                minor_radius,
+                angle,
+            })
+        }
+
+        fn relocated_raw_path(source: &str, corpus: &std::path::Path) -> std::path::PathBuf {
+            let original = std::path::PathBuf::from(source);
+            // Label documents can retain an absolute path from the machine
+            // on which they were reviewed.  Resolve the stable suffix inside
+            // the explicitly supplied corpus first, so this repository never
+            // depends on an abandoned source checkout still being present.
+            if let Some((_, relative)) = source.rsplit_once("/outputs/") {
+                let relocated = corpus.join(relative);
+                if relocated.is_file() {
+                    return relocated;
+                }
+            } else if let Some(relative) = source.strip_prefix("outputs/") {
+                let relocated = corpus.join(relative);
+                if relocated.is_file() {
+                    return relocated;
+                }
+            }
+            if original.is_file() {
+                original
+            } else {
+                corpus.join(source)
+            }
+        }
+
+        let corpus = std::path::PathBuf::from(
+            std::env::var_os("BUTTERCUP_FLAT_TIRE_CORPUS")
+                .expect("BUTTERCUP_FLAT_TIRE_CORPUS must name the lossless label tree"),
+        );
+        let mut labels = Vec::new();
+        collect_label_paths(&corpus, &mut labels);
+        labels.sort();
+
+        let mut reviewed = 0usize;
+        let mut unique_raws = std::collections::BTreeSet::<std::path::PathBuf>::new();
+        let mut detected_curves = 0usize;
+        let mut detected_upper = 0usize;
+        let mut detected_lower = 0usize;
+        let mut censored_edges = 0usize;
+        let mut extinguished_tracks = 0usize;
+        let mut visible_labels = 0usize;
+        let mut censored_visible_labels = Vec::<String>::new();
+        let mut elapsed_micros = 0u128;
+        let mut nested_detected = 0usize;
+        let mut nested_seed_pupil_like = 0usize;
+        let mut nested_outer_scale_errors = Vec::<f32>::new();
+        let mut nested_elapsed_micros = 0u128;
+        for label_path in labels {
+            let document: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&label_path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", label_path.display())),
+            )
+            .unwrap_or_else(|error| panic!("parse {}: {error}", label_path.display()));
+            if document
+                .get("reviewed")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                continue;
+            }
+            let Some(seed) = labeled_seed(&document) else {
+                continue;
+            };
+            let Some(source) = document
+                .get("source_raw")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let raw_path = relocated_raw_path(source, &corpus);
+            if !raw_path.is_file() || !unique_raws.insert(raw_path.clone()) {
+                continue;
+            }
+            let width = document
+                .get("frame_width")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(384) as usize;
+            let height = document
+                .get("frame_height")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(256) as usize;
+            let sensor_origin = document
+                .get("sensor_origin")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|origin| {
+                    Some((
+                        origin.first()?.as_u64()? as u32,
+                        origin.get(1)?.as_u64()? as u32,
+                    ))
+                })
+                .unwrap_or_default();
+            let packed = std::fs::read(&raw_path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", raw_path.display()));
+            let stride = packed.len() / height;
+            let raw = crate::raw10::unpack_raw10(&packed, width, height, stride);
+            assert_eq!(raw.len(), width * height, "{}", raw_path.display());
+            let focus = crate::raw_iris_focus::score_stream_eye(&raw, width, height);
+            let upper = crate::raw_iris_focus::detect_upper_eyelid_points(
+                &raw,
+                width,
+                height,
+                sensor_origin.0,
+                sensor_origin.1,
+                &focus,
+            )
+            .into_iter()
+            .map(|point| LidMarginPoint {
+                x: point.x as f32,
+                y: point.y as f32,
+            })
+            .collect::<Vec<_>>();
+            let lower = crate::raw_iris_focus::detect_lower_eyelid_points(
+                &raw,
+                width,
+                height,
+                sensor_origin.0,
+                sensor_origin.1,
+                &focus,
+            )
+            .into_iter()
+            .map(|point| LidMarginPoint {
+                x: point.x as f32,
+                y: point.y as f32,
+            })
+            .collect::<Vec<_>>();
+            let frame = RawFrame {
+                sensor_x: 0,
+                sensor_y: 0,
+                width,
+                height,
+                pixels: cfa_neutral_raw(&raw, width, height),
+            };
+            let mut canny = canny_field(&frame);
+            let edges = edge_evidence(&mut canny, width, height).edges;
+            let started = std::time::Instant::now();
+            let curves = detect_lid_occlusions(&edges, Some(seed), &upper, &lower);
+            let detector_micros = started.elapsed().as_micros();
+            elapsed_micros += detector_micros;
+            detected_curves += curves.len();
+            detected_upper += curves.iter().filter(|curve| curve.upper).count();
+            detected_lower += curves.iter().filter(|curve| !curve.upper).count();
+            censored_edges += curves
+                .iter()
+                .map(|curve| curve.censored_edges)
+                .sum::<usize>();
+            let nested_started = std::time::Instant::now();
+            let (nested, _) = nested_eye_boundary_pair(
+                &frame,
+                EyeMotionRegion::from_local_seed(seed, &frame),
+                &curves,
+            );
+            nested_elapsed_micros += nested_started.elapsed().as_micros();
+            let mut nested_summary = "none".to_string();
+            if let Some(pair) = nested {
+                nested_detected += 1;
+                nested_seed_pupil_like += usize::from(pair.input_seed_was_pupil_like);
+                let labeled_area_radius = (seed.major_radius * seed.minor_radius).sqrt() as f32;
+                let recovered_area_radius =
+                    (pair.limbus.major_radius * pair.limbus.minor_radius).sqrt() as f32;
+                nested_outer_scale_errors
+                    .push((recovered_area_radius / labeled_area_radius.max(1.0) - 1.0).abs());
+                nested_summary = format!(
+                    "role={} outer_scale={:.3} pupil_ratio={:.3} q={:.3} support={}/{}/{}",
+                    if pair.input_seed_was_pupil_like {
+                        "pupil"
+                    } else {
+                        "limbus"
+                    },
+                    recovered_area_radius / labeled_area_radius.max(1.0),
+                    pair.pupil_to_limbus_radius_ratio,
+                    pair.confidence,
+                    pair.pupil_support,
+                    pair.limbus_support,
+                    pair.paired_support,
+                );
+            }
+
+            let points = document
+                .get("annotation_points")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|point| {
+                    point.get("kind").and_then(serde_json::Value::as_str) == Some("iris_edge")
+                        && point.get("visibility").and_then(serde_json::Value::as_str)
+                            != Some("occluded")
+                })
+                .filter_map(|point| {
+                    Some([
+                        point.get("x")?.as_f64()? as f32,
+                        point.get("y")?.as_f64()? as f32,
+                    ])
+                })
+                .collect::<Vec<_>>();
+            visible_labels += points.len();
+            for point in points {
+                if point_is_lid_censored(point, &curves) {
+                    censored_visible_labels.push(format!(
+                        "{} @ ({:.2},{:.2})",
+                        raw_path.display(),
+                        point[0],
+                        point[1]
+                    ));
+                }
+            }
+            for curve in &curves {
+                assert!(curve.support_points.len() >= LID_OCCLUSION_MIN_CANNY_POINTS);
+                assert!(curve.confidence >= 0.34);
+            }
+            if !curves.is_empty() {
+                // Establish ordinary feature identities with no lid input,
+                // then present the exact same RAW exposure with its directly
+                // measured margin. This isolates censor handoff from motion:
+                // covered identities must disappear in that second frame,
+                // including identities whose patch matcher has no destination.
+                let mut temporal = FourMotionOctrees::default();
+                let _ = temporal.observe_with_iris_seed_at_with_canny_profile_and_lids(
+                    &raw,
+                    width,
+                    height,
+                    sensor_origin.0,
+                    sensor_origin.1,
+                    1_000_000_000,
+                    None,
+                    LearningCannyProfile::CannyBalanced,
+                    Some(seed),
+                    &[],
+                    &[],
+                );
+                let censored = temporal.observe_with_iris_seed_at_with_canny_profile_and_lids(
+                    &raw,
+                    width,
+                    height,
+                    sensor_origin.0,
+                    sensor_origin.1,
+                    1_025_000_000,
+                    None,
+                    LearningCannyProfile::CannyBalanced,
+                    Some(seed),
+                    &upper,
+                    &lower,
+                );
+                assert!(!censored.lid_occlusions.is_empty());
+                assert!(censored.provisional_features.iter().all(|point| {
+                    !point_is_lid_censored([point.0, point.1], &censored.lid_occlusions)
+                }));
+                assert!(censored.trails.iter().all(|trail| {
+                    trail.points.last().is_none_or(|point| {
+                        !point_is_lid_censored([point.x, point.y], &censored.lid_occlusions)
+                    })
+                }));
+                extinguished_tracks += censored
+                    .lid_occlusions
+                    .iter()
+                    .map(|curve| curve.extinguished_tracks)
+                    .sum::<usize>();
+            }
+            let scored = score_edge_ellipse_with_occlusions(
+                seed.ellipse(),
+                &edges,
+                seed.area_seed(),
+                true,
+                &curves,
+            );
+            assert!(scored.inliers.iter().all(|index| {
+                let edge = edges[*index];
+                !point_is_lid_censored([edge.x, edge.y], &curves)
+            }));
+            reviewed += 1;
+            eprintln!(
+                "flat-tire-corpus raw={} lids={}/{} curves={} censored_edges={} detector_us={} nested={}",
+                raw_path.display(),
+                upper.len(),
+                lower.len(),
+                curves.len(),
+                curves
+                    .iter()
+                    .map(|curve| curve.censored_edges)
+                    .sum::<usize>(),
+                detector_micros,
+                nested_summary,
+            );
+        }
+        eprintln!(
+            "flat-tire-corpus reviewed={reviewed} visible_labels={visible_labels} curves={detected_curves} upper={detected_upper} lower={detected_lower} censored_edges={censored_edges} extinguished_tracks={extinguished_tracks} mean_detector_us={:.1} nested={nested_detected} nested_seed_pupil_like={nested_seed_pupil_like} nested_mean_us={:.1} nested_outer_mean_abs_scale_error={:.4}",
+            elapsed_micros as f64 / reviewed.max(1) as f64,
+            nested_elapsed_micros as f64 / reviewed.max(1) as f64,
+            nested_outer_scale_errors.iter().copied().sum::<f32>()
+                / nested_outer_scale_errors.len().max(1) as f32,
+        );
+        assert!(reviewed >= 5, "too few uniquely labeled RAW fixtures");
+        assert!(visible_labels >= 35, "too few human limbus points");
+        assert!(
+            detected_curves == 0 || extinguished_tracks > 0,
+            "real occluding lid failed to extinguish pre-existing feature identities"
+        );
+        assert!(
+            censored_visible_labels.is_empty(),
+            "lid censor removed human-visible limbus truth: {censored_visible_labels:#?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "set BUTTERCUP_FLAT_TIRE_REPLAY to a consecutive lossless RAW replay containing report.json"]
+    fn flat_tire_censor_replays_consecutive_raw_without_stale_occluded_tracks() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("BUTTERCUP_FLAT_TIRE_REPLAY")
+                .expect("BUTTERCUP_FLAT_TIRE_REPLAY must name a RAW replay directory"),
+        );
+        let report: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join("report.json")).expect("read report.json"),
+        )
+        .expect("parse report.json");
+        let records = report
+            .get("frames")
+            .and_then(serde_json::Value::as_array)
+            .expect("report frames");
+        let mut tracker = FourMotionOctrees::default();
+        let mut replayed = 0usize;
+        let mut curves = 0usize;
+        let mut curve_frames = 0usize;
+        let mut censored_edges = 0usize;
+        let mut extinguished_tracks = 0usize;
+        let mut detector_timings = Vec::<u64>::new();
+        let mut total_timings = Vec::<u128>::new();
+        for record in records {
+            let Some(ordinal) = record.get("index").and_then(serde_json::Value::as_u64) else {
+                continue;
+            };
+            let Some(semantic) = record.get("semantic_iris").filter(|value| !value.is_null())
+            else {
+                continue;
+            };
+            let center = semantic
+                .get("center")
+                .and_then(serde_json::Value::as_array)
+                .expect("semantic iris center");
+            let seed = IrisEllipseSeed {
+                center: (
+                    center.first().and_then(serde_json::Value::as_f64).unwrap(),
+                    center.get(1).and_then(serde_json::Value::as_f64).unwrap(),
+                ),
+                major_radius: semantic
+                    .get("major_radius")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap(),
+                minor_radius: semantic
+                    .get("minor_radius")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap(),
+                angle: semantic
+                    .get("angle")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap(),
+            };
+            let width = record
+                .get("width")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(384) as usize;
+            let height = record
+                .get("height")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(256) as usize;
+            let stride = record
+                .get("stride")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or((width * 5 / 4) as u64) as usize;
+            let origin = record
+                .get("sensor_origin")
+                .and_then(serde_json::Value::as_array)
+                .expect("sensor origin");
+            let sensor_x = origin.first().and_then(serde_json::Value::as_u64).unwrap() as u32;
+            let sensor_y = origin.get(1).and_then(serde_json::Value::as_u64).unwrap() as u32;
+            let timestamp_ns = record
+                .get("timestamp_ns")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap();
+            let raw_path = root.join(format!("frame-{ordinal:04}.raw10"));
+            let packed = std::fs::read(&raw_path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", raw_path.display()));
+            let raw = crate::raw10::unpack_raw10(&packed, width, height, stride);
+            let focus = crate::raw_iris_focus::score_stream_eye(&raw, width, height);
+            let upper = crate::raw_iris_focus::detect_upper_eyelid_points(
+                &raw, width, height, sensor_x, sensor_y, &focus,
+            )
+            .into_iter()
+            .map(|point| LidMarginPoint {
+                x: point.x as f32,
+                y: point.y as f32,
+            })
+            .collect::<Vec<_>>();
+            let lower = crate::raw_iris_focus::detect_lower_eyelid_points(
+                &raw, width, height, sensor_x, sensor_y, &focus,
+            )
+            .into_iter()
+            .map(|point| LidMarginPoint {
+                x: point.x as f32,
+                y: point.y as f32,
+            })
+            .collect::<Vec<_>>();
+            let started = std::time::Instant::now();
+            let overlay = tracker.observe_with_iris_seed_at_with_canny_profile_and_lids(
+                &raw,
+                width,
+                height,
+                sensor_x,
+                sensor_y,
+                timestamp_ns,
+                None,
+                LearningCannyProfile::CannyBalanced,
+                Some(seed),
+                &upper,
+                &lower,
+            );
+            total_timings.push(started.elapsed().as_micros());
+            replayed += 1;
+            curves += overlay.lid_occlusions.len();
+            curve_frames += usize::from(!overlay.lid_occlusions.is_empty());
+            censored_edges += overlay
+                .lid_occlusions
+                .iter()
+                .map(|curve| curve.censored_edges)
+                .sum::<usize>();
+            extinguished_tracks += overlay
+                .lid_occlusions
+                .iter()
+                .map(|curve| curve.extinguished_tracks)
+                .sum::<usize>();
+            detector_timings.push(overlay.match_diagnostics.lid_occlusion_micros);
+            assert_eq!(
+                overlay.match_diagnostics.lid_occlusion_curves,
+                overlay.lid_occlusions.len()
+            );
+            assert!(overlay.provisional_features.iter().all(|point| {
+                !point_is_lid_censored([point.0, point.1], &overlay.lid_occlusions)
+            }));
+            assert!(overlay.trails.iter().all(|trail| {
+                trail.points.last().is_none_or(|point| {
+                    !point_is_lid_censored([point.x, point.y], &overlay.lid_occlusions)
+                })
+            }));
+        }
+        detector_timings.sort_unstable();
+        total_timings.sort_unstable();
+        let percentile_u64 = |values: &[u64], fraction: f64| {
+            values
+                .get(
+                    ((values.len().saturating_sub(1) as f64 * fraction).round() as usize)
+                        .min(values.len().saturating_sub(1)),
+                )
+                .copied()
+                .unwrap_or_default()
+        };
+        let percentile_u128 = |values: &[u128], fraction: f64| {
+            values
+                .get(
+                    ((values.len().saturating_sub(1) as f64 * fraction).round() as usize)
+                        .min(values.len().saturating_sub(1)),
+                )
+                .copied()
+                .unwrap_or_default()
+        };
+        eprintln!(
+            "flat-tire-temporal frames={replayed} curve_frames={curve_frames} curves={curves} censored_edges={censored_edges} extinguished_tracks={extinguished_tracks} detector_us_p50/p99={}/{} total_us_p50/p99={}/{}",
+            percentile_u64(&detector_timings, 0.50),
+            percentile_u64(&detector_timings, 0.99),
+            percentile_u128(&total_timings, 0.50),
+            percentile_u128(&total_timings, 0.99),
+        );
+        assert!(replayed >= 30, "replayed frames={replayed}");
+        assert!(
+            percentile_u64(&detector_timings, 0.99) <= 2_000,
+            "lid detector exceeded its bounded 2ms p99 budget"
+        );
+    }
+
+    #[test]
+    #[ignore = "set BUTTERCUP_FLAT_TIRE_STREAM_REPORT to a compact temporal report backed by a lossless RAW10 stream"]
+    fn flat_tire_censor_scans_stratified_long_raw_stream() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let report_path = std::path::PathBuf::from(
+            std::env::var_os("BUTTERCUP_FLAT_TIRE_STREAM_REPORT")
+                .expect("BUTTERCUP_FLAT_TIRE_STREAM_REPORT must name report.json"),
+        );
+        let report: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&report_path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", report_path.display())),
+        )
+        .expect("parse compact stream report");
+        let source = report
+            .get("source")
+            .and_then(|source| source.get("stream"))
+            .and_then(serde_json::Value::as_str)
+            .expect("source.stream");
+        let stream_path = std::env::var_os("BUTTERCUP_FLAT_TIRE_STREAM")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(source));
+        let mut stream = std::fs::File::open(&stream_path)
+            .unwrap_or_else(|error| panic!("open {}: {error}", stream_path.display()));
+        let records = report
+            .get("frames")
+            .and_then(serde_json::Value::as_array)
+            .expect("report frames")
+            .iter()
+            .filter(|record| {
+                record
+                    .get("semantic_iris")
+                    .is_some_and(|value| !value.is_null())
+            })
+            .collect::<Vec<_>>();
+        assert!(records.len() >= 100, "semantic records={}", records.len());
+        const MAX_STRATIFIED_SAMPLES: usize = 256;
+        let sample_step = records.len().div_ceil(MAX_STRATIFIED_SAMPLES).max(1);
+        let mut sampled = 0usize;
+        let mut curve_frames = 0usize;
+        let mut curves = 0usize;
+        let mut upper_curves = 0usize;
+        let mut lower_curves = 0usize;
+        let mut censored_edges = 0usize;
+        let mut detector_timings = Vec::<u64>::new();
+        let mut detected_indices = Vec::<u64>::new();
+        for record in records.into_iter().step_by(sample_step) {
+            let semantic = record.get("semantic_iris").unwrap();
+            let center = semantic
+                .get("center")
+                .and_then(serde_json::Value::as_array)
+                .expect("semantic center");
+            let seed = IrisEllipseSeed {
+                center: (
+                    center.first().and_then(serde_json::Value::as_f64).unwrap(),
+                    center.get(1).and_then(serde_json::Value::as_f64).unwrap(),
+                ),
+                major_radius: semantic
+                    .get("major_radius")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap(),
+                minor_radius: semantic
+                    .get("minor_radius")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap(),
+                angle: semantic
+                    .get("angle")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap(),
+            };
+            let width = record
+                .get("width")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(384) as usize;
+            let height = record
+                .get("height")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(256) as usize;
+            let stride = record
+                .get("stride")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or((width * 5 / 4) as u64) as usize;
+            let record_index = record
+                .get("source_record_index")
+                .and_then(serde_json::Value::as_u64)
+                .expect("source record index");
+            let frame_bytes = stride
+                .checked_mul(height)
+                .expect("RAW frame byte length overflow");
+            let offset = record_index
+                .checked_mul(frame_bytes as u64)
+                .expect("RAW stream offset overflow");
+            stream.seek(SeekFrom::Start(offset)).unwrap();
+            let mut packed = vec![0u8; frame_bytes];
+            stream.read_exact(&mut packed).unwrap_or_else(|error| {
+                panic!(
+                    "read record {record_index} from {}: {error}",
+                    stream_path.display()
+                )
+            });
+            let raw = crate::raw10::unpack_raw10(&packed, width, height, stride);
+            let origin = record
+                .get("sensor_origin")
+                .and_then(serde_json::Value::as_array)
+                .expect("sensor origin");
+            let sensor_x = origin.first().and_then(serde_json::Value::as_u64).unwrap() as u32;
+            let sensor_y = origin.get(1).and_then(serde_json::Value::as_u64).unwrap() as u32;
+            let focus = crate::raw_iris_focus::score_stream_eye(&raw, width, height);
+            let upper = crate::raw_iris_focus::detect_upper_eyelid_points(
+                &raw, width, height, sensor_x, sensor_y, &focus,
+            )
+            .into_iter()
+            .map(|point| LidMarginPoint {
+                x: point.x as f32,
+                y: point.y as f32,
+            })
+            .collect::<Vec<_>>();
+            let lower = crate::raw_iris_focus::detect_lower_eyelid_points(
+                &raw, width, height, sensor_x, sensor_y, &focus,
+            )
+            .into_iter()
+            .map(|point| LidMarginPoint {
+                x: point.x as f32,
+                y: point.y as f32,
+            })
+            .collect::<Vec<_>>();
+            let frame = RawFrame {
+                sensor_x: 0,
+                sensor_y: 0,
+                width,
+                height,
+                pixels: cfa_neutral_raw(&raw, width, height),
+            };
+            let mut canny = canny_field(&frame);
+            let edges = edge_evidence(&mut canny, width, height).edges;
+            let started = std::time::Instant::now();
+            let detected = detect_lid_occlusions(&edges, Some(seed), &upper, &lower);
+            detector_timings.push(started.elapsed().as_micros() as u64);
+            sampled += 1;
+            if !detected.is_empty() {
+                curve_frames += 1;
+                let frame_index = record
+                    .get("index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(record_index);
+                detected_indices.push(frame_index);
+                for curve in &detected {
+                    let midpoint = curve.points[curve.points.len() / 2];
+                    eprintln!(
+                        "  flat-tire-hit frame={frame_index} side={} confidence={:.3} midpoint=({:.1},{:.1}) span=({:.1}..{:.1}) supports={} censored_edges={}",
+                        if curve.upper { "upper" } else { "lower" },
+                        curve.confidence,
+                        midpoint.0,
+                        midpoint.1,
+                        curve.points.first().map_or(0.0, |point| point.0),
+                        curve.points.last().map_or(0.0, |point| point.0),
+                        curve.support_points.len(),
+                        curve.censored_edges,
+                    );
+                }
+            }
+            curves += detected.len();
+            upper_curves += detected.iter().filter(|curve| curve.upper).count();
+            lower_curves += detected.iter().filter(|curve| !curve.upper).count();
+            censored_edges += detected
+                .iter()
+                .map(|curve| curve.censored_edges)
+                .sum::<usize>();
+        }
+        detector_timings.sort_unstable();
+        let p99 = detector_timings
+            .get(
+                ((detector_timings.len().saturating_sub(1) as f64 * 0.99).round() as usize)
+                    .min(detector_timings.len().saturating_sub(1)),
+            )
+            .copied()
+            .unwrap_or_default();
+        let curve_fraction = curve_frames as f64 / sampled.max(1) as f64;
+        eprintln!(
+            "flat-tire-stream stream={} source_frames={} sampled={} curve_frames={} curve_fraction={curve_fraction:.4} curves={} upper={} lower={} censored_edges={} detector_us_p99={} indices={detected_indices:?}",
+            stream_path.display(),
+            report["frames"].as_array().map_or(0, Vec::len),
+            sampled,
+            curve_frames,
+            curves,
+            upper_curves,
+            lower_curves,
+            censored_edges,
+            p99,
+        );
+        assert!(sampled >= 100, "sampled frames={sampled}");
+        assert!(
+            curve_fraction <= 0.25,
+            "flat-tire gate fired implausibly often: {curve_frames}/{sampled}"
+        );
+        assert!(p99 <= 2_000, "lid detector p99={p99}us");
+    }
+
     #[test]
     #[ignore = "set BUTTERCUP_LIMBUS_FEATURE_LABEL and BUTTERCUP_LIMBUS_FEATURE_RAW"]
     fn limbus_feature_budget_replays_a_human_labeled_lossless_raw() {
@@ -15933,7 +18983,9 @@ mod tests {
         )
         .expect("parse human limbus labels JSON");
         assert_eq!(
-            document.get("reviewed").and_then(serde_json::Value::as_bool),
+            document
+                .get("reviewed")
+                .and_then(serde_json::Value::as_bool),
             Some(true),
             "the corpus replay must not treat an unreviewed algorithm proposal as truth"
         );
@@ -15979,19 +19031,19 @@ mod tests {
         };
         let mut canny = canny_field(&frame);
         let edges = edge_evidence(&mut canny, width, height).edges;
-        let baseline = seed_points(&frame, Some(&canny), &edges, None, &[], MAX_FEATURES);
+        let baseline = seed_points(&frame, Some(&canny), &edges, None, &[], &[], MAX_FEATURES);
         let discounted = seed_points(
             &frame,
             Some(&canny),
             &edges,
             Some(seed),
             &[],
+            &[],
             MAX_FEATURES,
         );
         let ellipse = seed.ellipse();
         let near_limbus = |point: [f32; 2]| {
-            (normalized_ellipse_radius(ellipse, (point[0] as f64, point[1] as f64)) - 1.0)
-                .abs()
+            (normalized_ellipse_radius(ellipse, (point[0] as f64, point[1] as f64)) - 1.0).abs()
                 * ellipse.minor
                 <= 4.0
         };
@@ -16698,8 +19750,16 @@ mod tests {
                     production_quantiles(correct, |score| score.reverse_margin),
                     production_quantiles(correct, |score| score.normal_alignment),
                     production_quantiles(correct, |score| score.confidence),
-                    result.production_scores.iter().filter(|score| score.correct == correct && score.anchor_conditioned).count(),
-                    result.production_scores.iter().filter(|score| score.correct == correct).count(),
+                    result
+                        .production_scores
+                        .iter()
+                        .filter(|score| score.correct == correct && score.anchor_conditioned)
+                        .count(),
+                    result
+                        .production_scores
+                        .iter()
+                        .filter(|score| score.correct == correct)
+                        .count(),
                 );
             }
             for object in 0..OBJECTS {

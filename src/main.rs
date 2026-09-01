@@ -2,6 +2,7 @@
 
 use softbuffer::{Context, Surface};
 mod checkerboard_calibration;
+mod keyboard_peeper;
 mod native_mediapipe;
 mod offline_segmentation_replay;
 mod pupil_clock_supervision;
@@ -25,7 +26,7 @@ use raw_eye_model_protocol::{
     FLAG_IDENTITY_PRESENT, FLAG_MOTION_COMPARABLE, FLAG_VERIFIED_RAW10_1X1,
 };
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -6718,6 +6719,332 @@ struct EyeFrame {
     lower_limbus_clearance_px: Option<f64>,
 }
 
+fn configured_roi_role(roi_id: u32) -> &'static str {
+    match roi_id {
+        1 => "subject-right-eye",
+        2 => "subject-left-eye",
+        _ => "unspecified",
+    }
+}
+
+fn json_finite_number(value: f64) -> serde_json::Value {
+    serde_json::Number::from_f64(value)
+        .map(serde_json::Value::Number)
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn json_point(point: (f64, f64)) -> serde_json::Value {
+    serde_json::Value::Array(vec![
+        json_finite_number(point.0),
+        json_finite_number(point.1),
+    ])
+}
+
+fn json_optional_point(point: Option<(f64, f64)>) -> serde_json::Value {
+    point
+        .filter(|point| point.0.is_finite() && point.1.is_finite())
+        .map(json_point)
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn json_points(points: &[(f64, f64)]) -> serde_json::Value {
+    serde_json::Value::Array(
+        points
+            .iter()
+            .copied()
+            .filter(|point| point.0.is_finite() && point.1.is_finite())
+            .map(json_point)
+            .collect(),
+    )
+}
+
+fn json_f32_points(points: &[(f32, f32)]) -> serde_json::Value {
+    serde_json::Value::Array(
+        points
+            .iter()
+            .filter(|point| point.0.is_finite() && point.1.is_finite())
+            .map(|point| json_point((f64::from(point.0), f64::from(point.1))))
+            .collect(),
+    )
+}
+
+fn json_ellipse_seed(seed: raw_motion_octrees::IrisEllipseSeed) -> serde_json::Value {
+    serde_json::json!({
+        "center": json_point(seed.center),
+        "major_radius": json_finite_number(seed.major_radius),
+        "minor_radius": json_finite_number(seed.minor_radius),
+        "angle_rad": json_finite_number(seed.angle),
+    })
+}
+
+fn json_optional_ellipse_seed(
+    seed: Option<raw_motion_octrees::IrisEllipseSeed>,
+) -> serde_json::Value {
+    seed.map(json_ellipse_seed)
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn json_surface_gaze(sample: Option<SurfaceGazeSample>) -> serde_json::Value {
+    sample
+        .map(|sample| {
+            serde_json::json!({
+                "rectified_area_px2": json_finite_number(sample.rectified_area_px2),
+                "area_bucket": sample.area_bucket,
+                "bucketed_face_radius_px": json_finite_number(sample.bucketed_face_radius_px),
+                "camera_near_point_sensor": json_point(sample.camera_near_point_sensor),
+                "feature": json_point(sample.feature),
+            })
+        })
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// Serialize only results already computed for the exact native-RAW frame.
+/// The recorder never re-runs segmentation, samples rendered pixels, or turns
+/// a configured ROI label into semantic evidence. This makes a lossless
+/// capture reproducible without perturbing its live analysis budget.
+fn roi_prediction_record(frame: &EyeFrame) -> serde_json::Value {
+    let overlay = frame.motion_octrees.as_ref();
+    let observed_semantic_role = if frame.eye_identity_present || frame.focus_anatomy_valid {
+        "eye"
+    } else {
+        "unknown"
+    };
+    let nested_boundaries = overlay
+        .nested_eye_boundaries
+        .as_ref()
+        .map(|pair| {
+            serde_json::json!({
+                "pupil": json_ellipse_seed(pair.pupil),
+                "limbus": json_ellipse_seed(pair.limbus),
+                "confidence": json_finite_number(f64::from(pair.confidence)),
+                "pupil_to_limbus_radius_ratio": json_finite_number(f64::from(pair.pupil_to_limbus_radius_ratio)),
+                "pupil_support": pair.pupil_support,
+                "limbus_support": pair.limbus_support,
+                "paired_support": pair.paired_support,
+                "paired_phases_rad": pair
+                    .paired_phases_rad
+                    .iter()
+                    .map(|value| json_finite_number(f64::from(*value)))
+                    .collect::<Vec<_>>(),
+                "input_seed_was_pupil_like": pair.input_seed_was_pupil_like,
+            })
+        })
+        .unwrap_or(serde_json::Value::Null);
+    let layers = overlay
+        .layers
+        .iter()
+        .zip(overlay.motions.iter())
+        .enumerate()
+        .map(|(index, (layer, motion))| {
+            serde_json::json!({
+                "id": index,
+                "centroid": json_point((f64::from(layer.centroid[0]), f64::from(layer.centroid[1]))),
+                "differential": json_point((f64::from(layer.differential[0]), f64::from(layer.differential[1]))),
+                "parallax": json_finite_number(f64::from(layer.parallax)),
+                "coherence": json_finite_number(f64::from(layer.coherence)),
+                "trajectory_error_px": json_finite_number(f64::from(layer.trajectory_error)),
+                "signature_samples": layer.signature_samples,
+                "separation": json_finite_number(f64::from(layer.separation)),
+                "persistent_tracks": layer.persistent_tracks,
+                "stable_frames": layer.stable_frames,
+                "similarity": {
+                    "translation": json_point((f64::from(motion.translation[0]), f64::from(motion.translation[1]))),
+                    "rotation_rad": json_finite_number(f64::from(motion.rotation)),
+                    "scale_delta": json_finite_number(f64::from(motion.scale_delta)),
+                    "residual_px": json_finite_number(f64::from(motion.residual)),
+                    "support": motion.support,
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let persistent_features = overlay
+        .trails
+        .iter()
+        .filter_map(|trail| {
+            trail.points.last().map(|point| {
+                serde_json::json!({
+                    "id": trail.id,
+                    "motion_layer": trail.object,
+                    "point": json_point((f64::from(point.x), f64::from(point.y))),
+                    "depth": json_finite_number(f64::from(point.z)),
+                    "match_score": json_finite_number(f64::from(trail.match_score)),
+                    "matched_streak": trail.matched_streak,
+                    "layer_evidence": trail.layer_evidence,
+                    "normal_flow_evidence": trail.normal_flow_evidence,
+                    "specularity": json_finite_number(f64::from(trail.specularity)),
+                    "assignment_confidence": json_finite_number(f64::from(trail.assignment_confidence)),
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let radial_limbus_probes = overlay
+        .radial_limbus_probes
+        .iter()
+        .map(|probe| {
+            serde_json::json!({
+                "point": json_point((f64::from(probe.point[0]), f64::from(probe.point[1]))),
+                "normal": json_point((f64::from(probe.normal[0]), f64::from(probe.normal[1]))),
+                "phase_rad": json_finite_number(f64::from(probe.phase_rad)),
+                "radial_shift_px": json_finite_number(f64::from(probe.radial_shift_px)),
+                "profile_cost": json_finite_number(f64::from(probe.profile_cost)),
+                "confidence": json_finite_number(f64::from(probe.confidence)),
+                "fused": probe.fused,
+            })
+        })
+        .collect::<Vec<_>>();
+    let lid_occlusions = overlay
+        .lid_occlusions
+        .iter()
+        .map(|curve| {
+            serde_json::json!({
+                "side": if curve.upper { "upper" } else { "lower" },
+                "confidence": json_finite_number(f64::from(curve.confidence)),
+                "curve_points": json_f32_points(&curve.points),
+                "support_points": json_f32_points(&curve.support_points),
+                "censored_edges": curve.censored_edges,
+                "extinguished_tracks": curve.extinguished_tracks,
+            })
+        })
+        .collect::<Vec<_>>();
+    let driving_limbus_edges = frame
+        .driving_limbus_edge_points
+        .iter()
+        .map(|point| {
+            let kind = match point.kind {
+                DrivingLimbusEdgeKind::DirectSupport => "direct-support",
+                DrivingLimbusEdgeKind::DirectCounterEvidence => "direct-counter-evidence",
+                DrivingLimbusEdgeKind::ProjectedConic => "projected-conic",
+            };
+            serde_json::json!({
+                "point": json_point((point.x, point.y)),
+                "kind": kind,
+            })
+        })
+        .collect::<Vec<_>>();
+    let pupil_reticle = frame
+        .pupil_size_reticle
+        .map(|reticle| {
+            serde_json::json!({
+                "center": json_point(reticle.center),
+                "minimum_fronto_parallel_radius_px": json_finite_number(reticle.lower_fronto_parallel_radius_px),
+                "maximum_fronto_parallel_radius_px": json_finite_number(reticle.upper_fronto_parallel_radius_px),
+                "estimated_fronto_parallel_radius_px": reticle.estimated_fronto_parallel_radius_px.map(json_finite_number),
+                "projection_minor_to_major": json_finite_number(reticle.projection_minor_to_major),
+                "projection_angle_rad": json_finite_number(reticle.projection_angle),
+            })
+        })
+        .unwrap_or(serde_json::Value::Null);
+    let iris_reticle = frame
+        .iris_radius_reticle
+        .map(|reticle| {
+            serde_json::json!({
+                "center": json_point(reticle.center),
+                "minimum_fronto_parallel_radius_px": json_finite_number(reticle.minimum_fronto_parallel_radius_px),
+                "maximum_fronto_parallel_radius_px": json_finite_number(reticle.maximum_fronto_parallel_radius_px),
+                "estimated_fronto_parallel_radius_px": json_finite_number(reticle.estimated_fronto_parallel_radius_px),
+                "projection_minor_to_major": json_finite_number(reticle.projection_minor_to_major),
+                "projection_angle_rad": json_finite_number(reticle.projection_angle),
+                "nominal_cold_start": reticle.nominal_cold_start,
+            })
+        })
+        .unwrap_or(serde_json::Value::Null);
+
+    serde_json::json!({
+        "schema": "buttercup-roi-prediction-frame-v1",
+        "roi_frame_key": {
+            "roi_id": frame.eye_id,
+            "sequence": frame.sequence,
+            "sensor_timestamp_ns": frame.timestamp_ns,
+        },
+        "capture": {
+            "sensor_x": frame.sensor_x,
+            "sensor_y": frame.sensor_y,
+            "sensor_window": {
+                "x": frame.sensor_window.0,
+                "y": frame.sensor_window.1,
+                "width": frame.sensor_window.2,
+                "height": frame.sensor_window.3,
+            },
+            "width": frame.width,
+            "height": frame.height,
+        },
+        "semantic": {
+            "configured_role": configured_roi_role(frame.eye_id),
+            "observed_role": observed_semantic_role,
+            "accepted_eye": frame.eye_identity_present || frame.focus_anatomy_valid,
+            "supported_roles": ["eye", "mouth", "unknown"],
+        },
+        "analysis_state": "complete",
+        "predictions": {
+            "eye_candidate": {
+                "segmentation_mode": frame.segmentation_mode.label(),
+                "quality": {
+                    "focus_score": json_finite_number(frame.focus_score),
+                    "focus_points": frame.focus_points,
+                    "eye_basin_valid": frame.focus_eye_basin_valid,
+                    "anatomy_valid": frame.focus_anatomy_valid,
+                    "identity_present": frame.eye_identity_present,
+                    "motion_score": json_finite_number(frame.motion_score),
+                },
+                "centers_and_gaze": {
+                    "focus_center": json_optional_point(frame.focus_center),
+                    "projected_rotation_center": json_optional_point(frame.projected_rotation_center),
+                    "projected_rotation_center_z": frame.projected_rotation_center_z.map(json_finite_number),
+                    "projected_gaze_pole": json_optional_point(frame.projected_gaze_pole),
+                    "projected_sphere_radius": frame.projected_sphere_radius.map(json_finite_number),
+                    "detected_gaze_feature": json_optional_point(frame.detected_gaze_feature),
+                    "surface_gaze": json_surface_gaze(frame.surface_gaze),
+                    "virtual_contact_surface_gaze": json_surface_gaze(frame.virtual_contact_surface_gaze),
+                },
+                "limbus": {
+                    "published_points": json_points(frame.outer_iris_points.as_slice()),
+                    "evidence_points": json_points(frame.outer_iris_evidence_points.as_slice()),
+                    "occluded_points": json_points(frame.outer_iris_occluded_points.as_slice()),
+                    "veto_points": json_points(frame.outer_iris_veto_points.as_slice()),
+                    "roi_truncated_points": json_points(frame.roi_truncated_limbus_points.as_slice()),
+                    "semantic_ellipse": json_optional_ellipse_seed(overlay.semantic_iris),
+                    "radial_probe_ellipse": json_optional_ellipse_seed(overlay.radial_limbus_region),
+                    "radial_probes": radial_limbus_probes,
+                    "nested_boundaries": nested_boundaries,
+                    "driving_diagnostic_points": json_points(frame.driving_diagnostic_points.as_slice()),
+                    "driving_edge_source_timestamp_ns": frame.driving_limbus_edge_source_timestamp_ns,
+                    "driving_edges": driving_limbus_edges,
+                    "iris_size_reticle": iris_reticle,
+                },
+                "pupil": {
+                    "inner_iris_points": json_points(frame.inner_iris_points.as_slice()),
+                    "polar_points": json_points(frame.pupil_polar_points.as_slice()),
+                    "polar_slice_points": json_points(frame.pupil_polar_slice_points.as_slice()),
+                    "driving_diagnostic_center": json_optional_point(frame.driving_diagnostic_pupil),
+                    "size_reticle": pupil_reticle,
+                },
+                "eyelids": {
+                    "upper_margin_points": json_points(frame.upper_eyelid_points.as_slice()),
+                    "lower_margin_points": json_points(frame.lower_eyelid_points.as_slice()),
+                    "upper_fold_points": json_points(frame.upper_eyelid_fold_points.as_slice()),
+                    "lower_fold_points": json_points(frame.lower_eyelid_fold_points.as_slice()),
+                    "upper_lash_points": json_points(frame.upper_eyelash_points.as_slice()),
+                    "lower_lash_points": json_points(frame.lower_eyelash_points.as_slice()),
+                    "upper_status": format!("{:?}", frame.upper_eyelid_status),
+                    "lower_status": format!("{:?}", frame.lower_eyelid_status),
+                    "upper_limbus_clearance_px": frame.upper_limbus_clearance_px.map(json_finite_number),
+                    "lower_limbus_clearance_px": frame.lower_limbus_clearance_px.map(json_finite_number),
+                    "occlusion_curves": lid_occlusions,
+                },
+                "motion": {
+                    "generation": overlay.generation,
+                    "active_objects": overlay.active_objects,
+                    "matched_features": overlay.matched_features,
+                    "parallax_axis": json_point((f64::from(overlay.parallax_axis[0]), f64::from(overlay.parallax_axis[1]))),
+                    "layers": layers,
+                    "persistent_features": persistent_features,
+                },
+            },
+            "mouth_candidate": serde_json::Value::Null,
+        },
+    })
+}
+
 #[derive(Clone)]
 struct RejectionCapture {
     sequence: u64,
@@ -8119,13 +8446,106 @@ fn control_status_json(state: &SharedState) -> String {
             })
             .collect::<Vec<_>>()
             .join(",");
+        let nested_boundary_json = frame
+            .motion_octrees
+            .nested_eye_boundaries
+            .as_ref()
+            .map_or_else(
+                || "null".to_string(),
+                |pair| {
+                    let phases = pair
+                        .paired_phases_rad
+                        .iter()
+                        .map(|phase| format!("{phase:.5}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!(
+                        "{{\"pupil\":{{\"center\":[{:.3},{:.3}],\"major_radius\":{:.3},\"minor_radius\":{:.3},\"angle_rad\":{:.5}}},\"limbus\":{{\"center\":[{:.3},{:.3}],\"major_radius\":{:.3},\"minor_radius\":{:.3},\"angle_rad\":{:.5}}},\"confidence\":{:.5},\"pupil_to_limbus_radius_ratio\":{:.5},\"pupil_support\":{},\"limbus_support\":{},\"paired_support\":{},\"input_seed_role\":{},\"paired_phases_rad\":[{}]}}",
+                        pair.pupil.center.0,
+                        pair.pupil.center.1,
+                        pair.pupil.major_radius,
+                        pair.pupil.minor_radius,
+                        pair.pupil.angle,
+                        pair.limbus.center.0,
+                        pair.limbus.center.1,
+                        pair.limbus.major_radius,
+                        pair.limbus.minor_radius,
+                        pair.limbus.angle,
+                        pair.confidence,
+                        pair.pupil_to_limbus_radius_ratio,
+                        pair.pupil_support,
+                        pair.limbus_support,
+                        pair.paired_support,
+                        json_string(if pair.input_seed_was_pupil_like {
+                            "pupil-like"
+                        } else {
+                            "limbus-like"
+                        }),
+                        phases,
+                    )
+                },
+            );
+        let radial_region_json = frame
+            .motion_octrees
+            .radial_limbus_region
+            .map_or_else(|| "null".to_string(), |ellipse| {
+                format!(
+                    "{{\"center\":[{:.3},{:.3}],\"major_radius\":{:.3},\"minor_radius\":{:.3},\"angle_rad\":{:.5}}}",
+                    ellipse.center.0,
+                    ellipse.center.1,
+                    ellipse.major_radius,
+                    ellipse.minor_radius,
+                    ellipse.angle,
+                )
+            });
         let radial_limbus = format!(
-            "{{\"micros\":{},\"evaluations\":{},\"accepted\":{},\"fused\":{},\"probes\":[{}]}}",
+            "{{\"micros\":{},\"evaluations\":{},\"accepted\":{},\"fused\":{},\"sampling_region\":{},\"nested_micros\":{},\"nested_evaluations\":{},\"nested_pair\":{},\"probes\":[{}]}}",
             matching.radial_limbus_micros,
             matching.radial_limbus_evaluations,
             matching.radial_limbus_accepted,
             matching.radial_limbus_fused,
+            radial_region_json,
+            matching.nested_boundary_micros,
+            matching.nested_boundary_evaluations,
+            nested_boundary_json,
             radial_probe_json,
+        );
+        let lid_curve_json = frame
+            .motion_octrees
+            .lid_occlusions
+            .iter()
+            .map(|curve| {
+                let points = curve
+                    .points
+                    .iter()
+                    .map(|point| format!("[{:.3},{:.3}]", point.0, point.1))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let support = curve
+                    .support_points
+                    .iter()
+                    .map(|point| format!("[{:.3},{:.3}]", point.0, point.1))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    "{{\"side\":{},\"confidence\":{:.5},\"censored_edges\":{},\"extinguished_tracks\":{},\"points\":[{}],\"support_points\":[{}]}}",
+                    json_string(if curve.upper { "upper" } else { "lower" }),
+                    curve.confidence,
+                    curve.censored_edges,
+                    curve.extinguished_tracks,
+                    points,
+                    support,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let lid_occlusions = format!(
+            "{{\"micros\":{},\"curves\":{},\"censored_edges\":{},\"extinguished_tracks\":{},\"geometry\":[{}]}}",
+            matching.lid_occlusion_micros,
+            matching.lid_occlusion_curves,
+            matching.lid_occlusion_censored_edges,
+            matching.lid_occlusion_extinguished_tracks,
+            lid_curve_json,
         );
         let relation_origin = if matching.relation_origin_valid {
             format!(
@@ -8301,7 +8721,7 @@ fn control_status_json(state: &SharedState) -> String {
             coupled.micro_motion_likelihood,
         );
         format!(
-            "{{\"sequence\":{},\"timestamp_ns\":{},\"sensor_x\":{},\"sensor_y\":{},\"width\":{},\"height\":{},\"focus_score\":{:.6},\"focus_points\":{},\"focus_center\":{},\"eye_basin_valid\":{},\"anatomy_valid\":{},\"virtual_contact\":{},\"motion_octrees\":{{\"generation\":{},\"active_objects\":{},\"feature_trails\":{},\"nodes\":{},\"objects\":[{}],\"subpixel\":{},\"nautilus_fingerprint_tree\":{},\"horizontal_light_field\":{},\"radial_limbus\":{},\"relation_graph\":{},\"coupled_motion\":{},\"focus_sfm\":{}}}}}",
+            "{{\"sequence\":{},\"timestamp_ns\":{},\"sensor_x\":{},\"sensor_y\":{},\"width\":{},\"height\":{},\"focus_score\":{:.6},\"focus_points\":{},\"focus_center\":{},\"eye_basin_valid\":{},\"anatomy_valid\":{},\"virtual_contact\":{},\"motion_octrees\":{{\"generation\":{},\"active_objects\":{},\"feature_trails\":{},\"nodes\":{},\"objects\":[{}],\"subpixel\":{},\"nautilus_fingerprint_tree\":{},\"horizontal_light_field\":{},\"radial_limbus\":{},\"lid_occlusions\":{},\"relation_graph\":{},\"coupled_motion\":{},\"focus_sfm\":{}}}}}",
             frame.sequence,
             frame.timestamp_ns,
             frame.sensor_x,
@@ -8323,6 +8743,7 @@ fn control_status_json(state: &SharedState) -> String {
             nautilus,
             horizontal_light_field,
             radial_limbus,
+            lid_occlusions,
             relation_graph,
             coupled_motion,
             focus_sfm,
@@ -10124,6 +10545,8 @@ struct App {
     presentation_pivot_contact: Option<PresentationPivotContact>,
     quit_armed_until: Option<Instant>,
     checkerboard_status: checkerboard_calibration::StatusSnapshot,
+    keyboard_peeper: keyboard_peeper::Registration,
+    window_focused: bool,
 }
 
 impl App {
@@ -10813,6 +11236,15 @@ struct DrivingMultibankLimbusEvidence {
     edge_centroid_absolute_mean_px: f64,
     edge_centroid_coherence: f64,
     edge_centroid_samples: usize,
+    /// Width of the monotone iris-to-sclera transition measured along each
+    /// native-RAW conic normal.  This is deliberately distinct from optical
+    /// blur: the hand-labelled transition is a bounded band whose iris-side
+    /// and sclera-side endpoints remain meaningful even when no single pixel
+    /// can be called "the" limbus.  A pupil rim is commonly much narrower.
+    transition_band_width_mean_px: f64,
+    transition_band_width_mad_px: f64,
+    transition_band_width_coherence: f64,
+    transition_band_width_samples: usize,
     far_sclera_step_mean: f64,
     outside_plateau_mean: f64,
     outside_secondary_edge_mean: f64,
@@ -12099,6 +12531,30 @@ impl DrivingMultibankLimbusProposal {
 }
 
 #[inline]
+fn driving_lateral_lane_score(evidence: DrivingMultibankLimbusEvidence, left: bool) -> f64 {
+    let (quantile, mean, supported, samples) = if left {
+        (
+            evidence.left_quantile,
+            evidence.left_mean_support,
+            evidence.left_supported_fraction,
+            evidence.left_samples,
+        )
+    } else {
+        (
+            evidence.right_quantile,
+            evidence.right_mean_support,
+            evidence.right_supported_fraction,
+            evidence.right_samples,
+        )
+    };
+    if samples < 6 {
+        0.0
+    } else {
+        0.50 * quantile + 0.30 * mean + 0.20 * supported
+    }
+}
+
+#[inline]
 fn driving_carrier_neutral_log_sample(
     raw: &[u16],
     width: usize,
@@ -12504,6 +12960,7 @@ fn driving_multibank_limbus_evidence(
     let mut edge_centroid_absolute_sum = 0.0;
     let mut edge_centroid_coherence_sum = 0.0;
     let mut edge_centroid_samples = 0usize;
+    let mut transition_band_widths = Vec::with_capacity(PHASES);
     let mut far_sclera_step_sum = 0.0;
     let mut outside_plateau_sum = 0.0;
     let mut outside_secondary_edge_sum = 0.0;
@@ -12573,6 +13030,57 @@ fn driving_multibank_limbus_evidence(
             edge_centroid_absolute_sum += centroid.abs();
             edge_centroid_coherence_sum += (-centroid.abs() / 3.5).exp();
             edge_centroid_samples += 1;
+        }
+        // Treat the boundary as a transition band rather than assuming one
+        // infinitely sharp edge. Measure the 15th--85th percentiles of the
+        // *positive derivative mass*, not the range-normalized samples. The
+        // latter made a real transition unmeasurable whenever the first
+        // carrier cell sat slightly above its two-cell inner average. The
+        // derivative CDF is invariant to that baseline error, retains the
+        // native sub-pixel interval interpolation, and gives a narrow pupil
+        // rim a materially smaller width than the labelled limbus band.
+        // Everything below reads the borrowed `values` stack array; no image
+        // or downsampled profile is allocated.
+        let inner_level = 0.5 * (values[0] + values[1]);
+        let outer_level = 0.5 * (values[10] + values[11]);
+        let transition_amplitude = outer_level - inner_level;
+        if transition_amplitude >= 0.035 {
+            let mut positive_steps = [0.0; OFFSETS.len() - 1];
+            let mut positive_mass = 0.0;
+            for index in 0..OFFSETS.len() - 1 {
+                let step = (values[index + 1] - values[index]).max(0.0);
+                positive_steps[index] = step;
+                positive_mass += step;
+            }
+            // Reject profiles whose apparent rise is mostly oscillatory
+            // texture rather than one coherent iris-to-sclera transition.
+            let monotone_fraction = transition_amplitude / positive_mass.max(1.0e-9);
+            if positive_mass >= 0.035 && monotone_fraction >= 0.35 {
+                let crossing = |fraction: f64| {
+                    let target = positive_mass * fraction.clamp(0.0, 1.0);
+                    let mut cumulative = 0.0;
+                    for (index, step) in positive_steps.iter().copied().enumerate() {
+                        if step <= 1.0e-12 {
+                            continue;
+                        }
+                        if cumulative + step >= target {
+                            let within = ((target - cumulative) / step).clamp(0.0, 1.0);
+                            return Some(
+                                OFFSETS[index] + within * (OFFSETS[index + 1] - OFFSETS[index]),
+                            );
+                        }
+                        cumulative += step;
+                    }
+                    Some(OFFSETS[OFFSETS.len() - 1])
+                };
+                if let Some(width_px) = crossing(0.15)
+                    .zip(crossing(0.85))
+                    .map(|(inner, outer)| outer - inner)
+                    .filter(|width| width.is_finite() && (1.0..=24.0).contains(width))
+                {
+                    transition_band_widths.push(width_px);
+                }
+            }
         }
         let bank = normalized_narrow
             .min(normalized_medium)
@@ -12733,6 +13241,26 @@ fn driving_multibank_limbus_evidence(
     } else {
         (right_quantile, right_mean, right_supported)
     };
+    let transition_band_width_samples = transition_band_widths.len();
+    let transition_band_width_mean_px = if transition_band_widths.is_empty() {
+        0.0
+    } else {
+        transition_band_widths.iter().sum::<f64>() / transition_band_widths.len() as f64
+    };
+    let transition_band_width_mad_px = if transition_band_widths.is_empty() {
+        0.0
+    } else {
+        let mut deviations = transition_band_widths
+            .iter()
+            .map(|width| (width - transition_band_width_mean_px).abs())
+            .collect::<Vec<_>>();
+        driving_slice_median(&mut deviations)
+    };
+    let transition_band_width_coherence = if transition_band_width_samples < 4 {
+        0.0
+    } else {
+        (-transition_band_width_mad_px / 4.0).exp()
+    };
     Some(DrivingMultibankLimbusEvidence {
         score: (0.50 * weakest_lateral_quantile
             + 0.30 * mean_lateral_support
@@ -12756,6 +13284,10 @@ fn driving_multibank_limbus_evidence(
             / edge_centroid_samples.max(1) as f64,
         edge_centroid_coherence: edge_centroid_coherence_sum / edge_centroid_samples.max(1) as f64,
         edge_centroid_samples,
+        transition_band_width_mean_px,
+        transition_band_width_mad_px,
+        transition_band_width_coherence,
+        transition_band_width_samples,
         far_sclera_step_mean: far_sclera_step_sum / far_lane_samples.max(1) as f64,
         outside_plateau_mean: outside_plateau_sum / far_lane_samples.max(1) as f64,
         outside_secondary_edge_mean: outside_secondary_edge_sum / far_lane_samples.max(1) as f64,
@@ -12812,6 +13344,20 @@ fn driving_multibank_limbus_pose_shortlists_with_beam(
     let verified_aperture_multiscale =
         cold_current_geometry && focus.is_some_and(|focus| focus.eye_basin_valid);
     let unverified_geometry_expansion = cold_current_geometry && !verified_aperture_multiscale;
+    let unverified_pupil_carrier = unverified_geometry_expansion
+        && focus.is_some_and(|focus| {
+            !focus.eye_basin_valid
+                && focus.pupil_hint.is_some()
+                && focus.pupil_hint_score >= 80.0
+                && focus.radius.is_finite()
+                && focus.radius >= 20.0
+        });
+    let broad_unverified_eye_carrier = unverified_pupil_carrier
+        && focus.is_some_and(|focus| {
+            focus.pupil_hint_radius.is_finite()
+                && focus.pupil_hint_radius >= 8.0
+                && focus.radius / focus.pupil_hint_radius > 2.30
+        });
     let mut search_radii = if verified_aperture_multiscale {
         // The independent eye aperture often measures about 1.6--1.8 limbus
         // radii.  The old 0.52 -> 0.68 gap skipped the labeled ~0.58 basin
@@ -12822,11 +13368,20 @@ fn driving_multibank_limbus_pose_shortlists_with_beam(
             .map(|scale| prior.estimate_px * scale)
             .filter(|radius| prior.admits_radius(*radius))
             .collect::<Vec<_>>()
+    } else if unverified_pupil_carrier {
+        // The typed prior estimate is now the expected *limbus* radius, while
+        // its hard support still reaches inward to the rough pupil/carrier
+        // alias. These factors are the same sparse physical hypotheses as
+        // 1.00--1.98 times the carrier, expressed around the 1.88x limbus
+        // estimate established by the paired native-RAW labels.
+        [0.53, 0.65, 0.77, 0.90, 0.96, 1.00, 1.05]
+            .into_iter()
+            .map(|scale| prior.estimate_px * scale)
+            .filter(|radius| prior.admits_radius(*radius))
+            .collect::<Vec<_>>()
     } else if unverified_geometry_expansion {
-        // With no verified eye basin, a native conic may itself already be
-        // the limbus. Never search inward toward its pupil-sized aliases (the
-        // regression seen in the positive temporal archive), but permit one
-        // modest outward hypothesis for a clipped native arc.
+        // Without a strong compact pupil carrier, a native conic may already
+        // be the limbus. Preserve the older modest outward fork.
         [1.0, 1.22]
             .into_iter()
             .map(|scale| prior.estimate_px * scale)
@@ -12874,7 +13429,7 @@ fn driving_multibank_limbus_pose_shortlists_with_beam(
     } else {
         4.0
     };
-    let mut coarse = Vec::<(f64, (f64, f64), f64)>::new();
+    let mut coarse = Vec::<(f64, f64, f64, (f64, f64), f64)>::new();
     for radius in search_radii.iter().copied() {
         let span_x = (radius * 1.40).clamp(54.0, 92.0);
         let span_y = (radius * 1.05).clamp(44.0, 72.0);
@@ -12915,7 +13470,13 @@ fn driving_multibank_limbus_pose_shortlists_with_beam(
                 }
                 if let Some(evidence) = driving_multibank_limbus_evidence(raw, width, height, pose)
                 {
-                    coarse.push((evidence.score, pose.center, radius));
+                    coarse.push((
+                        evidence.score,
+                        driving_lateral_lane_score(evidence, true),
+                        driving_lateral_lane_score(evidence, false),
+                        pose.center,
+                        radius,
+                    ));
                 }
                 center_x += coarse_step;
             }
@@ -12924,36 +13485,70 @@ fn driving_multibank_limbus_pose_shortlists_with_beam(
     }
     coarse.sort_by(|left, right| right.0.total_cmp(&left.0));
     let mut centers = Vec::<((f64, f64), f64)>::new();
-    // Give every cold radius one representative before filling the remaining
-    // beam globally.  Otherwise several nearby lid centers at the wrong scale
-    // can consume all eight coarse slots even when a smaller true limbus has
-    // the better fully refined double-Canny road.
+    let push_distinct_center =
+        |centers: &mut Vec<((f64, f64), f64)>, center: (f64, f64), radius: f64| {
+            if centers.iter().all(|(old, old_radius)| {
+                (old.0 - center.0).hypot(old.1 - center.1) >= 8.0
+                    || (old_radius / radius).ln().abs() >= 0.10
+            }) {
+                centers.push((center, radius));
+                true
+            } else {
+                false
+            }
+        };
+    // Give every cold radius an overall, left-lane, and right-lane basin.
+    // A cropped limbus is often the strongest signed edge on only one side;
+    // forcing it to win the bilateral mean before the semantic ROI-censoring
+    // stage made the correct center unreachable in the newly labelled right-
+    // clipped frames.
     if cold_multiscale {
         for radius in search_radii.iter().copied() {
-            if let Some((_, center, _)) = coarse
+            if let Some((_, _, _, center, _)) = coarse
                 .iter()
-                .find(|(_, _, candidate_radius)| (*candidate_radius - radius).abs() < 1.0)
+                .find(|(_, _, _, _, candidate_radius)| (*candidate_radius - radius).abs() < 1.0)
             {
-                centers.push((*center, radius));
+                push_distinct_center(&mut centers, *center, radius);
+            }
+            for lane in [1usize, 2usize] {
+                let best = coarse
+                    .iter()
+                    .filter(|candidate| (candidate.4 - radius).abs() < 1.0)
+                    .max_by(|left, right| {
+                        let left_score = if lane == 1 { left.1 } else { left.2 };
+                        let right_score = if lane == 1 { right.1 } else { right.2 };
+                        left_score.total_cmp(&right_score)
+                    });
+                if let Some((_, left_score, right_score, center, _)) = best {
+                    let lane_score = if lane == 1 { *left_score } else { *right_score };
+                    if lane_score >= 0.35 {
+                        push_distinct_center(&mut centers, *center, radius);
+                    }
+                }
             }
         }
     }
-    for (_, center, radius) in coarse {
-        if centers.iter().all(|(old, old_radius)| {
-            (old.0 - center.0).hypot(old.1 - center.1) >= 8.0
-                || (old_radius / radius).ln().abs() >= 0.10
-        }) {
-            centers.push((center, radius));
-            if centers.len() >= 8 {
-                break;
-            }
+    let center_limit = if cold_multiscale {
+        search_radii.len().saturating_mul(3).max(8)
+    } else {
+        8
+    };
+    for (_, _, _, center, radius) in coarse {
+        push_distinct_center(&mut centers, center, radius);
+        if centers.len() >= center_limit {
+            break;
         }
     }
     let mut fine = Vec::<DrivingMultibankLimbusProposal>::new();
+    let fine_offsets: &[f64] = if cold_multiscale {
+        &[-3.0, 0.0, 3.0]
+    } else {
+        &[-4.0, -2.0, 0.0, 2.0, 4.0]
+    };
     for (center, radius) in centers {
-        for offset_y in [-4.0, -2.0, 0.0, 2.0, 4.0] {
-            for offset_x in [-4.0, -2.0, 0.0, 2.0, 4.0] {
-                for ratio in [0.72, 0.80, 0.88, 0.95] {
+        for offset_y in fine_offsets.iter().copied() {
+            for offset_x in fine_offsets.iter().copied() {
+                for ratio in [0.72, 0.82, 0.88, 0.95] {
                     for angle_step in 0..12 {
                         let pose = DrivingAffinePose {
                             center: (center.0 + offset_x, center.1 + offset_y),
@@ -12980,9 +13575,101 @@ fn driving_multibank_limbus_pose_shortlists_with_beam(
     // cell directly can promote a sharp but geometrically weaker iris
     // striation before bilateral edge consensus has shortlisted it.
     fine.sort_by(|left, right| right.evidence.score.total_cmp(&left.evidence.score));
-    let mut shortlist = Vec::new();
-    for proposal in fine {
-        let distinct = shortlist
+    // A broad, unverified eye carrier can be an oblique, severely clipped eye
+    // opening rather than a compact pupil. In that state the direct edge bank
+    // can spend every center basin on the visible lid/glasses arc, even though
+    // the rough pupil is usable as a bounded orbital reference. Preserve a
+    // small geometry-only cohort around the pupil-to-carrier direction for the
+    // wider recovery beam. This never runs in the ordinary four-road path and
+    // it never publishes without the same full RAW anatomy/temporal gates.
+    let mut orbital_guarantees = Vec::<DrivingMultibankLimbusProposal>::new();
+    if beam_size >= 24 && broad_unverified_eye_carrier {
+        if let Some(focus) = focus {
+            if let Some(pupil) = focus.pupil_hint {
+                let carrier_delta = (pupil.0 - focus.center.0, pupil.1 - focus.center.1);
+                if carrier_delta.0.hypot(carrier_delta.1) >= 2.0 {
+                    let direction = carrier_delta.1.atan2(carrier_delta.0);
+                    let per_center_quota = if beam_size >= 48 { 2 } else { 1 };
+                    for radius in search_radii.iter().copied().filter(|radius| {
+                        (radius / prior.estimate_px).clamp(0.0, f64::INFINITY) >= 0.74
+                    }) {
+                        for direction_offset_degrees in [-30.0f64, -15.0, 0.0, 15.0, 30.0] {
+                            let center_direction =
+                                direction + direction_offset_degrees.to_radians();
+                            let center = (
+                                pupil.0 + 0.25 * radius * center_direction.cos(),
+                                pupil.1 + 0.25 * radius * center_direction.sin(),
+                            );
+                            if center.0 < 12.0
+                                || center.0 > width as f64 - 13.0
+                                || center.1 < 12.0
+                                || center.1 > height as f64 - 13.0
+                            {
+                                continue;
+                            }
+                            let mut center_cohort = Vec::new();
+                            for ratio in [0.58, 0.65, 0.72, 0.82, 0.90] {
+                                for angle_offset_degrees in [-30.0f64, -15.0, 0.0, 15.0, 30.0] {
+                                    let pose = DrivingAffinePose {
+                                        center,
+                                        major_radius: radius,
+                                        minor_radius: radius * ratio,
+                                        // For the affine projection of a
+                                        // circular limbus, the major axis is
+                                        // perpendicular to the estimated
+                                        // surface-tilt/gaze displacement.
+                                        angle: (direction
+                                            + std::f64::consts::FRAC_PI_2
+                                            + angle_offset_degrees.to_radians())
+                                        .rem_euclid(std::f64::consts::PI),
+                                    };
+                                    if !driving_radius_prior_admits_pose(radius_prior, pose) {
+                                        continue;
+                                    }
+                                    if let Some(evidence) =
+                                        driving_multibank_limbus_evidence(raw, width, height, pose)
+                                    {
+                                        center_cohort.push(DrivingMultibankLimbusProposal {
+                                            pose,
+                                            evidence,
+                                        });
+                                    }
+                                }
+                            }
+                            center_cohort.sort_by(|left, right| {
+                                right.selection_score().total_cmp(&left.selection_score())
+                            });
+                            // Preserve one explicitly oblique member. A clipped
+                            // limbus can have weak direct support precisely at
+                            // the true 3D foreshortening, so an unrestricted
+                            // top-two often keeps only the round lid/aperture
+                            // aliases from the same center.
+                            let highly_oblique = center_cohort.iter().copied().find(|proposal| {
+                                proposal.pose.minor_radius / proposal.pose.major_radius <= 0.60
+                            });
+                            if let Some(highly_oblique) = highly_oblique {
+                                orbital_guarantees.push(highly_oblique);
+                            }
+                            if per_center_quota >= 2 {
+                                if let Some(moderately_oblique) =
+                                    center_cohort.into_iter().find(|proposal| {
+                                        let ratio =
+                                            proposal.pose.minor_radius / proposal.pose.major_radius;
+                                        ratio > 0.60 && ratio <= 0.66
+                                    })
+                                {
+                                    orbital_guarantees.push(moderately_oblique);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let distinct_from = |shortlist: &[DrivingMultibankLimbusProposal],
+                         proposal: DrivingMultibankLimbusProposal| {
+        shortlist
             .iter()
             .all(|old: &DrivingMultibankLimbusProposal| {
                 (old.pose.center.0 - proposal.pose.center.0)
@@ -12993,20 +13680,94 @@ fn driving_multibank_limbus_pose_shortlists_with_beam(
                         .abs()
                         >= 0.05
                     || driving_angle_difference(old.pose.angle, proposal.pose.angle).abs() >= 0.18
-            });
-        if distinct {
-            shortlist.push(proposal);
-            if shortlist.len() >= beam_size.clamp(1, 64) {
+            })
+    };
+    // Keep the direct four-member incumbent exactly label-blind and ordered
+    // by the original edge score *and* the legacy pose de-duplication. The
+    // wider cold bank below gets an additional radius-cohort guarantee;
+    // otherwise dozens of nearly equal pupil/lid poses at one sharp scale can
+    // consume all 64 slots before the correctly sized limbus reaches its
+    // anatomy/material audit.
+    let mut direct_top_four = Vec::with_capacity(4);
+    for proposal in fine.iter().copied() {
+        if distinct_from(&direct_top_four, proposal) {
+            direct_top_four.push(proposal);
+            if direct_top_four.len() == 4 {
                 break;
             }
         }
     }
-    // Preserve the exact legacy four-member incumbent before the wider
-    // shortlist is re-ordered.  Equal direct-edge scores are intentionally
-    // resolved by their original deterministic fine-lattice traversal; that
-    // information cannot be reconstructed after the 64-member selection
-    // sort (several saturated non-eye fixtures tie exactly).
-    let mut direct_top_four = shortlist.iter().copied().take(4).collect::<Vec<_>>();
+    let mut shortlist = Vec::new();
+    let bounded_beam = beam_size.clamp(1, 64);
+    for proposal in orbital_guarantees {
+        if distinct_from(&shortlist, proposal) {
+            shortlist.push(proposal);
+            if shortlist.len() >= bounded_beam {
+                break;
+            }
+        }
+    }
+    if cold_multiscale && bounded_beam >= search_radii.len().saturating_mul(4) {
+        // Eight representatives per searched radius leave sixteen global
+        // slots in the ordinary 64-member bank. This changes no search work:
+        // it only prevents a wrong-radius cohort from erasing already-scored
+        // correct-scale RAW hypotheses before the richer partial/anatomy
+        // rank can inspect them.
+        let per_radius = 8usize.min(bounded_beam / search_radii.len().max(1));
+        for radius in search_radii.iter().copied() {
+            let mut radius_candidates = fine
+                .iter()
+                .copied()
+                .filter(|proposal| (proposal.pose.major_radius - radius).abs() < 1.0)
+                .collect::<Vec<_>>();
+            let overall_quota = per_radius.saturating_sub(4).max(2);
+            let mut accept_from = |candidates: &[DrivingMultibankLimbusProposal], quota: usize| {
+                let mut accepted = 0usize;
+                for proposal in candidates.iter().copied() {
+                    if distinct_from(&shortlist, proposal) {
+                        shortlist.push(proposal);
+                        accepted += 1;
+                        if accepted == quota {
+                            break;
+                        }
+                    }
+                }
+            };
+            accept_from(&radius_candidates, overall_quota);
+            radius_candidates.sort_by(|left, right| {
+                driving_lateral_lane_score(right.evidence, true)
+                    .total_cmp(&driving_lateral_lane_score(left.evidence, true))
+            });
+            accept_from(
+                &radius_candidates,
+                2.min(per_radius.saturating_sub(overall_quota)),
+            );
+            radius_candidates.sort_by(|left, right| {
+                driving_lateral_lane_score(right.evidence, false)
+                    .total_cmp(&driving_lateral_lane_score(left.evidence, false))
+            });
+            accept_from(
+                &radius_candidates,
+                per_radius.saturating_sub(overall_quota + 2),
+            );
+            if shortlist.len() >= bounded_beam {
+                break;
+            }
+        }
+    }
+    for proposal in fine {
+        if distinct_from(&shortlist, proposal) {
+            shortlist.push(proposal);
+            if shortlist.len() >= bounded_beam {
+                break;
+            }
+        }
+    }
+    shortlist.truncate(bounded_beam);
+    // Equal direct-edge scores are intentionally resolved by their original
+    // deterministic fine-lattice traversal; that information cannot be
+    // reconstructed after the 64-member selection sort (several saturated
+    // non-eye fixtures tie exactly).
     direct_top_four
         .sort_by(|left, right| right.selection_score().total_cmp(&left.selection_score()));
     shortlist.sort_by(|left, right| right.selection_score().total_cmp(&left.selection_score()));
@@ -13191,12 +13952,84 @@ fn temporal_canny_outer_geometry_rank(
     anatomy: DrivingHypothesis,
     semantic: DrivingSemanticEyeEvidence,
     proposal: DrivingMultibankLimbusProposal,
+    radius_prior: DrivingRadiusPrior,
 ) -> f64 {
+    // Current-frame geometry has broad hard support, but its estimate is a
+    // typed fronto-parallel *limbus* radius. After complete eye anatomy has
+    // independently admitted the road, proximity is only a small tie-breaker
+    // between otherwise coherent physical measurements.
+    // Transported priors need no soft term: their narrow manifold is already
+    // enforced as a hard physical constraint.
+    let current_frame_scale_affinity =
+        driving_current_frame_limbus_scale_affinity(anatomy.pose, radius_prior);
     anatomy.score
         + 0.35 * anatomy.bilateral_limbus_order
         + 0.50 * semantic.score
         + 0.30 * proposal.evidence.score
         + 0.20 * proposal.selection_score()
+        + 0.65 * current_frame_scale_affinity
+        + 0.15 * proposal.evidence.transition_band_width_coherence
+}
+
+fn driving_current_frame_limbus_scale_affinity(
+    pose: DrivingAffinePose,
+    radius_prior: DrivingRadiusPrior,
+) -> f64 {
+    radius_prior
+        .filter(|prior| {
+            prior.source
+                == raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry
+        })
+        .and_then(|prior| {
+            driving_fronto_parallel_radius_px(pose).map(|radius| {
+                let log_error = (radius / prior.estimate_px.max(1.0)).ln();
+                (-0.5 * (log_error / 0.10).powi(2)).exp()
+            })
+        })
+        .unwrap_or(0.0)
+}
+
+/// Broad scale compatibility for a censored proposal which has not completed
+/// eye anatomy yet. The paired inner/outer RAW labels constrain the compact
+/// carrier-to-limbus conversion to an interval rather than one exact ratio,
+/// so proposals inside that aiming uncertainty share a flat maximum. This is
+/// deliberately separate from the small post-anatomy measurement tie-breaker
+/// above: proposal support and a completed physical measurement have different
+/// semantics even though both carry the same radius type.
+fn driving_current_frame_limbus_scale_support_affinity(
+    pose: DrivingAffinePose,
+    radius_prior: DrivingRadiusPrior,
+) -> f64 {
+    radius_prior
+        .filter(|prior| {
+            prior.source
+                == raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry
+        })
+        .and_then(|prior| {
+            driving_fronto_parallel_radius_px(pose).map(|radius| {
+                let log_error = (radius / prior.estimate_px.max(1.0)).ln().abs();
+                // The typed hard support records how certain this particular
+                // current-frame carrier really is.  A compact pupil carrier
+                // converted to a limbus has a narrow upper side, whereas a
+                // native or ROI-censored outer proposal deliberately carries
+                // a much broader interval.  Giving both an unconditional 8%
+                // soft plateau made the rough carrier dominate the very RAW
+                // perimeter evidence it was intended only to aim.
+                let lower_log_width = (prior.estimate_px / prior.minimum_px.max(1.0))
+                    .ln()
+                    .max(0.0);
+                let upper_log_width = (prior.maximum_px / prior.estimate_px.max(1.0))
+                    .ln()
+                    .max(0.0);
+                let nearest_hard_edge_log_width = lower_log_width.min(upper_log_width);
+                let plateau_log_width =
+                    (0.50 * nearest_hard_edge_log_width).clamp(1.08f64.ln(), 1.25f64.ln());
+                let falloff_log_width = (0.35 * nearest_hard_edge_log_width).clamp(0.10, 0.20);
+                let excess = (log_error - plateau_log_width).max(0.0);
+                (-0.5 * (excess / falloff_log_width).powi(2)).exp()
+            })
+        })
+        .unwrap_or(0.0)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -13233,7 +14066,7 @@ fn driving_outer_geometry_audit(
     };
     Some(DrivingOuterGeometryAudit {
         pose: hypothesis.pose,
-        rank: temporal_canny_outer_geometry_rank(hypothesis, semantic, proposal),
+        rank: temporal_canny_outer_geometry_rank(hypothesis, semantic, proposal, None),
         semantic,
         evidence,
     })
@@ -13331,14 +14164,14 @@ fn driving_bounded_wide_recovery_from_proposals(
             )
         })
         .filter_map(|proposal| {
-            let hypothesis = score_driving_native_anatomy_from_working_pose(
+            let hypothesis = score_driving_multibank_measured_anatomy(
                 raw,
                 width,
                 height,
                 sensor_origin,
                 proposal.pose,
-                proposal.pose,
-                None,
+                proposal,
+                focus,
                 2,
                 radius_prior,
             )?;
@@ -13348,7 +14181,7 @@ fn driving_bounded_wide_recovery_from_proposals(
                 return None;
             }
             let completion_rank =
-                temporal_canny_outer_geometry_rank(hypothesis, semantic, proposal);
+                temporal_canny_outer_geometry_rank(hypothesis, semantic, proposal, radius_prior);
             let final_audit =
                 driving_outer_geometry_audit(raw, width, height, sensor_origin, hypothesis)?;
             Some(DrivingWideRecoveryRoad {
@@ -14267,7 +15100,7 @@ fn measured_multibank_temporal_canny_seed(
                 && anatomy.bilateral_limbus_order >= 0.70;
             (semantic_geometry && (complete_pupil_headed_geometry || semantic_outer_only_geometry))
                 .then(|| {
-                    temporal_canny_outer_geometry_rank(anatomy, semantic, *proposal)
+                    temporal_canny_outer_geometry_rank(anatomy, semantic, *proposal, search_prior)
                         - if pupil_horizon_bilateral { 0.0 } else { 0.30 }
                 })
         };
@@ -14589,13 +15422,7 @@ fn driving_multibank_proposal_is_strong_censored_geometry(
 ) -> bool {
     let pose = proposal.pose;
     let evidence = proposal.evidence;
-    let (sine, cosine) = pose.angle.sin_cos();
-    let extent_x = (pose.major_radius * cosine).hypot(pose.minor_radius * sine);
-    let extent_y = (pose.major_radius * sine).hypot(pose.minor_radius * cosine);
-    let crosses_roi = pose.center.0 - extent_x < 4.0
-        || pose.center.0 + extent_x > width as f64 - 4.0
-        || pose.center.1 - extent_y < 4.0
-        || pose.center.1 + extent_y > height as f64 - 4.0;
+    let crosses_roi = driving_multibank_pose_crosses_roi(pose, width, height, 4.0);
     // `driving_multibank_limbus_evidence` deliberately attenuates a
     // unilateral observation by 0.72.  Requiring score >= 0.85 here made a
     // genuinely ROI-clipped conic mathematically impossible to classify as
@@ -14623,6 +15450,166 @@ fn driving_multibank_proposal_is_strong_censored_geometry(
         && proposal.pose.minor_radius <= height as f64 * 0.72
         && evidence_strong
         && driving_pose_has_plausible_limbus_projection(pose)
+}
+
+fn driving_multibank_pose_crosses_roi(
+    pose: DrivingAffinePose,
+    width: usize,
+    height: usize,
+    margin: f64,
+) -> bool {
+    let (sine, cosine) = pose.angle.sin_cos();
+    let extent_x = (pose.major_radius * cosine).hypot(pose.minor_radius * sine);
+    let extent_y = (pose.major_radius * sine).hypot(pose.minor_radius * cosine);
+    pose.center.0 - extent_x < margin
+        || pose.center.0 + extent_x > width as f64 - margin
+        || pose.center.1 - extent_y < margin
+        || pose.center.1 + extent_y > height as f64 - margin
+}
+
+/// Lower, explicitly proposal-only gate for a clipped outer conic whose
+/// physical scale and one visible signed limbus lane agree. It cannot publish
+/// identity: callers must observe three sensor-registered, radius-consistent
+/// frames and then complete the ordinary pupil/lid/annular semantic road.
+fn driving_multibank_proposal_is_temporal_censored_candidate(
+    proposal: DrivingMultibankLimbusProposal,
+    width: usize,
+    height: usize,
+    radius_prior: DrivingRadiusPrior,
+) -> bool {
+    if driving_multibank_proposal_is_strong_censored_geometry(proposal, width, height) {
+        return true;
+    }
+    let evidence = proposal.evidence;
+    let strongest_lane =
+        driving_lateral_lane_score(evidence, true).max(driving_lateral_lane_score(evidence, false));
+    driving_multibank_pose_crosses_roi(proposal.pose, width, height, 4.0)
+        && proposal.pose.major_radius <= width as f64 * 0.62
+        && proposal.pose.minor_radius <= height as f64 * 0.72
+        && driving_current_frame_limbus_scale_support_affinity(proposal.pose, radius_prior) >= 0.70
+        && strongest_lane >= 0.70
+        && evidence.supported_fraction >= 0.64
+        && evidence.samples >= 10
+        && evidence.far_sclera_step_mean >= 0.50
+        && evidence.edge_centroid_absolute_mean_px <= 3.5
+        && proposal.selection_score() >= 1.10
+        && driving_pose_has_plausible_limbus_projection(proposal.pose)
+}
+
+fn driving_temporal_censored_proposal_rank(
+    proposal: DrivingMultibankLimbusProposal,
+    radius_prior: DrivingRadiusPrior,
+) -> f64 {
+    let evidence = proposal.evidence;
+    let strongest_lane =
+        driving_lateral_lane_score(evidence, true).max(driving_lateral_lane_score(evidence, false));
+    0.35 * proposal.selection_score()
+        + 1.20 * driving_current_frame_limbus_scale_support_affinity(proposal.pose, radius_prior)
+        + 0.60 * strongest_lane
+        + 0.20 * evidence.far_sclera_step_mean
+        + 0.15 * evidence.transition_band_width_coherence
+        + 0.30 * driving_limbus_transition_band_scale_affinity(proposal)
+}
+
+/// Dimensionless outer-limbus transition-band support for a temporally
+/// censored proposal. The reviewed paired RAW labels span approximately
+/// 0.085--0.12 band-width / fronto-parallel-radius. Keep a deliberately broad
+/// response around 0.10: this cue may break a tie between already strong,
+/// same-scale visible lanes, but cannot authorize eye identity or enter the
+/// complete-anatomy rank on its own.
+fn driving_limbus_transition_band_scale_affinity(proposal: DrivingMultibankLimbusProposal) -> f64 {
+    let evidence = proposal.evidence;
+    if evidence.transition_band_width_samples < 4 || evidence.transition_band_width_mean_px <= 0.0 {
+        return 0.0;
+    }
+    let Some(radius) = driving_fronto_parallel_radius_px(proposal.pose) else {
+        return 0.0;
+    };
+    let normalized_width = evidence.transition_band_width_mean_px / radius.max(1.0);
+    let standardized = (normalized_width - 0.10) / 0.025;
+    (-0.5 * standardized * standardized).exp()
+}
+
+fn driving_temporal_censored_proposals_share_cohort(
+    confirmed: DrivingMultibankLimbusProposal,
+    candidate: DrivingMultibankLimbusProposal,
+) -> bool {
+    let center_change = (confirmed.pose.center.0 - candidate.pose.center.0)
+        .hypot(confirmed.pose.center.1 - candidate.pose.center.1)
+        / confirmed
+            .pose
+            .major_radius
+            .max(candidate.pose.major_radius)
+            .max(1.0);
+    let radius_consistent = driving_fronto_parallel_radius_px(confirmed.pose)
+        .zip(driving_fronto_parallel_radius_px(candidate.pose))
+        .is_some_and(|(left, right)| (left / right.max(1.0)).ln().abs() <= 1.08f64.ln());
+    let confirmed_ratio = confirmed.pose.minor_radius / confirmed.pose.major_radius.max(1.0);
+    let candidate_ratio = candidate.pose.minor_radius / candidate.pose.major_radius.max(1.0);
+    let orientation_consistent = confirmed_ratio.min(candidate_ratio) >= 0.90
+        || driving_angle_difference(confirmed.pose.angle, candidate.pose.angle).abs() <= 0.35;
+    center_change <= 0.18
+        && radius_consistent
+        && (confirmed_ratio - candidate_ratio).abs() <= 0.16
+        && orientation_consistent
+}
+
+/// After one censored outer basin has survived three registered frames, try a
+/// tiny same-basin beam and retain the first proposal which independently
+/// completes an identity-authorizing pupil/lid/annular scene. A sharp but
+/// incomplete visible arc can therefore lead to its nearby physical conic
+/// instead of being reconfirmed forever. This runs only during cold censored
+/// recovery, considers at most four full-resolution candidates, and never
+/// weakens the ordinary publication gates.
+#[allow(clippy::too_many_arguments)]
+fn driving_bounded_temporal_censored_completion(
+    raw: &[u16],
+    width: usize,
+    height: usize,
+    sensor_origin: (u32, u32),
+    focus: Option<&raw_iris_focus::BorderFocus>,
+    radius_prior: DrivingRadiusPrior,
+    confirmed: DrivingMultibankLimbusProposal,
+    proposals: &[DrivingMultibankLimbusProposal],
+) -> Option<(DrivingMultibankLimbusProposal, DrivingHypothesis)> {
+    let mut cohort = proposals
+        .iter()
+        .copied()
+        .filter(|proposal| {
+            driving_multibank_proposal_is_temporal_censored_candidate(
+                *proposal,
+                width,
+                height,
+                radius_prior,
+            ) && driving_temporal_censored_proposals_share_cohort(confirmed, *proposal)
+        })
+        .collect::<Vec<_>>();
+    cohort.sort_by(|left, right| {
+        driving_temporal_censored_proposal_rank(*right, radius_prior).total_cmp(
+            &driving_temporal_censored_proposal_rank(*left, radius_prior),
+        )
+    });
+    cohort.into_iter().take(4).find_map(|proposal| {
+        let proposal =
+            driving_analog_polish_multibank_proposal(raw, width, height, proposal, radius_prior);
+        let hypothesis = score_driving_multibank_measured_anatomy(
+            raw,
+            width,
+            height,
+            sensor_origin,
+            proposal.pose,
+            proposal,
+            focus,
+            2,
+            radius_prior,
+        )?;
+        let semantic =
+            driving_semantic_eye_evidence(raw, width, height, sensor_origin, hypothesis)?;
+        (driving_hypothesis_admissible(hypothesis)
+            && semantic.authorizes_cold_identity
+            && driving_wide_recovery_has_complete_geometry(hypothesis, semantic))
+        .then_some((proposal, hypothesis))
+    })
 }
 
 /// A high bilateral double-Canny score does not by itself mean that the
@@ -18022,6 +19009,16 @@ fn driving_temporal_fit_assessment(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrivingOuterPosePolicy {
+    /// The perimeter drive is the geometry source and may refit the conic.
+    RefitFromPerimeter,
+    /// A separately measured native-RAW transition band already owns the
+    /// conic.  The perimeter and pupil roads may validate or veto it, but may
+    /// not move it onto a sharper pupil/lid edge.
+    PreserveMeasuredConic,
+}
+
 fn score_driving_native_anatomy_from_working_pose(
     raw: &[u16],
     width: usize,
@@ -18162,7 +19159,170 @@ fn score_driving_native_anatomy_from_working_pose(
         iterations,
         refinement_laps,
         radius_prior,
+        DrivingOuterPosePolicy::RefitFromPerimeter,
     )
+}
+
+/// Complete pupil and eye-scene validation around an independently measured
+/// multi-bank limbus without allowing that smaller, more specular inner road
+/// to refit the outer conic.  Two bounded native-RAW pupil starts are enough:
+/// one from the measured conic center and, when available, one from the
+/// separately detected compact pupil hint.  Neither hint is trusted without
+/// the ordinary perimeter, horizon, margin, and sclera checks below.
+#[allow(clippy::too_many_arguments)]
+fn score_driving_measured_outer_anatomy(
+    raw: &[u16],
+    width: usize,
+    height: usize,
+    sensor_origin: (u32, u32),
+    original_seed_pose: DrivingAffinePose,
+    measured_pose: DrivingAffinePose,
+    focus: Option<&raw_iris_focus::BorderFocus>,
+    minimum_refinement_laps: usize,
+    radius_prior: DrivingRadiusPrior,
+) -> Option<DrivingHypothesis> {
+    let make_search = |center: (f64, f64)| raw_iris_focus::BorderFocus {
+        eye_basin_valid: true,
+        center,
+        radius: (measured_pose.major_radius * measured_pose.minor_radius).sqrt(),
+        axis_ratio: measured_pose.major_radius / measured_pose.minor_radius.max(1.0),
+        axis_angle: measured_pose.angle,
+        ..raw_iris_focus::BorderFocus::default()
+    };
+    let mut pupils = Vec::with_capacity(2);
+    if let Some(pupil) = raw_iris_focus::debug_drive_pupil_center(
+        raw,
+        width,
+        height,
+        sensor_origin.0,
+        sensor_origin.1,
+        &make_search(measured_pose.center),
+    ) {
+        pupils.push(pupil);
+    }
+    if let Some(hint) = focus.and_then(|focus| focus.pupil_hint) {
+        let hint_inside = driving_canonical_point(measured_pose, hint)
+            .is_some_and(|point| point.0.hypot(point.1) <= 0.82);
+        if hint_inside
+            && pupils
+                .iter()
+                .all(|pupil| (pupil.center.0 - hint.0).hypot(pupil.center.1 - hint.1) > 3.0)
+        {
+            if let Some(pupil) = raw_iris_focus::debug_drive_pupil_center(
+                raw,
+                width,
+                height,
+                sensor_origin.0,
+                sensor_origin.1,
+                &make_search(hint),
+            ) {
+                if pupils.iter().all(|old| {
+                    (old.center.0 - pupil.center.0).hypot(old.center.1 - pupil.center.1) > 3.0
+                }) {
+                    pupils.push(pupil);
+                }
+            }
+        }
+    }
+    pupils
+        .iter()
+        .filter_map(|pupil| {
+            score_driving_native_anatomy_at_fixed_pose(
+                raw,
+                width,
+                height,
+                sensor_origin,
+                original_seed_pose,
+                measured_pose,
+                pupil,
+                minimum_refinement_laps,
+                radius_prior,
+            )
+        })
+        .max_by(|left, right| {
+            let rank = |candidate: &DrivingHypothesis| {
+                candidate.score
+                    + 0.24 * candidate.through_eye_score
+                    + 0.18 * candidate.pupil_margin
+                    + 0.12 * candidate.bilateral_limbus_order
+            };
+            rank(left).total_cmp(&rank(right))
+        })
+}
+
+/// Complete the same independently measured outer conic along two bounded
+/// roads: the legacy perimeter refit and a conic-preserving transition-band
+/// validation. The latter prevents a sharp pupil/lid edge from erasing a
+/// good outer measurement; the former remains free to deliver the better
+/// sub-pixel closure when its complete semantic eye scene supports the move.
+#[allow(clippy::too_many_arguments)]
+fn score_driving_multibank_measured_anatomy(
+    raw: &[u16],
+    width: usize,
+    height: usize,
+    sensor_origin: (u32, u32),
+    original_seed_pose: DrivingAffinePose,
+    proposal: DrivingMultibankLimbusProposal,
+    focus: Option<&raw_iris_focus::BorderFocus>,
+    minimum_refinement_laps: usize,
+    radius_prior: DrivingRadiusPrior,
+) -> Option<DrivingHypothesis> {
+    let refitted = score_driving_native_anatomy_from_working_pose(
+        raw,
+        width,
+        height,
+        sensor_origin,
+        original_seed_pose,
+        proposal.pose,
+        None,
+        minimum_refinement_laps,
+        radius_prior,
+    );
+    let preserved = score_driving_measured_outer_anatomy(
+        raw,
+        width,
+        height,
+        sensor_origin,
+        original_seed_pose,
+        proposal.pose,
+        focus,
+        minimum_refinement_laps,
+        radius_prior,
+    );
+    [refitted, preserved]
+        .into_iter()
+        .flatten()
+        .max_by(|left, right| {
+            let rank = |hypothesis: DrivingHypothesis| {
+                driving_semantic_eye_evidence(raw, width, height, sensor_origin, hypothesis)
+                    .zip(driving_multibank_limbus_evidence(
+                        raw,
+                        width,
+                        height,
+                        hypothesis.pose,
+                    ))
+                    .map(|(semantic, completed_evidence)| {
+                        // The legacy perimeter lap may legitimately improve a
+                        // measured proposal, but it must re-earn outer-edge
+                        // evidence at the pose it actually returns. Reusing
+                        // `proposal.evidence` here let an inward pupil/lid
+                        // refit inherit the strong RAW score of the abandoned
+                        // outer conic and defeat the preserving completion.
+                        let completed_proposal = DrivingMultibankLimbusProposal {
+                            pose: hypothesis.pose,
+                            evidence: completed_evidence,
+                        };
+                        temporal_canny_outer_geometry_rank(
+                            hypothesis,
+                            semantic,
+                            completed_proposal,
+                            radius_prior,
+                        )
+                    })
+                    .unwrap_or(hypothesis.score)
+            };
+            rank(*left).total_cmp(&rank(*right))
+        })
 }
 
 /// Score a completed pupil-headed road at one already-established affine
@@ -18181,6 +19341,7 @@ fn score_driving_completed_pose(
     iterations: usize,
     refinement_laps: usize,
     radius_prior: DrivingRadiusPrior,
+    outer_pose_policy: DrivingOuterPosePolicy,
 ) -> Option<DrivingHypothesis> {
     macro_rules! reject_completed_pose {
         ($reason:expr) => {{
@@ -18263,11 +19424,17 @@ fn score_driving_completed_pose(
         Some(strip) => strip,
         None => reject_completed_pose!("perimeter"),
     };
-    // The strip moves the sampled outer boundary, so its robust ellipse is
-    // authoritative.  Never return the seed's cached center after the road
-    // has moved.  If the first refit materially changes the affine frame,
-    // make one bounded reparameterized lap, then fit the final points again.
-    for fit_pass in 0..2 {
+    // Usually the strip moves the sampled outer boundary, so its robust
+    // ellipse is authoritative.  A multi-bank transition-band measurement is
+    // different: it has already localized the outer conic directly, and the
+    // smaller/specular pupil road must not drag it inward.  In that policy the
+    // strip remains full-resolution validation evidence but geometry stays
+    // fixed at `pose`.
+    let refit_passes = match outer_pose_policy {
+        DrivingOuterPosePolicy::RefitFromPerimeter => 2,
+        DrivingOuterPosePolicy::PreserveMeasuredConic => 0,
+    };
+    for fit_pass in 0..refit_passes {
         if strip.lower_occlusion_rejoined == Some(false) {
             reject_completed_pose!("lower-occlusion-no-rejoin");
         }
@@ -18617,6 +19784,7 @@ fn score_driving_native_anatomy_at_fixed_pose(
         pupil.trace.len().saturating_sub(1),
         minimum_refinement_laps.max(1),
         radius_prior,
+        DrivingOuterPosePolicy::PreserveMeasuredConic,
     )
 }
 
@@ -20525,6 +21693,41 @@ fn driving_seed_pose(
     )
 }
 
+/// Geometry-only cold proposal seed when the native outer detector has not
+/// yet completed a conic.  A strong pupil hint is allowed to aim the bounded
+/// limbus bank, but it is never eye identity and never becomes a radius
+/// observation.  The complete RAW pupil/iris/sclera and semantic gates remain
+/// mandatory before anything is published.
+fn driving_cold_proposal_seed(
+    native: &raw_iris_focus::OuterIrisBoundary,
+    fallback: Option<((f64, f64), f64)>,
+    focus: Option<&raw_iris_focus::BorderFocus>,
+) -> Option<DrivingAffinePose> {
+    driving_seed_pose(native, fallback).or_else(|| {
+        let focus = focus?;
+        let pupil = focus.pupil_hint?;
+        if !pupil.0.is_finite()
+            || !pupil.1.is_finite()
+            || !focus.radius.is_finite()
+            || focus.radius < 20.0
+            || focus.pupil_hint_score < 80.0
+        {
+            return None;
+        }
+        let center = if focus.center.0.is_finite() && focus.center.1.is_finite() {
+            focus.center
+        } else {
+            pupil
+        };
+        Some(DrivingAffinePose {
+            center,
+            major_radius: focus.radius,
+            minor_radius: focus.radius * 0.82,
+            angle: 0.0,
+        })
+    })
+}
+
 /// Select geometry for an established-road continuation while the independent
 /// current-frame eye-anatomy gate is closed. In that state a native contour
 /// is only an edge proposal: the glasses temple/front-frame junction can form
@@ -20570,10 +21773,36 @@ fn driving_cold_start_radius_prior(
     fallback: Option<((f64, f64), f64)>,
     independent_focus: Option<&raw_iris_focus::BorderFocus>,
 ) -> DrivingRadiusPrior {
-    let focus_radius = independent_focus
+    let verified_focus_radius = independent_focus
         .filter(|focus| focus.eye_basin_valid)
         .and_then(PupilProjectionReference::from_raw_focus)
         .map(|projection| projection.fronto_parallel_limbus_radius_px.value());
+    // When the broad eye-basin gate is conservative but the native RAW pupil
+    // locator still supplies a strong compact center, its carrier scale is a
+    // useful *proposal coordinate*.  It does not claim that `focus.radius`
+    // is the limbus; the reviewed partial-frame corpus shows the true limbus
+    // can be roughly twice as large.  Keep that uncertainty in the typed
+    // CurrentFrameGeometry support and require full anatomy before learning.
+    let unverified_focus_radius = independent_focus
+        .filter(|focus| {
+            !focus.eye_basin_valid
+                && focus.pupil_hint.is_some()
+                && focus.pupil_hint_score >= 80.0
+                && focus.radius.is_finite()
+                && focus.radius >= 20.0
+        })
+        .map(|focus| {
+            // `radius` has two observably different meanings at a censored
+            // cold start.  When it is near the compact pupil carrier it needs
+            // the learned carrier-to-limbus expansion.  When it is already
+            // more than roughly 2.3 pupil-hint radii it is a broad eye-opening
+            // or censored-outer scale; multiplying that by 1.88 a second time
+            // manufactures an implausibly large conic.  An unavailable hint
+            // radius preserves the established compact-carrier behavior.
+            let compact_carrier = focus.pupil_hint_radius < 8.0
+                || focus.radius / focus.pupil_hint_radius.max(1.0) <= 2.30;
+            (focus.radius, compact_carrier)
+        });
     let native_radius = (native.points.len() >= 8)
         .then(|| {
             driving_fronto_parallel_radius_px(DrivingAffinePose {
@@ -20587,11 +21816,41 @@ fn driving_cold_start_radius_prior(
     let fallback_radius = fallback
         .map(|(_, radius)| radius)
         .filter(|radius| radius.is_finite() && *radius >= 8.0);
-    let reference = focus_radius.or(native_radius).or(fallback_radius)?;
+    let (reference, minimum_px, maximum_px) = if let Some(reference) = verified_focus_radius {
+        (reference, reference * 0.52, reference * 1.80)
+    } else if let Some((focus_radius, compact_carrier)) = unverified_focus_radius {
+        // Keep the type honest: `estimate_px` is always the expected
+        // fronto-parallel radius of the physical limbus, never the radius of
+        // the compact pupil/carrier used to aim a cold search. The paired RAW
+        // annotations place that limbus at 1.77--1.98 carrier radii; 1.88 is
+        // the robust center. Native/fallback outer evidence may enlarge that
+        // expectation but is never multiplied a second time.
+        let carrier_to_limbus = if compact_carrier { 1.88 } else { 1.36 };
+        let inferred_limbus = native_radius
+            .into_iter()
+            .chain(fallback_radius)
+            .fold(focus_radius * carrier_to_limbus, f64::max);
+        if compact_carrier {
+            (
+                inferred_limbus,
+                (focus_radius * 0.98).min(inferred_limbus * 0.72),
+                inferred_limbus * 1.18,
+            )
+        } else {
+            // A broad censored carrier is already close to outer-eye scale,
+            // but its missing perimeter warrants a wider, symmetric search
+            // envelope.  It remains only CurrentFrameGeometry: temporal
+            // consensus and complete anatomy still own publication.
+            (inferred_limbus, focus_radius * 0.90, inferred_limbus * 1.35)
+        }
+    } else {
+        let reference = native_radius.or(fallback_radius)?;
+        (reference, reference * 0.52, reference * 1.80)
+    };
     raw_iris_focus::FrontoParallelLimbusRadiusPrior::from_hard_support(
         reference,
-        reference * 0.52,
-        reference * 1.80,
+        minimum_px,
+        maximum_px,
         raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry,
     )
 }
@@ -22183,9 +23442,17 @@ impl DrivingSegmentationTracker {
                 / proposal.pose.major_radius.max(1.0);
             let ratio = proposal.pose.minor_radius / proposal.pose.major_radius.max(1.0);
             let old_ratio = old.pose.minor_radius / old.pose.major_radius.max(1.0);
+            let radius_consistent = driving_fronto_parallel_radius_px(proposal.pose)
+                .zip(driving_fronto_parallel_radius_px(old.pose))
+                .is_some_and(|(radius, old_radius)| {
+                    (radius / old_radius.max(1.0)).ln().abs() <= 1.08f64.ln()
+                });
             let orientation_consistent = ratio.min(old_ratio) >= 0.90
                 || driving_angle_difference(proposal.pose.angle, old.pose.angle).abs() <= 0.35;
-            center_change <= 0.18 && (ratio - old_ratio).abs() <= 0.12 && orientation_consistent
+            center_change <= 0.18
+                && radius_consistent
+                && (ratio - old_ratio).abs() <= 0.12
+                && orientation_consistent
         };
         if self
             .multibank_limbus_history
@@ -22783,12 +24050,20 @@ impl DrivingSegmentationTracker {
             }
         }
         // Expire the single active provisional head without discarding other
-        // recently observed cold basins. This is the key distinction from a
-        // mode/session reset: an interleaved alias or three missing results
-        // must not erase two good votes for the eye elsewhere in the ROI.
+        // recently observed cold basins or an incomplete current-RAW limbus
+        // consensus. This is the key distinction from a mode/session reset:
+        // an interleaved alias or a frame whose censored limbus cannot yet be
+        // completed must not erase two good votes elsewhere in the ROI. The
+        // proposal observer owns spatial/scale consistency and the one-second
+        // expiry; retaining these private votes cannot publish eye identity.
         let retained_cold_banks = std::mem::take(&mut self.cold_start_hypothesis_banks);
+        let mut retained_multibank_history = std::mem::take(&mut self.multibank_limbus_history);
+        retained_multibank_history.retain(|observation| {
+            now.saturating_duration_since(observation.observed_at) <= Duration::from_secs(1)
+        });
         self.clear_tracking();
         self.cold_start_hypothesis_banks = retained_cold_banks;
+        self.multibank_limbus_history = retained_multibank_history;
         self.prune_cold_start_hypothesis_banks(now);
         false
     }
@@ -23220,7 +24495,7 @@ impl DrivingSegmentationTracker {
             );
         }
 
-        let Some(seed) = driving_seed_pose(native, fallback) else {
+        let Some(seed) = driving_cold_proposal_seed(native, fallback, independent_focus) else {
             self.hold_proven_road_after_miss(now, sensor_origin);
             return None;
         };
@@ -23286,7 +24561,7 @@ impl DrivingSegmentationTracker {
                 // fork can hide the limbus deep in the ordered bank.  Let 64
                 // cheap full-resolution RAW proposals participate; the
                 // bounded completion helper below still permits at most
-                // eight full anatomy walks.
+                // four full anatomy walks.
                 let shortlists = driving_multibank_limbus_pose_shortlists_with_beam(
                     raw,
                     width,
@@ -23311,9 +24586,6 @@ impl DrivingSegmentationTracker {
         } else {
             (Vec::new(), Vec::new())
         };
-        let global_strong_proposal = global_incumbent_multibank.iter().copied().find(|proposal| {
-            driving_multibank_proposal_is_strong_censored_geometry(*proposal, width, height)
-        });
         let full_multibank_proposal = local_full_proposal.or_else(|| {
             global_incumbent_multibank.iter().copied().find(|proposal| {
                 driving_multibank_proposal_is_strong_censored_geometry(*proposal, width, height)
@@ -23326,26 +24598,78 @@ impl DrivingSegmentationTracker {
                     )
             })
         });
+        // The exact four-member incumbent remains the one-frame full-context
+        // path. For censored geometry, search the already-computed 64-member
+        // bank and prefer the typed physical limbus scale plus the strongest
+        // visible signed lane. This proposal is history-only until three
+        // radius-consistent frames and complete eye anatomy agree.
+        let global_temporal_censored_proposal = full_multibank_proposal
+            .is_none()
+            .then(|| {
+                global_multibank
+                    .iter()
+                    .copied()
+                    .filter(|proposal| {
+                        driving_multibank_proposal_is_temporal_censored_candidate(
+                            *proposal,
+                            width,
+                            height,
+                            radius_prior,
+                        )
+                    })
+                    .max_by(|left, right| {
+                        driving_temporal_censored_proposal_rank(*left, radius_prior).total_cmp(
+                            &driving_temporal_censored_proposal_rank(*right, radius_prior),
+                        )
+                    })
+            })
+            .flatten();
         let strong_censored_current_proposal = full_multibank_proposal.is_none()
-            && local_strong_proposal.or(global_strong_proposal).is_some();
+            && local_strong_proposal
+                .or(global_temporal_censored_proposal)
+                .is_some();
         let partial_multibank_selected =
             full_multibank_proposal.is_none() && local_partial_proposal.is_some();
-        let proposal_for_temporal_confirmation = full_multibank_proposal.or(local_partial_proposal);
+        let global_censored_multibank_selected = full_multibank_proposal.is_none()
+            && local_partial_proposal.is_none()
+            && global_temporal_censored_proposal.is_some();
+        let proposal_for_temporal_confirmation = full_multibank_proposal
+            .or(local_partial_proposal)
+            .or(global_temporal_censored_proposal);
         let multibank_temporally_confirmed =
             proposal_for_temporal_confirmation.is_some_and(|proposal| {
                 self.observe_multibank_limbus_proposal(now, sensor_origin, proposal)
             });
         let partial_multibank_confirmed =
             partial_multibank_selected && multibank_temporally_confirmed;
+        let global_censored_multibank_confirmed =
+            global_censored_multibank_selected && multibank_temporally_confirmed;
+        let global_censored_completion = global_censored_multibank_confirmed
+            .then(|| {
+                driving_bounded_temporal_censored_completion(
+                    raw,
+                    width,
+                    height,
+                    sensor_origin,
+                    independent_focus,
+                    radius_prior,
+                    global_temporal_censored_proposal
+                        .expect("confirmed global censored proposal exists"),
+                    &global_multibank,
+                )
+            })
+            .flatten();
         // A unilateral/censored road may be visible immediately, but it may
         // only alter geometry after three mutually consistent current-RAW
-        // observations. Until then the proven pupil-headed road is held.
+        // observations. The globally censored road must then produce a nearby
+        // identity-authorizing completion; until then the proven road is held.
         let multibank_proposal = full_multibank_proposal
             .or_else(|| {
                 partial_multibank_confirmed
                     .then_some(local_partial_proposal)
                     .flatten()
             })
+            .or_else(|| global_censored_completion.map(|(proposal, _)| proposal))
             .map(|proposal| {
                 driving_analog_polish_multibank_proposal(raw, width, height, proposal, radius_prior)
             });
@@ -23515,7 +24839,10 @@ impl DrivingSegmentationTracker {
         let best = temporal
             .or(established_focus)
             .or_else(|| {
-                if previous_pose.is_none() && strong_censored_current_proposal {
+                if previous_pose.is_none()
+                    && strong_censored_current_proposal
+                    && !global_censored_multibank_confirmed
+                {
                     // A semantically censored conic is useful continuation
                     // geometry only. Without an established pupil-headed
                     // identity, a broad cold search in the same tight crop
@@ -23528,19 +24855,23 @@ impl DrivingSegmentationTracker {
                 // latter remains available when the direct road is genuinely
                 // incomplete, but it may not silently replace a 2--4 px RAW
                 // limbus fit with a lid/aperture ellipse.
-                let measured = multibank_proposal.and_then(|proposal| {
-                    score_driving_native_anatomy_from_working_pose(
-                        raw,
-                        width,
-                        height,
-                        sensor_origin,
-                        proposal.pose,
-                        proposal.pose,
-                        None,
-                        2,
-                        radius_prior,
-                    )
-                });
+                let measured = global_censored_completion
+                    .map(|(_, hypothesis)| hypothesis)
+                    .or_else(|| {
+                        multibank_proposal.and_then(|proposal| {
+                            score_driving_multibank_measured_anatomy(
+                                raw,
+                                width,
+                                height,
+                                sensor_origin,
+                                proposal.pose,
+                                proposal,
+                                independent_focus,
+                                2,
+                                radius_prior,
+                            )
+                        })
+                    });
                 // On cold acquisition only, compare a materially displaced
                 // measured conic with one independent native pupil-headed
                 // road.  The comparison is bounded to ambiguous pose changes
@@ -23680,7 +25011,7 @@ impl DrivingSegmentationTracker {
                 proposal,
                 independent_focus,
                 multibank_large_correction_confirmed,
-                partial_multibank_confirmed,
+                partial_multibank_confirmed || global_censored_multibank_confirmed,
             ) else {
                 // The complete pupil road and independently measured limbus
                 // disagree about which anatomy they describe. Neither source
@@ -25052,12 +26383,59 @@ impl RawSetCadence {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RecordedRoiFrame {
+    roi_id: u32,
+    sequence: u64,
+    timestamp_ns: u64,
+    sensor_x: u32,
+    sensor_y: u32,
+    width: usize,
+    height: usize,
+}
+
+impl RecordedRoiFrame {
+    fn key(self) -> (u32, u64, u64) {
+        (self.roi_id, self.sequence, self.timestamp_ns)
+    }
+
+    fn unavailable_prediction_record(self) -> serde_json::Value {
+        serde_json::json!({
+            "schema": "buttercup-roi-prediction-frame-v1",
+            "roi_frame_key": {
+                "roi_id": self.roi_id,
+                "sequence": self.sequence,
+                "sensor_timestamp_ns": self.timestamp_ns,
+            },
+            "capture": {
+                "sensor_x": self.sensor_x,
+                "sensor_y": self.sensor_y,
+                "width": self.width,
+                "height": self.height,
+            },
+            "semantic": {
+                "configured_role": configured_roi_role(self.roi_id),
+                "observed_role": "unknown",
+                "accepted_eye": false,
+                "supported_roles": ["eye", "mouth", "unknown"],
+            },
+            "analysis_state": "unavailable",
+            "predictions": {
+                "eye_candidate": serde_json::Value::Null,
+                "mouth_candidate": serde_json::Value::Null,
+            },
+        })
+    }
+}
+
 struct Recorder {
     output: PathBuf,
     temp: PathBuf,
     jsonl: File,
+    predictions: File,
     raw: [File; 2],
     offsets: [u64; 2],
+    pending_predictions: BTreeMap<(u32, u64, u64), RecordedRoiFrame>,
     finalized: bool,
 }
 
@@ -25092,7 +26470,7 @@ impl Recorder {
         ));
         fs::create_dir_all(&temp).map_err(|error| error.to_string())?;
         let manifest = format!(
-            "{{\n  \"schema\": \"buttercup-raw-eye-bundle-v1\",\n  \"container\": \"POSIX ustar\",\n  \"pixel_format\": \"RAW10_LE40_1X1\",\n  \"raw_layout\": \"four 10-bit little-endian pixels packed consecutively into five bytes; rows contiguous\",\n  \"sensor_window\": {{\"x\":{},\"y\":{},\"width\":{},\"height\":{}}},\n  \"eye_size\": {{\"width\":{},\"height\":{}}},\n  \"streams\": [\"subject-right.raw10\",\"subject-left.raw10\"],\n  \"index\": \"frames.jsonl\"\n}}\n",
+            "{{\n  \"schema\": \"buttercup-raw-eye-bundle-v1\",\n  \"container\": \"POSIX ustar\",\n  \"pixel_format\": \"RAW10_LE40_1X1\",\n  \"raw_layout\": \"four 10-bit little-endian pixels packed consecutively into five bytes; rows contiguous\",\n  \"sensor_window\": {{\"x\":{},\"y\":{},\"width\":{},\"height\":{}}},\n  \"eye_size\": {{\"width\":{},\"height\":{}}},\n  \"streams\": [\"subject-right.raw10\",\"subject-left.raw10\"],\n  \"index\": \"frames.jsonl\",\n  \"prediction_schema\": \"buttercup-roi-prediction-frame-v1\",\n  \"prediction_index\": \"predictions.jsonl\",\n  \"prediction_semantic_roles\": [\"eye\",\"mouth\",\"unknown\"]\n}}\n",
             config.origin.0,
             config.origin.1,
             config.window_size.0,
@@ -25102,6 +26480,8 @@ impl Recorder {
         );
         fs::write(temp.join("manifest.json"), manifest).map_err(|error| error.to_string())?;
         let jsonl = File::create(temp.join("frames.jsonl")).map_err(|error| error.to_string())?;
+        let predictions =
+            File::create(temp.join("predictions.jsonl")).map_err(|error| error.to_string())?;
         let right =
             File::create(temp.join("subject-right.raw10")).map_err(|error| error.to_string())?;
         let left =
@@ -25110,8 +26490,10 @@ impl Recorder {
             output: output.to_path_buf(),
             temp,
             jsonl,
+            predictions,
             raw: [right, left],
             offsets: [0, 0],
+            pending_predictions: BTreeMap::new(),
             finalized: false,
         })
     }
@@ -25120,6 +26502,12 @@ impl Recorder {
         let PacketKind::Eye(eye_id) = header.kind else {
             return Err("raw eye recorder received a non-eye packet".to_string());
         };
+        // Analysis is synchronous with stream ingestion: by the time the next
+        // ROI packet reaches this method, any older pending key can no longer
+        // acquire a completed EyeFrame. Emit its explicit unavailable row now
+        // so a long toggle recording never accumulates per-frame metadata in
+        // memory merely because one semantic ROI is intentionally disabled.
+        self.flush_unavailable_predictions()?;
         // Capture this at recorder ingress, before filesystem work can add a
         // variable page-cache or writeback delay to the coarse screen join.
         let host_arrival_unix_ns = SystemTime::now()
@@ -25162,6 +26550,50 @@ impl Recorder {
             payload.len(),
         )
         .map_err(|error| error.to_string())?;
+        let recorded = RecordedRoiFrame {
+            roi_id: eye_id,
+            sequence: header.sequence,
+            timestamp_ns: header.timestamp_ns,
+            sensor_x: header.sensor_x,
+            sensor_y: header.sensor_y,
+            width: header.width,
+            height: header.height,
+        };
+        self.pending_predictions.insert(recorded.key(), recorded);
+        Ok(())
+    }
+
+    fn record_prediction(&mut self, frame: &EyeFrame) -> Result<(), String> {
+        let key = (frame.eye_id, frame.sequence, frame.timestamp_ns);
+        if !self.pending_predictions.contains_key(&key) {
+            return Ok(());
+        }
+        serde_json::to_writer(&mut self.predictions, &roi_prediction_record(frame))
+            .map_err(|error| format!("serialize ROI prediction: {error}"))?;
+        self.predictions
+            .write_all(b"\n")
+            .map_err(|error| format!("write ROI prediction: {error}"))?;
+        self.pending_predictions.remove(&key);
+        Ok(())
+    }
+
+    fn flush_unavailable_predictions(&mut self) -> Result<(), String> {
+        let unavailable = self
+            .pending_predictions
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        for frame in unavailable {
+            serde_json::to_writer(
+                &mut self.predictions,
+                &frame.unavailable_prediction_record(),
+            )
+            .map_err(|error| format!("serialize unavailable ROI prediction: {error}"))?;
+            self.predictions
+                .write_all(b"\n")
+                .map_err(|error| format!("write unavailable ROI prediction: {error}"))?;
+        }
+        self.pending_predictions.clear();
         Ok(())
     }
 
@@ -25170,7 +26602,11 @@ impl Recorder {
             return Ok(());
         }
         self.finalized = true;
+        self.flush_unavailable_predictions()?;
         self.jsonl.flush().map_err(|error| error.to_string())?;
+        self.predictions
+            .flush()
+            .map_err(|error| error.to_string())?;
         for raw in &mut self.raw {
             raw.flush().map_err(|error| error.to_string())?;
         }
@@ -25182,6 +26618,7 @@ impl Recorder {
             .args([
                 "manifest.json",
                 "frames.jsonl",
+                "predictions.jsonl",
                 "subject-left.raw10",
                 "subject-right.raw10",
             ])
@@ -30089,7 +31526,7 @@ fn receive(
                                     match Recorder::new(&path, &config) {
                                         Ok(dynamic_recorder) => {
                                             eprintln!(
-                                                "H started two-eye RAW recording {}",
+                                                "S/H started two-ROI RAW recording with frame predictions {}",
                                                 path.display(),
                                             );
                                             hotkey_recording = Some(HotkeyRecording {
@@ -30136,7 +31573,7 @@ fn receive(
                                         "complete"
                                     };
                                     eprintln!(
-                                        "H stopped two-eye RAW recording {} ({} complete sets)",
+                                        "S/H stopped two-ROI RAW recording {} ({} complete sets)",
                                         active.path.display(),
                                         active.complete_sets,
                                     );
@@ -31425,19 +32862,44 @@ fn receive(
                 // 24-patch iris-annulus bank. Native and SAM run neither.
                 let temporal_clusters_active =
                     segmentation_profile.motion_work == SegmentationMotionWork::TemporalClusters;
+                let upper_temporal_lid_margin = temporal_clusters_active
+                    .then(|| {
+                        upper_eyelid_points
+                            .iter()
+                            .map(|point| raw_motion_octrees::LidMarginPoint {
+                                x: point.x as f32,
+                                y: point.y as f32,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let lower_temporal_lid_margin = temporal_clusters_active
+                    .then(|| {
+                        lower_eyelid_points
+                            .iter()
+                            .map(|point| raw_motion_octrees::LidMarginPoint {
+                                x: point.x as f32,
+                                y: point.y as f32,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 let temporal_match_started = Instant::now();
                 let mut motion_overlay = if temporal_clusters_active {
-                    motion_octree_trackers[index].observe_with_iris_seed_at_with_canny_profile(
-                        raw.as_slice(),
-                        header.width,
-                        header.height,
-                        header.sensor_x,
-                        header.sensor_y,
-                        header.timestamp_ns,
-                        motion_focus_probe,
-                        edge_map_variant.learning_canny_profile(),
-                        cluster_ellipse_seed,
-                    )
+                    motion_octree_trackers[index]
+                        .observe_with_iris_seed_at_with_canny_profile_and_lids(
+                            raw.as_slice(),
+                            header.width,
+                            header.height,
+                            header.sensor_x,
+                            header.sensor_y,
+                            header.timestamp_ns,
+                            motion_focus_probe,
+                            edge_map_variant.learning_canny_profile(),
+                            cluster_ellipse_seed,
+                            &upper_temporal_lid_margin,
+                            &lower_temporal_lid_margin,
+                        )
                 } else {
                     motion_octree_trackers[index].clear();
                     raw_motion_octrees::MotionOctreeOverlay::default()
@@ -34274,6 +35736,64 @@ fn receive(
                         publisher.submit(Arc::clone(&model_frame));
                     }
                 }
+                if let Some(active) = recorder.as_mut() {
+                    active.record_prediction(&frame)?;
+                }
+                let timed_prediction_error = timed_recording
+                    .as_mut()
+                    .and_then(|active| active.recorder.record_prediction(&frame).err());
+                if let Some(prediction_error) = timed_prediction_error {
+                    let mut active = timed_recording
+                        .take()
+                        .expect("timed prediction failure lost its recorder");
+                    let finalize_error = active.recorder.finalize().err();
+                    let error = finalize_error.map_or(prediction_error.clone(), |finalize_error| {
+                        format!("{prediction_error}; finalize RAW bundle: {finalize_error}")
+                    });
+                    if let Ok(mut state) = shared.lock() {
+                        state.timed_record_result = Some(TimedRecordResult {
+                            id: active.request.id,
+                            state: "failed",
+                            path: active.request.path,
+                            duration_ms: active
+                                .started_at
+                                .elapsed()
+                                .as_millis()
+                                .min(u64::MAX as u128)
+                                as u64,
+                            complete_sets: active.complete_sets,
+                            frames: active.frames,
+                            error: Some(error),
+                        });
+                    }
+                }
+                let hotkey_prediction_error = hotkey_recording
+                    .as_mut()
+                    .and_then(|active| active.recorder.record_prediction(&frame).err());
+                if let Some(prediction_error) = hotkey_prediction_error {
+                    let mut active = hotkey_recording
+                        .take()
+                        .expect("hotkey prediction failure lost its recorder");
+                    let finalize_error = active.recorder.finalize().err();
+                    let error = finalize_error.map_or(prediction_error.clone(), |finalize_error| {
+                        format!("{prediction_error}; finalize RAW bundle: {finalize_error}")
+                    });
+                    if let Ok(mut state) = shared.lock() {
+                        state.hotkey_record_result = Some(HotkeyRecordResult {
+                            state: "failed",
+                            path: active.path,
+                            elapsed_ms: active
+                                .started_at
+                                .elapsed()
+                                .as_millis()
+                                .min(u64::MAX as u128)
+                                as u64,
+                            complete_sets: active.complete_sets,
+                            frames: active.frames,
+                            error: Some(error),
+                        });
+                    }
+                }
                 previous[index] = Some(Arc::clone(&raw));
                 if let Ok(mut state) = shared.lock() {
                     state.eyes[index] = Some(frame);
@@ -36500,6 +38020,7 @@ fn draw_eye(
             y,
             pixel_scale,
             frame.motion_octrees.as_ref(),
+            frame.focus_anatomy_valid && frame.focus_eye_basin_valid,
         );
     }
     if segmentation_profile.show_sclera_red_canny {
@@ -37289,6 +38810,7 @@ fn draw_motion_octree_overlay(
     origin_y: i32,
     pixel_scale: usize,
     overlay: &raw_motion_octrees::MotionOctreeOverlay,
+    anatomy_authorized: bool,
 ) {
     let scale = pixel_scale.max(1) as f32;
     // Show the actual current-frame Canny evidence as a subdued underlay. A
@@ -37298,17 +38820,20 @@ fn draw_motion_octree_overlay(
     for edge in &overlay.edges {
         let px = origin_x + (edge.x * scale).round() as i32;
         let py = origin_y + (edge.y * scale).round() as i32;
-        let inside_iris_annulus = overlay.semantic_iris.is_some_and(|ellipse| {
-            let cosine = ellipse.angle.cos();
-            let sine = ellipse.angle.sin();
-            let dx = edge.x as f64 - ellipse.center.0;
-            let dy = edge.y as f64 - ellipse.center.1;
-            let local_x = cosine * dx + sine * dy;
-            let local_y = -sine * dx + cosine * dy;
-            let radius = (local_x / ellipse.major_radius.max(1.0))
-                .hypot(local_y / ellipse.minor_radius.max(1.0));
-            (0.30..=0.92).contains(&radius)
-        });
+        let inside_iris_annulus = overlay
+            .radial_limbus_region
+            .or(overlay.semantic_iris)
+            .is_some_and(|ellipse| {
+                let cosine = ellipse.angle.cos();
+                let sine = ellipse.angle.sin();
+                let dx = edge.x as f64 - ellipse.center.0;
+                let dy = edge.y as f64 - ellipse.center.1;
+                let local_x = cosine * dx + sine * dy;
+                let local_y = -sine * dx + cosine * dy;
+                let radius = (local_x / ellipse.major_radius.max(1.0))
+                    .hypot(local_y / ellipse.minor_radius.max(1.0));
+                (0.30..=0.92).contains(&radius)
+            });
         let motion_shadow = edge.iris_motion_consistency < 0.45;
         let marker = if motion_shadow {
             1
@@ -37347,14 +38872,93 @@ fn draw_motion_octree_overlay(
             draw_line_clipped(pixels, width, height, a.0, a.1, b.0, b.1, 0x00b8_f8ff);
         }
     }
+    // A pupil edge and a limbus edge both brighten in the outward direction.
+    // When the current native RAW frame supplies both ordered transitions,
+    // show the constrained pair as two dashed projected ellipses: violet is
+    // the pupillary aperture and gold is the outer iris/sclera boundary.
+    // These remain diagnostic until the independent anatomy gate publishes.
+    if let Some(pair) = overlay
+        .nested_eye_boundaries
+        .as_ref()
+        .filter(|_| anatomy_authorized)
+    {
+        let ellipse_point = |ellipse: raw_motion_octrees::IrisEllipseSeed, phase: f64| {
+            let (sine, cosine) = ellipse.angle.sin_cos();
+            let local_x = ellipse.major_radius * phase.cos();
+            let local_y = ellipse.minor_radius * phase.sin();
+            (
+                ellipse.center.0 + cosine * local_x - sine * local_y,
+                ellipse.center.1 + sine * local_x + cosine * local_y,
+            )
+        };
+        for (ellipse, color) in [(pair.pupil, 0x00d8_5cff), (pair.limbus, 0x00ff_d447)] {
+            let mut previous = None::<(i32, i32)>;
+            for sample in 0..=96 {
+                let phase = sample as f64 * std::f64::consts::TAU / 96.0;
+                let point = ellipse_point(ellipse, phase);
+                let current = (
+                    origin_x + (point.0 * scale as f64).round() as i32,
+                    origin_y + (point.1 * scale as f64).round() as i32,
+                );
+                if sample % 4 <= 1 {
+                    if let Some(prior) = previous {
+                        draw_line_clipped(
+                            pixels, width, height, prior.0, prior.1, current.0, current.1, color,
+                        );
+                    }
+                }
+                previous = Some(current);
+            }
+        }
+        // Mark only a sparse subset of sectors that independently observed
+        // both transitions; this makes the distinction auditable without
+        // recreating the dense spoke fan which hid the pupil/limbus mistake.
+        for phase in pair.paired_phases_rad.iter().step_by(2) {
+            for (ellipse, color) in [(pair.pupil, 0x00d8_5cff), (pair.limbus, 0x00ff_d447)] {
+                let point = ellipse_point(ellipse, f64::from(*phase));
+                let px = origin_x + (point.0 * scale as f64).round() as i32;
+                let py = origin_y + (point.1 * scale as f64).round() as i32;
+                let marker = pixel_scale.max(2) as i32;
+                draw_line_clipped(
+                    pixels,
+                    width,
+                    height,
+                    px - marker,
+                    py,
+                    px + marker,
+                    py,
+                    color,
+                );
+                draw_line_clipped(
+                    pixels,
+                    width,
+                    height,
+                    px,
+                    py - marker,
+                    px,
+                    py + marker,
+                    color,
+                );
+            }
+        }
+    }
     // Radial limbus probes are eleven exact sampling locations: five toward
     // the projected pupil center, the selected transition, and five toward
-    // sclera. Yellow centers were fused into the joint iris-motion solve;
-    // dim centers passed photometry but were withheld by motion consistency.
+    // sclera. Yellow centers passed the distributed bilateral normal-flow
+    // solve; when semantic point motion is also available, they additionally
+    // contribute to the joint iris-motion fit. Dim centers passed photometry
+    // but were withheld by motion/consensus consistency.
+    // A withheld single transition draws only its center. Even when a nested
+    // pair exists, its two independently supported rings and sparse crosses
+    // are the honest visualization; stretching an unfused probe across them
+    // would again make one ambiguous edge look like a solved boundary.
     for probe in &overlay.radial_limbus_probes {
         let center_x = origin_x + (probe.point[0] * scale).round() as i32;
         let center_y = origin_y + (probe.point[1] * scale).round() as i32;
         for sample_index in 0..=2 * raw_motion_octrees::RADIAL_LIMBUS_HALF_SAMPLES {
+            if !probe.fused && sample_index != raw_motion_octrees::RADIAL_LIMBUS_HALF_SAMPLES {
+                continue;
+            }
             let offset = (sample_index as f32
                 - raw_motion_octrees::RADIAL_LIMBUS_HALF_SAMPLES as f32)
                 * raw_motion_octrees::RADIAL_LIMBUS_SAMPLE_SPACING_PX;
@@ -37395,6 +38999,76 @@ fn draw_motion_octree_overlay(
             ] {
                 draw_line_clipped(pixels, width, height, a.0, a.1, b.0, b.1, 0x00ff_e040);
             }
+        }
+    }
+    // Hot-pink palpebral-margin curves are exact-current-frame flat-tire
+    // censors. Short hatches point toward the skin/occluded half-plane; small
+    // white-pink squares are the native Canny samples which gave the gentle
+    // curve authority. They are geometry diagnostics, never inferred limbus.
+    for curve in &overlay.lid_occlusions {
+        let color = if curve.upper {
+            0x00ff_4fc3
+        } else {
+            0x00ff_72d8
+        };
+        for pair in curve.points.windows(2) {
+            let first = (
+                origin_x + (pair[0].0 * scale).round() as i32,
+                origin_y + (pair[0].1 * scale).round() as i32,
+            );
+            let second = (
+                origin_x + (pair[1].0 * scale).round() as i32,
+                origin_y + (pair[1].1 * scale).round() as i32,
+            );
+            draw_line_clipped(
+                pixels, width, height, first.0, first.1, second.0, second.1, color,
+            );
+        }
+        let hatch_direction = if curve.upper { -1 } else { 1 };
+        let hatch_length = pixel_scale.max(3) as i32 + 2;
+        for point in curve.points.iter().step_by(4) {
+            let px = origin_x + (point.0 * scale).round() as i32;
+            let py = origin_y + (point.1 * scale).round() as i32;
+            draw_line_clipped(
+                pixels,
+                width,
+                height,
+                px,
+                py,
+                px,
+                py + hatch_direction * hatch_length,
+                color,
+            );
+        }
+        let marker = pixel_scale.max(2) as i32;
+        for &(point_x, point_y) in &curve.support_points {
+            let px = origin_x + (point_x * scale).round() as i32;
+            let py = origin_y + (point_y * scale).round() as i32;
+            fill_rect(
+                pixels,
+                width,
+                height,
+                px - marker / 2,
+                py - marker / 2,
+                marker,
+                marker,
+                0x00ff_c8ec,
+            );
+        }
+        if let Some(&(label_x, label_y)) = curve.points.first() {
+            draw_text(
+                pixels,
+                width,
+                height,
+                origin_x + (label_x * scale).round() as i32,
+                origin_y + (label_y * scale).round() as i32 + hatch_direction * (hatch_length + 8),
+                if curve.upper {
+                    "UPPER LID CENSOR"
+                } else {
+                    "LOWER LID CENSOR"
+                },
+                color,
+            );
         }
     }
     // `semantic_iris` is a search region, not an anatomical publication.
@@ -39542,7 +41216,7 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
         (frame_contrast, core_background),
         (focus_filter_status, core_background),
         (
-            "H RECORD  S BOTH STILL  D RIGHT STILL".to_string(),
+            "S/H RECORD TOGGLE + PREDICTIONS  D RIGHT STILL".to_string(),
             core_background,
         ),
         (
@@ -39804,6 +41478,9 @@ impl ApplicationHandler for App {
                 if let Some(state) = self.window_state.as_mut() {
                     resize_surface(&mut state.surface, size);
                 }
+            }
+            WindowEvent::Focused(focused) => {
+                self.window_focused = focused;
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 match event.physical_key {
@@ -40213,34 +41890,17 @@ impl ApplicationHandler for App {
                             }
                         }
                     }
-                    PhysicalKey::Code(KeyCode::KeyS) => {
-                        if !event.repeat {
-                            if let Ok(mut shared) = self.shared.lock() {
-                                if local_camera_control_allowed(&mut shared, "PAIRED RAW EXPORT") {
-                                    match queue_hotkey_paired_raw_export(&mut shared) {
-                                        Ok((id, prefix)) => eprintln!(
-                                            "queued paired RAW export id={id} prefix={}",
-                                            prefix.display(),
-                                        ),
-                                        Err(error) => {
-                                            eprintln!("paired RAW export refused: {error}")
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    PhysicalKey::Code(KeyCode::KeyH) => {
+                    PhysicalKey::Code(KeyCode::KeyS) | PhysicalKey::Code(KeyCode::KeyH) => {
                         if !event.repeat {
                             if let Ok(mut shared) = self.shared.lock() {
                                 if local_camera_control_allowed(&mut shared, "RAW RECORD") {
                                     match queue_hotkey_raw_record_toggle(&mut shared) {
                                         Ok((action, path)) => eprintln!(
-                                            "queued H RAW recording {action}: {}",
+                                            "queued S/H RAW recording {action}: {}",
                                             path.display(),
                                         ),
                                         Err(error) => {
-                                            eprintln!("H RAW recording toggle refused: {error}")
+                                            eprintln!("S/H RAW recording toggle refused: {error}")
                                         }
                                     }
                                 }
@@ -40447,6 +42107,14 @@ impl ApplicationHandler for App {
         if let Some(state) = self.window_state.as_ref() {
             state.window.request_redraw();
         }
+        let driving = self
+            .shared
+            .lock()
+            .is_ok_and(|shared| shared.segmentation_mode == SegmentationMode::Driving);
+        let hotkeys = self
+            .window_focused
+            .then(|| keyboard_peeper::buttercup_map(self.virtual_mouse.is_some(), driving));
+        self.keyboard_peeper.replace_if_changed(hotkeys);
     }
 }
 
@@ -40777,6 +42445,8 @@ fn run() -> Result<(), String> {
         presentation_pivot_contact: None,
         quit_armed_until: None,
         checkerboard_status: checkerboard_calibration::StatusSnapshot::default(),
+        keyboard_peeper: keyboard_peeper::Registration::new(None),
+        window_focused: false,
     };
     let event_result = event_loop
         .run_app(&mut app)
@@ -41133,6 +42803,64 @@ mod tests {
     }
 
     #[test]
+    fn censored_temporal_rank_prefers_a_dimensionally_plausible_limbus_band() {
+        let pose = DrivingAffinePose {
+            center: (270.0, 128.0),
+            major_radius: 130.0,
+            minor_radius: 106.0,
+            angle: 0.08,
+        };
+        let mut plausible = strong_multibank_proposal(pose);
+        plausible.evidence.transition_band_width_mean_px = 13.0;
+        plausible.evidence.transition_band_width_mad_px = 2.0;
+        plausible.evidence.transition_band_width_coherence = 0.60;
+        plausible.evidence.transition_band_width_samples = 16;
+        plausible.evidence.far_sclera_step_mean = 0.70;
+        let mut overwide = plausible;
+        overwide.evidence.transition_band_width_mean_px = 20.0;
+        let prior = raw_iris_focus::FrontoParallelLimbusRadiusPrior::from_hard_support(
+            130.0,
+            95.0,
+            160.0,
+            raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry,
+        )
+        .expect("valid current-frame limbus scale support");
+        assert!(
+            driving_limbus_transition_band_scale_affinity(plausible)
+                > driving_limbus_transition_band_scale_affinity(overwide)
+        );
+        assert!(
+            driving_temporal_censored_proposal_rank(plausible, Some(prior))
+                > driving_temporal_censored_proposal_rank(overwide, Some(prior))
+        );
+    }
+
+    #[test]
+    fn censored_completion_cohort_allows_nearby_shape_variants_but_not_remote_arcs() {
+        let confirmed = strong_multibank_proposal(DrivingAffinePose {
+            center: (279.0, 127.0),
+            major_radius: 137.0,
+            minor_radius: 130.0,
+            angle: 0.26,
+        });
+        let nearby = strong_multibank_proposal(DrivingAffinePose {
+            center: (270.0, 127.0),
+            major_radius: 131.0,
+            minor_radius: 107.0,
+            angle: 0.0,
+        });
+        assert!(driving_temporal_censored_proposals_share_cohort(
+            confirmed, nearby,
+        ));
+
+        let mut remote = nearby;
+        remote.pose.center.1 = 193.0;
+        assert!(!driving_temporal_censored_proposals_share_cohort(
+            confirmed, remote,
+        ));
+    }
+
+    #[test]
     fn oversized_lateral_limbus_is_censored_geometry_not_full_roi_identity() {
         let proposal = strong_multibank_proposal(DrivingAffinePose {
             center: (190.0, 142.0),
@@ -41226,6 +42954,46 @@ mod tests {
     }
 
     #[test]
+    fn cold_censored_limbus_votes_survive_the_incomplete_road_hold() {
+        let mut tracker = DrivingSegmentationTracker::default();
+        let now = Instant::now();
+        let origin = (4_000, 3_000);
+        let proposal = strong_multibank_proposal(DrivingAffinePose {
+            center: (120.0, 90.0),
+            major_radius: 60.0,
+            minor_radius: 50.0,
+            angle: 0.12,
+        });
+
+        // This is the actual cold live lifecycle: the first two censored
+        // frames cannot form a complete pupil-headed road, so the generic
+        // hold runs after each one. They must nevertheless accumulate three
+        // private current-RAW votes before bounded completion is attempted.
+        for (index, offset_ms) in [0, 20].into_iter().enumerate() {
+            assert!(!tracker.observe_multibank_limbus_proposal(
+                now + Duration::from_millis(offset_ms),
+                origin,
+                proposal,
+            ));
+            assert!(!tracker
+                .hold_proven_road_after_miss(now + Duration::from_millis(offset_ms), origin,));
+            assert_eq!(tracker.multibank_limbus_history.len(), index + 1);
+            assert!(tracker.pose.is_none(), "censored votes cannot publish");
+        }
+
+        assert!(tracker.observe_multibank_limbus_proposal(
+            now + Duration::from_millis(40),
+            origin,
+            proposal,
+        ));
+        assert_eq!(tracker.multibank_limbus_history.len(), 3);
+        assert!(
+            tracker.pose.is_none(),
+            "consensus still requires completion"
+        );
+    }
+
+    #[test]
     fn inconsistent_partial_limbus_fork_restarts_three_frame_confirmation() {
         let mut tracker = DrivingSegmentationTracker::default();
         let now = Instant::now();
@@ -41259,6 +43027,49 @@ mod tests {
             (4_000, 3_000),
             strong_multibank_proposal(pose),
         ));
+        assert!(tracker.observe_multibank_limbus_proposal(
+            now + Duration::from_millis(80),
+            (4_000, 3_000),
+            strong_multibank_proposal(pose),
+        ));
+    }
+
+    #[test]
+    fn implausible_partial_limbus_radius_fork_restarts_three_frame_confirmation() {
+        let mut tracker = DrivingSegmentationTracker::default();
+        let now = Instant::now();
+        let pose = DrivingAffinePose {
+            center: (120.0, 90.0),
+            major_radius: 100.0,
+            minor_radius: 82.0,
+            angle: 0.12,
+        };
+        assert!(!tracker.observe_multibank_limbus_proposal(
+            now,
+            (4_000, 3_000),
+            strong_multibank_proposal(pose),
+        ));
+
+        // A sharp nested rim can preserve center, axis ratio, and angle while
+        // changing only scale. It must restart confirmation rather than
+        // contributing a vote to the physical outer-limbus trajectory.
+        let mut nested_fork = pose;
+        nested_fork.major_radius = 125.0;
+        nested_fork.minor_radius = 102.5;
+        assert!(!tracker.observe_multibank_limbus_proposal(
+            now + Duration::from_millis(20),
+            (4_000, 3_000),
+            strong_multibank_proposal(nested_fork),
+        ));
+        assert_eq!(tracker.multibank_limbus_history.len(), 1);
+
+        for offset_ms in [40, 60] {
+            assert!(!tracker.observe_multibank_limbus_proposal(
+                now + Duration::from_millis(offset_ms),
+                (4_000, 3_000),
+                strong_multibank_proposal(pose),
+            ));
+        }
         assert!(tracker.observe_multibank_limbus_proposal(
             now + Duration::from_millis(80),
             (4_000, 3_000),
@@ -46877,6 +48688,101 @@ mod tests {
         let guarded = driving_cold_start_radius_prior(&native, None, Some(&focus)).unwrap();
         assert!((guarded.estimate_px - 98.0).abs() < 1.0e-9, "{guarded:?}");
         assert!(!guarded.admits_radius(30.0), "{guarded:?}");
+    }
+
+    #[test]
+    fn strong_unverified_pupil_carrier_aims_a_typed_outer_limbus_search() {
+        let native = raw_iris_focus::OuterIrisBoundary::default();
+        let focus = raw_iris_focus::BorderFocus {
+            eye_basin_valid: false,
+            center: (180.0, 120.0),
+            radius: 70.0,
+            pupil_hint: Some((181.0, 119.0)),
+            pupil_hint_score: 100.0,
+            ..raw_iris_focus::BorderFocus::default()
+        };
+        let prior = driving_cold_start_radius_prior(&native, None, Some(&focus))
+            .expect("a strong compact carrier should aim a broad outer-limbus search");
+        assert_eq!(
+            prior.source,
+            raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry
+        );
+        assert!((prior.estimate_px - 131.6).abs() < 1.0e-9, "{prior:?}");
+        assert!(prior.admits_radius(70.0), "{prior:?}");
+        assert!(prior.admits_radius(131.6), "{prior:?}");
+        assert!(!prior.admits_radius(60.0), "{prior:?}");
+        assert!(!prior.admits_radius(160.0), "{prior:?}");
+    }
+
+    #[test]
+    fn broad_unverified_eye_carrier_is_not_expanded_as_a_compact_pupil_again() {
+        let native = raw_iris_focus::OuterIrisBoundary {
+            center: (125.0, 110.0),
+            major_radius: 98.0,
+            minor_radius: 92.0,
+            points: vec![raw_iris_focus::OuterIrisPoint::default(); 8],
+            ..raw_iris_focus::OuterIrisBoundary::default()
+        };
+        let focus = raw_iris_focus::BorderFocus {
+            eye_basin_valid: false,
+            center: (125.0, 121.0),
+            radius: 108.96,
+            pupil_hint: Some((143.5, 139.5)),
+            pupil_hint_radius: 45.76,
+            pupil_hint_score: 100.0,
+            ..raw_iris_focus::BorderFocus::default()
+        };
+        let prior = driving_cold_start_radius_prior(&native, None, Some(&focus))
+            .expect("a broad censored carrier should retain an outer-eye search interval");
+        assert!(
+            (prior.estimate_px - focus.radius * 1.36).abs() < 1.0e-9,
+            "{prior:?}"
+        );
+        assert!(prior.admits_radius(156.0), "{prior:?}");
+        assert!(!prior.admits_radius(focus.radius * 1.88), "{prior:?}");
+    }
+
+    #[test]
+    fn current_frame_limbus_scale_support_is_flat_across_aiming_uncertainty() {
+        let prior = raw_iris_focus::FrontoParallelLimbusRadiusPrior::from_hard_support(
+            100.0,
+            70.0,
+            130.0,
+            raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry,
+        )
+        .expect("valid typed current-frame support");
+        let pose_at_radius = |radius| DrivingAffinePose {
+            center: (180.0, 120.0),
+            major_radius: radius,
+            minor_radius: radius * 0.82,
+            angle: 0.1,
+        };
+        let low =
+            driving_current_frame_limbus_scale_support_affinity(pose_at_radius(93.0), Some(prior));
+        let center =
+            driving_current_frame_limbus_scale_support_affinity(pose_at_radius(100.0), Some(prior));
+        let high =
+            driving_current_frame_limbus_scale_support_affinity(pose_at_radius(107.0), Some(prior));
+        assert!((low - 1.0).abs() < 1.0e-12, "{low}");
+        assert!((center - 1.0).abs() < 1.0e-12, "{center}");
+        assert!((high - 1.0).abs() < 1.0e-12, "{high}");
+        assert!(
+            driving_current_frame_limbus_scale_support_affinity(pose_at_radius(80.0), Some(prior))
+                < 0.7
+        );
+
+        let broad_prior = raw_iris_focus::FrontoParallelLimbusRadiusPrior::from_hard_support(
+            100.0,
+            50.0,
+            180.0,
+            raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry,
+        )
+        .unwrap();
+        let broad = driving_current_frame_limbus_scale_support_affinity(
+            pose_at_radius(120.0),
+            Some(broad_prior),
+        );
+        assert!((broad - 1.0).abs() < 1.0e-12, "{broad}");
     }
 
     #[test]
@@ -54313,7 +56219,7 @@ mod tests {
         let height = 100;
         let mut pixels = vec![0u32; width * height];
 
-        draw_motion_octree_overlay(&mut pixels, width, height, 10, 30, 2, &overlay);
+        draw_motion_octree_overlay(&mut pixels, width, height, 10, 30, 2, &overlay, false);
 
         assert_eq!(pixels[50 * width + 30], 0x0038_a6b8);
         assert!(overlay.trails.is_empty());
@@ -54341,9 +56247,68 @@ mod tests {
         let height = 100;
         let mut pixels = vec![0u32; width * height];
 
-        draw_motion_octree_overlay(&mut pixels, width, height, 10, 30, 2, &overlay);
+        draw_motion_octree_overlay(&mut pixels, width, height, 10, 30, 2, &overlay, false);
 
         assert_eq!(pixels[50 * width + 44], 0x0000_efff);
+    }
+
+    #[test]
+    fn nested_pupil_and_limbus_diagnostics_require_current_anatomy_authorization() {
+        let pupil_color = 0x00d8_5cff;
+        let limbus_color = 0x00ff_d447;
+        let overlay = raw_motion_octrees::MotionOctreeOverlay {
+            nested_eye_boundaries: Some(raw_motion_octrees::NestedEyeBoundaryPair {
+                pupil: raw_motion_octrees::IrisEllipseSeed::circle((40.0, 40.0), 10.0),
+                limbus: raw_motion_octrees::IrisEllipseSeed::circle((40.0, 40.0), 20.0),
+                confidence: 0.9,
+                pupil_to_limbus_radius_ratio: 0.5,
+                pupil_support: 16,
+                limbus_support: 16,
+                paired_support: 12,
+                paired_phases_rad: vec![0.0, std::f32::consts::FRAC_PI_2],
+                input_seed_was_pupil_like: false,
+            }),
+            ..raw_motion_octrees::MotionOctreeOverlay::default()
+        };
+        let width = 96;
+        let height = 96;
+        let mut pixels = vec![0u32; width * height];
+
+        draw_motion_octree_overlay(&mut pixels, width, height, 0, 0, 1, &overlay, false);
+        assert!(!pixels.iter().any(|pixel| *pixel == pupil_color));
+        assert!(!pixels.iter().any(|pixel| *pixel == limbus_color));
+
+        pixels.fill(0);
+        draw_motion_octree_overlay(&mut pixels, width, height, 0, 0, 1, &overlay, true);
+        assert!(pixels.iter().any(|pixel| *pixel == pupil_color));
+        assert!(pixels.iter().any(|pixel| *pixel == limbus_color));
+    }
+
+    #[test]
+    fn motion_overlay_draws_current_frame_lid_censor_curve_and_native_support() {
+        let mut lid_occlusion = raw_motion_octrees::LidOcclusionCurve::default();
+        lid_occlusion.upper = false;
+        lid_occlusion.confidence = 0.9;
+        lid_occlusion.points = vec![(10.0, 20.0), (20.0, 21.0), (30.0, 20.0)];
+        lid_occlusion.support_points = vec![(20.0, 21.0)];
+        let overlay = raw_motion_octrees::MotionOctreeOverlay {
+            lid_occlusions: vec![lid_occlusion],
+            ..raw_motion_octrees::MotionOctreeOverlay::default()
+        };
+        let width = 128;
+        let height = 96;
+        let mut pixels = vec![0u32; width * height];
+
+        draw_motion_octree_overlay(&mut pixels, width, height, 5, 7, 2, &overlay, false);
+
+        assert!(
+            pixels.iter().any(|pixel| *pixel == 0x00ff_72d8),
+            "the fitted lower palpebral margin and skin-side hatches must be visible"
+        );
+        assert!(
+            pixels.iter().any(|pixel| *pixel == 0x00ff_c8ec),
+            "the exact native Canny support point must remain distinguishable"
+        );
     }
 
     #[test]
@@ -54357,7 +56322,7 @@ mod tests {
         let height = 96;
         let green = motion_object_color(raw_motion_octrees::PUPIL_LAYER);
         let mut pixels = vec![0u32; width * height];
-        draw_motion_octree_overlay(&mut pixels, width, height, 0, 0, 1, &overlay);
+        draw_motion_octree_overlay(&mut pixels, width, height, 0, 0, 1, &overlay, false);
         assert!(
             !pixels.iter().any(|pixel| *pixel == green),
             "a search region must not masquerade as published anatomy"
@@ -54366,7 +56331,7 @@ mod tests {
         overlay.coupled_motion.projected_globe.anatomy_authorized = true;
         overlay.coupled_motion.projected_globe.publishable = true;
         pixels.fill(0);
-        draw_motion_octree_overlay(&mut pixels, width, height, 0, 0, 1, &overlay);
+        draw_motion_octree_overlay(&mut pixels, width, height, 0, 0, 1, &overlay, false);
         assert!(pixels.iter().any(|pixel| *pixel == green));
     }
 
@@ -54405,7 +56370,7 @@ mod tests {
         let width = 128;
         let height = 128;
         let mut pixels = vec![0u32; width * height];
-        draw_motion_octree_overlay(&mut pixels, width, height, 10, 10, 1, &overlay);
+        draw_motion_octree_overlay(&mut pixels, width, height, 10, 10, 1, &overlay, false);
         assert_eq!(pixels[(10 + 20) * width + 10 + 50], 0x0058_2868);
         assert_eq!(pixels[(10 + 80) * width + 10 + 50], 0x0000_efff);
     }
@@ -58489,7 +60454,63 @@ mod tests {
         let host = row["host_arrival_unix_ns"].as_u64().unwrap();
         assert!((before..=after).contains(&host));
         assert_ne!(host, header.timestamp_ns);
+        let predictions = Command::new("tar")
+            .args(["-xOf"])
+            .arg(&output)
+            .arg("predictions.jsonl")
+            .output()
+            .unwrap();
+        assert!(predictions.status.success());
+        let prediction: serde_json::Value = serde_json::from_slice(&predictions.stdout).unwrap();
+        assert_eq!(prediction["analysis_state"], "unavailable");
+        assert_eq!(prediction["roi_frame_key"]["roi_id"].as_u64(), Some(1));
+        assert_eq!(
+            prediction["roi_frame_key"]["sequence"].as_u64(),
+            Some(header.sequence)
+        );
+        assert_eq!(
+            prediction["roi_frame_key"]["sensor_timestamp_ns"].as_u64(),
+            Some(header.timestamp_ns)
+        );
+        assert_eq!(prediction["semantic"]["observed_role"], "unknown");
+        assert!(prediction["predictions"]["eye_candidate"].is_null());
         fs::remove_file(output).unwrap();
+    }
+
+    #[test]
+    fn prediction_trace_keeps_unknown_roi_analysis_without_calling_it_an_eye() {
+        let mut frame = control_eye_frame(91);
+        frame.eye_identity_present = false;
+        frame.focus_anatomy_valid = false;
+        frame.focus_eye_basin_valid = false;
+        frame.outer_iris_points = Arc::new(vec![(1.25, 2.5), (3.75, 0.5)]);
+
+        let row = roi_prediction_record(&frame);
+
+        assert_eq!(row["analysis_state"], "complete");
+        assert_eq!(row["semantic"]["observed_role"], "unknown");
+        assert_eq!(row["semantic"]["configured_role"], "subject-right-eye");
+        assert!(row["predictions"]["eye_candidate"].is_object());
+        assert_eq!(
+            row["predictions"]["eye_candidate"]["limbus"]["published_points"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert!(row["predictions"]["mouth_candidate"].is_null());
+    }
+
+    #[test]
+    fn prediction_trace_marks_only_corroborated_anatomy_as_eye() {
+        let frame = control_eye_frame(92);
+        let row = roi_prediction_record(&frame);
+
+        assert_eq!(row["semantic"]["observed_role"], "eye");
+        assert_eq!(row["semantic"]["accepted_eye"], true);
+        assert_eq!(
+            row["roi_frame_key"]["sequence"].as_u64(),
+            Some(frame.sequence)
+        );
     }
 
     #[test]
