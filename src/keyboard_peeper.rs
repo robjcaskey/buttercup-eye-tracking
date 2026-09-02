@@ -130,7 +130,7 @@ pub fn buttercup_map(virtual_mouse: bool, driving: bool) -> HotkeyMap {
     add("=", "Iris max +", !virtual_mouse);
     add("N", "Pattern", virtual_mouse);
     add("V", "View", true);
-    add("F", "Spatial debug", true);
+    add("F", "ROI labels", true);
     add("X", "Lighthouse", true);
     add("Z", "Screen clock", true);
     add("K", "Edge map", true);
@@ -302,7 +302,7 @@ mod tests {
         assert!(!binding(&normal, "T").enabled);
         assert!(binding(&normal, "-").enabled);
         assert_eq!(binding(&normal, "[").label, "Iris min -");
-        assert_eq!(binding(&normal, "F").label, "Spatial debug");
+        assert_eq!(binding(&normal, "F").label, "ROI labels");
 
         let mouse_driving = buttercup_map(true, true);
         assert!(binding(&mouse_driving, "B").enabled);

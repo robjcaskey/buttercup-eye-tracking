@@ -4059,6 +4059,444 @@ fn labeled_distance_summary_json(values: &[f64]) -> Value {
     })
 }
 
+fn signed_distribution_json(values: &[f64]) -> Value {
+    if values.is_empty() {
+        return Value::Null;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let at = |fraction: f64| {
+        sorted[((sorted.len().saturating_sub(1) as f64 * fraction).round() as usize)
+            .min(sorted.len().saturating_sub(1))]
+    };
+    json!({
+        "samples": sorted.len(),
+        "minimum": at(0.0),
+        "p10": at(0.10),
+        "median": at(0.50),
+        "p90": at(0.90),
+        "maximum": at(1.0),
+    })
+}
+
+fn labeled_light_candidate_features(
+    candidate: raw_iris_focus::OuterIrisCandidateDebug,
+) -> [(&'static str, f64); 24] {
+    [
+        ("fused_score", candidate.fused_score),
+        ("luma_score", candidate.luma_score),
+        ("material_light_score", candidate.material_light_score),
+        ("reflectance_score", candidate.reflectance_score),
+        ("intrinsic_shadow_bonus", candidate.intrinsic_shadow_bonus),
+        ("shadow_disagreement", candidate.shadow_disagreement),
+        ("reflectance_plateau", candidate.reflectance_plateau),
+        (
+            "intrinsic_intensity_step",
+            candidate.intrinsic_intensity_step,
+        ),
+        ("meridian_profile_score", candidate.meridian_profile_score),
+        ("margin_clarity", candidate.margin_clarity),
+        ("pupil_void", candidate.pupil_void),
+        ("inner_limbus_step", candidate.inner_limbus_step),
+        ("iris_band", candidate.iris_band),
+        ("sclera_out", candidate.sclera_out),
+        ("far_sclera", candidate.far_sclera),
+        ("rough_rho", candidate.rough_rho),
+        ("common_mode_step", candidate.common_mode_step),
+        ("direct_chroma_jump", candidate.direct_chroma_jump),
+        (
+            "achromatic_edge_fraction",
+            candidate.achromatic_edge_fraction,
+        ),
+        (
+            "normal_edge_concentration",
+            candidate.normal_edge_concentration,
+        ),
+        (
+            "tangential_step_coherence",
+            candidate.tangential_step_coherence,
+        ),
+        ("inside_texture_energy", candidate.inside_texture_energy),
+        ("outside_texture_energy", candidate.outside_texture_energy),
+        ("texture_drop", candidate.texture_drop),
+    ]
+}
+
+fn labeled_light_candidate_json(
+    candidate: raw_iris_focus::OuterIrisCandidateDebug,
+    reference_distance_px: f64,
+) -> Value {
+    json!({
+        "point": [candidate.x, candidate.y],
+        "reference_distance_px": reference_distance_px,
+        "fused_score": candidate.fused_score,
+        "luma_score": candidate.luma_score,
+        "material_light_score": candidate.material_light_score,
+        "reflectance_score": candidate.reflectance_score,
+        "intrinsic_shadow_bonus": candidate.intrinsic_shadow_bonus,
+        "shadow_disagreement": candidate.shadow_disagreement,
+        "reflectance_plateau": candidate.reflectance_plateau,
+        "intrinsic_intensity_step": candidate.intrinsic_intensity_step,
+        "meridian_profile_score": candidate.meridian_profile_score,
+        "margin_clarity": candidate.margin_clarity,
+        "pupil_void": candidate.pupil_void,
+        "inner_limbus_step": candidate.inner_limbus_step,
+        "iris_band": candidate.iris_band,
+        "sclera_out": candidate.sclera_out,
+        "far_sclera": candidate.far_sclera,
+        "rough_rho": candidate.rough_rho,
+        "common_mode_step": candidate.common_mode_step,
+        "direct_chroma_jump": candidate.direct_chroma_jump,
+        "achromatic_edge_fraction": candidate.achromatic_edge_fraction,
+        "normal_edge_concentration": candidate.normal_edge_concentration,
+        "tangential_step_coherence": candidate.tangential_step_coherence,
+        "inside_texture_energy": candidate.inside_texture_energy,
+        "outside_texture_energy": candidate.outside_texture_energy,
+        "texture_drop": candidate.texture_drop,
+    })
+}
+
+#[derive(Default)]
+struct LabeledLightAuditAggregate {
+    rays: usize,
+    candidate_covered_rays: usize,
+    fused_hits: usize,
+    luma_hits: usize,
+    material_hits: usize,
+    material_changed: usize,
+    material_improved: usize,
+    material_regressed: usize,
+    oracle_distances: Vec<f64>,
+    fused_distances: Vec<f64>,
+    luma_distances: Vec<f64>,
+    material_distances: Vec<f64>,
+    fused_false_minus_truth: BTreeMap<&'static str, Vec<f64>>,
+    material_false_minus_truth: BTreeMap<&'static str, Vec<f64>>,
+}
+
+impl LabeledLightAuditAggregate {
+    fn observe(
+        &mut self,
+        oracle: (raw_iris_focus::OuterIrisCandidateDebug, f64),
+        fused: (raw_iris_focus::OuterIrisCandidateDebug, f64),
+        luma: (raw_iris_focus::OuterIrisCandidateDebug, f64),
+        material: (raw_iris_focus::OuterIrisCandidateDebug, f64),
+    ) {
+        const HIT_PX: f64 = 5.0;
+        const CLEARLY_FALSE_PX: f64 = 8.0;
+        self.rays += 1;
+        self.candidate_covered_rays += usize::from(oracle.1 <= HIT_PX);
+        self.fused_hits += usize::from(fused.1 <= HIT_PX);
+        self.luma_hits += usize::from(luma.1 <= HIT_PX);
+        self.material_hits += usize::from(material.1 <= HIT_PX);
+        self.oracle_distances.push(oracle.1);
+        self.fused_distances.push(fused.1);
+        self.luma_distances.push(luma.1);
+        self.material_distances.push(material.1);
+        let changed = (fused.0.x - material.0.x).hypot(fused.0.y - material.0.y) > 0.5;
+        self.material_changed += usize::from(changed);
+        self.material_improved += usize::from(changed && material.1 + 1.0 < fused.1);
+        self.material_regressed += usize::from(changed && fused.1 + 1.0 < material.1);
+
+        let record_false_delta = |destination: &mut BTreeMap<&'static str, Vec<f64>>,
+                                  selected: raw_iris_focus::OuterIrisCandidateDebug,
+                                  selected_distance: f64| {
+            if oracle.1 > HIT_PX || selected_distance < CLEARLY_FALSE_PX {
+                return;
+            }
+            for ((name, false_value), (_, truth_value)) in
+                labeled_light_candidate_features(selected)
+                    .into_iter()
+                    .zip(labeled_light_candidate_features(oracle.0))
+            {
+                if false_value.is_finite() && truth_value.is_finite() {
+                    destination
+                        .entry(name)
+                        .or_default()
+                        .push(false_value - truth_value);
+                }
+            }
+        };
+        record_false_delta(&mut self.fused_false_minus_truth, fused.0, fused.1);
+        record_false_delta(&mut self.material_false_minus_truth, material.0, material.1);
+    }
+
+    fn json(&self) -> Value {
+        let cue_deltas = |values: &BTreeMap<&'static str, Vec<f64>>| {
+            values
+                .iter()
+                .map(|(name, values)| ((*name).to_string(), signed_distribution_json(values)))
+                .collect::<serde_json::Map<String, Value>>()
+        };
+        json!({
+            "rays": self.rays,
+            "candidate_coverage_within_5px": self.candidate_covered_rays,
+            "candidate_coverage_fraction": self.candidate_covered_rays as f64 / self.rays.max(1) as f64,
+            "fused_top_within_5px": self.fused_hits,
+            "fused_top_fraction": self.fused_hits as f64 / self.rays.max(1) as f64,
+            "luma_top_within_5px": self.luma_hits,
+            "luma_top_fraction": self.luma_hits as f64 / self.rays.max(1) as f64,
+            "material_light_top_within_5px": self.material_hits,
+            "material_light_top_fraction": self.material_hits as f64 / self.rays.max(1) as f64,
+            "material_changed_candidate": self.material_changed,
+            "material_improved_by_over_1px": self.material_improved,
+            "material_regressed_by_over_1px": self.material_regressed,
+            "oracle_reference_distance_px": labeled_distance_summary_json(&self.oracle_distances),
+            "fused_top_reference_distance_px": labeled_distance_summary_json(&self.fused_distances),
+            "luma_top_reference_distance_px": labeled_distance_summary_json(&self.luma_distances),
+            "material_light_top_reference_distance_px": labeled_distance_summary_json(&self.material_distances),
+            "clearly_false_fused_minus_truth_cue_delta": cue_deltas(&self.fused_false_minus_truth),
+            "clearly_false_material_minus_truth_cue_delta": cue_deltas(&self.material_false_minus_truth),
+        })
+    }
+}
+
+/// Fast, label-posthoc audit of the RAW light/material cues on each visible
+/// limbus meridian. It never fits or publishes geometry. Labels choose only
+/// which ray to inspect and measure error after the complete candidate lattice
+/// has been generated independently by production code.
+pub(super) fn labeled_light_audit<I>(mut args: I) -> Result<(), String>
+where
+    I: Iterator<Item = String>,
+{
+    let output_path = PathBuf::from(args.next().ok_or_else(|| {
+        "usage: buttercup_wayland_raw_eyes --offline-labeled-light-audit OUTPUT.json LABEL.json [LABEL.json ...]".to_string()
+    })?);
+    let label_paths = args.map(PathBuf::from).collect::<Vec<_>>();
+    if label_paths.is_empty() {
+        return Err("at least one label JSON is required".to_string());
+    }
+    if output_path.exists() {
+        return Err(format!("output already exists: {}", output_path.display()));
+    }
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    }
+    let cwd = env::current_dir().map_err(|error| error.to_string())?;
+    let workspace = if cwd.join("rust-helpers").is_dir() {
+        cwd
+    } else if cwd.file_name().and_then(|name| name.to_str()) == Some("rust-helpers") {
+        cwd.parent().unwrap_or(&cwd).to_path_buf()
+    } else {
+        cwd
+    };
+
+    let mut aggregate = LabeledLightAuditAggregate::default();
+    let mut cases = Vec::new();
+    for (case_index, label_path) in label_paths.iter().enumerate() {
+        let label: Value = serde_json::from_slice(
+            &fs::read(label_path)
+                .map_err(|error| format!("read {}: {error}", label_path.display()))?,
+        )
+        .map_err(|error| format!("parse {}: {error}", label_path.display()))?;
+        let source = label
+            .get("source_raw")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{} has no source_raw", label_path.display()))?;
+        let source_raw = {
+            let path = PathBuf::from(source);
+            if path.is_absolute() {
+                path
+            } else {
+                workspace.join(path)
+            }
+        };
+        let metadata_path = labeled_raw_metadata_path(&source_raw)?;
+        let metadata: Value = serde_json::from_slice(
+            &fs::read(&metadata_path)
+                .map_err(|error| format!("read {}: {error}", metadata_path.display()))?,
+        )
+        .map_err(|error| format!("parse {}: {error}", metadata_path.display()))?;
+        let width = integer(&metadata, "width")? as usize;
+        let height = integer(&metadata, "height")? as usize;
+        let stride = integer(&metadata, "stride")? as usize;
+        let sensor_origin = (
+            integer(&metadata, "sensor_x")? as u32,
+            integer(&metadata, "sensor_y")? as u32,
+        );
+        let packed = fs::read(&source_raw)
+            .map_err(|error| format!("read {}: {error}", source_raw.display()))?;
+        let raw = raw10::try_unpack_raw10(&packed, width, height, stride)?;
+        let visible = labeled_limbus_points(&label, "visible");
+        let reference_pose = labeled_reference_pose(&label);
+        let focus = raw_iris_focus::score_stream_eye(&raw, width, height);
+        let upper = raw_iris_focus::detect_upper_eyelid_points(
+            &raw,
+            width,
+            height,
+            sensor_origin.0,
+            sensor_origin.1,
+            &focus,
+        );
+        let lower = raw_iris_focus::detect_lower_eyelid_points(
+            &raw,
+            width,
+            height,
+            sensor_origin.0,
+            sensor_origin.1,
+            &focus,
+        );
+        let lattice = raw_iris_focus::debug_outer_iris_candidate_lattice(
+            &raw,
+            width,
+            height,
+            sensor_origin.0,
+            sensor_origin.1,
+            &focus,
+            &upper,
+            &lower,
+        );
+        let mut by_ray = BTreeMap::<usize, Vec<raw_iris_focus::OuterIrisCandidateDebug>>::new();
+        for candidate in lattice.iter().copied() {
+            by_ray
+                .entry(candidate.ray_index)
+                .or_default()
+                .push(candidate);
+        }
+        let mut assignments = Vec::<((f64, f64), usize, f64)>::new();
+        for point in visible.iter().copied() {
+            if let Some((candidate, distance)) = lattice
+                .iter()
+                .copied()
+                .map(|candidate| {
+                    let distance = (candidate.x - point.0).hypot(candidate.y - point.1);
+                    (candidate, distance)
+                })
+                .min_by(|left, right| left.1.total_cmp(&right.1))
+            {
+                assignments.push((point, candidate.ray_index, distance));
+            }
+        }
+
+        let illumination = raw_iris_focus::debug_material_illumination_diagnostics(
+            &raw,
+            width,
+            height,
+            sensor_origin.0,
+            sensor_origin.1,
+            &focus,
+        );
+        let mut case_aggregate = LabeledLightAuditAggregate::default();
+        let mut targets = assignments
+            .iter()
+            .map(|(point, ray_index, assignment_distance)| {
+                (*ray_index, Some(*point), Some(*assignment_distance))
+            })
+            .collect::<Vec<_>>();
+        // Older reviewed annotations may contain a fitted reference but no
+        // explicit visible points. Keep those useful without ever promoting a
+        // newer diagnostic midline fit into ground truth.
+        if targets.is_empty() && reference_pose.is_some() {
+            targets.extend(by_ray.keys().map(|ray_index| (*ray_index, None, None)));
+        }
+        let mut audited_targets = Vec::new();
+        for (ray_index, label_point, assignment_distance) in targets {
+            let Some(candidates) = by_ray.get(&ray_index) else {
+                continue;
+            };
+            let scored = candidates
+                .iter()
+                .copied()
+                .filter_map(|candidate| {
+                    let distance = if let Some(point) = label_point {
+                        (candidate.x - point.0).hypot(candidate.y - point.1)
+                    } else {
+                        labeled_point_to_ellipse_distance(
+                            (candidate.x, candidate.y),
+                            reference_pose?,
+                        )
+                    };
+                    distance.is_finite().then_some((candidate, distance))
+                })
+                .collect::<Vec<_>>();
+            let Some(oracle) = scored
+                .iter()
+                .copied()
+                .min_by(|left, right| left.1.total_cmp(&right.1))
+            else {
+                continue;
+            };
+            let fused = scored
+                .iter()
+                .copied()
+                .max_by(|left, right| left.0.fused_score.total_cmp(&right.0.fused_score))
+                .expect("nonempty candidate ray");
+            let luma = scored
+                .iter()
+                .copied()
+                .max_by(|left, right| left.0.luma_score.total_cmp(&right.0.luma_score))
+                .expect("nonempty candidate ray");
+            let material = scored
+                .iter()
+                .copied()
+                .max_by(|left, right| {
+                    left.0
+                        .material_light_score
+                        .total_cmp(&right.0.material_light_score)
+                })
+                .expect("nonempty candidate ray");
+            case_aggregate.observe(oracle, fused, luma, material);
+            aggregate.observe(oracle, fused, luma, material);
+            audited_targets.push(json!({
+                "ray_index": ray_index,
+                "candidate_count": candidates.len(),
+                "label_point": label_point.map(|point| [point.0, point.1]),
+                "label_to_nearest_lattice_distance_px": assignment_distance,
+                "oracle": labeled_light_candidate_json(oracle.0, oracle.1),
+                "fused_top": labeled_light_candidate_json(fused.0, fused.1),
+                "luma_top": labeled_light_candidate_json(luma.0, luma.1),
+                "material_light_top": labeled_light_candidate_json(material.0, material.1),
+            }));
+        }
+        cases.push(json!({
+            "case": format!("case-{:02}", case_index + 1),
+            "label": label_path,
+            "source_raw": source_raw,
+            "sensor_origin": [sensor_origin.0, sensor_origin.1],
+            "size": [width, height],
+            "visible_label_points": visible.len(),
+            "candidate_lattice_size": lattice.len(),
+            "focus_seed": {
+                "center": [focus.center.0, focus.center.1],
+                "radius": focus.radius,
+                "eye_basin_valid": focus.eye_basin_valid,
+            },
+            "illumination_model": illumination.map(|diagnostics| json!({
+                "reliable": raw_iris_focus::debug_material_illumination_is_reliable(diagnostics),
+                "sample_count": diagnostics.sample_count,
+                "iris_sample_count": diagnostics.iris_sample_count,
+                "sclera_sample_count": diagnostics.sclera_sample_count,
+                "lateral_sclera_balance": diagnostics.lateral_sclera_balance,
+                "residual_median": diagnostics.residual_median,
+                "inlier_fraction": diagnostics.inlier_fraction,
+                "light_span": diagnostics.light_span,
+            })),
+            "summary": case_aggregate.json(),
+            "audited_visible_targets": audited_targets,
+        }));
+    }
+    let report = json!({
+        "schema": "buttercup-labeled-light-structure-audit-v1",
+        "policy": {
+            "inference_input": false,
+            "raw_space": "native lossless RAW10; no resize or RGB image round trip",
+            "label_use": "posthoc ray selection and direct distance to each human-visible point; a reviewed fitted ellipse is used only for legacy annotations with no visible points",
+            "hit_threshold_px": 5.0,
+            "clearly_false_threshold_px": 8.0,
+            "cue_delta_sign": "positive means the selected false edge had more of the cue than the nearest-to-truth candidate on the same ray",
+        },
+        "aggregate": aggregate.json(),
+        "cases": cases,
+    });
+    let output_file = File::create(&output_path)
+        .map_err(|error| format!("create {}: {error}", output_path.display()))?;
+    serde_json::to_writer_pretty(output_file, &report)
+        .map_err(|error| format!("write {}: {error}", output_path.display()))?;
+    println!("{}", output_path.display());
+    Ok(())
+}
+
 fn labeled_ellipse_reference_comparison_json(
     reference: Option<DrivingAffinePose>,
     prediction: Option<DrivingAffinePose>,
@@ -4586,7 +5024,6 @@ where
                 iris_seed_from_driving_pose(pose),
                 Some(&focus),
                 radius_prior,
-                None,
             )
         });
         let two_d_measured_multibank_pose = two_d_measured_multibank_seed
@@ -6936,16 +7373,14 @@ where
         let mut cluster_seed_geometry_measured = false;
         if temporal_feature_layer_ready_for_geometry(&cluster_overlay) {
             if let Some(seed) = cluster_seed {
-                let aim = temporal_canny_motion_conditioned_measurement_aim(seed, &cluster_overlay);
                 if let Some(measured) = measured_multibank_temporal_canny_seed(
                     &raw,
                     width,
                     height,
                     sensor_origin,
-                    aim.seed,
+                    seed,
                     Some(&focus),
                     cluster_prior,
-                    aim.center_prior,
                 ) {
                     cluster_seed = Some(measured);
                     cluster_seed_geometry_measured = true;
@@ -7063,7 +7498,7 @@ where
             .as_ref()
             .and_then(|hypothesis| cluster_overlay.layers.get(hypothesis.motion_layer))
             .map_or(0, |layer| layer.persistent_tracks);
-        let mut cluster_semantic_assessment = temporal_feature_limbus_semantic_assessment(
+        let cluster_semantic_assessment = temporal_feature_limbus_semantic_assessment(
             cluster_candidate.as_ref(),
             cluster_seed,
             cluster_prior,
@@ -7077,16 +7512,6 @@ where
             cluster_reflection_disk_evidence,
             cluster_layer_tracks,
         );
-        let cluster_radial_center_assessment = temporal_feature_radial_center_assessment(
-            cluster_candidate
-                .as_ref()
-                .map(|hypothesis| hypothesis.center),
-            &cluster_overlay,
-        );
-        if cluster_semantic_assessment.admissible && !cluster_radial_center_assessment.admissible {
-            cluster_semantic_assessment.admissible = false;
-            cluster_semantic_assessment.reason = "radial-vertical-center-disagreement";
-        }
         let cluster_layer_motion = cluster_candidate.as_ref().and_then(|hypothesis| {
             cluster_overlay
                 .motions
@@ -7651,15 +8076,6 @@ where
                 "material_topology_probe": driving_json(cluster_topology_probe),
                 "iris_texture": texture_json(cluster_texture),
                 "center_kinematics": temporal_feature_center_assessment_json(cluster_center_assessment),
-                "radial_center_kinematics": {
-                    "checked": cluster_radial_center_assessment.checked,
-                    "admissible": cluster_radial_center_assessment.admissible,
-                    "vertical_departure_px": cluster_radial_center_assessment.vertical_departure_px,
-                    "maximum_vertical_departure_px": cluster_radial_center_assessment.maximum_vertical_departure_px,
-                    "fused_probes": cluster_radial_center_assessment.fused_probes,
-                    "fused_image_left": cluster_radial_center_assessment.fused_image_left,
-                    "fused_image_right": cluster_radial_center_assessment.fused_image_right,
-                },
                 "semantic_admission": temporal_feature_semantic_assessment_json(cluster_semantic_assessment),
                 "semantic_eye": driving_semantic_eye_json(cluster_semantic_eye),
                 "diagnostics": feature_cluster_diagnostics_json(cluster_diagnostics),
@@ -7680,15 +8096,6 @@ where
                 "radial_limbus": {
                     "accepted": cluster_overlay.radial_limbus_probes.len(),
                     "fused": cluster_overlay.radial_limbus_probes.iter().filter(|probe| probe.fused).count(),
-                    "probes": cluster_overlay.radial_limbus_probes.iter().map(|probe| json!({
-                        "point": probe.point,
-                        "normal": probe.normal,
-                        "phase_rad": probe.phase_rad,
-                        "radial_shift_px": probe.radial_shift_px,
-                        "profile_cost": probe.profile_cost,
-                        "confidence": probe.confidence,
-                        "fused": probe.fused,
-                    })).collect::<Vec<_>>(),
                     "image_left": cluster_radial_left,
                     "image_left_fused": cluster_radial_left_fused,
                     "image_right": cluster_radial_right,

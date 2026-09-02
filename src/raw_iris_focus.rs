@@ -3060,6 +3060,13 @@ impl NativeLogPlane {
         )
     }
 
+    fn sample_reflectance_chroma(&self, x: f64, y: f64) -> (f64, f64) {
+        (
+            self.sample_map(&self.reflectance_log_rg, x, y),
+            self.sample_map(&self.reflectance_log_bg, x, y),
+        )
+    }
+
     fn sample_intensity(&self, x: f64, y: f64) -> f64 {
         self.sample_map(&self.intensity, x, y)
     }
@@ -5814,6 +5821,162 @@ pub struct OuterIrisCandidateDebug {
     pub sclera_out: f64,
     pub far_sclera: f64,
     pub rough_rho: f64,
+    /// Direct common-mode log-intensity change across the candidate. This is
+    /// measured independently of the fitted material/light model.
+    pub common_mode_step: f64,
+    /// Direct change in scale-invariant two-axis RAW log chroma.
+    pub direct_chroma_jump: f64,
+    /// Near one for a mostly achromatic brightness edge, near zero for a
+    /// primarily chromatic/material transition. It is evidence, not a veto.
+    pub achromatic_edge_fraction: f64,
+    /// Fraction of normal-profile derivative energy concentrated at its
+    /// strongest sample. Broad penumbrae tend lower than localized edges.
+    pub normal_edge_concentration: f64,
+    /// Agreement of the common-mode step at five neighboring tangential
+    /// samples. This distinguishes a coherent light boundary from a speck.
+    pub tangential_step_coherence: f64,
+    /// Native log-luma texture energy on the iris-facing side.
+    pub inside_texture_energy: f64,
+    /// Native log-luma texture energy on the sclera-facing side.
+    pub outside_texture_energy: f64,
+    /// Positive when the inside is more textured than the outside, as is
+    /// common at an iris-to-sclera transition; close to zero for one material
+    /// crossed by a gain-only shadow.
+    pub texture_drop: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct OuterLightStructureDebug {
+    common_mode_step: f64,
+    direct_chroma_jump: f64,
+    achromatic_edge_fraction: f64,
+    normal_edge_concentration: f64,
+    tangential_step_coherence: f64,
+    inside_texture_energy: f64,
+    outside_texture_energy: f64,
+    texture_drop: f64,
+}
+
+/// Inspect the local formation of an edge directly in native RAW coordinates.
+/// This deliberately does not consume the iris/sclera classifier or the
+/// polynomial illumination reconstruction: those are the hypotheses being
+/// audited. The decomposition asks whether the transition is a common gain
+/// applied across channels, whether it is a broad penumbra, and whether the
+/// material texture changes across it.
+fn debug_outer_light_structure(
+    native: Option<&NativeLogPlane>,
+    search: OuterSearchEllipse,
+    x: f64,
+    y: f64,
+) -> OuterLightStructureDebug {
+    let Some(native) = native else {
+        return OuterLightStructureDebug::default();
+    };
+    let local = search.normalized_coordinates(x, y);
+    let phase = local.1.atan2(local.0);
+    let (_, normal) = search.point_and_normal(phase, 1.0);
+    let tangent = (-normal.1, normal.0);
+    let point = |normal_offset: f64, tangent_offset: f64| {
+        (
+            x + normal.0 * normal_offset + tangent.0 * tangent_offset,
+            y + normal.1 * normal_offset + tangent.1 * tangent_offset,
+        )
+    };
+    let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len().max(1) as f64;
+    let rms_first_difference = |values: &[f64]| {
+        if values.len() < 2 {
+            return 0.0;
+        }
+        (values
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).powi(2))
+            .sum::<f64>()
+            / (values.len() - 1) as f64)
+            .sqrt()
+    };
+
+    let mut common_steps = Vec::new();
+    let mut chroma_jumps = Vec::new();
+    for distance in [2.5, 5.5, 9.0] {
+        let inside = point(-distance, 0.0);
+        let outside = point(distance, 0.0);
+        common_steps.push(
+            native.sample_log_intensity(outside.0, outside.1)
+                - native.sample_log_intensity(inside.0, inside.1),
+        );
+        let inside_chroma = native.sample_reflectance_chroma(inside.0, inside.1);
+        let outside_chroma = native.sample_reflectance_chroma(outside.0, outside.1);
+        chroma_jumps
+            .push((outside_chroma.0 - inside_chroma.0).hypot(outside_chroma.1 - inside_chroma.1));
+    }
+    let common_mode_step = mean(&common_steps);
+    let direct_chroma_jump = mean(&chroma_jumps);
+    let achromatic_edge_fraction =
+        common_mode_step.abs() / (common_mode_step.abs() + 2.5 * direct_chroma_jump + 0.015);
+
+    let normal_profile = (-7..=7)
+        .map(|index| {
+            let sample = point(index as f64 * 2.0, 0.0);
+            native.sample_log_intensity(sample.0, sample.1)
+        })
+        .collect::<Vec<_>>();
+    let normal_derivatives = normal_profile
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).abs())
+        .collect::<Vec<_>>();
+    let derivative_sum = normal_derivatives.iter().sum::<f64>();
+    let normal_edge_concentration = normal_derivatives
+        .into_iter()
+        .max_by(f64::total_cmp)
+        .unwrap_or(0.0)
+        / derivative_sum.max(1.0e-9);
+
+    let tangent_offsets = [-10.0, -5.0, 0.0, 5.0, 10.0];
+    let tangential_steps = tangent_offsets
+        .map(|offset| {
+            let inside = point(-5.5, offset);
+            let outside = point(5.5, offset);
+            native.sample_log_intensity(outside.0, outside.1)
+                - native.sample_log_intensity(inside.0, inside.1)
+        })
+        .to_vec();
+    let tangential_mean = mean(&tangential_steps);
+    let tangential_mad = mean(
+        &tangential_steps
+            .iter()
+            .map(|value| (value - tangential_mean).abs())
+            .collect::<Vec<_>>(),
+    );
+    let tangential_step_coherence =
+        (1.0 - tangential_mad / (tangential_mean.abs() + 0.08)).clamp(0.0, 1.0);
+
+    let inside_texture = tangent_offsets
+        .map(|offset| {
+            let sample = point(-7.0, offset);
+            native.sample_log_intensity(sample.0, sample.1)
+        })
+        .to_vec();
+    let outside_texture = tangent_offsets
+        .map(|offset| {
+            let sample = point(7.0, offset);
+            native.sample_log_intensity(sample.0, sample.1)
+        })
+        .to_vec();
+    let inside_texture_energy = rms_first_difference(&inside_texture);
+    let outside_texture_energy = rms_first_difference(&outside_texture);
+    let texture_drop = (inside_texture_energy - outside_texture_energy)
+        / (inside_texture_energy + outside_texture_energy + 0.02);
+
+    OuterLightStructureDebug {
+        common_mode_step,
+        direct_chroma_jump,
+        achromatic_edge_fraction,
+        normal_edge_concentration,
+        tangential_step_coherence,
+        inside_texture_energy,
+        outside_texture_energy,
+        texture_drop,
+    }
 }
 
 /// Offline diagnostics for validating the complete limbus candidate lattice
@@ -5838,6 +6001,7 @@ pub fn debug_outer_iris_candidate_lattice(
     let native = native_log_plane(raw, width, height, sensor_x, sensor_y, coarse)
         .map(blur_outer_appearance)
         .map(Arc::new);
+    let debug_native = native.clone();
     let appearance = native
         .as_deref()
         .and_then(|plane| estimate_iris_sclera_appearance(plane, rough_search));
@@ -5879,9 +6043,15 @@ pub fn debug_outer_iris_candidate_lattice(
         .into_iter()
         .enumerate()
         .flat_map(|(ray_index, candidates)| {
-            candidates
-                .into_iter()
-                .map(move |candidate| OuterIrisCandidateDebug {
+            let debug_native = debug_native.clone();
+            candidates.into_iter().map(move |candidate| {
+                let light = debug_outer_light_structure(
+                    debug_native.as_deref(),
+                    rough_search,
+                    candidate.point.x,
+                    candidate.point.y,
+                );
+                OuterIrisCandidateDebug {
                     ray_index,
                     x: candidate.point.x,
                     y: candidate.point.y,
@@ -5901,7 +6071,16 @@ pub fn debug_outer_iris_candidate_lattice(
                     sclera_out: candidate.sclera_out,
                     far_sclera: candidate.far_sclera,
                     rough_rho: candidate.rough_rho,
-                })
+                    common_mode_step: light.common_mode_step,
+                    direct_chroma_jump: light.direct_chroma_jump,
+                    achromatic_edge_fraction: light.achromatic_edge_fraction,
+                    normal_edge_concentration: light.normal_edge_concentration,
+                    tangential_step_coherence: light.tangential_step_coherence,
+                    inside_texture_energy: light.inside_texture_energy,
+                    outside_texture_energy: light.outside_texture_energy,
+                    texture_drop: light.texture_drop,
+                }
+            })
         })
         .collect()
 }

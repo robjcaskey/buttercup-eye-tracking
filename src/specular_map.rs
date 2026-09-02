@@ -18,6 +18,12 @@ pub struct SpecularViews {
     pub specular_map: Vec<u32>,
     pub cross_polarized: Vec<u32>,
     pub diffuse: Vec<u32>,
+    /// Presentation-only broad illumination field. Mid-gray is the robust
+    /// frame reference; darker/brighter pixels show multiplicative shading.
+    pub illumination: Vec<u32>,
+    /// Presentation estimate of surface reflectance after broad local
+    /// illumination and the neutral specular component are divided out.
+    pub albedo: Vec<u32>,
     pub motion_compensated: bool,
 }
 
@@ -27,6 +33,8 @@ impl SpecularViews {
             specular_map: vec![0; pixel_count],
             cross_polarized: vec![0; pixel_count],
             diffuse: vec![0; pixel_count],
+            illumination: vec![0; pixel_count],
+            albedo: vec![0; pixel_count],
             motion_compensated: false,
         }
     }
@@ -208,14 +216,18 @@ impl SpecularMapTracker {
         let mut specular_map = Vec::with_capacity(pixel_count);
         let mut cross_polarized = Vec::with_capacity(pixel_count);
         let mut diffuse = Vec::with_capacity(pixel_count);
+        let mut illumination = Vec::with_capacity(pixel_count);
+        let mut albedo = Vec::with_capacity(pixel_count);
         let mut diffuse_linear = Vec::with_capacity(pixel_count);
         let mut used_motion = false;
+        let illumination_radius = (width.min(height) / 12).clamp(8, 24);
         for y in 0..height {
             for x in 0..width {
                 let index = y * width + x;
                 let pixel = pixels[index];
                 let pixel_luma = luma(pixel);
                 let local = box_average(&integral, width, height, x, y, 4);
+                let broad = box_average(&integral, width, height, x, y, illumination_radius);
                 let local_rgb = [local[1], local[2], local[3]];
                 let maximum = pixel[0].max(pixel[1]).max(pixel[2]);
                 let minimum = pixel[0].min(pixel[1]).min(pixel[2]);
@@ -251,10 +263,30 @@ impl SpecularMapTracker {
                 let diffuse_pixel = std::array::from_fn(|channel| {
                     pixel[channel] * (1.0 - score) + replacement[channel] * score
                 });
+                // Remove broad multiplicative illumination while retaining
+                // local chroma and fine reflectance texture. The robust frame
+                // baseline fixes display brightness; clamping prevents deep
+                // occlusions from being amplified into invented structure.
+                // This is a diagnostic albedo estimate, not calibrated
+                // photometry or an inference input.
+                let local_illumination = broad[0].max(8.0);
+                let reference_illumination = baseline.max(32.0);
+                let illumination_scale =
+                    (reference_illumination / local_illumination).clamp(0.45, 2.25);
+                let albedo_pixel =
+                    std::array::from_fn(|channel| diffuse_pixel[channel] * illumination_scale);
+                let relative_log_light = (local_illumination / reference_illumination).ln();
+                let illumination_level = (128.0 + 92.0 * relative_log_light)
+                    .round()
+                    .clamp(0.0, 255.0) as u32;
                 let map_level = (score.sqrt() * 255.0).round() as u32;
                 specular_map.push((map_level << 16) | (map_level << 8) | map_level);
                 cross_polarized.push(pack(cross));
                 diffuse.push(pack(diffuse_pixel));
+                illumination.push(
+                    (illumination_level << 16) | (illumination_level << 8) | illumination_level,
+                );
+                albedo.push(pack(albedo_pixel));
                 diffuse_linear.push(diffuse_pixel);
             }
         }
@@ -270,6 +302,8 @@ impl SpecularMapTracker {
             specular_map,
             cross_polarized,
             diffuse,
+            illumination,
+            albedo,
             motion_compensated: used_motion,
         }
     }
@@ -296,6 +330,30 @@ mod tests {
         assert_eq!(gray(views.specular_map[0]), 0);
         assert!(gray(views.cross_polarized[highlight]) < 100);
         assert!(gray(views.diffuse[highlight]) < 100);
+        assert!(gray(views.albedo[highlight]) < 120);
+    }
+
+    #[test]
+    fn albedo_view_suppresses_a_broad_multiplicative_light_step() {
+        let width = 64;
+        let height = 24;
+        let mut color = vec![0x0020_2830; width * height];
+        for row in color.chunks_exact_mut(width) {
+            row[width / 2..].fill(0x0040_5060);
+        }
+        let views = SpecularMapTracker::default().observe(&color, width, height, 0, 0, None);
+        let left = unpack(views.albedo[12 * width + 8]);
+        let right = unpack(views.albedo[12 * width + 55]);
+        assert!(
+            gray(views.illumination[12 * width + 8]) < gray(views.illumination[12 * width + 55]),
+            "the light-field view must retain the broad shading direction"
+        );
+        for channel in 0..3 {
+            assert!(
+                (left[channel] - right[channel]).abs() <= 2.0,
+                "left={left:?} right={right:?}"
+            );
+        }
     }
 
     #[test]

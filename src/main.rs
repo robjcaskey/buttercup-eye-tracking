@@ -127,11 +127,6 @@ const DRIVING_LOCAL_PRESENCE_SELF_AUTH_POSITIVE_ROWS: u32 = 72;
 // proposed affine iris annulus plus current-frame material and seed identity.
 const TEMPORAL_FEATURE_MIN_LAYER_TRACKS: usize = 16;
 const TEMPORAL_FEATURE_MIN_ANNULAR_TRACKS: usize = 6;
-// A motion-transported radial carrier must cover enough distinct normal lanes
-// to outvote a broad eyebrow/lid shadow. Eighteen is also the minimum used to
-// aim a new current-frame solve, so a solve trusted enough to consume this
-// carrier cannot slip through publication on a stricter, unrelated count.
-const TEMPORAL_FEATURE_MIN_RADIAL_CONSENSUS_PROBES: usize = 18;
 // Expensive current-frame geometry recovery is only useful after the motion
 // layer itself is cohesive. The reviewed glasses-junction sequence accumulated
 // many persistent skin/frame points but never exceeded 0.352 coherence; the
@@ -6640,6 +6635,8 @@ struct EyeFrame {
     specular_map: Arc<Vec<u32>>,
     cross_polarized: Arc<Vec<u32>>,
     diffuse: Arc<Vec<u32>>,
+    illumination: Arc<Vec<u32>>,
+    albedo: Arc<Vec<u32>>,
     specular_motion_compensated: bool,
     edge_map_variant: EdgeMapVariant,
     focus_score: f64,
@@ -9742,7 +9739,7 @@ fn handle_control_command(command: &str, shared: &Arc<Mutex<SharedState>>) -> St
             };
             let Some(mode) = annotated_view_mode(mode) else {
                 return control_error(
-                    "annotated mode must be QUAD_COLOR, RAW_COLOR, BLUE_FILTER, RED_FILTER, GREEN_FILTER, SPECULAR_MAP, CROSS_POLARIZED, DIFFUSE, QUAD_LUMA, RAW_LUMA, or CANNY",
+                    "annotated mode must be QUAD_COLOR, RAW_COLOR, BLUE_FILTER, RED_FILTER, GREEN_FILTER, SPECULAR_MAP, CROSS_POLARIZED, DIFFUSE, ILLUMINATION_MAP, ALBEDO_MAP, QUAD_LUMA, RAW_LUMA, or CANNY",
                 );
             };
             let frames = state.eyes.clone();
@@ -9768,7 +9765,7 @@ fn handle_control_command(command: &str, shared: &Arc<Mutex<SharedState>>) -> St
             }
         }
         [help] if help.eq_ignore_ascii_case("HELP") => {
-            "{\"ok\":true,\"commands\":[\"PING\",\"STATUS\",\"CHECKERBOARD START|STOP|RESET|STATUS\",\"SEGMENTATION NATIVE|SAM31|CLUSTERS|DRIVING|SCLERA-RED-CANNY\",\"SEGMENTATION STATUS\",\"IRIS STATUS\",\"IRIS BOUNDS MINIMUM|MAXIMUM +|-\",\"IRIS BOUNDS AUTO\",\"PUPIL STATUS\",\"PUPIL BOUNDS MINIMUM|MAXIMUM +|-\",\"PUPIL BOUNDS DEFAULT\",\"PUPIL CENTER IRIS-GUIDED|RAW-FOCUS|SAM31-CENTER|MEDIAPIPE-ACQUIRE|MEDIAPIPE-CONTINUOUS|DRIVING-TOPOLOGY\",\"PUPIL|IRIS RETICLE OFF|STATIC|PROJECTED|ON|TOGGLE\",\"EYE LASER ON|OFF|TOGGLE|STATUS\",\"DRIVING NORMAL|DOUBLE-SCLERA-10DEG|STATUS\",\"LEASE CLAIM OWNER TTL_MS\",\"LEASE RENEW TOKEN TTL_MS\",\"LEASE RELEASE TOKEN\",\"LEASE STATUS\",\"WITH TOKEN REACQUIRE\",\"WITH TOKEN LINEAR SNAPSHOT\",\"WITH TOKEN ROI HOLD RIGHT_X RIGHT_Y LEFT_X LEFT_Y\",\"WITH TOKEN ROI AUTO\",\"WITH TOKEN FOCUS EYE RIGHT|LEFT\",\"WITH TOKEN FOCUS SET N\",\"WITH TOKEN FOCUS AUTO\",\"WITH TOKEN EXPORT RAW RIGHT /absolute/path.raw10\",\"WITH TOKEN EXPORT RAW BOTH /absolute/prefix\",\"WITH TOKEN RECORD RAW BOTH SECONDS /absolute/file.tar\",\"RECORD STATUS\",\"EXPORT PRESENTATION /absolute/path.ppm\",\"EXPORT ANNOTATED RIGHT|LEFT|BOTH /absolute/path.ppm\",\"EXPORT ANNOTATED RIGHT|LEFT|BOTH QUAD_COLOR|RAW_COLOR|BLUE_FILTER|RED_FILTER|GREEN_FILTER|SPECULAR_MAP|CROSS_POLARIZED|DIFFUSE|QUAD_LUMA|RAW_LUMA|CANNY /absolute/path.ppm\",\"EXPORT STATUS\"]}".to_string()
+            "{\"ok\":true,\"commands\":[\"PING\",\"STATUS\",\"CHECKERBOARD START|STOP|RESET|STATUS\",\"SEGMENTATION NATIVE|SAM31|CLUSTERS|DRIVING|SCLERA-RED-CANNY\",\"SEGMENTATION STATUS\",\"IRIS STATUS\",\"IRIS BOUNDS MINIMUM|MAXIMUM +|-\",\"IRIS BOUNDS AUTO\",\"PUPIL STATUS\",\"PUPIL BOUNDS MINIMUM|MAXIMUM +|-\",\"PUPIL BOUNDS DEFAULT\",\"PUPIL CENTER IRIS-GUIDED|RAW-FOCUS|SAM31-CENTER|MEDIAPIPE-ACQUIRE|MEDIAPIPE-CONTINUOUS|DRIVING-TOPOLOGY\",\"PUPIL|IRIS RETICLE OFF|STATIC|PROJECTED|ON|TOGGLE\",\"EYE LASER ON|OFF|TOGGLE|STATUS\",\"DRIVING NORMAL|DOUBLE-SCLERA-10DEG|STATUS\",\"LEASE CLAIM OWNER TTL_MS\",\"LEASE RENEW TOKEN TTL_MS\",\"LEASE RELEASE TOKEN\",\"LEASE STATUS\",\"WITH TOKEN REACQUIRE\",\"WITH TOKEN LINEAR SNAPSHOT\",\"WITH TOKEN ROI HOLD RIGHT_X RIGHT_Y LEFT_X LEFT_Y\",\"WITH TOKEN ROI AUTO\",\"WITH TOKEN FOCUS EYE RIGHT|LEFT\",\"WITH TOKEN FOCUS SET N\",\"WITH TOKEN FOCUS AUTO\",\"WITH TOKEN EXPORT RAW RIGHT /absolute/path.raw10\",\"WITH TOKEN EXPORT RAW BOTH /absolute/prefix\",\"WITH TOKEN RECORD RAW BOTH SECONDS /absolute/file.tar\",\"RECORD STATUS\",\"EXPORT PRESENTATION /absolute/path.ppm\",\"EXPORT ANNOTATED RIGHT|LEFT|BOTH /absolute/path.ppm\",\"EXPORT ANNOTATED RIGHT|LEFT|BOTH QUAD_COLOR|RAW_COLOR|BLUE_FILTER|RED_FILTER|GREEN_FILTER|SPECULAR_MAP|CROSS_POLARIZED|DIFFUSE|ILLUMINATION_MAP|ALBEDO_MAP|QUAD_LUMA|RAW_LUMA|CANNY /absolute/path.ppm\",\"EXPORT STATUS\"]}".to_string()
         }
         [] => control_error("empty command"),
         _ => control_error("unknown command; send HELP"),
@@ -9854,6 +9851,8 @@ enum ViewMode {
     SpecularMap,
     CrossPolarized,
     Diffuse,
+    IlluminationMap,
+    AlbedoMap,
     QuadLuma,
     RawLuma,
     Canny,
@@ -9875,7 +9874,9 @@ impl ViewMode {
             Self::GreenFilter => Self::SpecularMap,
             Self::SpecularMap => Self::CrossPolarized,
             Self::CrossPolarized => Self::Diffuse,
-            Self::Diffuse => Self::QuadLuma,
+            Self::Diffuse => Self::IlluminationMap,
+            Self::IlluminationMap => Self::AlbedoMap,
+            Self::AlbedoMap => Self::QuadLuma,
             Self::QuadLuma => Self::RawLuma,
             Self::RawLuma => Self::Canny,
             Self::Canny => Self::QuadColor,
@@ -9889,6 +9890,61 @@ impl ViewMode {
             Self::GreenFilter => pixel & 0x0000_ff00,
             _ => pixel,
         }
+    }
+}
+
+/// Presentation-only label layers drawn over each lossless ROI. F cycles
+/// these independently of both the selected pixel view (V) and segmentation
+/// method (G), so inspecting evidence can never mutate tracker state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RoiOverlayMode {
+    #[default]
+    FullDiagnostics,
+    SpatialDebug,
+    RawFeaturePoints,
+    CannyEvidence,
+    Clean,
+}
+
+impl RoiOverlayMode {
+    const COUNT: usize = 5;
+
+    fn cycled(self) -> Self {
+        match self {
+            Self::FullDiagnostics => Self::SpatialDebug,
+            Self::SpatialDebug => Self::RawFeaturePoints,
+            Self::RawFeaturePoints => Self::CannyEvidence,
+            Self::CannyEvidence => Self::Clean,
+            Self::Clean => Self::FullDiagnostics,
+        }
+    }
+
+    fn ordinal(self) -> usize {
+        match self {
+            Self::FullDiagnostics => 1,
+            Self::SpatialDebug => 2,
+            Self::RawFeaturePoints => 3,
+            Self::CannyEvidence => 4,
+            Self::Clean => 5,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::FullDiagnostics => "FULL DIAGNOSTICS",
+            Self::SpatialDebug => "SPATIAL BOXES",
+            Self::RawFeaturePoints => "RAW FEATURE POINTS",
+            Self::CannyEvidence => "CANNY EVIDENCE",
+            Self::Clean => "CLEAN ROI",
+        }
+    }
+
+    fn show_spatial_debug_boxes(self) -> bool {
+        self == Self::SpatialDebug
+    }
+
+    fn show_full_diagnostics(self) -> bool {
+        matches!(self, Self::FullDiagnostics | Self::SpatialDebug)
     }
 }
 
@@ -10552,10 +10608,10 @@ struct App {
     checkerboard_status: checkerboard_calibration::StatusSnapshot,
     keyboard_peeper: keyboard_peeper::Registration,
     window_focused: bool,
-    /// Presentation-only visibility for coarse spatial search geometry. The
-    /// temporal octrees and horizontal deformation tree continue to run when
-    /// hidden; F exposes their projected boxes/spans for focused debugging.
-    spatial_debug_boxes_visible: bool,
+    /// Presentation-only ROI label layer. The temporal learners continue to
+    /// run unchanged while F selects full diagnostics, spatial geometry,
+    /// direct feature points, Canny evidence, or a clean image.
+    roi_overlay_mode: RoiOverlayMode,
 }
 
 impl App {
@@ -14925,27 +14981,6 @@ fn temporal_canny_decisive_analog_polish(
 /// and one bounded full-ROI bank.  In either case the returned geometry still
 /// requires a complete pupil-headed topology and semantic eye scene, and it
 /// cannot itself authorize 2D temporal identity or publication.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct TemporalCannyMeasurementCenterPrior {
-    center: (f64, f64),
-    horizontal_sigma_px: f64,
-    vertical_sigma_px: f64,
-}
-
-impl TemporalCannyMeasurementCenterPrior {
-    const MAXIMUM_NORMALIZED_DEPARTURE_SQUARED: f64 = 9.0;
-    const RANK_PENALTY_PER_SIGMA_SQUARED: f64 = 0.035;
-
-    fn rank_adjustment(self, center: (f64, f64)) -> Option<f64> {
-        let dx = (center.0 - self.center.0) / self.horizontal_sigma_px.max(1.0);
-        let dy = (center.1 - self.center.1) / self.vertical_sigma_px.max(1.0);
-        let normalized_departure_squared = dx * dx + dy * dy;
-        (normalized_departure_squared.is_finite()
-            && normalized_departure_squared <= Self::MAXIMUM_NORMALIZED_DEPARTURE_SQUARED)
-            .then_some(-Self::RANK_PENALTY_PER_SIGMA_SQUARED * normalized_departure_squared)
-    }
-}
-
 fn measured_multibank_temporal_canny_seed(
     raw: &[u16],
     width: usize,
@@ -14954,7 +14989,6 @@ fn measured_multibank_temporal_canny_seed(
     seed: raw_motion_octrees::IrisEllipseSeed,
     focus: Option<&raw_iris_focus::BorderFocus>,
     radius_prior: DrivingRadiusPrior,
-    center_prior: Option<TemporalCannyMeasurementCenterPrior>,
 ) -> Option<raw_motion_octrees::IrisEllipseSeed> {
     let trace = std::env::var_os("BUTTERCUP_TEMPORAL_CANNY_MEASUREMENT_TRACE").is_some();
     let measurement_started = Instant::now();
@@ -15028,9 +15062,6 @@ fn measured_multibank_temporal_canny_seed(
             // sampled pupil/sclera topology here so a brow, lid, wrinkle, or
             // glasses rim cannot acquire temporal identity from edge count alone.
             let pose = proposal.pose;
-            let center_prior_adjustment = center_prior
-                .map(|prior| prior.rank_adjustment(pose.center))
-                .unwrap_or(Some(0.0))?;
             let (sine, cosine) = pose.angle.sin_cos();
             let extent_x = (pose.major_radius * cosine).hypot(pose.minor_radius * sine);
             let extent_y = (pose.major_radius * sine).hypot(pose.minor_radius * cosine);
@@ -15040,7 +15071,7 @@ fn measured_multibank_temporal_canny_seed(
                 && pose.center.1 + extent_y <= height as f64 - 3.0;
             if trace {
                 eprintln!(
-                    "temporal-canny seed proposal pose=({:.1},{:.1},{:.1}x{:.1}@{:.2}) bank={:.3} weakq={:.3} support={:.3} samples={} select={:.3} center-prior={center_prior_adjustment:+.3} uncensored={uncensored}",
+                    "temporal-canny seed proposal pose=({:.1},{:.1},{:.1}x{:.1}@{:.2}) bank={:.3} weakq={:.3} support={:.3} samples={} select={:.3} uncensored={uncensored}",
                     pose.center.0,
                     pose.center.1,
                     pose.major_radius,
@@ -15259,7 +15290,6 @@ fn measured_multibank_temporal_canny_seed(
                 && (complete_pupil_headed_geometry || semantic_outer_only_geometry))
                 .then(|| {
                     temporal_canny_outer_geometry_rank(anatomy, semantic, *proposal, search_prior)
-                        + center_prior_adjustment
                         + if nested_outer_measurement || standalone_expanded_outer_measurement {
                             0.80
                         } else {
@@ -15515,7 +15545,6 @@ struct TemporalCannyGeometryWorkItem {
     seed: raw_motion_octrees::IrisEllipseSeed,
     focus: raw_iris_focus::BorderFocus,
     radius_prior: DrivingRadiusPrior,
-    center_prior: Option<TemporalCannyMeasurementCenterPrior>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -15588,7 +15617,6 @@ impl TemporalCannyGeometryWorker {
                     item.seed,
                     Some(&item.focus),
                     item.radius_prior,
-                    item.center_prior,
                 );
                 let result = TemporalCannyGeometryResult {
                     mode_session: item.mode_session,
@@ -18093,150 +18121,6 @@ fn temporal_feature_layer_ready_for_geometry(
                 && motion.residual.is_finite()
                 && motion.residual <= 3.20
         })
-}
-
-/// Aim the expensive current-frame outer-geometry measurement from the
-/// motion-transported limbus center when the temporal learner has both a
-/// cohesive layer and distributed native radial probes. Eyebrow/lid shadows
-/// can move a high-contrast current-frame seed vertically by several pixels;
-/// the transported region is less sensitive because measured inter-frame
-/// motion advances it before it is blended with the new observation.
-///
-/// This is deliberately a center prior only. The current frame keeps its own
-/// axes, projected area, and angle, and the downstream multi-bank solve still
-/// has to re-measure and authorize all geometry from untouched RAW samples.
-#[derive(Clone, Copy, Debug)]
-struct TemporalCannyMeasurementAim {
-    seed: raw_motion_octrees::IrisEllipseSeed,
-    center_prior: Option<TemporalCannyMeasurementCenterPrior>,
-}
-
-fn temporal_canny_motion_conditioned_measurement_aim(
-    current: raw_motion_octrees::IrisEllipseSeed,
-    overlay: &raw_motion_octrees::MotionOctreeOverlay,
-) -> TemporalCannyMeasurementAim {
-    let unconditioned = TemporalCannyMeasurementAim {
-        seed: current,
-        center_prior: None,
-    };
-    if !temporal_feature_layer_ready_for_geometry(overlay)
-        || overlay.radial_limbus_probes.len() < TEMPORAL_FEATURE_MIN_RADIAL_CONSENSUS_PROBES
-    {
-        return unconditioned;
-    }
-    let Some(transported) = overlay.radial_limbus_region else {
-        return unconditioned;
-    };
-    let current_radius = (current.major_radius * current.minor_radius).sqrt();
-    let transported_radius = (transported.major_radius * transported.minor_radius).sqrt();
-    if !current_radius.is_finite()
-        || !transported_radius.is_finite()
-        || current_radius < 12.0
-        || (transported_radius / current_radius).ln().abs() > 1.25f64.ln()
-    {
-        return unconditioned;
-    }
-    let center_step =
-        (transported.center.0 - current.center.0).hypot(transported.center.1 - current.center.1);
-    let maximum_step = (current_radius * 0.20).clamp(8.0, 22.0);
-    if !center_step.is_finite() || center_step > maximum_step {
-        return unconditioned;
-    }
-    let layer_residual = overlay
-        .layers
-        .iter()
-        .zip(overlay.motions.iter())
-        .filter(|(layer, motion)| {
-            layer.persistent_tracks >= 8
-                && layer.signature_samples >= 4
-                && layer.coherence >= TEMPORAL_FEATURE_MIN_GEOMETRY_LAYER_COHERENCE
-                && motion.support >= 8
-                && motion.residual.is_finite()
-                && motion.residual <= 3.20
-        })
-        .max_by(|(_, left), (_, right)| {
-            let quality = |motion: &raw_motion_octrees::SimilarityMotion| {
-                motion.support as f32 / (1.0 + motion.residual.max(0.0))
-            };
-            quality(left).total_cmp(&quality(right))
-        })
-        .map_or(2.0, |(_, motion)| f64::from(motion.residual));
-    TemporalCannyMeasurementAim {
-        seed: raw_motion_octrees::IrisEllipseSeed {
-            center: transported.center,
-            ..current
-        },
-        center_prior: Some(TemporalCannyMeasurementCenterPrior {
-            center: transported.center,
-            horizontal_sigma_px: (3.0 + 2.0 * layer_residual).clamp(5.0, 8.0),
-            vertical_sigma_px: (1.5 + layer_residual).clamp(2.5, 4.0),
-        }),
-    }
-}
-
-/// Publication-only check against the distributed current-frame normal-flow
-/// carrier. A cast eyebrow/lid shadow can win one local conic fit several
-/// pixels above or below the iris, while eighteen or more mutually consistent
-/// radial lanes continue to bracket the prior limbus. Keep the measured
-/// proposal available to the learner, but do not present it as current eye
-/// anatomy when that strong bilateral carrier disagrees vertically.
-///
-/// Horizontal displacement is intentionally not gated here: saccades and
-/// partial lateral framing make it both larger and better observed. The 5 px
-/// vertical boundary is applied only with at least eight fused lanes on each
-/// image side, so a single shadowed upper arc cannot create its own veto.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct TemporalFeatureRadialCenterAssessment {
-    checked: bool,
-    admissible: bool,
-    vertical_departure_px: f64,
-    maximum_vertical_departure_px: f64,
-    fused_probes: usize,
-    fused_image_left: usize,
-    fused_image_right: usize,
-}
-
-fn temporal_feature_radial_center_assessment(
-    candidate_center: Option<(f64, f64)>,
-    overlay: &raw_motion_octrees::MotionOctreeOverlay,
-) -> TemporalFeatureRadialCenterAssessment {
-    let mut assessment = TemporalFeatureRadialCenterAssessment {
-        admissible: true,
-        maximum_vertical_departure_px: 5.0,
-        ..TemporalFeatureRadialCenterAssessment::default()
-    };
-    let Some(candidate_center) = candidate_center else {
-        return assessment;
-    };
-    let Some(region) = overlay.radial_limbus_region else {
-        return assessment;
-    };
-    if !candidate_center.1.is_finite() || !region.center.1.is_finite() {
-        return assessment;
-    }
-    for probe in overlay
-        .radial_limbus_probes
-        .iter()
-        .filter(|probe| probe.fused)
-    {
-        assessment.fused_probes += 1;
-        if probe.normal[0] < -0.05 {
-            assessment.fused_image_left += 1;
-        } else if probe.normal[0] > 0.05 {
-            assessment.fused_image_right += 1;
-        }
-    }
-    if assessment.fused_probes < TEMPORAL_FEATURE_MIN_RADIAL_CONSENSUS_PROBES
-        || assessment.fused_image_left < 8
-        || assessment.fused_image_right < 8
-    {
-        return assessment;
-    }
-    assessment.checked = true;
-    assessment.vertical_departure_px = (candidate_center.1 - region.center.1).abs();
-    assessment.admissible =
-        assessment.vertical_departure_px <= assessment.maximum_vertical_departure_px;
-    assessment
 }
 
 /// Decide whether a persistent 2D conic has current eye identity.  Radius and
@@ -28164,6 +28048,8 @@ fn annotated_view_mode(value: &str) -> Option<ViewMode> {
         "SPECULAR" | "SPECULAR_MAP" => Some(ViewMode::SpecularMap),
         "CROSS_POLARIZED" | "CROSS_POLARISED" => Some(ViewMode::CrossPolarized),
         "DIFFUSE" | "DIFFUSED" => Some(ViewMode::Diffuse),
+        "ILLUMINATION" | "ILLUMINATION_MAP" | "LIGHT_FIELD" => Some(ViewMode::IlluminationMap),
+        "ALBEDO" | "ALBEDO_MAP" => Some(ViewMode::AlbedoMap),
         "QUAD_LUMA" => Some(ViewMode::QuadLuma),
         "RAW_LUMA" => Some(ViewMode::RawLuma),
         "CANNY" => Some(ViewMode::Canny),
@@ -28181,6 +28067,8 @@ fn annotated_view_mode_name(mode: ViewMode) -> &'static str {
         ViewMode::SpecularMap => "specular-map",
         ViewMode::CrossPolarized => "cross-polarized-estimate",
         ViewMode::Diffuse => "diffuse-reconstruction",
+        ViewMode::IlluminationMap => "broad-illumination-estimate",
+        ViewMode::AlbedoMap => "albedo-map-estimate",
         ViewMode::QuadLuma => "quad-luma",
         ViewMode::RawLuma => "raw-luma",
         ViewMode::Canny => "canny",
@@ -33383,10 +33271,6 @@ fn receive(
                         }
                     }
                     if let Some(seed) = cluster_ellipse_seed {
-                        let aim = temporal_canny_motion_conditioned_measurement_aim(
-                            seed,
-                            &motion_overlay,
-                        );
                         temporal_canny_geometry_workers[index].submit(
                             TemporalCannyGeometryWorkItem {
                                 mode_session: temporal_canny_mode_session,
@@ -33396,10 +33280,9 @@ fn receive(
                                 raw: Arc::clone(&raw),
                                 width: header.width,
                                 height: header.height,
-                                seed: aim.seed,
+                                seed,
                                 focus: border_focus.clone(),
                                 radius_prior: selected_iris_radius_prior,
-                                center_prior: aim.center_prior,
                             },
                         );
                     }
@@ -33686,7 +33569,7 @@ fn receive(
                     .as_ref()
                     .and_then(|hypothesis| motion_overlay.layers.get(hypothesis.motion_layer))
                     .map_or(0, |layer| layer.persistent_tracks);
-                let mut cluster_semantic_assessment = temporal_feature_limbus_semantic_assessment(
+                let cluster_semantic_assessment = temporal_feature_limbus_semantic_assessment(
                     cluster_candidate.as_ref(),
                     cluster_ellipse_seed,
                     selected_iris_radius_prior,
@@ -33703,18 +33586,6 @@ fn receive(
                     cluster_reflection_disk_evidence,
                     cluster_layer_tracks,
                 );
-                let cluster_radial_center_assessment = temporal_feature_radial_center_assessment(
-                    cluster_candidate
-                        .as_ref()
-                        .map(|hypothesis| hypothesis.center),
-                    &motion_overlay,
-                );
-                if cluster_semantic_assessment.admissible
-                    && !cluster_radial_center_assessment.admissible
-                {
-                    cluster_semantic_assessment.admissible = false;
-                    cluster_semantic_assessment.reason = "radial-vertical-center-disagreement";
-                }
                 let cluster_layer_motion = cluster_candidate.as_ref().and_then(|hypothesis| {
                     motion_overlay.motions.get(hypothesis.motion_layer).copied()
                 });
@@ -34434,34 +34305,21 @@ fn receive(
                                                 assessment.maximum_innovation_px,
                                             )
                                         } else if !cluster_semantic_assessment.admissible {
-                                            if cluster_radial_center_assessment.checked
-                                                && !cluster_radial_center_assessment.admissible
-                                            {
-                                                format!(
-                                                    "RADIAL VERTICAL VETO {:.1}>{:.1}PX FUSED {}/{}/{}",
-                                                    cluster_radial_center_assessment.vertical_departure_px,
-                                                    cluster_radial_center_assessment.maximum_vertical_departure_px,
-                                                    cluster_radial_center_assessment.fused_probes,
-                                                    cluster_radial_center_assessment.fused_image_left,
-                                                    cluster_radial_center_assessment.fused_image_right,
-                                                )
-                                            } else {
-                                                format!(
-                                                    "SEMANTIC VETO {} LAYER/ANN {}/{} SEED C/R/A/S {:.2}/{:.2}/{:.2}/{:.2} REF {} SCALE {:.2}",
-                                                    cluster_semantic_assessment.reason,
-                                                    cluster_semantic_assessment.layer_tracks,
-                                                    cluster_semantic_assessment.annular_tracks,
-                                                    cluster_semantic_assessment.seed_center_fraction,
-                                                    cluster_semantic_assessment.seed_radius_log_error,
-                                                    cluster_semantic_assessment.seed_area_radius_log_error,
-                                                    cluster_semantic_assessment.seed_normalized_shape_disagreement,
-                                                    cluster_semantic_assessment.reflection_normalized_radius.map_or_else(
-                                                        || "-".to_string(),
-                                                        |radius| format!("{radius:.2}"),
-                                                    ),
-                                                    cluster_semantic_assessment.scale_innovation_log,
-                                                )
-                                            }
+                                            format!(
+                                                "SEMANTIC VETO {} LAYER/ANN {}/{} SEED C/R/A/S {:.2}/{:.2}/{:.2}/{:.2} REF {} SCALE {:.2}",
+                                                cluster_semantic_assessment.reason,
+                                                cluster_semantic_assessment.layer_tracks,
+                                                cluster_semantic_assessment.annular_tracks,
+                                                cluster_semantic_assessment.seed_center_fraction,
+                                                cluster_semantic_assessment.seed_radius_log_error,
+                                                cluster_semantic_assessment.seed_area_radius_log_error,
+                                                cluster_semantic_assessment.seed_normalized_shape_disagreement,
+                                                cluster_semantic_assessment.reflection_normalized_radius.map_or_else(
+                                                    || "-".to_string(),
+                                                    |radius| format!("{radius:.2}"),
+                                                ),
+                                                cluster_semantic_assessment.scale_innovation_log,
+                                            )
                                         } else {
                                             "VERIFYING SCALE".to_string()
                                         },
@@ -35847,6 +35705,8 @@ fn receive(
                 let specular_map = Arc::new(specular_views.specular_map);
                 let cross_polarized = Arc::new(specular_views.cross_polarized);
                 let diffuse = Arc::new(specular_views.diffuse);
+                let illumination = Arc::new(specular_views.illumination);
+                let albedo = Arc::new(specular_views.albedo);
                 let motion_octrees = Arc::new(motion_overlay);
                 if last_eye_exports[index].elapsed() >= Duration::from_secs(30) {
                     let label = subject_eye_label(index);
@@ -35890,6 +35750,8 @@ fn receive(
                     specular_map,
                     cross_polarized,
                     diffuse,
+                    illumination,
+                    albedo,
                     specular_motion_compensated,
                     edge_map_variant,
                     focus_score: border_focus.score,
@@ -38340,6 +38202,207 @@ fn draw_sclera_red_canny_overlay(
     }
 }
 
+fn draw_roi_feature_marker(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    origin_x: i32,
+    origin_y: i32,
+    pixel_scale: usize,
+    point: (f64, f64),
+    color: u32,
+) {
+    if !point.0.is_finite() || !point.1.is_finite() {
+        return;
+    }
+    let scale = pixel_scale.max(1) as f64;
+    let x = origin_x + (point.0 * scale).round() as i32;
+    let y = origin_y + (point.1 * scale).round() as i32;
+    let radius = pixel_scale.max(1) as i32 + 1;
+    draw_line_clipped(pixels, width, height, x - radius, y, x + radius, y, color);
+    draw_line_clipped(pixels, width, height, x, y - radius, x, y + radius, color);
+}
+
+/// Draw only exact-current-frame, directly sampled feature locations. Fitted
+/// contours, projected conics, trails, pivots, reticles, and carried semantic
+/// geometry are intentionally absent from this inspection layer.
+#[allow(clippy::too_many_arguments)]
+fn draw_raw_feature_points_overlay(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    origin_x: i32,
+    origin_y: i32,
+    pixel_scale: usize,
+    frame: &EyeFrame,
+) -> usize {
+    let profile = frame.segmentation_mode.profile();
+    let mut count = 0usize;
+    if profile.show_motion_overlay() {
+        for &(x, y) in &frame.motion_octrees.provisional_features {
+            draw_roi_feature_marker(
+                pixels,
+                width,
+                height,
+                origin_x,
+                origin_y,
+                pixel_scale,
+                (f64::from(x), f64::from(y)),
+                0x0000_efff,
+            );
+            count += 1;
+        }
+    }
+    if profile.show_native_diagnostics {
+        for (&point, color) in frame
+            .outer_iris_evidence_points
+            .iter()
+            .zip(std::iter::repeat(0x00ff_d21f))
+            .chain(
+                frame
+                    .outer_iris_veto_points
+                    .iter()
+                    .zip(std::iter::repeat(0x00ff_4fc3)),
+            )
+            .chain(
+                frame
+                    .outer_iris_occluded_points
+                    .iter()
+                    .zip(std::iter::repeat(0x008d_949c)),
+            )
+        {
+            draw_roi_feature_marker(
+                pixels,
+                width,
+                height,
+                origin_x,
+                origin_y,
+                pixel_scale,
+                point,
+                color,
+            );
+            count += 1;
+        }
+    }
+    for &point in frame.pupil_polar_slice_points.iter() {
+        draw_roi_feature_marker(
+            pixels,
+            width,
+            height,
+            origin_x,
+            origin_y,
+            pixel_scale,
+            point,
+            0x005f_ff69,
+        );
+        count += 1;
+    }
+    if profile.show_driving_diagnostics
+        && frame.driving_limbus_edge_source_timestamp_ns == Some(frame.timestamp_ns)
+    {
+        for point in frame.driving_limbus_edge_points.iter().filter(|point| {
+            matches!(
+                point.kind,
+                DrivingLimbusEdgeKind::DirectSupport | DrivingLimbusEdgeKind::DirectCounterEvidence
+            )
+        }) {
+            let color = if point.kind == DrivingLimbusEdgeKind::DirectSupport {
+                DRIVING_RAW_EDGE_SUPPORT_COLOR
+            } else {
+                DRIVING_RAW_EDGE_COUNTER_COLOR
+            };
+            draw_roi_feature_marker(
+                pixels,
+                width,
+                height,
+                origin_x,
+                origin_y,
+                pixel_scale,
+                (point.x, point.y),
+                color,
+            );
+            count += 1;
+        }
+    }
+    if profile.show_sclera_red_canny && frame.sclera_red_canny.timestamp_ns == frame.timestamp_ns {
+        for anchor in &frame.sclera_red_canny.anchors {
+            draw_roi_feature_marker(
+                pixels,
+                width,
+                height,
+                origin_x,
+                origin_y,
+                pixel_scale,
+                (f64::from(anchor.point[0]), f64::from(anchor.point[1])),
+                0x00ff_e040,
+            );
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Paint the current calculated edge map over the selected V view. Historical
+/// trails and semantic fits are excluded; red-opponent segments are included
+/// only when their timestamp exactly matches the displayed RAW exposure.
+#[allow(clippy::too_many_arguments)]
+fn draw_current_canny_evidence_overlay(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    origin_x: i32,
+    origin_y: i32,
+    pixel_scale: usize,
+    frame: &EyeFrame,
+) -> usize {
+    let pixel_scale = pixel_scale.max(1);
+    let mut count = 0usize;
+    for (index, &candidate) in frame.canny.iter().enumerate() {
+        if candidate == 0 {
+            continue;
+        }
+        let column = index % frame.width;
+        let row = index / frame.width;
+        let color = if frame.edge_map_variant.preserves_edge_colors() {
+            candidate
+        } else {
+            0x00ff_e040
+        };
+        fill_rect(
+            pixels,
+            width,
+            height,
+            origin_x + (column * pixel_scale) as i32,
+            origin_y + (row * pixel_scale) as i32,
+            pixel_scale as i32,
+            pixel_scale as i32,
+            color,
+        );
+        count += 1;
+    }
+    if frame.sclera_red_canny.timestamp_ns == frame.timestamp_ns {
+        let scale = pixel_scale as f32;
+        for segment in &frame.sclera_red_canny.segments {
+            draw_line_clipped(
+                pixels,
+                width,
+                height,
+                origin_x + (segment.start[0] * scale).round() as i32,
+                origin_y + (segment.start[1] * scale).round() as i32,
+                origin_x + (segment.end[0] * scale).round() as i32,
+                origin_y + (segment.end[1] * scale).round() as i32,
+                if segment.strength >= 1.25 {
+                    0x00ff_3030
+                } else {
+                    0x00c8_2828
+                },
+            );
+            count += 1;
+        }
+    }
+    count
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_eye(
     pixels: &mut [u32],
@@ -38367,7 +38430,7 @@ fn draw_eye(
         focus_target,
         identity_present,
         pixel_scale,
-        false,
+        RoiOverlayMode::FullDiagnostics,
         checkerboard,
     );
 }
@@ -38385,7 +38448,7 @@ fn draw_eye_with_spatial_debug(
     focus_target: bool,
     identity_present: bool,
     pixel_scale: usize,
-    show_spatial_debug_boxes: bool,
+    roi_overlay_mode: RoiOverlayMode,
     checkerboard: Option<&checkerboard_calibration::Overlay>,
 ) {
     let pixel_scale = pixel_scale.max(1);
@@ -38427,6 +38490,8 @@ fn draw_eye_with_spatial_debug(
         ViewMode::SpecularMap => frame.specular_map.as_ref(),
         ViewMode::CrossPolarized => frame.cross_polarized.as_ref(),
         ViewMode::Diffuse => frame.diffuse.as_ref(),
+        ViewMode::IlluminationMap => frame.illumination.as_ref(),
+        ViewMode::AlbedoMap => frame.albedo.as_ref(),
         ViewMode::QuadLuma => frame.quad_luma.as_ref(),
         ViewMode::RawLuma => frame.raw_luma.as_ref(),
         ViewMode::Canny => frame.canny.as_ref(),
@@ -38463,6 +38528,33 @@ fn draw_eye_with_spatial_debug(
                 0x00ff_ff00,
             );
         }
+    }
+    if !roi_overlay_mode.show_full_diagnostics() {
+        let count = match roi_overlay_mode {
+            RoiOverlayMode::RawFeaturePoints => {
+                draw_raw_feature_points_overlay(pixels, width, height, x, y, pixel_scale, frame)
+            }
+            RoiOverlayMode::CannyEvidence => {
+                draw_current_canny_evidence_overlay(pixels, width, height, x, y, pixel_scale, frame)
+            }
+            RoiOverlayMode::Clean => 0,
+            RoiOverlayMode::FullDiagnostics | RoiOverlayMode::SpatialDebug => unreachable!(),
+        };
+        draw_text(
+            pixels,
+            width,
+            height,
+            x + 4,
+            y - 20,
+            &format!(
+                "{label}  F {}/{} {}  N {count}",
+                roi_overlay_mode.ordinal(),
+                RoiOverlayMode::COUNT,
+                roi_overlay_mode.label(),
+            ),
+            0x00ff_ffff,
+        );
+        return;
     }
     if let Some(reticle) = frame
         .iris_radius_reticle
@@ -38529,7 +38621,7 @@ fn draw_eye_with_spatial_debug(
             pixel_scale,
             frame.motion_octrees.as_ref(),
             frame.focus_anatomy_valid && frame.focus_eye_basin_valid,
-            show_spatial_debug_boxes,
+            roi_overlay_mode.show_spatial_debug_boxes(),
         );
     }
     if segmentation_profile.show_sclera_red_canny {
@@ -39048,7 +39140,20 @@ fn draw_eye_with_spatial_debug(
     if let Some(checkerboard) = checkerboard {
         draw_checkerboard_overlay(pixels, width, height, x, y, pixel_scale, checkerboard);
     }
-    draw_text(pixels, width, height, x + 4, y - 20, label, 0x00ff_ffff);
+    draw_text(
+        pixels,
+        width,
+        height,
+        x + 4,
+        y - 20,
+        &format!(
+            "{label}  F {}/{} {}",
+            roi_overlay_mode.ordinal(),
+            RoiOverlayMode::COUNT,
+            roi_overlay_mode.label(),
+        ),
+        0x00ff_ffff,
+    );
 }
 
 fn draw_checkerboard_overlay(
@@ -41468,7 +41573,7 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
             app.focus_eye == 0,
             app.eye_identity_present[0],
             eye_scales[0],
-            app.spatial_debug_boxes_visible,
+            app.roi_overlay_mode,
             checkerboard,
         );
     }
@@ -41506,7 +41611,7 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
             app.focus_eye == 1,
             app.eye_identity_present[1],
             eye_scales[1],
-            app.spatial_debug_boxes_visible,
+            app.roi_overlay_mode,
             checkerboard,
         );
     }
@@ -41545,6 +41650,10 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
         ViewMode::Diffuse => {
             format!("VIEW DIFFUSE RECONSTRUCTION {specular_temporal_state}")
         }
+        ViewMode::IlluminationMap => {
+            "VIEW BROAD ILLUMINATION ESTIMATE (MID-GRAY = FRAME REFERENCE)".to_string()
+        }
+        ViewMode::AlbedoMap => "VIEW ALBEDO MAP ESTIMATE (BROAD LIGHT REMOVED)".to_string(),
         ViewMode::QuadLuma => "VIEW QUAD BAYER LUMA".to_string(),
         ViewMode::RawLuma => "VIEW RAW10 LUMA 1X1".to_string(),
         ViewMode::Canny => format!(
@@ -41781,6 +41890,15 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
                 app.edge_map_variant.ordinal(),
                 EdgeMapVariant::COUNT,
                 app.edge_map_variant.label(),
+            ),
+            core_background,
+        ),
+        (
+            format!(
+                "F ROI LABELS {}/{} {}",
+                app.roi_overlay_mode.ordinal(),
+                RoiOverlayMode::COUNT,
+                app.roi_overlay_mode.label(),
             ),
             core_background,
         ),
@@ -42183,14 +42301,12 @@ impl ApplicationHandler for App {
                     }
                     PhysicalKey::Code(KeyCode::KeyF) => {
                         if !event.repeat {
-                            self.spatial_debug_boxes_visible = !self.spatial_debug_boxes_visible;
+                            self.roi_overlay_mode = self.roi_overlay_mode.cycled();
                             eprintln!(
-                                "octree and horizontal-stretch debug geometry {} by F",
-                                if self.spatial_debug_boxes_visible {
-                                    "visible"
-                                } else {
-                                    "hidden"
-                                },
+                                "ROI overlay cycled by F to {}/{} {}",
+                                self.roi_overlay_mode.ordinal(),
+                                RoiOverlayMode::COUNT,
+                                self.roi_overlay_mode.label(),
                             );
                         }
                     }
@@ -43001,7 +43117,7 @@ fn run() -> Result<(), String> {
         checkerboard_status: checkerboard_calibration::StatusSnapshot::default(),
         keyboard_peeper: keyboard_peeper::Registration::new(None),
         window_focused: false,
-        spatial_debug_boxes_visible: false,
+        roi_overlay_mode: RoiOverlayMode::default(),
     };
     let event_result = event_loop
         .run_app(&mut app)
@@ -43028,6 +43144,9 @@ fn main() {
         }
         Some("--offline-labeled-driving-eval") => {
             offline_segmentation_replay::labeled_raw_eval(env::args().skip(2))
+        }
+        Some("--offline-labeled-light-audit") => {
+            offline_segmentation_replay::labeled_light_audit(env::args().skip(2))
         }
         Some(screen_reflection_stimulus::SUBCOMMAND) => {
             screen_reflection_stimulus::run(env::args().skip(2))
@@ -44078,124 +44197,6 @@ mod tests {
 
         overlay.layers[0].coherence = 0.412;
         assert!(temporal_feature_layer_ready_for_geometry(&overlay));
-    }
-
-    #[test]
-    fn temporal_measurement_uses_transport_center_without_carrying_old_shape() {
-        let current = raw_motion_octrees::IrisEllipseSeed {
-            center: (250.0, 148.0),
-            major_radius: 102.0,
-            minor_radius: 94.0,
-            angle: 0.31,
-        };
-        let mut overlay = raw_motion_octrees::MotionOctreeOverlay::default();
-        overlay.layers[0].persistent_tracks = 32;
-        overlay.layers[0].signature_samples = 8;
-        overlay.layers[0].coherence = 0.52;
-        overlay.motions[0].support = 32;
-        overlay.motions[0].residual = 1.2;
-        overlay.radial_limbus_probes = vec![raw_motion_octrees::RadialLimbusProbe::default(); 24];
-        overlay.radial_limbus_region = Some(raw_motion_octrees::IrisEllipseSeed {
-            center: (252.5, 160.0),
-            major_radius: 97.0,
-            minor_radius: 96.0,
-            angle: 0.02,
-        });
-
-        let aimed = temporal_canny_motion_conditioned_measurement_aim(current, &overlay);
-        assert_eq!(aimed.seed.center, (252.5, 160.0));
-        assert_eq!(aimed.seed.major_radius, current.major_radius);
-        assert_eq!(aimed.seed.minor_radius, current.minor_radius);
-        assert_eq!(aimed.seed.angle, current.angle);
-        let prior = aimed.center_prior.expect("cohesive radial center prior");
-        assert_eq!(prior.center, aimed.seed.center);
-        assert!(prior.vertical_sigma_px < prior.horizontal_sigma_px);
-        assert_eq!(prior.rank_adjustment(prior.center), Some(0.0));
-        assert!(prior
-            .rank_adjustment((prior.center.0, prior.center.1 + 9.0))
-            .is_none());
-    }
-
-    #[test]
-    fn temporal_measurement_rejects_unprobed_or_nonlocal_transport_center() {
-        let current = raw_motion_octrees::IrisEllipseSeed {
-            center: (250.0, 148.0),
-            major_radius: 100.0,
-            minor_radius: 96.0,
-            angle: 0.0,
-        };
-        let mut overlay = raw_motion_octrees::MotionOctreeOverlay::default();
-        overlay.layers[0].persistent_tracks = 32;
-        overlay.layers[0].signature_samples = 8;
-        overlay.layers[0].coherence = 0.52;
-        overlay.motions[0].support = 32;
-        overlay.motions[0].residual = 1.2;
-        overlay.radial_limbus_region = Some(raw_motion_octrees::IrisEllipseSeed {
-            center: (250.0, 160.0),
-            ..current
-        });
-        assert_eq!(
-            temporal_canny_motion_conditioned_measurement_aim(current, &overlay)
-                .seed
-                .center,
-            current.center,
-        );
-
-        overlay.radial_limbus_probes = vec![raw_motion_octrees::RadialLimbusProbe::default(); 24];
-        overlay.radial_limbus_region = Some(raw_motion_octrees::IrisEllipseSeed {
-            center: (250.0, 180.0),
-            ..current
-        });
-        assert_eq!(
-            temporal_canny_motion_conditioned_measurement_aim(current, &overlay)
-                .seed
-                .center,
-            current.center,
-        );
-    }
-
-    #[test]
-    fn temporal_radial_center_veto_needs_bilateral_consensus() {
-        let mut overlay = raw_motion_octrees::MotionOctreeOverlay {
-            radial_limbus_region: Some(raw_motion_octrees::IrisEllipseSeed {
-                center: (252.0, 160.0),
-                major_radius: 98.0,
-                minor_radius: 90.0,
-                angle: 0.0,
-            }),
-            ..raw_motion_octrees::MotionOctreeOverlay::default()
-        };
-        overlay.radial_limbus_probes = (0..24)
-            .map(|index| {
-                let phase = std::f32::consts::TAU * index as f32 / 24.0;
-                raw_motion_octrees::RadialLimbusProbe {
-                    normal: [phase.cos(), phase.sin()],
-                    fused: true,
-                    ..raw_motion_octrees::RadialLimbusProbe::default()
-                }
-            })
-            .collect();
-
-        let nearby = temporal_feature_radial_center_assessment(Some((260.0, 164.9)), &overlay);
-        assert!(nearby.checked);
-        assert!(nearby.admissible);
-        assert_eq!(nearby.fused_probes, 24);
-        assert!(nearby.fused_image_left >= 8);
-        assert!(nearby.fused_image_right >= 8);
-
-        let shadow_jump = temporal_feature_radial_center_assessment(Some((260.0, 166.0)), &overlay);
-        assert!(shadow_jump.checked);
-        assert!(!shadow_jump.admissible);
-        assert_eq!(shadow_jump.vertical_departure_px, 6.0);
-
-        overlay
-            .radial_limbus_probes
-            .iter_mut()
-            .skip(TEMPORAL_FEATURE_MIN_RADIAL_CONSENSUS_PROBES - 1)
-            .for_each(|probe| probe.fused = false);
-        let sparse = temporal_feature_radial_center_assessment(Some((260.0, 170.0)), &overlay);
-        assert!(!sparse.checked);
-        assert!(sparse.admissible);
     }
 
     #[test]
@@ -47494,6 +47495,8 @@ mod tests {
             ViewMode::SpecularMap,
             ViewMode::CrossPolarized,
             ViewMode::Diffuse,
+            ViewMode::IlluminationMap,
+            ViewMode::AlbedoMap,
             ViewMode::QuadLuma,
             ViewMode::RawLuma,
             ViewMode::Canny,
@@ -47507,6 +47510,23 @@ mod tests {
     }
 
     #[test]
+    fn roi_overlay_cycle_separates_labels_from_pixel_and_algorithm_modes() {
+        let expected = [
+            RoiOverlayMode::FullDiagnostics,
+            RoiOverlayMode::SpatialDebug,
+            RoiOverlayMode::RawFeaturePoints,
+            RoiOverlayMode::CannyEvidence,
+            RoiOverlayMode::Clean,
+        ];
+        let mut mode = RoiOverlayMode::FullDiagnostics;
+        for expected_mode in expected.into_iter().skip(1) {
+            mode = mode.cycled();
+            assert_eq!(mode, expected_mode);
+        }
+        assert_eq!(mode.cycled(), RoiOverlayMode::FullDiagnostics);
+    }
+
+    #[test]
     fn specular_reflection_views_are_available_to_initial_and_export_parser() {
         assert_eq!(annotated_view_mode("specular"), Some(ViewMode::SpecularMap));
         assert_eq!(
@@ -47515,8 +47535,21 @@ mod tests {
         );
         assert_eq!(annotated_view_mode("diffused"), Some(ViewMode::Diffuse));
         assert_eq!(
+            annotated_view_mode("light_field"),
+            Some(ViewMode::IlluminationMap)
+        );
+        assert_eq!(annotated_view_mode("albedo_map"), Some(ViewMode::AlbedoMap));
+        assert_eq!(
             annotated_view_mode_name(ViewMode::CrossPolarized),
             "cross-polarized-estimate"
+        );
+        assert_eq!(
+            annotated_view_mode_name(ViewMode::IlluminationMap),
+            "broad-illumination-estimate"
+        );
+        assert_eq!(
+            annotated_view_mode_name(ViewMode::AlbedoMap),
+            "albedo-map-estimate"
         );
     }
 
@@ -47526,12 +47559,16 @@ mod tests {
         frame.specular_map = Arc::new(vec![0x0011_1111; 16]);
         frame.cross_polarized = Arc::new(vec![0x0022_3344; 16]);
         frame.diffuse = Arc::new(vec![0x0055_6677; 16]);
+        frame.illumination = Arc::new(vec![0x0044_4444; 16]);
+        frame.albedo = Arc::new(vec![0x0088_7766; 16]);
         let width = 32;
         let height = 48;
         for (mode, expected) in [
             (ViewMode::SpecularMap, 0x0011_1111),
             (ViewMode::CrossPolarized, 0x0022_3344),
             (ViewMode::Diffuse, 0x0055_6677),
+            (ViewMode::IlluminationMap, 0x0044_4444),
+            (ViewMode::AlbedoMap, 0x0088_7766),
         ] {
             let mut pixels = vec![0; width * height];
             draw_eye(
@@ -47675,6 +47712,8 @@ mod tests {
             specular_map: Arc::new(vec![0; 16]),
             cross_polarized: Arc::new(vec![0; 16]),
             diffuse: Arc::new(vec![0; 16]),
+            illumination: Arc::new(vec![0; 16]),
+            albedo: Arc::new(vec![0; 16]),
             specular_motion_compensated: false,
             edge_map_variant: EdgeMapVariant::default(),
             focus_score: 1.0,
@@ -56324,7 +56363,6 @@ mod tests {
             iris_seed_from_driving_pose(seed),
             Some(&focus),
             None,
-            None,
         );
         let temporal_measurement_elapsed = temporal_measurement_started.elapsed();
         let established_prior =
@@ -56342,7 +56380,6 @@ mod tests {
             iris_seed_from_driving_pose(seed),
             Some(&focus),
             established_prior,
-            None,
         );
         let temporal_local_elapsed = temporal_local_started.elapsed();
         eprintln!(
