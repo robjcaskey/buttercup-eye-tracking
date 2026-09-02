@@ -418,9 +418,15 @@ pub enum FrontoParallelLimbusRadiusPriorSource {
     FixedReference,
     OperatorHardLimits,
     /// Broad, current-frame geometric support used only before a temporal
-    /// Driving radius posterior exists. It may constrain a cold-start search
-    /// but never counts as an independently observed temporal size sample.
+    /// Driving radius posterior exists and independently verified by the
+    /// coarse eye-basin geometry. It may constrain a cold-start search but
+    /// never counts as an independently observed temporal size sample.
     CurrentFrameGeometry,
+    /// Broad proposal-only support from an unverified native conic or compact
+    /// carrier. Its midpoint is not a scale measurement: it may preserve
+    /// deterministic ordering inside the legacy carrier cohort, but expanded
+    /// outer-limbus hypotheses use only the stated hard interval.
+    CurrentFrameUnverifiedGeometry,
     TemporalRobustMedian,
     CoarseSemanticPose,
     FineVisualOdometry,
@@ -432,6 +438,7 @@ impl FrontoParallelLimbusRadiusPriorSource {
             Self::FixedReference => "FIXED",
             Self::OperatorHardLimits => "MANUAL",
             Self::CurrentFrameGeometry => "FRAME",
+            Self::CurrentFrameUnverifiedGeometry => "FRAME-WIDE",
             Self::TemporalRobustMedian => "TEMP",
             Self::CoarseSemanticPose => "COARSE",
             Self::FineVisualOdometry => "FINE",
@@ -538,7 +545,8 @@ impl FrontoParallelLimbusRadiusPrior {
         match self.source {
             FrontoParallelLimbusRadiusPriorSource::FixedReference
             | FrontoParallelLimbusRadiusPriorSource::OperatorHardLimits
-            | FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry => true,
+            | FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry
+            | FrontoParallelLimbusRadiusPriorSource::CurrentFrameUnverifiedGeometry => true,
             FrontoParallelLimbusRadiusPriorSource::TemporalRobustMedian
             | FrontoParallelLimbusRadiusPriorSource::CoarseSemanticPose
             | FrontoParallelLimbusRadiusPriorSource::FineVisualOdometry => {
@@ -988,7 +996,8 @@ impl FrontoParallelLimbusRadiusTracker {
                 .map_or(true, |prior| match prior.source {
                     FrontoParallelLimbusRadiusPriorSource::FixedReference
                     | FrontoParallelLimbusRadiusPriorSource::OperatorHardLimits
-                    | FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry => true,
+                    | FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry
+                    | FrontoParallelLimbusRadiusPriorSource::CurrentFrameUnverifiedGeometry => true,
                     FrontoParallelLimbusRadiusPriorSource::TemporalRobustMedian
                     | FrontoParallelLimbusRadiusPriorSource::CoarseSemanticPose
                     | FrontoParallelLimbusRadiusPriorSource::FineVisualOdometry => {

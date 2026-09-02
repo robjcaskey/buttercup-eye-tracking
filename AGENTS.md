@@ -12,3 +12,6 @@ This repository owns host-side eye analysis and presentation only.
 - Add source files deliberately and update `scripts/audit-tree.sh` whenever the
   allowlist changes.
 - Do not make this repository depend on paths inside another source checkout.
+- Canonical human labeler: always use `/home/rob/eye-training/paired-limbus-annotator/server.py`; do not substitute another annotation UI.
+- Feed it native RAW10 before/target/after frames and keep recorded predictions hidden until `SAVE + DONE`.
+- Save paired, triplet, and possibly-occluded evidence beneath the capture's `annotator/labels` directory.

@@ -10547,6 +10547,10 @@ struct App {
     checkerboard_status: checkerboard_calibration::StatusSnapshot,
     keyboard_peeper: keyboard_peeper::Registration,
     window_focused: bool,
+    /// Presentation-only visibility for coarse spatial search geometry. The
+    /// temporal octrees and horizontal deformation tree continue to run when
+    /// hidden; F exposes their projected boxes/spans for focused debugging.
+    spatial_debug_boxes_visible: bool,
 }
 
 impl App {
@@ -13328,6 +13332,7 @@ fn driving_multibank_limbus_pose_shortlists_with_beam(
     focus: Option<&raw_iris_focus::BorderFocus>,
     radius_prior: DrivingRadiusPrior,
     beam_size: usize,
+    expand_unverified_outer: bool,
 ) -> DrivingMultibankLimbusShortlists {
     let Some(prior) = radius_prior else {
         return DrivingMultibankLimbusShortlists::default();
@@ -13339,8 +13344,11 @@ fn driving_multibank_limbus_pose_shortlists_with_beam(
     // a directly visible ~63 px limbus out of the bank entirely.  Preserve a
     // single physical radius for every transported/operator/fixed prior, but
     // sparsely cover the cold support before topology establishes scale.
-    let cold_current_geometry =
-        prior.source == raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry;
+    let cold_current_geometry = matches!(
+        prior.source,
+        raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry
+            | raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameUnverifiedGeometry
+    );
     let verified_aperture_multiscale =
         cold_current_geometry && focus.is_some_and(|focus| focus.eye_basin_valid);
     let unverified_geometry_expansion = cold_current_geometry && !verified_aperture_multiscale;
@@ -13379,9 +13387,22 @@ fn driving_multibank_limbus_pose_shortlists_with_beam(
             .map(|scale| prior.estimate_px * scale)
             .filter(|radius| prior.admits_radius(*radius))
             .collect::<Vec<_>>()
-    } else if unverified_geometry_expansion {
+    } else if unverified_geometry_expansion && expand_unverified_outer {
         // Without a strong compact pupil carrier, a native conic may already
-        // be the limbus. Preserve the older modest outward fork.
+        // be the limbus, but it may also be the compact inner carrier.  This
+        // proposal-only prior already declares support out to 1.80x; sample
+        // that support instead of silently making its outer half unreachable
+        // to both the 2D temporal-Canny learner and Driving.  Full current-RAW
+        // eye topology still owns admission, and an established temporal
+        // radius never enters this cold branch.
+        [1.0, 1.22, 1.50, 1.72, 1.80]
+            .into_iter()
+            .map(|scale| prior.estimate_px * scale)
+            .filter(|radius| prior.admits_radius(*radius))
+            .collect::<Vec<_>>()
+    } else if unverified_geometry_expansion {
+        // Exact legacy incumbent bank used as a regression anchor while the
+        // wider outer-limbus bank is evaluated additively.
         [1.0, 1.22]
             .into_iter()
             .map(|scale| prior.estimate_px * scale)
@@ -13794,6 +13815,7 @@ fn driving_multibank_limbus_pose_shortlist_with_beam(
         focus,
         radius_prior,
         beam_size,
+        true,
     )
     .selected
 }
@@ -13977,16 +13999,41 @@ fn driving_current_frame_limbus_scale_affinity(
 ) -> f64 {
     radius_prior
         .filter(|prior| {
-            prior.source
-                == raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry
+            matches!(
+                prior.source,
+                raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry
+                    | raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameUnverifiedGeometry
+            )
         })
         .and_then(|prior| {
             driving_fronto_parallel_radius_px(pose).map(|radius| {
+                // Preserve the incumbent ordering inside the legacy native
+                // carrier cohort, but never let that proposal-only midpoint
+                // pull an independently proved expanded outer limbus back
+                // toward the inner alias.
+                if prior.source
+                    == raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameUnverifiedGeometry
+                    && radius / prior.estimate_px.max(1.0) > 1.30
+                {
+                    return 0.0;
+                }
                 let log_error = (radius / prior.estimate_px.max(1.0)).ln();
                 (-0.5 * (log_error / 0.10).powi(2)).exp()
             })
         })
         .unwrap_or(0.0)
+}
+
+fn driving_is_expanded_unverified_outer(
+    pose: DrivingAffinePose,
+    radius_prior: DrivingRadiusPrior,
+) -> bool {
+    radius_prior.is_some_and(|prior| {
+        prior.source
+            == raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameUnverifiedGeometry
+            && driving_fronto_parallel_radius_px(pose)
+                .is_some_and(|radius| radius / prior.estimate_px.max(1.0) > 1.30)
+    })
 }
 
 /// Broad scale compatibility for a censored proposal which has not completed
@@ -14002,8 +14049,11 @@ fn driving_current_frame_limbus_scale_support_affinity(
 ) -> f64 {
     radius_prior
         .filter(|prior| {
-            prior.source
-                == raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry
+            matches!(
+                prior.source,
+                raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry
+                    | raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameUnverifiedGeometry
+            )
         })
         .and_then(|prior| {
             driving_fronto_parallel_radius_px(pose).map(|radius| {
@@ -14892,11 +14942,15 @@ fn measured_multibank_temporal_canny_seed(
         raw_iris_focus::FrontoParallelLimbusRadiusPrior::from_fractional_support(
             seed_pose.major_radius,
             0.48,
-            raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry,
+            raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameUnverifiedGeometry,
         )
     });
     let cold_geometry = radius_prior.is_none_or(|prior| {
-        prior.source == raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry
+        matches!(
+            prior.source,
+            raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry
+                | raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameUnverifiedGeometry
+        )
     });
     let local_started = Instant::now();
     let local =
@@ -14920,6 +14974,15 @@ fn measured_multibank_temporal_canny_seed(
             )
         })
         .flatten();
+    let independent_native_self_supporting = independent_native.is_some_and(|hypothesis| {
+        driving_seed_local_native_outer_road_self_supporting(
+            raw,
+            width,
+            height,
+            sensor_origin,
+            hypothesis,
+        )
+    });
     let independent_elapsed = independent_started.elapsed();
     // A Native/lid seed can be internally smooth yet displaced by more than
     // the +/-10 px temporal basin. In that case local Canny used to stay
@@ -14969,19 +15032,42 @@ fn measured_multibank_temporal_canny_seed(
             {
                 return None;
             }
-            let anatomy = precomputed_anatomy.or_else(|| {
-                score_driving_native_anatomy_from_working_pose(
-                    raw,
-                    width,
-                    height,
-                    sensor_origin,
-                    pose,
-                    pose,
-                    None,
-                    2,
-                    search_prior,
-                )
-            })?;
+            let expanded_unverified_outer =
+                driving_is_expanded_unverified_outer(pose, search_prior);
+            let anatomy = precomputed_anatomy
+                .or_else(|| {
+                    expanded_unverified_outer.then(|| {
+                        score_driving_multibank_measured_anatomy(
+                            raw,
+                            width,
+                            height,
+                            sensor_origin,
+                            pose,
+                            *proposal,
+                            focus,
+                            2,
+                            search_prior,
+                        )
+                    })?
+                })
+                .or_else(|| {
+                    // The incumbent <=1.30x cohort deliberately retains its
+                    // established scorer. The direct multi-bank completion is
+                    // enabled only for the new expanded-outer branch, so a
+                    // wider proposal bank cannot turn old conservative
+                    // failures into unrelated cold-start publications.
+                    score_driving_native_anatomy_from_working_pose(
+                        raw,
+                        width,
+                        height,
+                        sensor_origin,
+                        pose,
+                        pose,
+                        None,
+                        2,
+                        search_prior,
+                    )
+                })?;
             let semantic =
                 driving_semantic_eye_evidence(raw, width, height, sensor_origin, anatomy)?;
             // A pupil-headed road with one lateral lane outside the RAW tile is a
@@ -15008,6 +15094,43 @@ fn measured_multibank_temporal_canny_seed(
                 width,
                 height,
             );
+            let nested_outer_measurement = independent_native.is_some_and(|independent| {
+                proposal.pose.major_radius / independent.pose.major_radius.max(1.0) >= 1.65
+                    && driving_canonical_point(anatomy.pose, independent.pose.center)
+                        .is_some_and(|canonical| canonical.0.hypot(canonical.1) <= 0.72)
+                    && proposal.evidence.bilateral
+                    && proposal.evidence.score >= 0.82
+                    && proposal.evidence.supported_fraction >= 0.64
+                    && proposal.evidence.samples >= 16
+                    && anatomy.limbus_score >= 0.56
+                    && anatomy.white_score >= 0.50
+                    && anatomy.far_sclera_score >= 0.50
+                    && anatomy.pupil_score >= 0.72
+                    && anatomy.through_eye_score >= 0.72
+                    && anatomy.bilateral_limbus_order >= 0.68
+                    && anatomy.pupil_enclosure >= 0.45
+                    && semantic.plausible_lids >= 1
+                    && semantic.score >= 0.78
+                    && semantic.annular.samples >= 64
+                    && semantic.annular.active_sectors >= 14
+                    && !semantic.straight_band.veto
+            });
+            let standalone_expanded_outer_measurement = expanded_unverified_outer
+                && !independent_native_self_supporting
+                && proposal.evidence.bilateral
+                && proposal.evidence.score >= 0.94
+                && proposal.evidence.supported_fraction >= 0.90
+                && proposal.evidence.samples >= 24
+                && anatomy.score >= 0.84
+                && anatomy.limbus_score >= 0.84
+                && anatomy.white_score >= 0.64
+                && anatomy.far_sclera_score >= 0.94
+                && anatomy.pupil_score >= 0.94
+                && anatomy.through_eye_score >= 0.94
+                && anatomy.bilateral_limbus_order >= 0.94
+                && semantic.plausible_lids >= 1
+                && semantic.score >= 0.94
+                && !semantic.straight_band.veto;
             if independent_native.is_some_and(|independent| {
                 independent.pose != anatomy.pose
                     && driving_independent_native_outer_road_preferred(
@@ -15098,16 +15221,27 @@ fn measured_multibank_temporal_canny_seed(
                 && anatomy.far_sclera_score >= 0.45
                 && anatomy.through_eye_score >= 0.70
                 && anatomy.bilateral_limbus_order >= 0.70;
-            (semantic_geometry && (complete_pupil_headed_geometry || semantic_outer_only_geometry))
+            let expanded_outer_admitted = !expanded_unverified_outer
+                || nested_outer_measurement
+                || standalone_expanded_outer_measurement;
+            (expanded_outer_admitted
+                && semantic_geometry
+                && (complete_pupil_headed_geometry || semantic_outer_only_geometry))
                 .then(|| {
                     temporal_canny_outer_geometry_rank(anatomy, semantic, *proposal, search_prior)
+                        + if nested_outer_measurement || standalone_expanded_outer_measurement {
+                            0.80
+                        } else {
+                            0.0
+                        }
                         - if pupil_horizon_bilateral { 0.0 } else { 0.30 }
                 })
         };
-    let mut proposals = local;
+    let mut proposals = local.clone();
+    let mut incumbent_proposals = local;
     let global_started = Instant::now();
     if cold_geometry {
-        proposals.extend(driving_multibank_limbus_pose_shortlist_with_beam(
+        let legacy = driving_multibank_limbus_pose_shortlists_with_beam(
             raw,
             width,
             height,
@@ -15115,6 +15249,19 @@ fn measured_multibank_temporal_canny_seed(
             focus,
             search_prior,
             16,
+            false,
+        )
+        .selected;
+        incumbent_proposals.extend(legacy.iter().copied());
+        proposals.extend(legacy);
+        proposals.extend(driving_multibank_limbus_pose_shortlist_with_beam(
+            raw,
+            width,
+            height,
+            seed_pose,
+            focus,
+            search_prior,
+            64,
         ));
         if let Some(independent) = independent_native {
             if let Some(evidence) =
@@ -15128,6 +15275,22 @@ fn measured_multibank_temporal_canny_seed(
         }
     }
     let global_elapsed = global_started.elapsed();
+    let mut incumbent_distinct =
+        Vec::<DrivingMultibankLimbusProposal>::with_capacity(incumbent_proposals.len());
+    for proposal in incumbent_proposals {
+        if incumbent_distinct.iter().all(|old| {
+            (old.pose.center.0 - proposal.pose.center.0)
+                .hypot(old.pose.center.1 - proposal.pose.center.1)
+                >= 1.0
+                || (old.pose.major_radius - proposal.pose.major_radius).abs() >= 1.0
+                || (old.pose.minor_radius - proposal.pose.minor_radius).abs() >= 1.0
+                || driving_angle_difference(old.pose.angle, proposal.pose.angle).abs() >= 0.03
+        }) {
+            incumbent_distinct.push(proposal);
+        }
+    }
+    incumbent_distinct
+        .sort_by(|left, right| right.selection_score().total_cmp(&left.selection_score()));
     let mut distinct = Vec::<DrivingMultibankLimbusProposal>::with_capacity(proposals.len());
     for proposal in proposals {
         if distinct.iter().all(|old| {
@@ -15142,10 +15305,12 @@ fn measured_multibank_temporal_canny_seed(
         }
     }
     distinct.sort_by(|left, right| right.selection_score().total_cmp(&left.selection_score()));
-    // Full pupil-headed topology laps dominate the cold-start cost.  Keep a
-    // deterministic bounded beam and reserve one slot for the independent
-    // native road even when a cluster of nearby high-contrast lid candidates
-    // ranks ahead of it.
+    // Full pupil-headed topology laps dominate the cold-start cost. Preserve
+    // both the strongest direct edges and a small material/lid-ranked cohort:
+    // a true shadowed limbus can be only the 10th--40th sharpest conic while
+    // still being among the best persistent sclera/iris transition systems.
+    // The partial score is finalist diversification only; every member still
+    // has to complete the same current-frame pupil-headed anatomy below.
     let independent_pose = independent_native.map(|hypothesis| hypothesis.pose);
     let independent_proposal = independent_pose.and_then(|pose| {
         distinct
@@ -15153,17 +15318,64 @@ fn measured_multibank_temporal_canny_seed(
             .copied()
             .find(|proposal| proposal.pose == pose)
     });
-    distinct.truncate(7);
-    if let Some(proposal) = independent_proposal {
-        if distinct
+    let mut finalists = Vec::<DrivingMultibankLimbusProposal>::with_capacity(18);
+    let push_finalist = |finalists: &mut Vec<DrivingMultibankLimbusProposal>,
+                         proposal: DrivingMultibankLimbusProposal| {
+        if finalists.iter().all(|old| old.pose != proposal.pose) {
+            finalists.push(proposal);
+        }
+    };
+    // Retain seven direct-edge finalists from the historical <=1.30x carrier
+    // cohort. Additional search radii must not crowd those established roads
+    // out merely by introducing more high-contrast cells.
+    for proposal in incumbent_distinct.iter().copied().take(7) {
+        push_finalist(&mut finalists, proposal);
+    }
+    if cold_geometry {
+        let pupil_hint = focus.and_then(|focus| focus.pupil_hint);
+        let seed_scene = raw_iris_focus::discover_eyelid_scene_nautilus(
+            raw,
+            width,
+            height,
+            &driving_boundary_from_pose(seed_pose, 255.0),
+            pupil_hint,
+        );
+        let material_ranked = driving_rank_partial_limbus_proposals(
+            raw,
+            width,
+            height,
+            sensor_origin,
+            seed_pose,
+            pupil_hint,
+            Some((&seed_scene, sensor_origin)),
+            &distinct,
+        );
+        // Include the two sharpest expanded roads as well as the richer
+        // material/lid-ranked cohort. Both are additive to the legacy beam;
+        // only these >1.30x proposals use the new direct measured anatomy.
+        for proposal in distinct
             .iter()
-            .all(|candidate| candidate.pose != proposal.pose)
+            .copied()
+            .filter(|proposal| driving_is_expanded_unverified_outer(proposal.pose, search_prior))
+            .take(2)
         {
-            distinct.push(proposal);
+            push_finalist(&mut finalists, proposal);
+        }
+        for ranked in material_ranked
+            .into_iter()
+            .filter(|ranked| {
+                driving_is_expanded_unverified_outer(ranked.proposal.pose, search_prior)
+            })
+            .take(8)
+        {
+            push_finalist(&mut finalists, ranked.proposal);
         }
     }
+    if let Some(proposal) = independent_proposal {
+        push_finalist(&mut finalists, proposal);
+    }
     let finalist_started = Instant::now();
-    let selected = distinct
+    let selected = finalists
         .into_iter()
         .filter_map(|proposal| {
             let precomputed =
@@ -15911,6 +16123,44 @@ fn driving_independent_native_outer_road_preferred(
 
     let measured_semantic_score = measured_semantic.map_or(0.0, |evidence| evidence.score);
     let measured_edge_score = measured_edge.map_or(0.0, |edge| edge.score);
+    // A compact native road can be the pupil/carrier rather than the limbus.
+    // Do not let that inner alias veto a larger conic which geometrically
+    // contains it and independently re-proves the complete ordered eye road.
+    // This is still entirely current-frame RAW evidence: no label, temporal
+    // size, or darkness-only shortcut participates.
+    let independent_center_in_measured =
+        driving_canonical_point(measured.pose, independent.pose.center)
+            .is_some_and(|canonical| canonical.0.hypot(canonical.1) <= 0.72);
+    let measured_proves_nested_outer = outer_radius_ratio >= 1.65
+        && independent_center_in_measured
+        && measured_edge.is_some_and(|edge| {
+            edge.bilateral
+                && edge.score >= 0.82
+                && edge.supported_fraction >= 0.64
+                && edge.samples >= 16
+        })
+        && measured.limbus_score >= 0.56
+        && measured.white_score >= 0.50
+        && measured.far_sclera_score >= 0.50
+        && measured.pupil_score >= 0.72
+        && measured.through_eye_score >= 0.72
+        && measured.bilateral_limbus_order >= 0.68
+        && measured.pupil_enclosure >= 0.45
+        && measured_semantic.is_some_and(|semantic| {
+            semantic.plausible_lids >= 1
+                && semantic.score >= 0.78
+                && semantic.annular.samples >= 64
+                && semantic.annular.active_sectors >= 14
+                && !semantic.straight_band.veto
+        });
+    if measured_proves_nested_outer {
+        if ownership_trace {
+            eprintln!(
+                "outer-ownership nested-inner alias rejected scale={outer_radius_ratio:.3} contained={independent_center_in_measured} measured-edge={measured_edge_score:.3} measured-semantic={measured_semantic_score:.3}"
+            );
+        }
+        return false;
+    }
     let materially_different_outer =
         outer_radius_ratio.ln().abs() >= 0.10 || outer_center_departure >= 0.16;
     if ownership_trace {
@@ -18935,7 +19185,11 @@ fn driving_temporal_fit_assessment(
     // innovation and pose-continuity tests below. Those tests are meaningful
     // only after a physical-size posterior (or an explicit operator/fixed
     // reference) exists.
-    if prior.source == raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry {
+    if matches!(
+        prior.source,
+        raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry
+            | raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameUnverifiedGeometry
+    ) {
         return DrivingTemporalFitAssessment {
             strong: driving_hypothesis_admissible(hypothesis),
             confidence: hypothesis.score.clamp(0.0, 1.0),
@@ -21221,7 +21475,11 @@ fn driving_rescue_major_radii(
     // frame and must not become a self-fulfilling radius proposal. Keep the
     // original multiplicative exploration for that source.
     let physical_prior = radius_prior.filter(|prior| {
-        prior.source != raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry
+        !matches!(
+            prior.source,
+            raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry
+                | raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameUnverifiedGeometry
+        )
     });
     let mut radii = if let Some(prior) = physical_prior {
         let span = prior.maximum_px - prior.minimum_px;
@@ -21816,6 +22074,11 @@ fn driving_cold_start_radius_prior(
     let fallback_radius = fallback
         .map(|(_, radius)| radius)
         .filter(|radius| radius.is_finite() && *radius >= 8.0);
+    let prior_source = if verified_focus_radius.is_some() {
+        raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry
+    } else {
+        raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameUnverifiedGeometry
+    };
     let (reference, minimum_px, maximum_px) = if let Some(reference) = verified_focus_radius {
         (reference, reference * 0.52, reference * 1.80)
     } else if let Some((focus_radius, compact_carrier)) = unverified_focus_radius {
@@ -21851,7 +22114,7 @@ fn driving_cold_start_radius_prior(
         reference,
         minimum_px,
         maximum_px,
-        raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry,
+        prior_source,
     )
 }
 
@@ -24570,6 +24833,7 @@ impl DrivingSegmentationTracker {
                     independent_focus,
                     radius_prior,
                     64,
+                    true,
                 );
                 (shortlists.selected, shortlists.direct_top_four)
             } else {
@@ -25101,8 +25365,11 @@ impl DrivingSegmentationTracker {
             && previous_pose.is_some()
             && self.admission_streak >= DRIVING_ADMISSION_FRAMES
             && radius_prior.is_some_and(|prior| {
-                prior.source
-                    != raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry
+                !matches!(
+                    prior.source,
+                    raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry
+                        | raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameUnverifiedGeometry
+                )
                     && prior.admits_kinematically_supported_ellipse(
                         best.pose.major_radius,
                         best.pose.minor_radius,
@@ -37866,6 +38133,7 @@ fn draw_sclera_red_canny_overlay(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_eye(
     pixels: &mut [u32],
     width: usize,
@@ -37878,6 +38146,39 @@ fn draw_eye(
     focus_target: bool,
     identity_present: bool,
     pixel_scale: usize,
+    checkerboard: Option<&checkerboard_calibration::Overlay>,
+) {
+    draw_eye_with_spatial_debug(
+        pixels,
+        width,
+        height,
+        frame,
+        x,
+        y,
+        mode,
+        label,
+        focus_target,
+        identity_present,
+        pixel_scale,
+        false,
+        checkerboard,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_eye_with_spatial_debug(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    frame: &EyeFrame,
+    x: i32,
+    y: i32,
+    mode: ViewMode,
+    label: &str,
+    focus_target: bool,
+    identity_present: bool,
+    pixel_scale: usize,
+    show_spatial_debug_boxes: bool,
     checkerboard: Option<&checkerboard_calibration::Overlay>,
 ) {
     let pixel_scale = pixel_scale.max(1);
@@ -38012,7 +38313,7 @@ fn draw_eye(
         return;
     }
     if segmentation_profile.show_motion_overlay() {
-        draw_motion_octree_overlay(
+        draw_motion_octree_overlay_with_spatial_debug(
             pixels,
             width,
             height,
@@ -38021,6 +38322,7 @@ fn draw_eye(
             pixel_scale,
             frame.motion_octrees.as_ref(),
             frame.focus_anatomy_valid && frame.focus_eye_basin_valid,
+            show_spatial_debug_boxes,
         );
     }
     if segmentation_profile.show_sclera_red_canny {
@@ -38812,6 +39114,31 @@ fn draw_motion_octree_overlay(
     overlay: &raw_motion_octrees::MotionOctreeOverlay,
     anatomy_authorized: bool,
 ) {
+    draw_motion_octree_overlay_with_spatial_debug(
+        pixels,
+        width,
+        height,
+        origin_x,
+        origin_y,
+        pixel_scale,
+        overlay,
+        anatomy_authorized,
+        false,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_motion_octree_overlay_with_spatial_debug(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    origin_x: i32,
+    origin_y: i32,
+    pixel_scale: usize,
+    overlay: &raw_motion_octrees::MotionOctreeOverlay,
+    anatomy_authorized: bool,
+    show_spatial_debug_boxes: bool,
+) {
     let scale = pixel_scale.max(1) as f32;
     // Show the actual current-frame Canny evidence as a subdued underlay. A
     // smooth iris striation may be valid edge evidence before it has enough
@@ -39119,7 +39446,12 @@ fn draw_motion_octree_overlay(
     // The broad root and accepted leaves make the coarse-to-fine tree visible
     // without repainting every rejected search cell over the eye.
     let light_field = &overlay.horizontal_light_field;
-    for (node_index, node) in light_field.nodes.iter().enumerate() {
+    for (node_index, node) in light_field
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|_| show_spatial_debug_boxes)
+    {
         if node.confidence < 0.08 || (!node.leaf && node.depth != 0) {
             continue;
         }
@@ -39190,7 +39522,7 @@ fn draw_motion_octree_overlay(
     for node in overlay
         .nodes
         .iter()
-        .filter(|node| node.depth > 0 && node.count >= 3)
+        .filter(|node| show_spatial_debug_boxes && node.depth > 0 && node.count >= 3)
     {
         let color = motion_object_color(node.object);
         let z0 = node.bounds[4].clamp(-8.0, 8.0) * 0.65 * scale;
@@ -40911,7 +41243,7 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
                 && overlay.sensor_origin == (frame.sensor_x, frame.sensor_y)
                 && overlay.timestamp_ns.abs_diff(frame.timestamp_ns) <= 1_000_000_000
         });
-        draw_eye(
+        draw_eye_with_spatial_debug(
             pixels,
             width,
             height,
@@ -40929,6 +41261,7 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
             app.focus_eye == 0,
             app.eye_identity_present[0],
             eye_scales[0],
+            app.spatial_debug_boxes_visible,
             checkerboard,
         );
     }
@@ -40948,7 +41281,7 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
         } else {
             start_y + display_heights[0] + gap
         };
-        draw_eye(
+        draw_eye_with_spatial_debug(
             pixels,
             width,
             height,
@@ -40966,6 +41299,7 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
             app.focus_eye == 1,
             app.eye_identity_present[1],
             eye_scales[1],
+            app.spatial_debug_boxes_visible,
             checkerboard,
         );
     }
@@ -41637,6 +41971,19 @@ impl ApplicationHandler for App {
                             eprintln!(
                                 "view cycled by V to {}",
                                 annotated_view_mode_name(self.mode),
+                            );
+                        }
+                    }
+                    PhysicalKey::Code(KeyCode::KeyF) => {
+                        if !event.repeat {
+                            self.spatial_debug_boxes_visible = !self.spatial_debug_boxes_visible;
+                            eprintln!(
+                                "octree and horizontal-stretch debug geometry {} by F",
+                                if self.spatial_debug_boxes_visible {
+                                    "visible"
+                                } else {
+                                    "hidden"
+                                },
                             );
                         }
                     }
@@ -42447,6 +42794,7 @@ fn run() -> Result<(), String> {
         checkerboard_status: checkerboard_calibration::StatusSnapshot::default(),
         keyboard_peeper: keyboard_peeper::Registration::new(None),
         window_focused: false,
+        spatial_debug_boxes_visible: false,
     };
     let event_result = event_loop
         .run_app(&mut app)
@@ -48705,7 +49053,7 @@ mod tests {
             .expect("a strong compact carrier should aim a broad outer-limbus search");
         assert_eq!(
             prior.source,
-            raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameGeometry
+            raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameUnverifiedGeometry
         );
         assert!((prior.estimate_px - 131.6).abs() < 1.0e-9, "{prior:?}");
         assert!(prior.admits_radius(70.0), "{prior:?}");
@@ -48734,6 +49082,10 @@ mod tests {
         };
         let prior = driving_cold_start_radius_prior(&native, None, Some(&focus))
             .expect("a broad censored carrier should retain an outer-eye search interval");
+        assert_eq!(
+            prior.source,
+            raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameUnverifiedGeometry
+        );
         assert!(
             (prior.estimate_px - focus.radius * 1.36).abs() < 1.0e-9,
             "{prior:?}"
@@ -48783,6 +49135,31 @@ mod tests {
             Some(broad_prior),
         );
         assert!((broad - 1.0).abs() < 1.0e-12, "{broad}");
+
+        let unverified = raw_iris_focus::FrontoParallelLimbusRadiusPrior::from_hard_support(
+            100.0,
+            50.0,
+            180.0,
+            raw_iris_focus::FrontoParallelLimbusRadiusPriorSource::CurrentFrameUnverifiedGeometry,
+        )
+        .unwrap();
+        assert!(
+            driving_current_frame_limbus_scale_affinity(pose_at_radius(100.0), Some(unverified),)
+                > 0.99,
+            "the legacy carrier cohort keeps deterministic incumbent ordering",
+        );
+        assert_eq!(
+            driving_current_frame_limbus_scale_affinity(pose_at_radius(140.0), Some(unverified)),
+            0.0,
+            "an expanded outer road must not be pulled toward an unverified carrier midpoint",
+        );
+        assert!(
+            driving_current_frame_limbus_scale_support_affinity(
+                pose_at_radius(120.0),
+                Some(unverified),
+            ) > 0.0,
+            "the declared hard proposal interval remains searchable",
+        );
     }
 
     #[test]
@@ -56223,6 +56600,54 @@ mod tests {
 
         assert_eq!(pixels[50 * width + 30], 0x0038_a6b8);
         assert!(overlay.trails.is_empty());
+    }
+
+    #[test]
+    fn spatial_search_boxes_are_hidden_by_default_and_remain_opt_in() {
+        let overlay = raw_motion_octrees::MotionOctreeOverlay {
+            nodes: vec![raw_motion_octrees::OverlayNode {
+                object: raw_motion_octrees::GENERAL_LAYER,
+                bounds: [70.0, 90.0, 70.0, 90.0, 0.0, 0.0],
+                depth: 1,
+                count: 3,
+            }],
+            horizontal_light_field: raw_motion_octrees::HorizontalLightFieldStatus {
+                nodes: vec![raw_motion_octrees::HorizontalLightFieldNode {
+                    depth: 1,
+                    leaf: true,
+                    source_bounds: [110.0, 100.0, 130.0, 120.0],
+                    source_center: [120.0, 110.0],
+                    destination_center: [120.0, 110.0],
+                    horizontal_scale_delta: 0.01,
+                    confidence: 1.0,
+                    ..raw_motion_octrees::HorizontalLightFieldNode::default()
+                }],
+                ..raw_motion_octrees::HorizontalLightFieldStatus::default()
+            },
+            ..raw_motion_octrees::MotionOctreeOverlay::default()
+        };
+        let width = 180;
+        let height = 150;
+        let mut pixels = vec![0u32; width * height];
+
+        draw_motion_octree_overlay(&mut pixels, width, height, 0, 0, 1, &overlay, false);
+        assert_eq!(pixels[70 * width + 70], 0);
+        assert_eq!(pixels[110 * width + 110], 0);
+
+        pixels.fill(0);
+        draw_motion_octree_overlay_with_spatial_debug(
+            &mut pixels,
+            width,
+            height,
+            0,
+            0,
+            1,
+            &overlay,
+            false,
+            true,
+        );
+        assert_ne!(pixels[70 * width + 70], 0);
+        assert_ne!(pixels[110 * width + 110], 0);
     }
 
     #[test]

@@ -4720,6 +4720,7 @@ where
                     Some(&focus),
                     radius_prior,
                     64,
+                    true,
                 )
             });
         if wide_shortlists.direct_top_four != multibank_proposals {

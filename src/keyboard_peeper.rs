@@ -94,7 +94,7 @@ impl Drop for Registration {
 }
 
 pub fn buttercup_map(virtual_mouse: bool, driving: bool) -> HotkeyMap {
-    let mut bindings = Vec::with_capacity(36);
+    let mut bindings = Vec::with_capacity(37);
     let mut add = |key, label, enabled| {
         bindings.push(Binding {
             modifiers: 0,
@@ -130,6 +130,7 @@ pub fn buttercup_map(virtual_mouse: bool, driving: bool) -> HotkeyMap {
     add("=", "Iris max +", !virtual_mouse);
     add("N", "Pattern", virtual_mouse);
     add("V", "View", true);
+    add("F", "Spatial debug", true);
     add("X", "Lighthouse", true);
     add("Z", "Screen clock", true);
     add("K", "Edge map", true);
@@ -301,6 +302,7 @@ mod tests {
         assert!(!binding(&normal, "T").enabled);
         assert!(binding(&normal, "-").enabled);
         assert_eq!(binding(&normal, "[").label, "Iris min -");
+        assert_eq!(binding(&normal, "F").label, "Spatial debug");
 
         let mouse_driving = buttercup_map(true, true);
         assert!(binding(&mouse_driving, "B").enabled);
