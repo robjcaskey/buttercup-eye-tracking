@@ -4586,6 +4586,7 @@ where
                 iris_seed_from_driving_pose(pose),
                 Some(&focus),
                 radius_prior,
+                None,
             )
         });
         let two_d_measured_multibank_pose = two_d_measured_multibank_seed
@@ -6935,14 +6936,16 @@ where
         let mut cluster_seed_geometry_measured = false;
         if temporal_feature_layer_ready_for_geometry(&cluster_overlay) {
             if let Some(seed) = cluster_seed {
+                let aim = temporal_canny_motion_conditioned_measurement_aim(seed, &cluster_overlay);
                 if let Some(measured) = measured_multibank_temporal_canny_seed(
                     &raw,
                     width,
                     height,
                     sensor_origin,
-                    seed,
+                    aim.seed,
                     Some(&focus),
                     cluster_prior,
+                    aim.center_prior,
                 ) {
                     cluster_seed = Some(measured);
                     cluster_seed_geometry_measured = true;
@@ -7060,7 +7063,7 @@ where
             .as_ref()
             .and_then(|hypothesis| cluster_overlay.layers.get(hypothesis.motion_layer))
             .map_or(0, |layer| layer.persistent_tracks);
-        let cluster_semantic_assessment = temporal_feature_limbus_semantic_assessment(
+        let mut cluster_semantic_assessment = temporal_feature_limbus_semantic_assessment(
             cluster_candidate.as_ref(),
             cluster_seed,
             cluster_prior,
@@ -7074,6 +7077,16 @@ where
             cluster_reflection_disk_evidence,
             cluster_layer_tracks,
         );
+        let cluster_radial_center_assessment = temporal_feature_radial_center_assessment(
+            cluster_candidate
+                .as_ref()
+                .map(|hypothesis| hypothesis.center),
+            &cluster_overlay,
+        );
+        if cluster_semantic_assessment.admissible && !cluster_radial_center_assessment.admissible {
+            cluster_semantic_assessment.admissible = false;
+            cluster_semantic_assessment.reason = "radial-vertical-center-disagreement";
+        }
         let cluster_layer_motion = cluster_candidate.as_ref().and_then(|hypothesis| {
             cluster_overlay
                 .motions
@@ -7638,6 +7651,15 @@ where
                 "material_topology_probe": driving_json(cluster_topology_probe),
                 "iris_texture": texture_json(cluster_texture),
                 "center_kinematics": temporal_feature_center_assessment_json(cluster_center_assessment),
+                "radial_center_kinematics": {
+                    "checked": cluster_radial_center_assessment.checked,
+                    "admissible": cluster_radial_center_assessment.admissible,
+                    "vertical_departure_px": cluster_radial_center_assessment.vertical_departure_px,
+                    "maximum_vertical_departure_px": cluster_radial_center_assessment.maximum_vertical_departure_px,
+                    "fused_probes": cluster_radial_center_assessment.fused_probes,
+                    "fused_image_left": cluster_radial_center_assessment.fused_image_left,
+                    "fused_image_right": cluster_radial_center_assessment.fused_image_right,
+                },
                 "semantic_admission": temporal_feature_semantic_assessment_json(cluster_semantic_assessment),
                 "semantic_eye": driving_semantic_eye_json(cluster_semantic_eye),
                 "diagnostics": feature_cluster_diagnostics_json(cluster_diagnostics),
@@ -7658,6 +7680,15 @@ where
                 "radial_limbus": {
                     "accepted": cluster_overlay.radial_limbus_probes.len(),
                     "fused": cluster_overlay.radial_limbus_probes.iter().filter(|probe| probe.fused).count(),
+                    "probes": cluster_overlay.radial_limbus_probes.iter().map(|probe| json!({
+                        "point": probe.point,
+                        "normal": probe.normal,
+                        "phase_rad": probe.phase_rad,
+                        "radial_shift_px": probe.radial_shift_px,
+                        "profile_cost": probe.profile_cost,
+                        "confidence": probe.confidence,
+                        "fused": probe.fused,
+                    })).collect::<Vec<_>>(),
                     "image_left": cluster_radial_left,
                     "image_left_fused": cluster_radial_left_fused,
                     "image_right": cluster_radial_right,
