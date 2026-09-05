@@ -34,6 +34,39 @@ cargo build --release
 scripts/run-viewer.sh
 ```
 
+SAM3.1 uses the native LibTorch/CUDA runtime under `data/runtime`. The launcher
+prefers `data/models/sam31_semantic_video_shared_features_u8.pt` when available,
+and falls back to the older `sam31_semantic_video_features_u8.pt` export. The
+shared export runs the image encoder once, then performs separate iris and
+pupil text-conditioned decodes. Model weights remain external runtime data.
+To generate that export from the supported detector archive:
+
+```bash
+cargo run --profile live --bin buttercup-sam31-video-graph -- \
+  data/models/sam31_semantic_dynamic_u8.pt \
+  data/models/sam31_semantic_video_shared_features_u8.pt --shared-features
+```
+
+When the SAM pupil-center mode is selected, the pupil prompt is followed by
+flat-tire contour exclusion, limbus-relative shape/size checks, reflection-aware
+RAW edge validation, and short temporal consistency checks. A failed pupil
+prompt does not discard a valid iris or silently acquire a different RAW dark
+component. `BUTTERCUP_SAM31_SEMANTIC_PUPIL=0` selects the older RAW-component
+proposal path for comparison; `BUTTERCUP_SAM31_SHARED_FEATURE_PROMPT=0` disables
+feature reuse. These switches do not bypass RAW publication checks.
+
+Offline replay uses the same worker and original sensor timestamps, without
+recorded prediction or annotation seeds. A stride simulates dropped frames:
+
+```bash
+scripts/run-viewer.sh --offline-sam-sequence-eval \
+  outputs/replay.json outputs/EXTRACTED_CAPTURE subject-right 0 32 1
+```
+
+Replay includes the post-SAM pupil solver under an explicitly optimistic
+settled-focus assumption. Candidate counts are not accuracy measurements;
+pupil accuracy needs pupil-specific human reference.
+
 When Keyboard Peeper is running, the viewer optionally publishes its current
 hotkeys over the versioned binary KPP/1 Unix-socket protocol. Mode-dependent
 buttons are retained in the map with an enabled or disabled state, and updates

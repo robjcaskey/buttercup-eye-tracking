@@ -20,8 +20,17 @@ mapfile -t unexpected_files < <(
       ./docs/viewer-overview.png \
       ./scripts/audit-tree.sh \
       ./scripts/run-viewer.sh \
+      ./scripts/run-sam31-arc-trial.sh \
+      ./scripts/run-sam31-prompt-lab.sh \
+      ./scripts/prompt-lab-troublesome-3.txt \
+      ./scripts/prompt-lab-troublesome-20.txt \
       ./src/checkerboard_calibration.rs \
       ./src/bin/buttercup_screen_reflection_raw_decode.rs \
+      ./src/bin/buttercup_sam31_arc_trial.rs \
+      ./src/bin/buttercup_sam31_prompt_bundle.rs \
+      ./src/bin/buttercup_sam31_video_graph.rs \
+      ./src/bin/buttercup_sam31_tracker_bundle.rs \
+      ./src/bin/buttercup_raw10_preview.rs \
       ./src/coupled_eye_kinematics.rs \
       ./src/keyboard_peeper.rs \
       ./src/main.rs \
@@ -32,8 +41,10 @@ mapfile -t unexpected_files < <(
       ./src/raw_eye_model_protocol.rs \
       ./src/raw_iris_focus.rs \
       ./src/raw_motion_octrees.rs \
+      ./src/raw_sclera_vein_graph.rs \
       ./src/raw_sclera_red_canny.rs \
       ./src/sam31_outer.rs \
+      ./src/sam31_text.rs \
       ./src/screen_reflection_clock.rs \
       ./src/screen_reflection_code.rs \
       ./src/screen_reflection_live.rs \
@@ -75,7 +86,7 @@ if ((${#forbidden_names[@]})); then
 fi
 
 if rg -n '/home/rob/|extracted_rootfs|/app/bin/camera|af_test|UVCIOC|PyUSB' \
-  --glob '!Cargo.lock' --glob '!scripts/audit-tree.sh' .; then
+  --glob '!Cargo.lock' --glob '!AGENTS.md' --glob '!scripts/audit-tree.sh' .; then
   printf 'forbidden source-project or device-control references found\n' >&2
   status=1
 fi

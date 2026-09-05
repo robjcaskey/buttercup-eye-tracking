@@ -1,0 +1,5 @@
+# Fast interactive prompt loop. These are the first three targets from the
+# larger troublesome-20 manifest and retain their native temporal context.
+data/outputs/labeling/roi-jump-1788101004/extracted@308@subject-right
+data/outputs/labeling/roi-jump-1788101004/extracted@317@subject-right
+data/outputs/labeling/limbus-band-set-1788101016/extracted@506@subject-right

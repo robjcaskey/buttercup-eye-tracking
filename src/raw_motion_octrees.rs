@@ -160,6 +160,55 @@ const PREDICTED_PATCH_RADIUS: i32 = 5;
 const PREDICTED_PYRAMID_PATCH_RADIUS: i32 = 6;
 const SEARCH_RADIUS: i32 = 16;
 const MIN_FEATURE_SEPARATION: f32 = 8.0;
+// Edge polarity may reverse as illumination changes, so feature orientation
+// lives on a half-turn rather than a full circle. Sixteen circular buckets
+// retain 11.25-degree resolution; accepting the immediately adjacent bucket
+// prevents boundary chatter while still rejecting an unrelated ridge whose
+// orientation the old |dot| > 0.20 gate could admit nearly 78 degrees away.
+pub const FEATURE_ORIENTATION_BUCKETS: u8 = 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FeatureOrientationBucket(u8);
+
+impl FeatureOrientationBucket {
+    pub fn from_angle_radians(angle: f32) -> Option<Self> {
+        if !angle.is_finite() {
+            return None;
+        }
+        let phase = angle.rem_euclid(std::f32::consts::PI) / std::f32::consts::PI;
+        Some(Self(
+            ((phase * f32::from(FEATURE_ORIENTATION_BUCKETS)).floor() as u8)
+                .min(FEATURE_ORIENTATION_BUCKETS - 1),
+        ))
+    }
+
+    pub fn from_unoriented_vector(vector: [f32; 2]) -> Option<Self> {
+        (vector[0].hypot(vector[1]) > 0.5)
+            .then(|| Self::from_angle_radians(vector[1].atan2(vector[0])))
+            .flatten()
+    }
+
+    pub fn circular_distance(self, other: Self) -> u8 {
+        let direct = self.0.abs_diff(other.0);
+        direct.min(FEATURE_ORIENTATION_BUCKETS - direct)
+    }
+
+    pub fn compatible(self, other: Self) -> bool {
+        self.circular_distance(other) <= 1
+    }
+}
+
+pub fn feature_orientations_compatible(first: [f32; 2], second: [f32; 2]) -> bool {
+    match (
+        FeatureOrientationBucket::from_unoriented_vector(first),
+        FeatureOrientationBucket::from_unoriented_vector(second),
+    ) {
+        (Some(first), Some(second)) => first.compatible(second),
+        // Preserve weak/non-edge seeds; Canny support and RAW patch identity
+        // still decide whether they can become established tracks.
+        _ => true,
+    }
+}
 // Forward/backward consistency is the ambiguity test. A conventional
 // second-best margin rejects exactly the long, locally one-dimensional Canny
 // contours whose motion we need to watch over time.
@@ -13343,12 +13392,7 @@ impl FourMotionOctrees {
                     // Patch identity needs edge orientation, not photometric
                     // polarity. Signed polarity is still enforced later when
                     // a current edge votes for the limbus ellipse.
-                    if prior_normal[0].hypot(prior_normal[1]) > 0.5
-                        && (candidate_normal[0] * prior_normal[0]
-                            + candidate_normal[1] * prior_normal[1])
-                            .abs()
-                            < 0.20
-                    {
+                    if !feature_orientations_compatible(prior_normal, candidate_normal) {
                         return false;
                     }
                 }
@@ -14606,6 +14650,32 @@ impl FourMotionOctrees {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_feature_orientation_buckets_are_unoriented_and_circular() {
+        let horizontal = FeatureOrientationBucket::from_angle_radians(0.0).unwrap();
+        let reversed = FeatureOrientationBucket::from_angle_radians(std::f32::consts::PI).unwrap();
+        let across_wrap =
+            FeatureOrientationBucket::from_angle_radians(-2.0f32.to_radians()).unwrap();
+        assert_eq!(horizontal, reversed);
+        assert!(horizontal.compatible(across_wrap));
+        assert!(feature_orientations_compatible([1.0, 0.0], [-1.0, 0.0]));
+    }
+
+    #[test]
+    fn shared_feature_orientation_buckets_reject_rotated_decoys() {
+        let horizontal = FeatureOrientationBucket::from_angle_radians(0.0).unwrap();
+        let boundary_jitter =
+            FeatureOrientationBucket::from_angle_radians(10.0f32.to_radians()).unwrap();
+        let rotated_decoy =
+            FeatureOrientationBucket::from_angle_radians(30.0f32.to_radians()).unwrap();
+        assert!(horizontal.compatible(boundary_jitter));
+        assert!(!horizontal.compatible(rotated_decoy));
+        assert!(!feature_orientations_compatible(
+            [1.0, 0.0],
+            [30.0f32.to_radians().cos(), 30.0f32.to_radians().sin()],
+        ));
+    }
 
     fn synthetic_translucent_limbus_frame(
         width: usize,

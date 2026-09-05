@@ -4801,6 +4801,411 @@ fn labeled_wide64_selection_json(
     })
 }
 
+#[derive(Default)]
+struct PostSamPupilReplay {
+    center: PupilCenterStateTracker,
+    size: PupilSizeTracker,
+    rate: RadiusRateLimiter,
+    motion: raw_motion_octrees::FourMotionOctrees,
+    clock: Option<(u64, Instant)>,
+    last_timestamp: Option<u64>,
+}
+
+impl PostSamPupilReplay {
+    fn observe(&mut self,frame:&sam31_outer::RawFrame,
+        projection:Option<PupilProjectionReference>,rough:Option<(f64,f64)>) -> Value {
+        let timestamp=frame.timestamp_ns;
+        if self.last_timestamp.is_some_and(|last|timestamp<=last || timestamp-last>1_000_000_000) {
+            *self=Self::default();
+        }
+        self.last_timestamp=Some(timestamp);
+        let (first,start)=*self.clock.get_or_insert_with(||(timestamp,Instant::now()));
+        let now=start+Duration::from_nanos(timestamp-first);
+        let (width,height)=(frame.width,frame.height);
+        let origin=(frame.sensor_x,frame.sensor_y);
+        let focus=raw_iris_focus::score_stream_eye(&frame.pixels,width,height);
+        let motion=self.motion.observe_with_iris_seed_at(&frame.pixels,width,height,origin.0,origin.1,timestamp,None,true,None);
+        let prediction=self.center.begin_frame(now,origin,(width,height),projection,rough,&motion);
+        let support=self.size.begin_frame(now,prediction.map(|p|p.center),projection,true,
+            DEFAULT_PUPIL_RADIUS_LOWER_FRACTION,DEFAULT_PUPIL_RADIUS_UPPER_FRACTION);
+        let condition=projection.map_or_default(|p|PupilEvidenceCondition::fully_reliable(p.fronto_parallel_limbus_radius_px.value()));
+        let prior=inner_radius_prior_from_support_conditioned(support,condition);
+        let mut boundary=prediction.zip(projection).map(|(prediction,projection)|
+            solve_pupil_boundary_from_temporal_state(&mut self.center,now,origin,&frame.pixels,
+                width,height,&focus,projection,prediction,rough,&motion,support,prior,condition.raw_solver_condition()))
+            .unwrap_or_default();
+        let confidence=pupil_boundary_confidence(&boundary,support);
+        let pre_rate_limit = json!({"center":boundary.center,
+            "radii":[boundary.major_radius,boundary.minor_radius],
+            "equivalent_radius":boundary.radius,"points":boundary.points.len()});
+        let admission=stabilize_and_observe_pupil_size(&mut self.size,&mut self.rate,now,
+            &mut boundary,support,confidence,true,condition);
+        json!({"assumption":"optimistic settled focus; recorded RAW and production post-SAM solver",
+            "rough_center":rough,"projection_available":projection.is_some(),
+            "candidate_points":boundary.points.len(),"candidate_center":boundary.center,
+            "candidate_radii":[boundary.major_radius,boundary.minor_radius],"candidate_angle":boundary.angle,
+            "equivalent_radius":boundary.radius,
+            "pre_rate_limit":pre_rate_limit,
+            "points":boundary.points.iter().map(|p|json!({"x":p.x,"y":p.y,"score":p.score})).collect::<Vec<_>>(),
+            "radial_candidates":boundary.radial_candidates.iter().map(|p|json!({
+                "sector":p.sector_index,"radius":p.equivalent_radius_px,"x":p.x,"y":p.y,
+                "raw_score":p.raw_score,"prominence":p.peak_prominence,"luma":p.luma_transition,
+                "chroma":p.chroma_transition,"void_drop":p.void_drop,"inside_void":p.inside_void,
+                "broad_dark_step":p.broad_dark_step})).collect::<Vec<_>>(),
+            "confidence":confidence,"publishable":admission.current_boundary_publishable(),
+            "focus_size_qualified":admission.focus_size_qualified,"limbus_geometry_qualified":admission.limbus_geometry_qualified,
+            "raw_diameter_qualified":admission.raw_diameter_qualified,"rate_limited":admission.rate_limited,
+            "trajectory_updated":admission.trajectory_updated,"center_track":pupil_center_track_json(self.center.diagnostics())})
+    }
+}
+
+/// CPU-only diagnostic: hold previously inferred SAM limbi fixed while
+/// exercising today's pupil cleanup against the original native exposure.
+/// This is NOT a full pipeline benchmark or an annotation-seeded fit.
+pub(super) fn sam_pupil_refit<I>(mut args: I) -> Result<(), String>
+where I: Iterator<Item = String> {
+    let output = PathBuf::from(args.next().ok_or("expected OUTPUT.json SAM_REPORT.json")?);
+    let source = PathBuf::from(args.next().ok_or("missing SAM report")?);
+    if args.next().is_some() { return Err("unexpected pupil-refit argument".into()); }
+    if output.exists() { return Err(format!("output already exists: {}",output.display())); }
+    let mut report: Value = serde_json::from_slice(&fs::read(&source).map_err(|e|e.to_string())?)
+        .map_err(|e|e.to_string())?;
+    let capture = report["capture"].as_str().map(PathBuf::from);
+    let cases = report["cases"].as_array_mut().ok_or("missing SAM cases")?;
+    let mut post_replay=PostSamPupilReplay::default();
+    for (index, case) in cases.iter_mut().enumerate() {
+        let outer = if capture.is_some() { &case["outer"] } else { &case["sam"]["ellipse"] };
+        let number = |key: &str| outer[key].as_f64().ok_or_else(||format!("invalid ellipse {key}"));
+        let outer = if outer.is_null() {None} else {Some(sam31_outer::Ellipse {
+            center: (outer["center"][0].as_f64().ok_or("invalid ellipse center")?,
+                outer["center"][1].as_f64().ok_or("invalid ellipse center")?),
+            major_radius:number("major_radius")?,minor_radius:number("minor_radius")?,angle:number("angle")?,
+        })};
+        let (meta, packed) = if let Some(capture) = capture.as_ref() {
+            let meta = case["frame"].clone();
+            let member = meta["stream"].as_str().ok_or("missing stream")?;
+            if Path::new(member).components().count() != 1 { return Err("invalid RAW member".into()); }
+            let mut file = File::open(capture.join(member)).map_err(|e|e.to_string())?;
+            file.seek(SeekFrom::Start(integer(&meta,"offset")?)).map_err(|e|e.to_string())?;
+            let mut packed = vec![0;integer(&meta,"length")? as usize];
+            file.read_exact(&mut packed).map_err(|e|e.to_string())?;
+            (meta,packed)
+        } else {
+            let path = PathBuf::from(case["source_raw"].as_str().ok_or("missing source RAW")?);
+            let meta = serde_json::from_slice(&fs::read(labeled_raw_metadata_path(&path)?).map_err(|e|e.to_string())?)
+                .map_err(|e|e.to_string())?;
+            (meta,fs::read(path).map_err(|e|e.to_string())?)
+        };
+        let width = integer(&meta,"width")? as usize;
+        let height = integer(&meta,"height")? as usize;
+        let frame = Arc::new(sam31_outer::RawFrame {
+            eye_index:0,sequence:meta["sequence"].as_u64().unwrap_or(index as u64),
+            timestamp_ns:meta["timestamp_ns"].as_u64().unwrap_or(index as u64+1),
+            sensor_x:integer(&meta,"sensor_x")? as u32,sensor_y:integer(&meta,"sensor_y")? as u32,
+            width,height,registration_anchor:None,pupil_component_seed:None,
+            pixels:Arc::new(raw10::try_unpack_raw10(&packed,width,height,integer(&meta,"stride")? as usize)?),
+        });
+        case["pupil_refit"] = outer.map_or(Value::Null,|outer|sam31_outer::inspect_pupil_fit(frame.clone(),outer));
+        if capture.is_some() {
+            let projection=outer.filter(|_|case["raw_admitted"].as_bool()==Some(true)).and_then(|o|
+                PupilProjectionReference::from_axes(o.center,o.major_radius,o.minor_radius,o.angle,PupilProjectionSource::SelectedIris));
+            let center=&case["pupil"]["center"];
+            let rough=projection.and_then(|_|Some((center[0].as_f64()?,center[1].as_f64()?)));
+            case["post_refit"]=post_replay.observe(&frame,projection,rough);
+        }
+    }
+    report["pupil_refit_contract"] = json!({"source_report":source,
+        "method":"pupil_refit: stateless RAW cleanup with frozen inferred limbus; post_refit: temporal production solver with frozen inferred SAM geometry/center and original RAW; no human seeds"});
+    fs::write(output,serde_json::to_vec_pretty(&report).map_err(|e|e.to_string())?).map_err(|e|e.to_string())
+}
+
+/// Replay actual exposures through the production SAM video worker. An
+/// optional stride simulates skipped frames at live inference cadence while
+/// preserving source timestamps. No predictions, labels, or future frames seed it.
+/// Missing outputs remain missing; temporal metrics never bridge a miss.
+pub(super) fn sam_sequence_eval<I>(mut args: I) -> Result<(), String>
+where I: Iterator<Item = String> {
+    let output = PathBuf::from(args.next().ok_or("expected OUTPUT.json CAPTURE_DIR LABEL [START] [COUNT] [STRIDE]")?);
+    let capture = PathBuf::from(args.next().ok_or("missing capture directory")?);
+    let label = args.next().ok_or("missing eye label")?;
+    let start = parse_usize(args.next(), 0, "start")?;
+    let count = parse_usize(args.next(), usize::MAX, "count")?;
+    let stride = parse_usize(args.next(), 1, "stride")?;
+    if stride == 0 { return Err("sequence stride must be positive".into()); }
+    if args.next().is_some() { return Err("unexpected sequence argument".into()); }
+    if output.exists() { return Err(format!("output already exists: {}", output.display())); }
+    let records = fs::read_to_string(capture.join("frames.jsonl")).map_err(|e|e.to_string())?
+        .lines().map(serde_json::from_str::<Value>).collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?
+        .into_iter().filter(|r| r["label"].as_str() == Some(label.as_str()))
+        .skip(start).step_by(stride).take(count).collect::<Vec<_>>();
+    if records.is_empty() { return Err("empty SAM sequence".into()); }
+    let model = env::var_os("BUTTERCUP_SAM31_MODEL").map(PathBuf::from)
+        .unwrap_or_else(sam31_outer::default_model_path);
+    let client = sam31_outer::Client::start(&model)?;
+    let mut history = VecDeque::new();
+    let mut cases = Vec::new();
+    let mut outer_summary = ModelAggregate::default();
+    let mut pupil_summary = ModelAggregate::default();
+    let mut previous_ratio = None::<f64>;
+    let mut ratio_steps = Vec::new();
+    let mut ratios = Vec::new();
+    let mut previous_time = None;
+    let mut epoch = 1;
+    let mut post_replay = PostSamPupilReplay::default();
+    for (index, record) in records.iter().enumerate() {
+        let width = integer(record,"width")? as usize;
+        let height = integer(record,"height")? as usize;
+        let origin = (integer(record,"sensor_x")? as u32,integer(record,"sensor_y")? as u32);
+        let timestamp = integer(record,"timestamp_ns")?;
+        if previous_time.is_some_and(|t| timestamp <= t || timestamp - t > 1_000_000_000) {
+            history.clear(); epoch += 1;
+            previous_ratio = None;
+        }
+        previous_time = Some(timestamp);
+        let member = record["stream"].as_str().ok_or("missing RAW stream")?;
+        if Path::new(member).components().count() != 1 { return Err("invalid RAW stream member".into()); }
+        let mut file = File::open(capture.join(member)).map_err(|e|e.to_string())?;
+        file.seek(SeekFrom::Start(integer(record,"offset")?)).map_err(|e|e.to_string())?;
+        let mut packed = vec![0; integer(record,"length")? as usize];
+        file.read_exact(&mut packed).map_err(|e|e.to_string())?;
+        let frame = Arc::new(sam31_outer::RawFrame {
+            eye_index: 0, sequence: integer(record,"sequence")?, timestamp_ns: timestamp,
+            sensor_x: origin.0, sensor_y: origin.1, width, height,
+            registration_anchor: None, pupil_component_seed: None,
+            pixels: Arc::new(raw10::try_unpack_raw10(&packed,width,height,integer(record,"stride")? as usize)?),
+        });
+        history.push_back(frame.clone());
+        while history.len() > 8 { history.pop_front(); }
+        let completed = client.status().completed_batches;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match client.submit_history(&history,sam31_outer::Target::OuterLimbusAndInnerPupilVoid,
+                sam31_outer::OUTER_IRIS_PROMPT,0,epoch) {
+                sam31_outer::SubmitOutcome::Accepted => break,
+                sam31_outer::SubmitOutcome::Invalid => return Err(client.status().detail),
+                _ => {},
+            }
+            if Instant::now() > deadline { return Err("SAM sequence submission timed out".into()); }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        while client.status().completed_batches <= completed {
+            if Instant::now() > deadline { return Err(format!("SAM sequence timed out: {}",client.status().detail)); }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let proposal = client.drain_proposal_masks().into_iter().find(|p|p.source_timestamp_ns == timestamp);
+        let result = client.drain_results().into_iter().find(|r|r.source_timestamp_ns == timestamp);
+        let outer = proposal.as_ref().and_then(|p|p.outer_fit.as_ref()).map(|p|p.ellipse);
+        let pupil = proposal.as_ref().and_then(|p|p.inner_pupil_fit);
+        // Isolate the same post-SAM RAW pupil solver used live, giving it an
+        // optimistic settled-focus condition. This is not a claim that focus
+        // was actually settled in the recording; failures here cannot be
+        // explained merely by the live autofocus gate.
+        let boundary = result.as_ref().and_then(|r|sam31_outer_boundary_for_frame(r,timestamp,origin.0,origin.1,None));
+        let projection = boundary.as_ref().and_then(|b|PupilProjectionReference::from_outer(b,PupilProjectionSource::SelectedIris));
+        let rough = result.as_ref().and_then(|r|sam31_pupil_center_for_frame(r,timestamp,origin.0,origin.1,None));
+        let post = post_replay.observe(&frame,projection,rough);
+        let ratio = outer.zip(pupil).map(|(o,p)| (p.ellipse.major_radius * p.ellipse.minor_radius / (o.major_radius * o.minor_radius)).sqrt());
+        if let Some(ratio) = ratio {
+            ratios.push(ratio);
+            if let Some(previous) = previous_ratio { ratio_steps.push((ratio / previous).ln().abs()); }
+        }
+        previous_ratio = ratio;
+        let elapsed = client.status().last_elapsed_ms.unwrap_or_default() as f64;
+        outer_summary.observe(outer.is_some(),result.is_some(),outer.map(|o|o.center),outer.map(|o|o.major_radius),origin,elapsed);
+        pupil_summary.observe(pupil.is_some(),pupil.is_some(),pupil.map(|p|p.ellipse.center),
+            pupil.map(|p|(p.ellipse.major_radius*p.ellipse.minor_radius).sqrt()),origin,elapsed);
+        let ellipse_json = |e: sam31_outer::Ellipse| json!({"center":e.center,"major_radius":e.major_radius,"minor_radius":e.minor_radius,"angle":e.angle});
+        cases.push(json!({"frame":record,"epoch":epoch,"outer":outer.map(ellipse_json),
+            "raw_admitted":result.is_some(),"pupil":pupil.map(|p|ellipse_json(p.ellipse)),
+            "pupil_support":pupil.map(|p|json!({"score":p.raw_support.score,"positive_fraction":p.raw_support.positive_fraction,"strong_sectors":p.raw_support.strong_sectors})),
+            "pupil_radius_ratio":ratio,"post_sam":post,"pupil_diagnostics":outer.map(|o|sam31_outer::inspect_pupil_fit(frame,o)),
+            "status":client.status().detail,"elapsed_ms":elapsed}));
+        if index % 10 == 0 || index+1 == records.len() {
+            eprintln!("SAM sequence {} {}/{} outer={} pupil={}",label,index+1,records.len(),outer.is_some(),pupil.is_some());
+        }
+    }
+    let report = json!({"schema":"buttercup-sam-sequence-eval-v1","capture":capture,"label":label,
+        "model":model,"configuration":sam31_outer::live_configuration(),
+        "sampling":{"start":start,"maximum_samples":count,"source_frame_stride":stride},
+        "contract":"production video worker, sequential native RAW exposures, no prediction/label seeds; proposal-only pupil metrics, not final UI publication or accuracy ground truth",
+        "outer_summary":outer_summary.json(cases.len()),"pupil_summary":pupil_summary.json(cases.len()),
+        "pupil_radius_ratio":distribution(&ratios),"consecutive_pupil_ratio_log_step":distribution(&ratio_steps),"cases":cases});
+    fs::write(output,serde_json::to_vec_pretty(&report).map_err(|e|e.to_string())?).map_err(|e|e.to_string())
+}
+
+/// Score independent stills through the production SAM worker. Human labels
+/// are consulted only after inference, never used to seed a candidate.
+pub(super) fn labeled_sam_eval<I>(mut args: I) -> Result<(), String>
+where
+    I: Iterator<Item = String>,
+{
+    let output = PathBuf::from(
+        args.next()
+            .ok_or("expected OUTPUT.json then LABEL.json paths")?,
+    );
+    if output.exists() {
+        return Err(format!("output already exists: {}", output.display()));
+    }
+    let labels = args.collect::<Vec<_>>();
+    if labels.is_empty() {
+        return Err("expected at least one LABEL.json path".into());
+    }
+    let model = env::var_os("BUTTERCUP_SAM31_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(sam31_outer::default_model_path);
+    let client = sam31_outer::Client::start(&model)?;
+    let mut cases = Vec::new();
+    for (index, path) in labels.into_iter().enumerate() {
+        let label: Value = serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        let source = PathBuf::from(label["source_raw"].as_str().ok_or("missing source_raw")?);
+        let meta: Value = serde_json::from_slice(
+            &fs::read(labeled_raw_metadata_path(&source)?).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let width = integer(&meta, "width")? as usize;
+        let height = integer(&meta, "height")? as usize;
+        let origin = (
+            integer(&meta, "sensor_x")? as u32,
+            integer(&meta, "sensor_y")? as u32,
+        );
+        let raw = Arc::new(raw10::try_unpack_raw10(
+            &fs::read(&source).map_err(|e| e.to_string())?,
+            width,
+            height,
+            integer(&meta, "stride")? as usize,
+        )?);
+        let source_timestamp = (index as u64 + 1) * 1_000_000_000;
+        let history = VecDeque::from([Arc::new(sam31_outer::RawFrame {
+            eye_index: 0,
+            sequence: index as u64 + 1,
+            timestamp_ns: source_timestamp,
+            sensor_x: origin.0,
+            sensor_y: origin.1,
+            width,
+            height,
+            registration_anchor: None,
+            pupil_component_seed: None,
+            pixels: raw.clone(),
+        })]);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let completed_before = client.status().completed_batches;
+        loop {
+            match client.submit_history(
+                &history,
+                sam31_outer::Target::OuterLimbusAndInnerPupilVoid,
+                sam31_outer::OUTER_IRIS_PROMPT,
+                0,
+                index as u64 + 1,
+            ) {
+                sam31_outer::SubmitOutcome::Accepted => break,
+                sam31_outer::SubmitOutcome::Invalid => return Err(client.status().detail),
+                _ => {}
+            }
+            if Instant::now() > deadline {
+                return Err("SAM submission timed out".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut proposal = None;
+        let mut admitted = false;
+        loop {
+            for p in client.drain_proposal_masks() {
+                if p.source_timestamp_ns == source_timestamp {
+                    proposal = Some(p);
+                }
+            }
+            for r in client.drain_results() {
+                admitted |= r.source_timestamp_ns == source_timestamp;
+            }
+            if client.status().completed_batches > completed_before {
+                break;
+            }
+            if Instant::now() > deadline {
+                return Err(format!(
+                    "SAM inference timed out: {}",
+                    client.status().detail
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Channels may be populated immediately before the completion flag.
+        for p in client.drain_proposal_masks() {
+            if p.source_timestamp_ns == source_timestamp {
+                proposal = Some(p);
+            }
+        }
+        for r in client.drain_results() {
+            admitted |= r.source_timestamp_ns == source_timestamp;
+        }
+        let focus = raw_iris_focus::score_stream_eye(&raw, width, height);
+        let upper = raw_iris_focus::detect_upper_eyelid_points(
+            &raw, width, height, origin.0, origin.1, &focus,
+        );
+        let lower = raw_iris_focus::detect_lower_eyelid_points(
+            &raw, width, height, origin.0, origin.1, &focus,
+        );
+        let native = raw_iris_focus::detect_outer_iris_boundary_between_eyelids_tracked_for_driving(
+            &raw,
+            width,
+            height,
+            origin.0,
+            origin.1,
+            &focus,
+            &upper,
+            &lower,
+            &mut raw_iris_focus::OuterIrisTracker::default(),
+        );
+        // Only now consult annotations for scoring; no labels seed inference.
+        let points = labeled_limbus_points(&label, "visible");
+        let bands = labeled_limbus_band_pairs(&label, "visible");
+        let metrics = |pose: Option<DrivingAffinePose>| {
+            let distances = labeled_ellipse_residuals(&points, pose);
+            json!({"ellipse":pose.map(|p| json!({"center":p.center,"major_radius":p.major_radius,
+                "minor_radius":p.minor_radius,"angle":p.angle})),
+                "visible_distances_px":distances,"rms_px":labeled_rms(&distances),
+                "visible_band_comparison":labeled_limbus_band_comparison_json(&bands,pose)})
+        };
+        let sam = proposal
+            .as_ref()
+            .and_then(|p| p.outer_fit.as_ref())
+            .map(|p| DrivingAffinePose {
+                center: p.ellipse.center,
+                major_radius: p.ellipse.major_radius,
+                minor_radius: p.ellipse.minor_radius,
+                angle: p.ellipse.angle,
+            });
+        let native_pose = (!native.points.is_empty()).then_some(DrivingAffinePose {
+            center: native.center,
+            major_radius: native.major_radius,
+            minor_radius: native.minor_radius,
+            angle: native.angle,
+        });
+        let row = json!({"label":path,"source_raw":source,"reviewed":label["reviewed"],
+            "visible_points":points.len(),"sam":metrics(sam),"native":metrics(native_pose),
+            "sam_raw_admitted":admitted,"sam_status":client.status().detail,
+            "sam_elapsed_ms":client.status().last_elapsed_ms,
+            "pupil_diagnostics":proposal.as_ref().and_then(|p|p.outer_fit.as_ref()).map(|p|
+                sam31_outer::inspect_pupil_fit(history[0].clone(),p.ellipse)),
+            "sam_pupil":proposal.as_ref().and_then(|p|p.inner_pupil_fit).map(|p|json!({
+                "center":p.ellipse.center,"major_radius":p.ellipse.major_radius,
+                "minor_radius":p.ellipse.minor_radius,"angle":p.ellipse.angle,
+                "raw_support":p.raw_support.score})),
+            "censored_points":proposal.as_ref().and_then(|p|p.outer_fit.as_ref()).map(|p|p.flat_tire_points.len())});
+        eprintln!(
+            "reference {} SAM rms={} native rms={}",
+            index + 1,
+            row["sam"]["rms_px"],
+            row["native"]["rms_px"]
+        );
+        cases.push(row);
+    }
+    fs::write(output,serde_json::to_vec_pretty(&json!({"schema":"buttercup-labeled-sam-eval-v1","model":model,
+        "configuration":sam31_outer::live_configuration(),
+        "contract":"independent cold starts through production SAM video worker; labels used only for scoring; pupil has no human reference here","cases":cases})).map_err(|e|e.to_string())?)
+        .map_err(|e|e.to_string())
+}
+
 /// Score hand-labelled still RAWs with Driving's exact production proposal
 /// machinery.  Publication is intentionally not simulated: a still cannot
 /// establish the three-frame physical-radius/identity consensus.  This audit

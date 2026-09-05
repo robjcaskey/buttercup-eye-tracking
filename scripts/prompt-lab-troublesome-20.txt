@@ -1,0 +1,22 @@
+# One native RAW10 target per line. Capture targets retain their preceding
+# temporal context without extracting, copying, or downsampling the source.
+data/outputs/labeling/roi-jump-1788101004/extracted@308@subject-right
+data/outputs/labeling/roi-jump-1788101004/extracted@317@subject-right
+data/outputs/labeling/limbus-band-set-1788101016/extracted@506@subject-right
+data/outputs/labeling/limbus-band-set-1788101016/extracted@512@subject-right
+data/outputs/labeling/limbus-band-set-1788101016/extracted@518@subject-right
+data/outputs/labeling/limbus-band-set-1788101016/extracted@521@subject-right
+data/outputs/labeling/limbus-band-set-1788101016/extracted@525@subject-right
+data/outputs/labeling/limbus-band-set-1788101016/extracted@532@subject-right
+data/outputs/labeling/limbus-band-set-1788101016/extracted@533@subject-right
+data/outputs/labeling/limbus-band-set-1788101016/extracted@538@subject-right
+data/outputs/labeling/limbus-band-set-1788101016/extracted@543@subject-right
+data/outputs/labeling/limbus-band-set-1788101016/extracted@544@subject-right
+data/outputs/labeling/limbus-band-set-1788101016/extracted@549@subject-right
+data/outputs/labeling/limbus-band-set-1788101016/extracted@550@subject-right
+data/outputs/labeling/limbus-band-set-1788101016/extracted@557@subject-right
+data/outputs/labeling/limbus-band-set-1788101016/extracted@562@subject-right
+data/outputs/labeling/limbus-band-set-1788101016/extracted@565@subject-right
+data/outputs/labeling/limbus-band-set-1788101016/extracted@568@subject-right
+data/outputs/labeling/limbus-band-set-1788101016/extracted@569@subject-right
+data/outputs/labeling/limbus-band-set-1788101016/extracted@578@subject-right
