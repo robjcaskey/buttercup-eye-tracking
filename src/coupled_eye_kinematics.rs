@@ -8,7 +8,9 @@
 //! current-frame iris geometry must corroborate the fixed point before the
 //! projected globe state becomes publishable.
 
-use super::{MotionLayerStatus, SimilarityMotion, GENERAL_LAYER, PUPIL_LAYER};
+use crate::roi_evidence::{
+    MotionLayerStatus, SimilarityMotion, GENERAL_LAYER, OBJECTS, PUPIL_LAYER,
+};
 use std::collections::VecDeque;
 
 const MIN_LAYER_SUPPORT: usize = 3;
@@ -92,8 +94,9 @@ impl GlobeMotionRegime {
 }
 
 /// A head-material-frame globe state. `projected_pivot` is a filtered latent
-/// anatomical hypothesis; `projected_pole` is the current iris-center vector
-/// from that pivot. Neither is publishable until current anatomy and the
+/// effective-pivot hypothesis, not a rigid anatomical hinge; `projected_pole`
+/// is the current iris-center vector from that pivot. Neither is publishable
+/// until current anatomy and the
 /// independent relative-motion equation agree.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProjectedGlobePoseStatus {
@@ -1338,8 +1341,8 @@ impl CoupledEyeKinematics {
         timestamp_ns: u64,
         analysis_center: [f32; 2],
         frame_extent_px: f64,
-        motions: [SimilarityMotion; super::OBJECTS],
-        layers: [MotionLayerStatus; super::OBJECTS],
+        motions: [SimilarityMotion; OBJECTS],
+        layers: [MotionLayerStatus; OBJECTS],
         semantic_layers: bool,
         iris_geometry: Option<ProjectedIrisGeometry>,
     ) -> CoupledMotionStatus {
@@ -2107,8 +2110,8 @@ mod tests {
     #[test]
     fn invalid_current_frame_does_not_republish_stale_dynamics() {
         let mut tracker = CoupledEyeKinematics::default();
-        let mut motions = [SimilarityMotion::default(); super::super::OBJECTS];
-        let mut layers = [MotionLayerStatus::default(); super::super::OBJECTS];
+        let mut motions = [SimilarityMotion::default(); super::OBJECTS];
+        let mut layers = [MotionLayerStatus::default(); super::OBJECTS];
         for object in [GENERAL_LAYER, PUPIL_LAYER] {
             motions[object] = SimilarityMotion {
                 translation: [1.0, 0.25],
@@ -2152,8 +2155,8 @@ mod tests {
             start + 5 * 20_000_000,
             [120.0, 80.0],
             384.0,
-            [SimilarityMotion::default(); super::super::OBJECTS],
-            [MotionLayerStatus::default(); super::super::OBJECTS],
+            [SimilarityMotion::default(); super::OBJECTS],
+            [MotionLayerStatus::default(); super::OBJECTS],
             false,
             None,
         );

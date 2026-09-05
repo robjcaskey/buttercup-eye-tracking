@@ -2,6 +2,22 @@
 #![recursion_limit = "256"]
 
 #[cfg(feature = "sam31")]
+#[path = "../geometry.rs"]
+mod geometry;
+#[cfg(feature = "sam31")]
+#[path = "../"]
+mod native {
+    // Preserve the shared modules' normal child-module directories. Loading
+    // each file via #[path = "../file.rs"] instead searches its children at
+    // the source root and breaks the standalone trial binary.
+    pub(crate) mod roi_evidence;
+    pub(crate) mod conic_solver;
+    pub(crate) mod outline_conic_segments;
+}
+#[cfg(feature = "sam31")]
+use native::{conic_solver, outline_conic_segments, roi_evidence};
+
+#[cfg(feature = "sam31")]
 #[path = "../raw10.rs"]
 mod raw10;
 #[cfg(feature = "sam31")]

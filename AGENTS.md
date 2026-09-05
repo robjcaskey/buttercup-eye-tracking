@@ -15,3 +15,21 @@ This repository owns host-side eye analysis and presentation only.
 - Canonical human labeler: always use `/home/rob/eye-training/paired-limbus-annotator/server.py`; do not substitute another annotation UI.
 - Feed it native RAW10 before/target/after frames and keep recorded predictions hidden until `SAVE + DONE`.
 - Save paired, triplet, and possibly-occluded evidence beneath the capture's `annotator/labels` directory.
+
+# Geometry development validation
+
+- Use **scale-normalized frontal-equivalent iris disk area (SN-FEIDA)** as a
+  north-star diagnostic for outer-limbus consistency. Its definition and
+  limitations live in `docs/flat-tire-area-and-motion.md`; it is not visible mask
+  area, pupil aperture area, or a measured curved anatomical surface area.
+- When developing or testing geometry theories, favor matched baseline/candidate
+  corpus evaluation alongside synthetic/unit tests. Run independent evaluations
+  in parallel when practical, then inspect and explain the results, including
+  regressions; merely launching a replay is not validation.
+- Pair area stability with human-label localization error, coverage/dropouts,
+  source-time/motion alignment and independent scale support. Never normalize by
+  the candidate's own radius, count held predictions as fresh observations, or
+  reward a frozen/wrong ellipse merely because its area is constant.
+- State the actual corpus subset, missing labels/scale/timing, uncertainty
+  assumptions and remaining failures. Treat bounded support and heuristic
+  fidelity as defeasible estimates, not calibrated probabilities.

@@ -10,18 +10,15 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-#[path = "coupled_eye_kinematics.rs"]
-mod coupled_eye_kinematics;
-pub use coupled_eye_kinematics::{
+pub use crate::eye_scene_model::{
     CoupledEyeKinematics, CoupledMotionStatus, GlobeMotionRegime, KinematicDerivatives,
     ProjectedGlobePoseStatus, ProjectedIrisGeometry, RotationCenterStatus,
 };
 
-pub const OBJECTS: usize = 4;
-pub const GENERAL_LAYER: usize = 0;
-pub const PUPIL_LAYER: usize = 1;
-pub const REFLECTION_LAYER: usize = 2;
-pub const RESIDUAL_LAYER: usize = 3;
+pub use crate::roi_evidence::{
+    MotionLayerStatus, SimilarityMotion, NativeGlobalSimilarityEvidence,
+    OBJECTS, GENERAL_LAYER, PUPIL_LAYER, REFLECTION_LAYER, RESIDUAL_LAYER,
+};
 
 /// Runtime-selectable native-RAW edge definition for the 2D temporal learning
 /// layers.  This is deliberately a calculation profile, not a renderer mode:
@@ -469,35 +466,6 @@ pub struct FocusSfmStatus {
     pub improvement: f32,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SimilarityMotion {
-    pub translation: [f32; 2],
-    pub rotation: f32,
-    pub scale_delta: f32,
-    pub residual: f32,
-    pub support: usize,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct MotionLayerStatus {
-    /// Mean image-space position of the currently associated tracks.
-    pub centroid: [f32; 2],
-    /// Translation relative to the robust whole-frame motion.
-    pub differential: [f32; 2],
-    /// Signed coordinate on the learned dominant parallax axis. This is not
-    /// metric depth, but remains directionally consistent across frames.
-    pub parallax: f32,
-    /// Temporal agreement of member tracks with this layer's motion model.
-    pub coherence: f32,
-    /// Mean RMS distance between member motion histories and the layer's
-    /// multi-frame signature, in full-resolution pixels.
-    pub trajectory_error: f32,
-    pub signature_samples: usize,
-    /// Distance in motion space to the nearest other supported layer.
-    pub separation: f32,
-    pub persistent_tracks: usize,
-    pub stable_frames: u16,
-}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RelationIrisCandidateDiagnostics {
@@ -789,16 +757,6 @@ pub struct MatchDiagnostics {
     pub relation_mean_support_continuity: f32,
 }
 
-impl SimilarityMotion {
-    fn predict(self, point: [f32; 2], center: [f32; 2]) -> [f32; 2] {
-        let x = point[0] - center[0];
-        let y = point[1] - center[1];
-        [
-            point[0] + self.translation[0] + self.scale_delta * x - self.rotation * y,
-            point[1] + self.translation[1] + self.rotation * x + self.scale_delta * y,
-        ]
-    }
-}
 
 #[derive(Clone, Debug)]
 struct FeatureTrack {
@@ -1214,6 +1172,21 @@ pub struct MotionOctreeOverlay {
     pub lid_occlusions: Vec<LidOcclusionCurve>,
     pub focus_sfm: FocusSfmStatus,
     pub coupled_motion: CoupledMotionStatus,
+}
+
+/// Preserve the observation/rendering boundary: pupil-center state receives
+/// only borrowed motion evidence, not this overlay's image buffers or trails.
+impl<'a> From<&'a MotionOctreeOverlay>
+    for crate::eye_scene_model::pupil_center::PupilCenterMotionEvidence<'a>
+{
+    fn from(overlay: &'a MotionOctreeOverlay) -> Self {
+        Self {
+            global_motion: &overlay.motions[GENERAL_LAYER],
+            global_layer: &overlay.layers[GENERAL_LAYER],
+            pupil_layer: &overlay.layers[PUPIL_LAYER],
+            coupled_motion: &overlay.coupled_motion,
+        }
+    }
 }
 
 /// Weak texture cannot publish anatomy, but two independently coherent
@@ -3273,31 +3246,6 @@ struct SharedNativeRawFrame {
     pixels: Arc<Vec<u16>>,
 }
 
-/// Independent full-ROI evidence that an apparent radius change is supported
-/// by coherent image scale elsewhere in the native eye frame.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NativeGlobalSimilarityEvidence {
-    /// Motion authorized as a physical image-scale transport. This remains
-    /// zero when the broadly distributed native matches fail any reliability
-    /// gate, so downstream anatomy code cannot accidentally consume a merely
-    /// diagnostic fit.
-    pub motion: SimilarityMotion,
-    /// Best robust fit before the whole-ROI reliability gates. Keeping this
-    /// diagnostic separate is important: a zero authorized motion otherwise
-    /// hides whether support, spatial coverage, residual, or excessive gross
-    /// movement rejected an otherwise informative candidate.
-    pub candidate_motion: SimilarityMotion,
-    pub candidate_matches: usize,
-    pub reliable: bool,
-    pub stable_frames: u16,
-    pub spatial_span: [f32; 2],
-    pub occupied_quadrants: usize,
-    /// Absolute sensor-space point about which `motion.translation` is
-    /// defined. Keeping the center beside the fitted transform is essential
-    /// when the sensor ROI moves: applying a scale/rotation about the current
-    /// crop center would otherwise manufacture relative pupil motion.
-    pub motion_center_sensor: [f32; 2],
-}
 
 /// Bounded native-resolution feature matcher used solely by the shared
 /// physical-size feasibility gate. It does not identify an iris and cannot
@@ -14650,6 +14598,17 @@ impl FourMotionOctrees {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pupil_center_adapter_borrows_exactly_the_consumed_motion_state() {
+        use crate::eye_scene_model::pupil_center::PupilCenterMotionEvidence;
+        let overlay = MotionOctreeOverlay::default();
+        let evidence = PupilCenterMotionEvidence::from(&overlay);
+        assert!(std::ptr::eq(evidence.global_motion, &overlay.motions[GENERAL_LAYER]));
+        assert!(std::ptr::eq(evidence.global_layer, &overlay.layers[GENERAL_LAYER]));
+        assert!(std::ptr::eq(evidence.pupil_layer, &overlay.layers[PUPIL_LAYER]));
+        assert!(std::ptr::eq(evidence.coupled_motion, &overlay.coupled_motion));
+    }
 
     #[test]
     fn shared_feature_orientation_buckets_are_unoriented_and_circular() {

@@ -4923,6 +4923,45 @@ where I: Iterator<Item = String> {
 /// optional stride simulates skipped frames at live inference cadence while
 /// preserving source timestamps. No predictions, labels, or future frames seed it.
 /// Missing outputs remain missing; temporal metrics never bridge a miss.
+pub(super) fn sam_outline_export<I>(mut args: I) -> Result<(), String>
+where I: Iterator<Item = String> {
+    let output = PathBuf::from(args.next().ok_or("expected OUTPUT.json CAPTURE_DIR LABEL")?);
+    let capture = PathBuf::from(args.next().ok_or("missing capture directory")?);
+    let label = args.next().ok_or("missing eye label")?;
+    if args.next().is_some() { return Err("unexpected outline-export argument".into()); }
+    if output.exists() { return Err(format!("output already exists: {}", output.display())); }
+    let records = fs::read_to_string(capture.join("frames.jsonl")).map_err(|e| e.to_string())?
+        .lines().map(serde_json::from_str::<Value>).collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?
+        .into_iter().filter(|r| r["label"].as_str() == Some(label.as_str())).collect::<Vec<_>>();
+    let mut frames = Vec::new();
+    for record in &records {
+        let width = integer(record, "width")? as usize;
+        let height = integer(record, "height")? as usize;
+        let member = record["stream"].as_str().ok_or("missing RAW stream")?;
+        if Path::new(member).components().count() != 1 || member == "." || member == ".." {
+            return Err("invalid RAW stream member".into());
+        }
+        let mut file = File::open(capture.join(member)).map_err(|e|e.to_string())?;
+        file.seek(SeekFrom::Start(integer(record, "offset")?)).map_err(|e|e.to_string())?;
+        let mut packed = vec![0; integer(record, "length")? as usize];
+        file.read_exact(&mut packed).map_err(|e|e.to_string())?;
+        frames.push(Arc::new(sam31_outer::RawFrame {
+            eye_index: 0, sequence: integer(record, "sequence")?, timestamp_ns: integer(record, "timestamp_ns")?,
+            sensor_x: integer(record, "sensor_x")? as u32, sensor_y: integer(record, "sensor_y")? as u32,
+            width, height, registration_anchor: None, pupil_component_seed: None,
+            pixels: Arc::new(raw10::try_unpack_raw10(&packed, width, height, integer(record, "stride")? as usize)?),
+        }));
+    }
+    let model = env::var_os("BUTTERCUP_SAM31_MODEL").map(PathBuf::from).unwrap_or_else(sam31_outer::default_model_path);
+    let mut report = sam31_outer::export_native_outline_sequence(&model, &frames)?;
+    report["capture"] = json!(capture);
+    report["label"] = json!(label);
+    for (case, record) in report["cases"].as_array_mut().ok_or("missing outline cases")?.iter_mut().zip(records) {
+        case["frame"] = record;
+    }
+    fs::write(output, serde_json::to_vec_pretty(&report).map_err(|e|e.to_string())?).map_err(|e|e.to_string())
+}
+
 pub(super) fn sam_sequence_eval<I>(mut args: I) -> Result<(), String>
 where I: Iterator<Item = String> {
     let output = PathBuf::from(args.next().ok_or("expected OUTPUT.json CAPTURE_DIR LABEL [START] [COUNT] [STRIDE]")?);
@@ -7623,16 +7662,9 @@ where
             native_specular_containment,
             native_pupil_horizon.is_some(),
         );
-        let native_scale_kinematically_supported = native_prior.is_none_or(|prior| {
-            prior.admits_kinematically_supported_ellipse(
-                native_boundary.major_radius,
-                native_boundary.minor_radius,
-            )
-        });
         let native_strong_measurement = !partial_frame
             && native_material_admissible
             && native_specular_admissible
-            && native_scale_kinematically_supported
             && native_meridian_strong_limbus_measurement(&native_boundary, native_diagnostics);
         // Match the live Native path: on a cold start, strong measurements
         // vote into the de-affined circular-radius posterior but remain
@@ -7640,21 +7672,45 @@ where
         // prior exists, its final latest-strong kinematic decision is also the
         // publication decision; merely calling the shared gate and ignoring a
         // false result would let Native bypass the common size invariant.
-        let native_radius_admitted = if native_strong_measurement {
+        let native_radius_admission = if native_strong_measurement {
             let confidence =
                 (0.45 + 0.55 * native_diagnostics.analog_mean_certainty).clamp(0.0, 1.0);
-            native_radius.observe_strong_ellipse_for_active_frame(
+            Some(native_radius.observe_independent_ellipse_for_active_frame(
                 now,
-                native_boundary.major_radius,
-                native_boundary.minor_radius,
-                confidence,
-            )
+                LimbusRadiusObservation {
+                    exposure: crate::roi_evidence::ExposureKey {
+                        roi: crate::roi_evidence::RoiId(0),
+                        clock: crate::roi_evidence::SourceClock { domain: 0, epoch: 0 },
+                        sequence: integer(record, "sequence")?,
+                        timestamp_ns,
+                    },
+                    lineage: 0,
+                    ellipse_sensor_px: crate::geometry::Ellipse {
+                        center: (native_boundary.center.0 + sensor_origin.0 as f64,
+                            native_boundary.center.1 + sensor_origin.1 as f64),
+                        major_radius: native_boundary.major_radius,
+                        minor_radius: native_boundary.minor_radius,
+                        angle: native_boundary.angle,
+                    },
+                    confidence,
+                    complete_in_source_roi: limbus_complete_in_roi(
+                        crate::geometry::Ellipse {
+                            center: native_boundary.center,
+                            major_radius: native_boundary.major_radius,
+                            minor_radius: native_boundary.minor_radius,
+                            angle: native_boundary.angle,
+                        },
+                        (0, 0),
+                        (width, height),
+                    ),
+                },
+            ))
         } else {
-            false
+            None
         };
         let native_admitted = native_prior.is_some()
             && native_strong_measurement
-            && native_radius_admitted
+            && native_radius_admission.is_some_and(LimbusRadiusAdmission::published)
             && !native_boundary.points.is_empty();
         let native_elapsed_ms = native_started.elapsed().as_secs_f64() * 1_000.0;
         native_summary.observe(
@@ -8463,7 +8519,9 @@ where
                     "contained_cohesive_peak": evidence.has_contained_cohesive_peak(),
                     "admissible": native_specular_admissible,
                 })),
-                "scale_kinematically_supported": native_scale_kinematically_supported,
+                "scale_kinematically_supported": native_prior.is_none_or(|prior| prior.admits_kinematically_supported_ellipse(
+                    native_boundary.major_radius, native_boundary.minor_radius)),
+                "scale_admission": native_radius_admission.map(LimbusRadiusAdmission::label),
                 "pupil_horizon": native_pupil_horizon_json(&raw, width, height, &native_unbounded, &focus),
                 "diagnostics": diagnostics_json(native_diagnostics),
                 "radius_prior": native_prior.map(|prior| json!({

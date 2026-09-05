@@ -5,25 +5,36 @@ project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$project_dir"
 
 cargo_features=${BUTTERCUP_CARGO_FEATURES:-}
+sam31_enabled=0
+sam31_requested=${BUTTERCUP_ENABLE_SAM31:-auto}
+sam31_feature_requested=0
+case ",${cargo_features// /,}," in
+  *,sam31,*) sam31_feature_requested=1 ;;
+esac
 
-# The UI always exposes SAM31 in its segmentation cycle, so the normal viewer
-# must carry the native Rust/tch implementation too.  Keep the sizeable model
+# Prefer the native SAM31 build when its runtime is installed. Keep the model
 # and LibTorch/CUDA runtime out of the source tree under the checked `data`
-# link.  Setting BUTTERCUP_ENABLE_SAM31=0 remains useful for lightweight
-# development builds that never select SAM31.
-if [[ ${BUTTERCUP_ENABLE_SAM31:-1} != 0 ]]; then
-  case ",${cargo_features// /,}," in
-    *,sam31,*) ;;
-    *) cargo_features="${cargo_features:+$cargo_features,}sam31" ;;
-  esac
-
+# link. Auto falls back to a lightweight build if LibTorch is missing;
+# explicit BUTTERCUP_ENABLE_SAM31=1 or a sam31 cargo feature remains strict.
+if [[ $sam31_requested != 0 || $sam31_feature_requested == 1 ]]; then
   sam31_runtime=${BUTTERCUP_SAM31_RUNTIME:-$project_dir/data/runtime/libtorch-2.9.0-cu128}
-  export LIBTORCH=${LIBTORCH:-$sam31_runtime/torch}
-  export LIBTORCH_CXX11_ABI=${LIBTORCH_CXX11_ABI:-1}
-  if [[ ! -f $LIBTORCH/lib/libtorch.so || ! -f $LIBTORCH/lib/libtorch_cuda.so ]]; then
-    printf 'Buttercup SAM31 native LibTorch runtime is unavailable: %s\n' "$LIBTORCH" >&2
+  sam31_libtorch=${LIBTORCH:-$sam31_runtime/torch}
+  if [[ -f $sam31_libtorch/lib/libtorch.so && -f $sam31_libtorch/lib/libtorch_cuda.so ]]; then
+    sam31_enabled=1
+  elif [[ $sam31_requested != auto || $sam31_feature_requested == 1 ]]; then
+    printf 'Buttercup SAM31 native LibTorch runtime is unavailable: %s\n' "$sam31_libtorch" >&2
     exit 1
+  else
+    printf 'Buttercup SAM31 runtime unavailable; building without SAM support: %s\n' "$sam31_libtorch" >&2
   fi
+fi
+
+if [[ $sam31_enabled == 1 ]]; then
+  if [[ $sam31_feature_requested == 0 ]]; then
+    cargo_features="${cargo_features:+$cargo_features,}sam31"
+  fi
+  export LIBTORCH=$sam31_libtorch
+  export LIBTORCH_CXX11_ABI=${LIBTORCH_CXX11_ABI:-1}
 
   torch_library_path=$LIBTORCH/lib
   nvidia_runtime=${BUTTERCUP_NVIDIA_RUNTIME:-$sam31_runtime/nvidia}
@@ -43,17 +54,17 @@ if [[ ${BUTTERCUP_ENABLE_SAM31:-1} != 0 ]]; then
   export BUTTERCUP_SAM31_MODEL=${BUTTERCUP_SAM31_MODEL:-$sam31_default_model}
   if [[ ! -f $BUTTERCUP_SAM31_MODEL ]]; then
     printf 'Buttercup SAM31 promptable graph is unavailable: %s\n' "$BUTTERCUP_SAM31_MODEL" >&2
-    exit 1
+    if [[ $sam31_requested != auto ]]; then exit 1; fi
   fi
   export BUTTERCUP_SAM31_PROMPT_BUNDLE=${BUTTERCUP_SAM31_PROMPT_BUNDLE:-$project_dir/data/models/sam31_semantic_prompts_cuda_bf16.pt}
   if [[ ! -f $BUTTERCUP_SAM31_PROMPT_BUNDLE ]]; then
     printf 'Buttercup SAM31 semantic prompt bundle is unavailable: %s\n' "$BUTTERCUP_SAM31_PROMPT_BUNDLE" >&2
-    exit 1
+    if [[ $sam31_requested != auto ]]; then exit 1; fi
   fi
   export BUTTERCUP_SAM31_TRACKER_BUNDLE=${BUTTERCUP_SAM31_TRACKER_BUNDLE:-$project_dir/data/models/sam31_tracker_weights.pt}
   if [[ ! -f $BUTTERCUP_SAM31_TRACKER_BUNDLE ]]; then
     printf 'Buttercup SAM31 native tracker bundle is unavailable: %s\n' "$BUTTERCUP_SAM31_TRACKER_BUNDLE" >&2
-    exit 1
+    if [[ $sam31_requested != auto ]]; then exit 1; fi
   fi
 fi
 
@@ -66,7 +77,7 @@ fi
 # The in-window SAM PROMPT editor invokes this sibling directly to encode a
 # replacement text row without Python or a nested Cargo process. Cached builds
 # make this effectively free after source changes settle.
-if [[ ${BUTTERCUP_ENABLE_SAM31:-1} != 0 ]]; then
+if [[ $sam31_enabled == 1 ]]; then
   cargo build --profile "$cargo_profile" --features "$cargo_features" \
     --bin buttercup_sam31_prompt_bundle
 fi

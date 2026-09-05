@@ -18,6 +18,8 @@ mapfile -t unexpected_files < <(
       ./Cargo.toml \
       ./README.md \
       ./docs/viewer-overview.png \
+      ./docs/geometry-architecture.md \
+      ./docs/flat-tire-area-and-motion.md \
       ./scripts/audit-tree.sh \
       ./scripts/run-viewer.sh \
       ./scripts/run-sam31-arc-trial.sh \
@@ -25,8 +27,24 @@ mapfile -t unexpected_files < <(
       ./scripts/prompt-lab-troublesome-3.txt \
       ./scripts/prompt-lab-troublesome-20.txt \
       ./src/checkerboard_calibration.rs \
+      ./src/geometry.rs \
+      ./src/conic_solver.rs \
+      ./src/conic_solver/fidelity.rs \
+      ./src/conic_solver/constraint_tests.rs \
+      ./src/outline_conic_segments.rs \
+      ./src/outline_conic_segments/recent_exclusion.rs \
+      ./src/roi_evidence.rs \
+      ./src/roi_evidence/timing.rs \
+      ./src/eye_scene_model.rs \
+      ./src/eye_scene_model/limbus_scale.rs \
+      ./src/eye_scene_model/pupil_center.rs \
+      ./src/eye_scene_model/pupil_projection.rs \
+      ./src/eye_scene_model/pupil_size.rs \
+      ./src/gaze_target_solver.rs \
+      ./src/binocular_coordinator.rs \
       ./src/bin/buttercup_screen_reflection_raw_decode.rs \
       ./src/bin/buttercup_sam31_arc_trial.rs \
+      ./src/bin/buttercup_flat_tire_eval.rs \
       ./src/bin/buttercup_sam31_prompt_bundle.rs \
       ./src/bin/buttercup_sam31_video_graph.rs \
       ./src/bin/buttercup_sam31_tracker_bundle.rs \

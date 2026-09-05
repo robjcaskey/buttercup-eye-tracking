@@ -1,10 +1,16 @@
 #![recursion_limit = "512"]
 
 use softbuffer::{Context, Surface};
+mod binocular_coordinator;
 mod checkerboard_calibration;
+mod conic_solver;
+mod eye_scene_model;
+mod gaze_target_solver;
+mod geometry;
 mod keyboard_peeper;
 mod native_mediapipe;
 mod offline_segmentation_replay;
+mod outline_conic_segments;
 mod pupil_clock_supervision;
 mod raw10;
 mod raw_eye_model_protocol;
@@ -12,6 +18,7 @@ mod raw_iris_focus;
 mod raw_motion_octrees;
 mod raw_sclera_red_canny;
 mod raw_sclera_vein_graph;
+mod roi_evidence;
 mod sam31_outer;
 mod screen_reflection_clock;
 mod screen_reflection_code;
@@ -20,6 +27,65 @@ mod screen_reflection_raw;
 mod screen_reflection_stimulus;
 mod specular_map;
 mod visible_lighthouse_control;
+
+use eye_scene_model::limbus_scale::{LimbusRadiusAdmission, LimbusRadiusObservation};
+use eye_scene_model::pupil_center::{
+    PupilCenterPrediction, PupilCenterStateTracker, PupilCenterTrackDiagnostics,
+    PUPIL_CENTER_PENDING_RELOCATION_MAX_AGE, PUPIL_CENTER_UNSUPPORTED_MAX_CANONICAL_RELOCATION,
+    pupil_center_orbital_measurement_admissible, pupil_center_orbital_measurement_decisive,
+    pupil_center_saccade_motion_supported, pupil_center_saccade_search_warranted,
+};
+#[cfg(test)]
+use eye_scene_model::pupil_center::{PupilCenterMotionRegime, PupilCenterTransportSource};
+use eye_scene_model::pupil_projection::{
+    PupilProjectionReference, PupilProjectionSource, pupil_projection_canonical_point,
+};
+#[cfg(test)]
+use eye_scene_model::pupil_projection::pupil_projection_image_point;
+use eye_scene_model::pupil_radius_units::FrontoParallelCircleRadiusPx;
+use eye_scene_model::pupil_size::{
+    PupilEvidenceCondition, PupilEvidenceConditionTracker, PupilSizeObservationAdmission,
+    PupilSizeSupport, PupilSizeSupportSource, PupilSizeTracker, RadiusKinematicSupport, RadiusRateLimiter,
+    fronto_parallel_area_equivalent_pupil_radius_px, projected_pupil_major_radius_px,
+    pupil_radius_within_bounds, pupil_size_median, PUPIL_EVIDENCE_SCALE_BASE_RADIUS_PX,
+    PUPIL_SIZE_MAX_TEMPORAL_HALF_WIDTH, PUPIL_SIZE_MIN_TEMPORAL_HALF_WIDTH,
+    PUPIL_SIZE_RATIO_WINDOW, PUPIL_SIZE_STALE_EXPANSION_PER_SECOND,
+    PUPIL_SIZE_TEMPORAL_MIN_OBSERVATIONS,
+};
+#[cfg(test)]
+use eye_scene_model::pupil_size::{
+    FrontoParallelScaleBucket, OpticalFocusClass, PUPIL_EVIDENCE_MIN_TRAINING_FOCUS_RATIO,
+};
+use eye_scene_model::{
+    CentimeterScaleEstimate, CoarseEyeScaleSeed, RelativeGazeVector, RotationCenterHistory,
+    RotationRenderGeometry, SurfaceGazeSample, SurfaceGazeTracker, camera_facing_convex_contact,
+    coarse_centimeter_scales, projected_gaze_angle_between, provisional_surface_pose,
+    relative_gaze_for_contact, require_convex_contact_for_output, resolve_projected_surface_normal,
+    resolve_rotation_render_geometry,
+};
+#[cfg(test)]
+use eye_scene_model::{
+    GAZE_SURFACE_AREA_BUCKET_RATIO, GAZE_SURFACE_RESET_AFTER, GAZE_SURFACE_SCALE_SWITCH_FRAMES,
+    GAZE_SURFACE_SIGN_SWITCH_FRAMES, GazeKinematicFrame, ProjectedVisionPose,
+    ROTATION_POSE_FIRM_START_FRAMES, RingPoseObservation, bucket_surface_area,
+    centimeter_scale_half_width, infer_projected_rotation_center, kinematic_gaze_sign_correction,
+    projected_pose_temporal_penalty, rectified_ellipse_area_px2,
+};
+use gaze_target_solver::{
+    GazeAffine, NOMINAL_DISPLAY_ASPECT_HEIGHT, NOMINAL_DISPLAY_ASPECT_WIDTH,
+    NOMINAL_DISPLAY_DIAGONAL_INCHES, VIRTUAL_MOUSE_CALIBRATION_TARGETS, VirtualDisplayPlane,
+    calibration_models_have_shared_support, calibration_targets_have_required_coverage,
+    fit_robust_gaze_affine, fit_virtual_display_plane,
+};
+#[cfg(test)]
+use gaze_target_solver::{
+    NOMINAL_DISPLAY_DISTANCE_INCHES, fit_gaze_affine, gaze_affine_linear_geometry_plausible,
+    nominal_display_dimensions_inches, nominal_display_target,
+};
+use roi_evidence::GlobalSimilarityTimeline;
+use geometry::{blend_point, upper_median_or_zero as median_focus};
+#[cfg(test)]
+use geometry::{add3, dot3, norm3, normalized3, scale3};
 
 use raw10::unpack_raw10;
 use raw_eye_model_protocol::{
@@ -83,81 +149,10 @@ const VIRTUAL_MOUSE_MIN_SAMPLES: usize = 6;
 // this bound, early outliers permanently prevent the dominant cluster from
 // reaching the required 60 percent even after the eye becomes still.
 const VIRTUAL_MOUSE_MAX_RECENT_SAMPLES: usize = VIRTUAL_MOUSE_MIN_SAMPLES * 2;
-const VIRTUAL_MOUSE_MIN_STABLE_TARGETS: usize = 7;
 const VIRTUAL_MOUSE_CLUSTER_ANGLE_RADIANS: f64 = std::f64::consts::PI / 15.0;
 const VIRTUAL_MOUSE_CLUSTER_RMS_RADIANS: f64 = std::f64::consts::PI / 24.0;
-// Allow a coarse initial calibration from the central 20% target field.
-// Coverage, affine conditioning, physical geometry and shared model support
-// remain mandatory; these tolerances are fractions of the full screen.
-const VIRTUAL_MOUSE_PLANE_INLIER_RESIDUAL: f64 = 0.10;
-const VIRTUAL_MOUSE_PLANE_MAX_RMS: f64 = 0.075;
-const VIRTUAL_MOUSE_AFFINE_INLIER_RESIDUAL: f64 = 0.09;
-const VIRTUAL_MOUSE_AFFINE_MAX_RMS: f64 = 0.065;
-const VIRTUAL_MOUSE_MODEL_MAX_DISAGREEMENT: f64 = 0.08;
-const VIRTUAL_MOUSE_AFFINE_MIN_SINGULAR_GAIN: f64 = 0.05;
-const VIRTUAL_MOUSE_AFFINE_MAX_SINGULAR_GAIN: f64 = 40.0;
-const VIRTUAL_MOUSE_AFFINE_MAX_CONDITION: f64 = 30.0;
-// Keep all fixation centers inside the display's central 20%. This reduces
-// eyelid occlusion and extreme-angle SAM foreshortening during calibration;
-// the fitted 3D plane/affine still maps gaze across the full display.
-const VIRTUAL_MOUSE_CALIBRATION_INSET: f64 = 0.40;
-const VIRTUAL_MOUSE_CALIBRATION_TARGETS: [(f64, f64); 9] = [
-    (
-        VIRTUAL_MOUSE_CALIBRATION_INSET,
-        VIRTUAL_MOUSE_CALIBRATION_INSET,
-    ),
-    (
-        1.0 - VIRTUAL_MOUSE_CALIBRATION_INSET,
-        VIRTUAL_MOUSE_CALIBRATION_INSET,
-    ),
-    (0.50, 0.50),
-    (
-        1.0 - VIRTUAL_MOUSE_CALIBRATION_INSET,
-        1.0 - VIRTUAL_MOUSE_CALIBRATION_INSET,
-    ),
-    (
-        VIRTUAL_MOUSE_CALIBRATION_INSET,
-        1.0 - VIRTUAL_MOUSE_CALIBRATION_INSET,
-    ),
-    (0.50, VIRTUAL_MOUSE_CALIBRATION_INSET),
-    (1.0 - VIRTUAL_MOUSE_CALIBRATION_INSET, 0.50),
-    (0.50, 1.0 - VIRTUAL_MOUSE_CALIBRATION_INSET),
-    (VIRTUAL_MOUSE_CALIBRATION_INSET, 0.50),
-];
 const VIRTUAL_MOUSE_BACKGROUND: u32 = 0x0000_0000;
 const VIRTUAL_MOUSE_INK: u32 = 0x00ff_ffff;
-const NOMINAL_DISPLAY_DISTANCE_INCHES: f64 = 24.0;
-const NOMINAL_DISPLAY_DIAGONAL_INCHES: f64 = 27.0;
-const NOMINAL_DISPLAY_ASPECT_WIDTH: f64 = 16.0;
-const NOMINAL_DISPLAY_ASPECT_HEIGHT: f64 = 9.0;
-const GAZE_SURFACE_AREA_BUCKET_RATIO: f64 = 1.04;
-const GAZE_SURFACE_AVERAGE_ALPHA: f64 = 0.35;
-const GAZE_SURFACE_RESET_AFTER: Duration = Duration::from_millis(1_250);
-const GAZE_SURFACE_MAX_BUCKET_JUMP: i32 = 8;
-/// A physical limbus cannot change scale discontinuously in one asynchronous
-/// SAM answer. Require several mutually consistent out-of-family fits before
-/// replacing the established scale/sign lineage; isolated whole-eye or lid
-/// masks are withheld without resetting the physical normal.
-const GAZE_SURFACE_SCALE_SWITCH_FRAMES: u8 = 3;
-const GAZE_SURFACE_SCALE_SWITCH_BUCKET_TOLERANCE: i32 = 2;
-const GAZE_SURFACE_SIGN_SWITCH_FRAMES: u8 = 4;
-// A pupil/limbus displacement which is effectively camera-normal, or nearly
-// perpendicular to the fitted ellipse normal, contains no trustworthy
-// information about which antipodal normal is physical.
-const GAZE_SURFACE_MIN_SIGN_ANCHOR_MAGNITUDE: f64 = 0.025;
-const GAZE_SURFACE_MIN_SIGN_ANCHOR_ALIGNMENT: f64 = 0.20;
-const GAZE_SURFACE_MIN_SIGN_PROJECTION: f64 = 0.025;
-// The iris/limbus can only be observed on the camera-facing half of the eye.
-// Keep this as a hard half-space boundary rather than a score: a zero or
-// negative Z surface normal describes an edge-on/away-facing (concave from
-// the camera) solution which the head would occlude.
-const CAMERA_FACING_CONTACT_EPSILON: f64 = 1.0e-6;
-const RELATIVE_GAZE_UNIT_TOLERANCE: f64 = 1.0e-6;
-const GAZE_KINEMATIC_HISTORY_FRAMES: usize = 6;
-// Covers more than the maximum accepted asynchronous SAM result age at the
-// normal eye-stream cadence. Entries are tiny affine summaries, never image
-// data, and are retained separately for each physical eye.
-const GLOBAL_SIMILARITY_TIMELINE_STEPS: usize = 64;
 const PRESENTATION_LASER_HOLD: Duration = Duration::from_secs(5);
 const DRIVING_ADMISSION_FRAMES: usize = 3;
 // Keep several mutually exclusive cold roads alive long enough for the real
@@ -541,11 +536,6 @@ const MANUAL_CAMERA_STEP_MIN_INTERVAL: Duration = Duration::from_millis(100);
 const PUPIL_CENTER_HEALTH: &str = "PUPIL_CENTER_HEALTH:";
 const FATAL_ROUGH_FOCUS: &str = "FATAL_ROUGH_FOCUS:";
 const MAX_REJECTION_CAPTURES: usize = 64;
-const ROTATION_CENTER_HISTORY: Duration = Duration::from_secs(3);
-const ROTATION_CENTER_MIN_OBSERVATIONS: usize = 12;
-const ROTATION_POSE_STILL_MOTION_MAX: f64 = 35.0;
-const ROTATION_POSE_FIRM_START_FRAMES: u32 = 4;
-const ROTATION_POSE_FIRM_FULL_FRAMES: u32 = 24;
 const OUTER_IRIS_MAX_CONTRACTION_PER_SECOND: f64 = 0.20;
 const OUTER_IRIS_MAX_EXPANSION_PER_SECOND: f64 = 0.20;
 const SAM31_RAW_SUPPORT_DECISIVE: f64 = 3.50;
@@ -567,7 +557,6 @@ const ACTIVE_MODE_PRESENCE_RETENTION: Duration = Duration::from_secs(8);
 // iris/lid arc in one frame.
 const INNER_IRIS_MAX_CONTRACTION_PER_SECOND: f64 = 0.095;
 const INNER_IRIS_MAX_EXPANSION_PER_SECOND: f64 = 0.095;
-const RADIUS_RATE_LIMITER_MAX_PUBLICATION_STEP: Duration = Duration::from_millis(100);
 // A selected radial edge only supports the published pupil diameter when its
 // current-frame RAW transition is strong and its independently selected
 // area-equivalent radius agrees with the robust ring radius.  These gates are
@@ -596,11 +585,6 @@ const IRIS_RADIUS_COLD_START_HALF_WIDTH: f64 = 0.20;
 // never enters the detector or temporal radius tracker.
 const STATIC_IRIS_NOMINAL_ROI_SHORT_SIDE_FRACTION: f64 = 0.375;
 const STATIC_IRIS_NOMINAL_HALF_WIDTH: f64 = 0.20;
-const PUPIL_SIZE_RATIO_WINDOW: usize = 9;
-const PUPIL_SIZE_TEMPORAL_MIN_OBSERVATIONS: usize = 3;
-const PUPIL_SIZE_MIN_TEMPORAL_HALF_WIDTH: f64 = 0.05;
-const PUPIL_SIZE_MAX_TEMPORAL_HALF_WIDTH: f64 = 0.35;
-const PUPIL_SIZE_STALE_EXPANSION_PER_SECOND: f64 = 0.035;
 // A complete provisional road may bridge the continuous search across a
 // stale outer-pose reacquisition, but it must remain close to the robust
 // published pupil/limbus ratio. Farther innovations are commonly an iris
@@ -616,22 +600,6 @@ const DRIVING_PUPIL_MAX_AFFINE_CONTAINMENT_RADIUS: f64 = 0.92;
 const DRIVING_PUPIL_ORBITAL_MIN_SCORE: f64 = 0.30;
 const DRIVING_PUPIL_ORBITAL_MIN_RING_COVERAGE: f64 = 0.25;
 const DRIVING_PUPIL_ORBITAL_MIN_OPPOSING_SUPPORT: f64 = 0.25;
-// Apparent fronto-parallel limbus scale is quantized at quarter octaves. This
-// is fine enough to keep fixed-pixel pupil cues in one spatial regime while
-// avoiding bucket churn from subpixel ellipse jitter.
-const PUPIL_EVIDENCE_SCALE_BUCKETS: usize = 16;
-const PUPIL_EVIDENCE_SCALE_BASE_RADIUS_PX: f64 = 24.0;
-const PUPIL_EVIDENCE_SCALE_BUCKETS_PER_OCTAVE: f64 = 4.0;
-const PUPIL_EVIDENCE_MIN_FOCUS_SUPPORT: usize = 6;
-const PUPIL_EVIDENCE_MIN_TRAINING_FOCUS_RATIO: f64 = 0.55;
-// A relative reference cannot prove that its first observation was sharp.
-// Keep a deliberately low absolute floor so a cold start on obvious defocus
-// may guide/display a pupil but cannot teach the physical size posterior.
-const PUPIL_EVIDENCE_MIN_TRAINING_ABSOLUTE_SHARPNESS: f64 = 0.055;
-// The native log/color plane has four-sensor-pixel spacing. A projected pupil
-// radius below ten pixels supplies fewer than five samples across its diameter
-// and must not teach a size posterior even when an ellipse can be displayed.
-const PUPIL_EVIDENCE_MIN_TRAINING_PROJECTED_RADIUS_PX: f64 = 10.0;
 // A pupil center outside this normalized affine-limbus radius is not eligible
 // for publication or physiological size state. The bound is deliberately
 // wider than ordinary pupil/limbus decentration so a rough acquisition center
@@ -1426,7 +1394,10 @@ impl SegmentationMode {
                 show_censored_limbus: false,
                 show_driving_diagnostics: false,
                 show_sclera_red_canny: false,
-                show_rotation_meridians: false,
+                // The normal live SAM view shows the same presentation-only
+                // contact as the dedicated de-flat-tire contact view. This
+                // does not enable Native diagnostics or require the J laser.
+                show_rotation_meridians: true,
                 eyelid_overlay: SegmentationEyelidOverlay::None,
             },
             Self::Clusters => SegmentationModeProfile {
@@ -1516,91 +1487,22 @@ struct Config {
     centimeter_scales: [Option<CentimeterScaleEstimate>; 2],
 }
 
-/// Presentation-only physical scale. MediaPipe reports an image-space iris
-/// radius but not a subject-specific physical diameter, so the initial
-/// projection assumes a 12 mm limbus. The interval is intentionally broad and
-/// changes only at semantic reacquisition boundaries.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct CentimeterScaleEstimate {
-    estimate_px: f64,
-    minimum_px: f64,
-    maximum_px: f64,
-    movement_fraction: f64,
-    reacquisition_count: u32,
-    semantic_center_sensor: [f64; 2],
-}
-
-const ROUGH_LIMBUS_DIAMETER_MM: f64 = 12.0;
-
-fn centimeter_scale_half_width(
-    previous: Option<CentimeterScaleEstimate>,
-    movement_fraction: f64,
-) -> f64 {
-    if let Some(old) = previous {
-        let old_half_width = (old.maximum_px - old.minimum_px) / (2.0 * old.estimate_px.max(1.0));
-        if movement_fraction <= 0.08 {
-            (old_half_width * 0.82).clamp(0.12, 0.25)
-        } else {
-            (0.14 + movement_fraction * 0.55)
-                .max(old_half_width)
-                .clamp(0.14, 0.65)
-        }
-    } else {
-        0.25
-    }
-}
-
 fn mediapipe_centimeter_scales(
     previous: &Config,
     eyes: [native_mediapipe::EyeCenter; 2],
 ) -> [Option<CentimeterScaleEstimate>; 2] {
-    let sensor_centers = eyes.map(|eye| {
-        (
+    let seeds = eyes.map(|eye| CoarseEyeScaleSeed {
+        center_sensor: (
             f64::from(eye.x) * f64::from(SENSOR_WIDTH),
             f64::from(eye.y) * f64::from(SENSOR_HEIGHT),
-        )
+        ),
+        iris_radius_px: f64::from(eye.iris_radius) * f64::from(SENSOR_WIDTH),
     });
-    let old_centers = previous.eyes.map(|(x, y)| {
-        (
-            f64::from(x) + f64::from(previous.eye_size.0) * 0.5,
-            f64::from(y) + f64::from(previous.eye_size.1) * 0.5,
-        )
-    });
-    let interocular_span = (sensor_centers[0].0 - sensor_centers[1].0)
-        .hypot(sensor_centers[0].1 - sensor_centers[1].1)
-        .max(1.0);
-    std::array::from_fn(|index| {
-        let radius_px = f64::from(eyes[index].iris_radius) * f64::from(SENSOR_WIDTH);
-        let estimate_px = radius_px * 20.0 / ROUGH_LIMBUS_DIAMETER_MM;
-        if !estimate_px.is_finite() || !(4.0..=2_000.0).contains(&estimate_px) {
-            return None;
-        }
-        let previous_scale = previous.centimeter_scales[index];
-        let prior_center = previous_scale
-            .map(|old| (old.semantic_center_sensor[0], old.semantic_center_sensor[1]))
-            .unwrap_or(old_centers[index]);
-        let center_motion = (sensor_centers[index].0 - prior_center.0)
-            .hypot(sensor_centers[index].1 - prior_center.1)
-            / interocular_span;
-        let scale_motion = previous_scale
-            .map(|old| (estimate_px / old.estimate_px).ln().abs())
-            .unwrap_or(0.0);
-        let movement_fraction = (center_motion + scale_motion).clamp(0.0, 2.0);
-        // A first anthropometric projection starts at +/-25%. Consistent
-        // reacquisitions narrow it toward +/-12%; head translation, apparent
-        // scale change, or a new pose broadens it as far as +/-65%.
-        let fractional_half_width = centimeter_scale_half_width(previous_scale, movement_fraction);
-        Some(CentimeterScaleEstimate {
-            estimate_px,
-            minimum_px: estimate_px * (1.0 - fractional_half_width),
-            maximum_px: estimate_px * (1.0 + fractional_half_width),
-            movement_fraction,
-            reacquisition_count: previous_scale
-                .map(|old| old.reacquisition_count.saturating_add(1))
-                .unwrap_or(1),
-            semantic_center_sensor: [sensor_centers[index].0, sensor_centers[index].1],
-        })
-    })
+    let old_centers = previous.eyes.map(|(x, y)| (
+        f64::from(x) + f64::from(previous.eye_size.0) * 0.5,
+        f64::from(y) + f64::from(previous.eye_size.1) * 0.5,
+    ));
+    coarse_centimeter_scales(previous.centimeter_scales, old_centers, seeds)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2129,11 +2031,6 @@ fn focus_positions_center_out(center: u16, radius: i32, step: i32) -> Vec<u16> {
         }
     }
     positions
-}
-
-fn median_focus(values: &mut [f64]) -> f64 {
-    values.sort_by(f64::total_cmp);
-    values.get(values.len() / 2).copied().unwrap_or(0.0)
 }
 
 fn low_confidence_focus_fallback(
@@ -2847,24 +2744,6 @@ struct Backdrop {
     pixels: Arc<Vec<u32>>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct RingPoseObservation {
-    captured_at: Instant,
-    center: (f64, f64),
-    major_radius: f64,
-    minor_radius: f64,
-    angle: f64,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ProjectedVisionPose {
-    center: (f64, f64),
-    // Projected vector from the anatomical rotation center toward the
-    // camera-visible iris pole. Retaining the vector, rather than only its
-    // endpoint, lets temporal scoring distinguish translation from rotation.
-    pole: (f64, f64),
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct LockedRayOrigin {
     eye: usize,
@@ -2915,1818 +2794,6 @@ struct PresentationLaserLease {
     observed_at: Instant,
 }
 
-#[derive(Default)]
-struct RotationCenterHistory {
-    observations: VecDeque<RingPoseObservation>,
-    estimate: Option<ProjectedVisionPose>,
-    previous_ring: Option<RingPoseObservation>,
-    stable_frames: u32,
-}
-
-impl RotationCenterHistory {
-    fn observe(
-        &mut self,
-        now: Instant,
-        center: (f64, f64),
-        major_radius: f64,
-        minor_radius: f64,
-        angle: f64,
-        motion_score: f64,
-        comparable_to_previous: bool,
-    ) -> Option<ProjectedVisionPose> {
-        let mut accepted_observation = None;
-        if center.0.is_finite()
-            && center.1.is_finite()
-            && major_radius.is_finite()
-            && minor_radius.is_finite()
-            && angle.is_finite()
-            && major_radius >= 8.0
-            && minor_radius <= major_radius
-            && raw_iris_focus::projected_circular_limbus_axes_plausible(major_radius, minor_radius)
-        {
-            let observation = RingPoseObservation {
-                captured_at: now,
-                center,
-                major_radius,
-                minor_radius,
-                angle,
-            };
-            let geometrically_still = self.previous_ring.is_some_and(|previous| {
-                let center_limit = (major_radius * 0.10).clamp(1.5, 3.0);
-                let center_shift =
-                    (previous.center.0 - center.0).hypot(previous.center.1 - center.1);
-                let radius_shift = (previous.major_radius - major_radius).abs()
-                    / previous.major_radius.max(major_radius).max(1.0);
-                let previous_ratio = previous.minor_radius / previous.major_radius.max(1.0);
-                let ratio = minor_radius / major_radius.max(1.0);
-                let ellipse_is_directional = previous_ratio.min(ratio) < 0.96;
-                let angle_shift = wrapped_angle_distance(previous.angle, angle);
-                center_shift <= center_limit
-                    && radius_shift <= 0.08
-                    && (previous_ratio - ratio).abs() <= 0.06
-                    && (!ellipse_is_directional || angle_shift <= 0.16)
-            });
-            let image_still = comparable_to_previous
-                && motion_score.is_finite()
-                && motion_score <= ROTATION_POSE_STILL_MOTION_MAX;
-            self.stable_frames = if geometrically_still && image_still {
-                self.stable_frames.saturating_add(1)
-            } else {
-                0
-            };
-            self.previous_ring = Some(observation);
-            self.observations.push_back(observation);
-            accepted_observation = Some(observation);
-        } else {
-            self.stable_frames = 0;
-            self.previous_ring = None;
-        }
-        while self.observations.front().is_some_and(|observation| {
-            now.saturating_duration_since(observation.captured_at) > ROTATION_CENTER_HISTORY
-        }) {
-            self.observations.pop_front();
-        }
-        if self.observations.is_empty() {
-            self.estimate = None;
-            return None;
-        }
-        let firmness = rotation_pose_firmness(self.stable_frames);
-        let next = infer_projected_vision_pose(&self.observations, self.estimate, firmness);
-        let Some(next) = next else {
-            if firmness > 0.0 {
-                if let (Some(mut held), Some(observation)) = (self.estimate, accepted_observation) {
-                    // A static ring cannot triangulate a new globe center, but
-                    // it is excellent evidence that an already-established
-                    // center and pole should stay put. Permit only a very slow
-                    // pole correction for detector quantization.
-                    let observed_pole = (
-                        observation.center.0 - held.center.0,
-                        observation.center.1 - held.center.1,
-                    );
-                    let pole_alpha = 0.02 * (1.0 - firmness);
-                    held.pole = blend_point(held.pole, observed_pole, pole_alpha);
-                    self.estimate = Some(held);
-                    return self.estimate;
-                }
-            }
-            self.estimate = None;
-            return None;
-        };
-        self.estimate = Some(match self.estimate {
-            Some(previous) => {
-                // React promptly to genuine motion, then progressively harden
-                // the solution as image and ring geometry remain still.
-                let alpha = 0.45 - firmness * 0.40;
-                ProjectedVisionPose {
-                    center: blend_point(previous.center, next.center, alpha),
-                    pole: blend_point(previous.pole, next.pole, alpha),
-                }
-            }
-            None => next,
-        });
-        self.estimate
-    }
-}
-
-fn blend_point(previous: (f64, f64), next: (f64, f64), alpha: f64) -> (f64, f64) {
-    let alpha = alpha.clamp(0.0, 1.0);
-    (
-        previous.0 * (1.0 - alpha) + next.0 * alpha,
-        previous.1 * (1.0 - alpha) + next.1 * alpha,
-    )
-}
-
-fn wrapped_angle_distance(left: f64, right: f64) -> f64 {
-    let mut delta = (left - right).abs() % std::f64::consts::PI;
-    if delta > std::f64::consts::FRAC_PI_2 {
-        delta = std::f64::consts::PI - delta;
-    }
-    delta
-}
-
-fn rotation_pose_firmness(stable_frames: u32) -> f64 {
-    if stable_frames <= ROTATION_POSE_FIRM_START_FRAMES {
-        return 0.0;
-    }
-    ((stable_frames - ROTATION_POSE_FIRM_START_FRAMES) as f64
-        / (ROTATION_POSE_FIRM_FULL_FRAMES - ROTATION_POSE_FIRM_START_FRAMES) as f64)
-        .clamp(0.0, 1.0)
-}
-
-fn infer_projected_rotation_center(
-    observations: &VecDeque<RingPoseObservation>,
-) -> Option<(f64, f64)> {
-    infer_projected_vision_pose(observations, None, 0.0).map(|pose| pose.center)
-}
-
-fn infer_projected_vision_pose(
-    observations: &VecDeque<RingPoseObservation>,
-    prior: Option<ProjectedVisionPose>,
-    firmness: f64,
-) -> Option<ProjectedVisionPose> {
-    let informative = observations
-        .iter()
-        .filter_map(|observation| {
-            let ratio = (observation.minor_radius / observation.major_radius).clamp(0.0, 1.0);
-            let tilt = (1.0 - ratio * ratio).sqrt();
-            (tilt >= 0.08).then(|| {
-                let normal = (-observation.angle.sin(), observation.angle.cos());
-                (*observation, tilt, normal)
-            })
-        })
-        .collect::<Vec<_>>();
-    if informative.len() < ROTATION_CENTER_MIN_OBSERVATIONS {
-        return None;
-    }
-    let mut angular_diversity = 0.0f64;
-    let mut center_span = 0.0f64;
-    for left in &informative {
-        for right in &informative {
-            angular_diversity =
-                angular_diversity.max((left.2 .0 * right.2 .1 - left.2 .1 * right.2 .0).abs());
-            center_span = center_span.max(
-                (left.0.center.0 - right.0.center.0).hypot(left.0.center.1 - right.0.center.1),
-            );
-        }
-    }
-    if angular_diversity < 0.10 || center_span < 1.5 {
-        return None;
-    }
-
-    let mut best: Option<(f64, f64, ProjectedVisionPose)> = None;
-    for scale_step in 0..=20 {
-        let depth_to_ring_radius = 1.15 + scale_step as f64 * 0.085;
-        let latest = informative.last()?;
-        for initial_sign in [-1.0, 1.0] {
-            let latest_offset = depth_to_ring_radius * latest.0.major_radius * latest.1;
-            let mut center = (
-                latest.0.center.0 + initial_sign * latest_offset * latest.2 .0,
-                latest.0.center.1 + initial_sign * latest_offset * latest.2 .1,
-            );
-            let mut selected = Vec::with_capacity(informative.len());
-            for _ in 0..4 {
-                selected.clear();
-                for (observation, tilt, normal) in &informative {
-                    let offset = depth_to_ring_radius * observation.major_radius * tilt;
-                    let plus = (
-                        observation.center.0 + offset * normal.0,
-                        observation.center.1 + offset * normal.1,
-                    );
-                    let minus = (
-                        observation.center.0 - offset * normal.0,
-                        observation.center.1 - offset * normal.1,
-                    );
-                    selected.push(
-                        if (plus.0 - center.0).hypot(plus.1 - center.1)
-                            <= (minus.0 - center.0).hypot(minus.1 - center.1)
-                        {
-                            plus
-                        } else {
-                            minus
-                        },
-                    );
-                }
-                let mut xs = selected.iter().map(|point| point.0).collect::<Vec<_>>();
-                let mut ys = selected.iter().map(|point| point.1).collect::<Vec<_>>();
-                center = (median_focus(&mut xs), median_focus(&mut ys));
-            }
-            let mut residuals = selected
-                .iter()
-                .map(|point| (point.0 - center.0).hypot(point.1 - center.1))
-                .collect::<Vec<_>>();
-            let residual = median_focus(&mut residuals);
-            let pole = (latest.0.center.0 - center.0, latest.0.center.1 - center.1);
-            let pose = ProjectedVisionPose { center, pole };
-            let temporal_penalty = prior
-                .map(|prior| projected_pose_temporal_penalty(prior, pose, latest.0.major_radius))
-                .unwrap_or(0.0)
-                * firmness.clamp(0.0, 1.0);
-            let score = residual + temporal_penalty;
-            if best.as_ref().is_none_or(|candidate| score < candidate.0) {
-                best = Some((score, residual, pose));
-            }
-        }
-    }
-    best.filter(|(_, residual, _)| *residual <= 5.0)
-        .map(|(_, _, pose)| pose)
-}
-
-fn projected_pose_temporal_penalty(
-    prior: ProjectedVisionPose,
-    candidate: ProjectedVisionPose,
-    ring_radius: f64,
-) -> f64 {
-    let center_translation =
-        (candidate.center.0 - prior.center.0).hypot(candidate.center.1 - prior.center.1);
-    let pole_translation = (candidate.pole.0 - prior.pole.0).hypot(candidate.pole.1 - prior.pole.1);
-    let prior_length = prior.pole.0.hypot(prior.pole.1);
-    let candidate_length = candidate.pole.0.hypot(candidate.pole.1);
-    let rotation = if prior_length > 1.0e-6 && candidate_length > 1.0e-6 {
-        ((prior.pole.0 * candidate.pole.0 + prior.pole.1 * candidate.pole.1)
-            / (prior_length * candidate_length))
-            .clamp(-1.0, 1.0)
-            .acos()
-    } else {
-        0.0
-    };
-    center_translation * 0.55 + pole_translation * 0.30 + rotation * ring_radius.max(1.0) * 0.75
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct RadiusKinematicSupport {
-    estimate: f64,
-    minimum: f64,
-    maximum: f64,
-}
-
-#[derive(Debug, Default)]
-struct RadiusRateLimiter {
-    state: Option<(Instant, f64)>,
-}
-
-impl RadiusRateLimiter {
-    /// Freeze the same continuous-time physiological support used by the
-    /// publication limiter so a native-coordinate search can look for an
-    /// admissible edge instead of first choosing an impossible edge and then
-    /// merely resizing or discarding it. After a one-second evidence gap the
-    /// continuous trajectory deliberately expires; robust size history owns
-    /// longer reacquisition intervals.
-    fn kinematic_support(
-        &self,
-        now: Instant,
-        max_contraction_per_second: f64,
-        max_expansion_per_second: f64,
-    ) -> Option<RadiusKinematicSupport> {
-        let (previous_at, previous_radius) = self.state?;
-        if !previous_radius.is_finite() || previous_radius <= 0.0 {
-            return None;
-        }
-        let elapsed_since_observation = now.saturating_duration_since(previous_at);
-        if elapsed_since_observation > Duration::from_secs(1) {
-            return None;
-        }
-        // A delayed worker result or one missing segmentation frame is not
-        // evidence that an anatomical boundary changed discontinuously.
-        // Bound each publication by one ordinary 10 Hz interval; repeated
-        // current-RAW edge pressure can still advance the trajectory on
-        // subsequent frames. This keeps the pupil's reconstructed circular
-        // area below a two-percent change between consecutive publications.
-        let elapsed = elapsed_since_observation
-            .min(RADIUS_RATE_LIMITER_MAX_PUBLICATION_STEP)
-            .as_secs_f64();
-        let minimum =
-            previous_radius * (1.0 - max_contraction_per_second.max(0.0) * elapsed).max(0.0);
-        let maximum = if max_expansion_per_second.is_finite() {
-            previous_radius * (1.0 + max_expansion_per_second.max(0.0) * elapsed)
-        } else {
-            f64::INFINITY
-        };
-        Some(RadiusKinematicSupport {
-            estimate: previous_radius,
-            minimum,
-            maximum,
-        })
-    }
-
-    fn constrain(
-        &self,
-        now: Instant,
-        measured_radius: f64,
-        max_contraction_per_second: f64,
-        max_expansion_per_second: f64,
-    ) -> f64 {
-        if !measured_radius.is_finite() || measured_radius <= 0.0 {
-            return measured_radius;
-        }
-        let Some(support) =
-            self.kinematic_support(now, max_contraction_per_second, max_expansion_per_second)
-        else {
-            return measured_radius;
-        };
-        measured_radius.clamp(support.minimum, support.maximum)
-    }
-
-    fn observe(
-        &mut self,
-        now: Instant,
-        measured_radius: f64,
-        max_contraction_per_second: f64,
-        max_expansion_per_second: f64,
-    ) -> f64 {
-        if !measured_radius.is_finite() || measured_radius <= 0.0 {
-            return measured_radius;
-        }
-        let Some((previous_at, _)) = self.state else {
-            self.state = Some((now, measured_radius));
-            return measured_radius;
-        };
-        let elapsed_since_observation = now.saturating_duration_since(previous_at);
-        if elapsed_since_observation > Duration::from_secs(1) {
-            // This limiter bounds a continuous physiological trajectory. An
-            // extended missing-boundary interval is not continuous evidence;
-            // the robust hard/soft size supports must validate a fresh fit
-            // instead of dragging it toward an indefinitely old ratio.
-            self.state = Some((now, measured_radius));
-            return measured_radius;
-        }
-        let stabilized = self.constrain(
-            now,
-            measured_radius,
-            max_contraction_per_second,
-            max_expansion_per_second,
-        );
-        self.state = Some((now, stabilized));
-        stabilized
-    }
-
-    fn constrain_with_hard_bounds(
-        &self,
-        now: Instant,
-        measured_radius: f64,
-        max_contraction_per_second: f64,
-        max_expansion_per_second: f64,
-        hard_lower: f64,
-        hard_upper: f64,
-    ) -> (f64, bool) {
-        let stabilized = self.constrain(
-            now,
-            measured_radius,
-            max_contraction_per_second,
-            max_expansion_per_second,
-        );
-        let tolerance = 1.0e-9 * measured_radius.abs().max(stabilized.abs()).max(1.0);
-        let trajectory_limited = (stabilized - measured_radius).abs() > tolerance;
-        let bounded = if hard_lower.is_finite()
-            && hard_upper.is_finite()
-            && hard_lower > 0.0
-            && hard_upper >= hard_lower
-        {
-            stabilized.clamp(hard_lower, hard_upper)
-        } else {
-            stabilized
-        };
-        (bounded, trajectory_limited)
-    }
-
-    fn enforce_state_hard_bounds(
-        &mut self,
-        now: Instant,
-        hard_lower: f64,
-        hard_upper: f64,
-    ) -> bool {
-        if !hard_lower.is_finite()
-            || !hard_upper.is_finite()
-            || hard_lower <= 0.0
-            || hard_upper < hard_lower
-        {
-            return false;
-        }
-        let Some((_, previous)) = self.state else {
-            return false;
-        };
-        let bounded = previous.clamp(hard_lower, hard_upper);
-        let tolerance = 1.0e-9 * previous.abs().max(bounded.abs()).max(1.0);
-        if (bounded - previous).abs() <= tolerance {
-            return false;
-        }
-        // This mutation is authorized by an explicit operator guide, not by
-        // the current image candidate. It remains valid while R is frozen and
-        // cannot let a blurry measurement choose the new trajectory value.
-        self.state = Some((now, bounded));
-        true
-    }
-
-    fn observe_with_hard_bounds(
-        &mut self,
-        now: Instant,
-        measured_radius: f64,
-        max_contraction_per_second: f64,
-        max_expansion_per_second: f64,
-        hard_lower: f64,
-        hard_upper: f64,
-    ) -> (f64, bool) {
-        let (bounded, trajectory_limited) = self.constrain_with_hard_bounds(
-            now,
-            measured_radius,
-            max_contraction_per_second,
-            max_expansion_per_second,
-            hard_lower,
-            hard_upper,
-        );
-        if bounded.is_finite() && bounded > 0.0 {
-            // This is the admitted/mutating path. Explicit operator hard
-            // guides therefore restart the trajectory at the published
-            // boundary, while the read-only path above never changes state.
-            self.state = Some((now, bounded));
-        }
-        (bounded, trajectory_limited)
-    }
-}
-
-/// Provenance of the limbus projection used to express pupil size in
-/// fronto-parallel radius space.  The pupil-size posterior is independent of
-/// the selected rough-center method; this enum records only the current scale
-/// and affine projection reference.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum PupilProjectionSource {
-    #[default]
-    SelectedIris,
-    CensoredLimbus,
-    RawEyeAnatomy,
-}
-
-impl PupilProjectionSource {
-    fn label(self) -> &'static str {
-        match self {
-            Self::SelectedIris => "selected-iris",
-            Self::CensoredLimbus => "censored-limbus",
-            Self::RawEyeAnatomy => "raw-eye-anatomy",
-        }
-    }
-}
-
-/// Unit-safe radius coordinates for the physical pupil-size posterior.
-///
-/// These constructors deliberately live behind a private module boundary:
-/// image-plane ellipse radii cannot be passed to temporal physical-size state
-/// as bare `f64`s. A fronto-parallel radius is produced either by the
-/// projected-circle limbus model or by explicitly undoing the limbus affine
-/// foreshortening from a projected equal-area pupil radius.
-mod pupil_radius_units {
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    pub(super) struct ProjectedAreaEquivalentRadiusPx(f64);
-
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    pub(super) struct AffineForeshortening(f64);
-
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    pub(super) struct FrontoParallelCircleRadiusPx(f64);
-
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    pub(super) struct PhysicalRadiusRatio(f64);
-
-    impl ProjectedAreaEquivalentRadiusPx {
-        pub(super) fn from_ellipse_axes(axis_a: f64, axis_b: f64) -> Option<Self> {
-            if !axis_a.is_finite() || !axis_b.is_finite() || axis_a <= 0.0 || axis_b <= 0.0 {
-                return None;
-            }
-            let radius = (axis_a * axis_b).sqrt();
-            (radius.is_finite() && radius > 0.0).then_some(Self(radius))
-        }
-    }
-
-    impl AffineForeshortening {
-        pub(super) fn from_minor_to_major(minor_to_major: f64) -> Option<Self> {
-            (minor_to_major.is_finite()
-                && (super::raw_iris_focus::PROVISIONAL_CENTRAL_CAMERA_LIMBUS_ENVELOPE
-                    .absolute_minimum_minor_to_major..=1.0)
-                    .contains(&minor_to_major))
-            .then_some(Self(minor_to_major))
-        }
-    }
-
-    impl FrontoParallelCircleRadiusPx {
-        /// Under weak perspective, a projected physical circle retains its
-        /// true radius along the ellipse's unforeshortened major axis.
-        pub(super) fn from_projected_circular_limbus_axes(
-            axis_a: f64,
-            axis_b: f64,
-        ) -> Option<Self> {
-            ProjectedAreaEquivalentRadiusPx::from_ellipse_axes(axis_a, axis_b)?;
-            let major = axis_a.max(axis_b);
-            let minor = axis_a.min(axis_b);
-            AffineForeshortening::from_minor_to_major(minor / major)?;
-            // This is the closed-form rectification for a projected circle:
-            // sqrt(a*b) / sqrt(b/a) = a. Return the measured major axis
-            // directly to avoid introducing roundoff into operator guides.
-            Some(Self(major))
-        }
-
-        pub(super) fn from_projected_area(
-            projected: ProjectedAreaEquivalentRadiusPx,
-            foreshortening: AffineForeshortening,
-        ) -> Option<Self> {
-            let radius = projected.0 / foreshortening.0.sqrt();
-            (radius.is_finite() && radius > 0.0).then_some(Self(radius))
-        }
-
-        pub(super) fn value(self) -> f64 {
-            self.0
-        }
-
-        pub(super) fn ratio_to(self, reference: Self) -> Option<PhysicalRadiusRatio> {
-            let ratio = self.0 / reference.0;
-            (ratio.is_finite() && ratio > 0.0).then_some(PhysicalRadiusRatio(ratio))
-        }
-    }
-
-    impl PhysicalRadiusRatio {
-        pub(super) fn value(self) -> f64 {
-            self.0
-        }
-    }
-}
-
-use pupil_radius_units::{
-    AffineForeshortening, FrontoParallelCircleRadiusPx, ProjectedAreaEquivalentRadiusPx,
-};
-
-/// Weak-perspective projection of a physical circular limbus.  Its larger
-/// semi-axis is the fronto-parallel radius; `minor_to_major` carries the
-/// affine foreshortening needed to draw a meaningful pupil-size reticle back
-/// in the untouched RAW ROI.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct PupilProjectionReference {
-    center: (f64, f64),
-    fronto_parallel_limbus_radius_px: FrontoParallelCircleRadiusPx,
-    equivalent_limbus_radius_px: f64,
-    minor_to_major: f64,
-    angle: f64,
-    source: PupilProjectionSource,
-}
-
-impl PupilProjectionReference {
-    fn from_axes(
-        center: (f64, f64),
-        mut major_radius: f64,
-        mut minor_radius: f64,
-        mut angle: f64,
-        source: PupilProjectionSource,
-    ) -> Option<Self> {
-        if !center.0.is_finite()
-            || !center.1.is_finite()
-            || !major_radius.is_finite()
-            || !minor_radius.is_finite()
-            || !angle.is_finite()
-            || major_radius <= 4.0
-            || minor_radius <= 2.0
-        {
-            return None;
-        }
-        if major_radius < minor_radius {
-            std::mem::swap(&mut major_radius, &mut minor_radius);
-            angle += std::f64::consts::FRAC_PI_2;
-        }
-        let assessment =
-            raw_iris_focus::assess_projected_circular_limbus_axes(major_radius, minor_radius)?;
-        if assessment.minor_to_major + 1.0e-12 < assessment.minimum_minor_to_major {
-            return None;
-        }
-        let minor_to_major = assessment.minor_to_major;
-        let fronto_parallel_limbus_radius_px =
-            FrontoParallelCircleRadiusPx::from_projected_circular_limbus_axes(
-                major_radius,
-                minor_radius,
-            )?;
-        Some(Self {
-            center,
-            fronto_parallel_limbus_radius_px,
-            equivalent_limbus_radius_px: (major_radius * minor_radius).sqrt(),
-            minor_to_major,
-            angle,
-            source,
-        })
-    }
-
-    fn from_outer(
-        boundary: &raw_iris_focus::OuterIrisBoundary,
-        source: PupilProjectionSource,
-    ) -> Option<Self> {
-        (!boundary.points.is_empty())
-            .then(|| {
-                Self::from_axes(
-                    boundary.center,
-                    boundary.major_radius,
-                    boundary.minor_radius,
-                    boundary.angle,
-                    source,
-                )
-            })
-            .flatten()
-    }
-
-    fn from_censored(observation: raw_iris_focus::RoiTruncatedLimbusObservation) -> Option<Self> {
-        (observation.confidence >= 0.45)
-            .then(|| {
-                Self::from_axes(
-                    observation.center,
-                    observation.major_radius,
-                    observation.minor_radius,
-                    observation.angle,
-                    PupilProjectionSource::CensoredLimbus,
-                )
-            })
-            .flatten()
-    }
-
-    fn from_raw_focus(focus: &raw_iris_focus::BorderFocus) -> Option<Self> {
-        if !focus.radius.is_finite() || focus.radius <= 4.0 || !focus.axis_angle.is_finite() {
-            return None;
-        }
-        let mut ratio = focus.axis_ratio.abs();
-        let mut angle = focus.axis_angle;
-        if !ratio.is_finite() || ratio <= 0.0 {
-            ratio = 1.0;
-        }
-        if ratio < 1.0 {
-            ratio = 1.0 / ratio;
-            angle += std::f64::consts::FRAC_PI_2;
-        }
-        let ratio_root = ratio.clamp(1.0, 2.5).sqrt();
-        Self::from_axes(
-            focus.center,
-            focus.radius * ratio_root,
-            focus.radius / ratio_root,
-            angle,
-            PupilProjectionSource::RawEyeAnatomy,
-        )
-    }
-}
-
-const PUPIL_CENTER_TRACK_STALE_AFTER: Duration = Duration::from_millis(1_250);
-const PUPIL_CENTER_PENDING_RELOCATION_MAX_AGE: Duration = Duration::from_millis(450);
-// A tracked fixation ball produces smooth pursuit rather than a sequence of
-// stationary fixations.  At the native 10 Hz eye cadence, requiring the
-// second remote pupil ring to remain at the first ring's sensor coordinate
-// turns real pursuit into a repeated relocation-pending hold.  Two decisive
-// RAW rings may instead establish a short-lived canonical velocity when both
-// increments are aligned and remain a small fraction of the measured limbus.
-// The prediction expires quickly, so a lid/glint edge cannot coast through an
-// evidence gap or become a new acquisition mechanism.
-const PUPIL_CENTER_PURSUIT_MAX_AGE: Duration = Duration::from_millis(350);
-const PUPIL_CENTER_PURSUIT_MIN_CANONICAL_STEP: f64 = 0.004;
-const PUPIL_CENTER_PURSUIT_MAX_CANONICAL_STEP: f64 = 0.105;
-const PUPIL_CENTER_PURSUIT_MIN_DIRECTION_COSINE: f64 = 0.35;
-const PUPIL_CENTER_PURSUIT_MIN_STEP_RATIO: f64 = 0.22;
-const PUPIL_CENTER_PURSUIT_MAX_STEP_RATIO: f64 = 4.50;
-const PUPIL_CENTER_PURSUIT_MAX_CANONICAL_SPEED_PER_SECOND: f64 = 1.10;
-// Without independently classified saccade motion, rough-center/RAW flow may
-// repair a lagging pursuit but may not teleport the pupil across half of the
-// limbus.  Large genuine saccades retain the separate high-jerk path.
-const PUPIL_CENTER_UNSUPPORTED_MAX_CANONICAL_RELOCATION: f64 = 0.24;
-
-/// Motion regime for the shared pupil-center state.  This is deliberately not
-/// a constant-velocity filter: a real saccade has large acceleration and jerk,
-/// then stops abruptly.  Fixations are therefore transported in the limbus
-/// coordinate frame, while a remote current-frame solution is either admitted
-/// by independent pupil/iris motion or verified on a second frame.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum PupilCenterMotionRegime {
-    #[default]
-    Uninitialized,
-    Fixation,
-    RelocationPending,
-    Saccade,
-    SmoothPursuit,
-}
-
-impl PupilCenterMotionRegime {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Uninitialized => "uninitialized",
-            Self::Fixation => "fixation",
-            Self::RelocationPending => "relocation-pending",
-            Self::Saccade => "saccade",
-            Self::SmoothPursuit => "smooth-pursuit",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct PupilCenterPrediction {
-    center: (f64, f64),
-    transported_track: bool,
-    transport_source: PupilCenterTransportSource,
-    limbus_transport_disagreement_px: f64,
-    pursuit_predicted: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum PupilCenterTransportSource {
-    #[default]
-    Uninitialized,
-    FrameProposal,
-    SensorHold,
-    GlobalSimilarity,
-    LimbusConsensus,
-    LimbusOnly,
-    LimbusReacquisition,
-}
-
-impl PupilCenterTransportSource {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Uninitialized => "uninitialized",
-            Self::FrameProposal => "frame-proposal",
-            Self::SensorHold => "sensor-hold",
-            Self::GlobalSimilarity => "global-similarity",
-            Self::LimbusConsensus => "limbus-consensus",
-            Self::LimbusOnly => "limbus-only",
-            Self::LimbusReacquisition => "limbus-proposal-reacquisition",
-        }
-    }
-
-    fn short_label(self) -> &'static str {
-        match self {
-            Self::Uninitialized => "WAIT",
-            Self::FrameProposal => "PROPOSAL",
-            Self::SensorHold => "SENSOR",
-            Self::GlobalSimilarity => "GLOBAL",
-            Self::LimbusConsensus => "GLOBAL+LIMBUS",
-            Self::LimbusOnly => "LIMBUS",
-            Self::LimbusReacquisition => "LIMBUS+PROPOSAL",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct PendingPupilCenterRelocation {
-    canonical_center: Option<(f64, f64)>,
-    reference_canonical_center: Option<(f64, f64)>,
-    sensor_center: (f64, f64),
-    agreeing_frames: u8,
-    last_seen: Option<Instant>,
-    decisive: bool,
-    measurement_score: f64,
-    proposal_agrees: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct PupilCenterTrackDiagnostics {
-    regime: PupilCenterMotionRegime,
-    transport_source: PupilCenterTransportSource,
-    predicted_center: Option<(f64, f64)>,
-    measured_center: Option<(f64, f64)>,
-    published_center: Option<(f64, f64)>,
-    limbus_transport_disagreement_px: f64,
-    innovation_px: f64,
-    fixation_gate_px: f64,
-    measurement_score: f64,
-    measurement_admissible: bool,
-    transported_hold: bool,
-    pending_relocation_frames: u8,
-    saccade_likelihood: f32,
-    relative_motion_confidence: f32,
-    relative_speed_px_s: f32,
-    relative_acceleration_px_s2: f32,
-    relative_jerk_px_s3: f32,
-    specular_layer_excluded: bool,
-    pursuit_predicted: bool,
-    pursuit_velocity_canonical_per_second: Option<(f64, f64)>,
-}
-
-#[derive(Default)]
-struct PupilCenterStateTracker {
-    /// Pupil location in the current physical limbus' fronto-parallel affine
-    /// coordinates.  Holding this fixed transports ordinary head/ROI motion
-    /// without pretending that the specular pupil interior is rigid.
-    canonical_center: Option<(f64, f64)>,
-    /// Absolute sensor coordinate is the fallback when the selected limbus is
-    /// temporarily withheld.  ROI-buffer and client-crop offsets therefore do
-    /// not silently become apparent pupil motion.
-    sensor_center: Option<(f64, f64)>,
-    last_supported: Option<Instant>,
-    fixation_streak: u8,
-    pending_relocation: Option<PendingPupilCenterRelocation>,
-    pursuit_velocity_canonical_per_second: Option<(f64, f64)>,
-    pursuit_supported_at: Option<Instant>,
-    last_frame_at: Option<Instant>,
-    diagnostics: PupilCenterTrackDiagnostics,
-}
-
-fn pupil_projection_canonical_point(
-    projection: PupilProjectionReference,
-    point: (f64, f64),
-) -> Option<(f64, f64)> {
-    let major = projection.fronto_parallel_limbus_radius_px.value();
-    let minor = major * projection.minor_to_major;
-    if !major.is_finite() || !minor.is_finite() || major <= 1.0 || minor <= 1.0 {
-        return None;
-    }
-    let delta = (point.0 - projection.center.0, point.1 - projection.center.1);
-    let (sine, cosine) = projection.angle.sin_cos();
-    let canonical = (
-        (cosine * delta.0 + sine * delta.1) / major,
-        (-sine * delta.0 + cosine * delta.1) / minor,
-    );
-    (canonical.0.is_finite() && canonical.1.is_finite()).then_some(canonical)
-}
-
-fn pupil_projection_image_point(
-    projection: PupilProjectionReference,
-    canonical: (f64, f64),
-) -> Option<(f64, f64)> {
-    let major = projection.fronto_parallel_limbus_radius_px.value();
-    let minor = major * projection.minor_to_major;
-    if !major.is_finite()
-        || !minor.is_finite()
-        || major <= 1.0
-        || minor <= 1.0
-        || !canonical.0.is_finite()
-        || !canonical.1.is_finite()
-    {
-        return None;
-    }
-    let local = (canonical.0 * major, canonical.1 * minor);
-    let (sine, cosine) = projection.angle.sin_cos();
-    Some((
-        projection.center.0 + cosine * local.0 - sine * local.1,
-        projection.center.1 + sine * local.0 + cosine * local.1,
-    ))
-}
-
-fn pupil_center_orbital_measurement_admissible(
-    measurement: raw_iris_focus::PupilCenterOrbitalFit,
-) -> bool {
-    measurement.score >= 0.54
-        && measurement.ring_transition >= 0.16
-        && measurement.ring_coverage >= 0.42
-        && measurement.opposing_support >= 0.42
-        && measurement.broad_dark_step >= 0.012
-        && measurement.broad_dark_support >= 0.58
-}
-
-fn pupil_center_orbital_measurement_decisive(
-    measurement: raw_iris_focus::PupilCenterOrbitalFit,
-) -> bool {
-    pupil_center_orbital_measurement_admissible(measurement)
-        && measurement.score >= 0.62
-        && measurement.ring_coverage >= 0.58
-        && measurement.opposing_support >= 0.58
-        && measurement.broad_dark_support >= 0.72
-}
-
-fn pupil_center_saccade_motion_supported(
-    overlay: &raw_motion_octrees::MotionOctreeOverlay,
-) -> bool {
-    let coupled = overlay.coupled_motion;
-    let relative = coupled.green_relative_to_cyan;
-    let pupil_layer = overlay.layers[raw_motion_octrees::PUPIL_LAYER];
-    let jerk = relative.jerk_px_s3[0].hypot(relative.jerk_px_s3[1]);
-    let classified_saccade = coupled.saccade_likelihood >= 0.68;
-    let high_jerk_transition = coupled.saccade_likelihood >= 0.34 && jerk >= 650.0;
-    relative.samples >= 4
-        && relative.confidence >= 0.12
-        && pupil_layer.persistent_tracks >= 3
-        && pupil_layer.stable_frames >= 2
-        && pupil_layer.coherence >= 0.18
-        && (classified_saccade || high_jerk_transition)
-}
-
-/// A short-history acceleration burst may be real before the cubic motion
-/// fit has accumulated enough confidence to authorize an immediate state
-/// transition. It may broaden the bounded RAW search, but publication remains
-/// behind `pupil_center_saccade_motion_supported` or multi-frame ring
-/// confirmation. The reflection layer is absent from every term here.
-fn pupil_center_saccade_search_warranted(
-    overlay: &raw_motion_octrees::MotionOctreeOverlay,
-) -> bool {
-    let relative = overlay.coupled_motion.green_relative_to_cyan;
-    let pupil_layer = overlay.layers[raw_motion_octrees::PUPIL_LAYER];
-    let acceleration = relative.acceleration_px_s2[0].hypot(relative.acceleration_px_s2[1]);
-    let jerk = relative.jerk_px_s3[0].hypot(relative.jerk_px_s3[1]);
-    relative.samples >= 4
-        && relative.confidence >= 0.045
-        && pupil_layer.persistent_tracks >= 3
-        && pupil_layer.stable_frames >= 2
-        && pupil_layer.coherence >= 0.18
-        && (overlay.coupled_motion.saccade_likelihood >= 0.22
-            || acceleration >= 420.0
-            || jerk >= 1_100.0)
-}
-
-fn bounded_pupil_pursuit_velocity(
-    previous: (f64, f64),
-    current: (f64, f64),
-    elapsed: Duration,
-) -> Option<(f64, f64)> {
-    let seconds = elapsed.as_secs_f64();
-    if !(0.035..=0.30).contains(&seconds) {
-        return None;
-    }
-    let velocity = (
-        (current.0 - previous.0) / seconds,
-        (current.1 - previous.1) / seconds,
-    );
-    let speed = velocity.0.hypot(velocity.1);
-    (speed.is_finite()
-        && speed > 0.0
-        && speed <= PUPIL_CENTER_PURSUIT_MAX_CANONICAL_SPEED_PER_SECOND)
-        .then_some(velocity)
-}
-
-fn pupil_center_progressive_pursuit_velocity(
-    pending: PendingPupilCenterRelocation,
-    current_canonical: Option<(f64, f64)>,
-    now: Instant,
-    current_decisive: bool,
-    current_measurement_score: f64,
-    current_proposal_agrees: bool,
-) -> Option<(f64, f64)> {
-    let trace = std::env::var_os("BUTTERCUP_PUPIL_PURSUIT_TRACE").is_some();
-    let raw_pair_strong = (pending.decisive && current_measurement_score >= 0.58)
-        || (current_decisive && pending.measurement_score >= 0.58)
-        || (pending.measurement_score >= 0.62 && current_measurement_score >= 0.62);
-    if !raw_pair_strong || !pending.proposal_agrees || !current_proposal_agrees {
-        if trace {
-            eprintln!(
-                "pupil-pursuit reject=raw/proposal prior={:.3}/{} current={:.3}/{} proposal={}/{}",
-                pending.measurement_score,
-                pending.decisive,
-                current_measurement_score,
-                current_decisive,
-                pending.proposal_agrees,
-                current_proposal_agrees,
-            );
-        }
-        return None;
-    }
-    let reference = pending.reference_canonical_center?;
-    let previous = pending.canonical_center?;
-    let current = current_canonical?;
-    let previous_seen = pending.last_seen?;
-    let elapsed = now.saturating_duration_since(previous_seen);
-    if elapsed > PUPIL_CENTER_PURSUIT_MAX_AGE {
-        return None;
-    }
-    let first_step = (previous.0 - reference.0, previous.1 - reference.1);
-    let second_step = (current.0 - previous.0, current.1 - previous.1);
-    let first_length = first_step.0.hypot(first_step.1);
-    let second_length = second_step.0.hypot(second_step.1);
-    if !(PUPIL_CENTER_PURSUIT_MIN_CANONICAL_STEP..=PUPIL_CENTER_PURSUIT_MAX_CANONICAL_STEP)
-        .contains(&first_length)
-        || !(PUPIL_CENTER_PURSUIT_MIN_CANONICAL_STEP..=PUPIL_CENTER_PURSUIT_MAX_CANONICAL_STEP)
-            .contains(&second_length)
-    {
-        if trace {
-            eprintln!(
-                "pupil-pursuit reject=step first={first_length:.5} second={second_length:.5}"
-            );
-        }
-        return None;
-    }
-    let direction_cosine = (first_step.0 * second_step.0 + first_step.1 * second_step.1)
-        / (first_length * second_length);
-    let step_ratio = second_length / first_length;
-    if direction_cosine < PUPIL_CENTER_PURSUIT_MIN_DIRECTION_COSINE
-        || !(PUPIL_CENTER_PURSUIT_MIN_STEP_RATIO..=PUPIL_CENTER_PURSUIT_MAX_STEP_RATIO)
-            .contains(&step_ratio)
-    {
-        if trace {
-            eprintln!(
-                "pupil-pursuit reject=direction cosine={direction_cosine:.4} ratio={step_ratio:.4} first={first_length:.5} second={second_length:.5}"
-            );
-        }
-        return None;
-    }
-    let velocity = bounded_pupil_pursuit_velocity(previous, current, elapsed);
-    if trace {
-        eprintln!(
-            "pupil-pursuit {} cosine={direction_cosine:.4} ratio={step_ratio:.4} first={first_length:.5} second={second_length:.5} velocity={velocity:?}",
-            if velocity.is_some() {
-                "accept"
-            } else {
-                "reject=speed"
-            }
-        );
-    }
-    velocity
-}
-
-impl PupilCenterStateTracker {
-    fn clear(&mut self) {
-        *self = Self::default();
-    }
-
-    fn diagnostics(&self) -> PupilCenterTrackDiagnostics {
-        self.diagnostics
-    }
-
-    fn begin_frame(
-        &mut self,
-        now: Instant,
-        sensor_origin: (u32, u32),
-        frame_extent: (usize, usize),
-        projection: Option<PupilProjectionReference>,
-        frame_proposal: Option<(f64, f64)>,
-        motion: &raw_motion_octrees::MotionOctreeOverlay,
-    ) -> Option<PupilCenterPrediction> {
-        if self.last_supported.is_some_and(|last| {
-            now.saturating_duration_since(last) > PUPIL_CENTER_TRACK_STALE_AFTER
-        }) {
-            self.clear();
-        }
-        let frame_dt = self
-            .last_frame_at
-            .map(|previous| now.saturating_duration_since(previous).as_secs_f64())
-            .unwrap_or(0.0)
-            .clamp(0.0, 0.20);
-        self.last_frame_at = Some(now);
-        let pursuit_velocity = self.pursuit_velocity_canonical_per_second.filter(|_| {
-            self.pursuit_supported_at.is_some_and(|supported| {
-                now.saturating_duration_since(supported) <= PUPIL_CENTER_PURSUIT_MAX_AGE
-            })
-        });
-        if pursuit_velocity.is_none() {
-            self.pursuit_velocity_canonical_per_second = None;
-            self.pursuit_supported_at = None;
-        }
-        let limbus_hold =
-            projection
-                .zip(self.canonical_center)
-                .and_then(|(projection, canonical)| {
-                    pupil_projection_image_point(projection, canonical)
-                });
-        let limbus_transport = projection
-            .zip(self.canonical_center)
-            .zip(pursuit_velocity)
-            .filter(|_| frame_dt > 0.0)
-            .and_then(|((projection, canonical), velocity)| {
-                pupil_projection_image_point(
-                    projection,
-                    (
-                        canonical.0 + velocity.0 * frame_dt,
-                        canonical.1 + velocity.1 * frame_dt,
-                    ),
-                )
-            })
-            .or(limbus_hold);
-        let pursuit_delta = limbus_hold
-            .zip(limbus_transport)
-            .map(|(held, pursued)| (pursued.0 - held.0, pursued.1 - held.1))
-            .filter(|delta| delta.0.hypot(delta.1) > 1.0e-6);
-        let sensor_hold = self.sensor_center.map(|sensor| {
-            (
-                sensor.0 - f64::from(sensor_origin.0),
-                sensor.1 - f64::from(sensor_origin.1),
-            )
-        });
-        let global_motion = motion.motions[raw_motion_octrees::GENERAL_LAYER];
-        let global_layer = motion.layers[raw_motion_octrees::GENERAL_LAYER];
-        let global_reliable = global_motion.support >= 4
-            && global_layer.persistent_tracks >= 3
-            && global_layer.stable_frames >= 2
-            && global_layer.coherence >= 0.10
-            && global_motion.residual.is_finite()
-            && global_motion.residual <= 4.0;
-        let global_transport = self
-            .sensor_center
-            .filter(|_| global_reliable)
-            .map(|sensor| {
-                // `SimilarityMotion` is fitted in absolute sensor coordinates
-                // about the current RAW slice center. Applying the same bounded
-                // transform to the persistent pupil state transports head motion
-                // without treating iris texture or a reflection as rigid.
-                let analysis_center = (
-                    f64::from(sensor_origin.0) + frame_extent.0 as f64 * 0.5,
-                    f64::from(sensor_origin.1) + frame_extent.1 as f64 * 0.5,
-                );
-                let x = sensor.0 - analysis_center.0;
-                let y = sensor.1 - analysis_center.1;
-                (
-                    sensor.0
-                        + f64::from(global_motion.translation[0])
-                        + f64::from(global_motion.scale_delta) * x
-                        - f64::from(global_motion.rotation) * y
-                        - f64::from(sensor_origin.0),
-                    sensor.1
-                        + f64::from(global_motion.translation[1])
-                        + f64::from(global_motion.rotation) * x
-                        + f64::from(global_motion.scale_delta) * y
-                        - f64::from(sensor_origin.1),
-                )
-            });
-        let (material_transport, material_source) = if let Some(center) = global_transport {
-            (Some(center), PupilCenterTransportSource::GlobalSimilarity)
-        } else if let Some(center) = sensor_hold {
-            (Some(center), PupilCenterTransportSource::SensorHold)
-        } else {
-            (None, PupilCenterTransportSource::Uninitialized)
-        };
-        // Global/sensor transport owns head and ROI motion.  Add only the
-        // short-lived limbus-canonical pursuit displacement, keeping those
-        // coordinate systems separate instead of treating iris texture as a
-        // rigid pupil feature.
-        let material_transport = material_transport.map(|center| {
-            pursuit_delta.map_or(center, |delta| (center.0 + delta.0, center.1 + delta.1))
-        });
-        let limbus_disagreement = material_transport
-            .zip(limbus_transport)
-            .map_or(0.0, |(material, limbus)| {
-                (material.0 - limbus.0).hypot(material.1 - limbus.1)
-            });
-        let limbus_consensus_gate = projection.map_or(3.0, |projection| {
-            (projection.fronto_parallel_limbus_radius_px.value() * 0.035).clamp(2.5, 5.0)
-        });
-        let (transported, transport_source) = match (material_transport, limbus_transport) {
-            (Some(material), Some(limbus)) if limbus_disagreement <= limbus_consensus_gate => {
-                // Material motion is authoritative. The independently fitted
-                // limbus gets a small subpixel refinement only in consensus.
-                (
-                    Some((
-                        0.78 * material.0 + 0.22 * limbus.0,
-                        0.78 * material.1 + 0.22 * limbus.1,
-                    )),
-                    PupilCenterTransportSource::LimbusConsensus,
-                )
-            }
-            (Some(material), _) => (Some(material), material_source),
-            (None, Some(limbus)) => (Some(limbus), PupilCenterTransportSource::LimbusOnly),
-            (None, None) => (None, PupilCenterTransportSource::Uninitialized),
-        };
-        let (center, transport_source) = transported
-            .map(|center| (center, transport_source))
-            .or_else(|| {
-                frame_proposal.map(|center| (center, PupilCenterTransportSource::FrameProposal))
-            })?;
-        if !center.0.is_finite() || !center.1.is_finite() {
-            return None;
-        }
-        // A held sensor coordinate is not evidence that the eye stayed put.
-        // If the independently acquired current pupil agrees with transport
-        // by the current limbus, test that location as a NEW acquisition.
-        // In particular, do not publish it through the transported-hold path:
-        // assimilation must first verify a fresh native-RAW pupil ring.
-        let coherent_reacquisition = limbus_transport.zip(frame_proposal).zip(projection).is_some_and(
-                |((limbus, proposal), projection)| {
-                    let radius = projection.fronto_parallel_limbus_radius_px.value();
-                    // Small contour jitter belongs to normal fixation
-                    // refinement, not repeated cold acquisition.
-                    limbus_disagreement > (0.10 * radius).clamp(8.0, 16.0)
-                        && (limbus.0 - proposal.0).hypot(limbus.1 - proposal.1)
-                            <= (0.18 * radius).clamp(8.0, 20.0)
-                },
-            );
-        let prediction = PupilCenterPrediction {
-            center: if coherent_reacquisition { frame_proposal.unwrap_or(center) } else { center },
-            transported_track: transported.is_some() && !coherent_reacquisition,
-            transport_source: if coherent_reacquisition { PupilCenterTransportSource::LimbusReacquisition } else { transport_source },
-            limbus_transport_disagreement_px: limbus_disagreement,
-            pursuit_predicted: pursuit_delta.is_some(),
-        };
-        self.diagnostics = PupilCenterTrackDiagnostics {
-            regime: if prediction.transported_track {
-                self.diagnostics.regime
-            } else {
-                PupilCenterMotionRegime::Uninitialized
-            },
-            transport_source: prediction.transport_source,
-            predicted_center: Some(prediction.center),
-            limbus_transport_disagreement_px: limbus_disagreement,
-            specular_layer_excluded: true,
-            pursuit_predicted: prediction.pursuit_predicted,
-            pursuit_velocity_canonical_per_second: pursuit_velocity,
-            ..PupilCenterTrackDiagnostics::default()
-        };
-        Some(prediction)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn assimilate(
-        &mut self,
-        now: Instant,
-        sensor_origin: (u32, u32),
-        projection: Option<PupilProjectionReference>,
-        prediction: PupilCenterPrediction,
-        frame_proposal: Option<(f64, f64)>,
-        measurement: Option<raw_iris_focus::PupilCenterOrbitalFit>,
-        overlay: &raw_motion_octrees::MotionOctreeOverlay,
-    ) -> Option<(f64, f64)> {
-        let previous_canonical_center = self.canonical_center;
-        let previous_supported_at = self.last_supported;
-        let measured = measurement
-            .filter(|measurement| pupil_center_orbital_measurement_admissible(*measurement));
-        let limbus_radius = projection.map_or(64.0, |projection| {
-            projection.fronto_parallel_limbus_radius_px.value()
-        });
-        let fixation_gate = (limbus_radius * 0.014).clamp(1.25, 2.40);
-        let micro_gate = if overlay.coupled_motion.micro_motion_likelihood >= 0.65 {
-            fixation_gate * 1.35
-        } else {
-            fixation_gate
-        };
-        let relative = overlay.coupled_motion.green_relative_to_cyan;
-        let relative_acceleration =
-            relative.acceleration_px_s2[0].hypot(relative.acceleration_px_s2[1]);
-        let relative_jerk = relative.jerk_px_s3[0].hypot(relative.jerk_px_s3[1]);
-        let mut published = prediction.transported_track.then_some(prediction.center);
-        let mut regime = if prediction.transported_track {
-            if prediction.pursuit_predicted {
-                PupilCenterMotionRegime::SmoothPursuit
-            } else {
-                PupilCenterMotionRegime::Fixation
-            }
-        } else {
-            PupilCenterMotionRegime::Uninitialized
-        };
-        let mut innovation = 0.0;
-        let mut transported_hold = prediction.transported_track;
-        let mut confirmed_pursuit_velocity = None;
-
-        if let Some(measurement) = measured {
-            innovation = (measurement.center.0 - prediction.center.0)
-                .hypot(measurement.center.1 - prediction.center.1);
-            if !prediction.transported_track {
-                published = Some(measurement.center);
-                self.pending_relocation = None;
-                self.fixation_streak = 1;
-                regime = PupilCenterMotionRegime::Fixation;
-                transported_hold = false;
-            } else if innovation <= micro_gate {
-                // A fixation measurement may converge below the integer pixel
-                // grid, but one noisy meridian cannot move the state by more
-                // than the physical fixation gate in a single frame.
-                let gain = (0.42 + 0.38 * measurement.score).clamp(0.50, 0.78);
-                let requested = (
-                    (measurement.center.0 - prediction.center.0) * gain,
-                    (measurement.center.1 - prediction.center.1) * gain,
-                );
-                let requested_length = requested.0.hypot(requested.1);
-                let scale = if requested_length > fixation_gate {
-                    fixation_gate / requested_length
-                } else {
-                    1.0
-                };
-                published = Some((
-                    prediction.center.0 + requested.0 * scale,
-                    prediction.center.1 + requested.1 * scale,
-                ));
-                self.pending_relocation = None;
-                self.fixation_streak = self.fixation_streak.saturating_add(1);
-                regime = if prediction.pursuit_predicted {
-                    PupilCenterMotionRegime::SmoothPursuit
-                } else if self.diagnostics.regime == PupilCenterMotionRegime::Saccade
-                    && self.fixation_streak < 2
-                {
-                    PupilCenterMotionRegime::Saccade
-                } else {
-                    PupilCenterMotionRegime::Fixation
-                };
-                transported_hold = false;
-            } else {
-                let saccade_motion = pupil_center_saccade_motion_supported(overlay);
-                // The independently produced rough center is usually close
-                // even though it is not accurate enough to publish directly.
-                // A remote ring beyond this anatomical acquisition corridor
-                // is more likely an iris fibre/lid alias than a pupil.
-                let proposal_agreement_gate = (limbus_radius * 0.11).clamp(6.0, 13.0);
-                let proposal_agrees = frame_proposal.is_some_and(|proposal| {
-                    (proposal.0 - measurement.center.0).hypot(proposal.1 - measurement.center.1)
-                        <= proposal_agreement_gate
-                });
-                let immediate_saccade = saccade_motion
-                    && proposal_agrees
-                    && pupil_center_orbital_measurement_decisive(measurement);
-                let measured_canonical = projection.and_then(|projection| {
-                    pupil_projection_canonical_point(projection, measurement.center)
-                });
-                let progressive_pursuit_velocity = self.pending_relocation.and_then(|pending| {
-                    pupil_center_progressive_pursuit_velocity(
-                        pending,
-                        measured_canonical,
-                        now,
-                        pupil_center_orbital_measurement_decisive(measurement),
-                        measurement.score,
-                        proposal_agrees,
-                    )
-                });
-                if immediate_saccade {
-                    published = Some(measurement.center);
-                    self.pending_relocation = None;
-                    self.pursuit_velocity_canonical_per_second = None;
-                    self.pursuit_supported_at = None;
-                    self.fixation_streak = 0;
-                    regime = PupilCenterMotionRegime::Saccade;
-                    transported_hold = false;
-                } else if let Some(velocity) = progressive_pursuit_velocity {
-                    published = Some(measurement.center);
-                    self.pending_relocation = None;
-                    self.fixation_streak = 0;
-                    confirmed_pursuit_velocity = Some(velocity);
-                    regime = PupilCenterMotionRegime::SmoothPursuit;
-                    transported_hold = false;
-                } else {
-                    let measured_sensor = (
-                        measurement.center.0 + f64::from(sensor_origin.0),
-                        measurement.center.1 + f64::from(sensor_origin.1),
-                    );
-                    // Without already-supported saccade kinematics, temporal
-                    // persistence means the same physical ring, not merely
-                    // two vaguely nearby dark structures. A real continuing
-                    // saccade takes the independent motion-authorized path.
-                    let pending_agreement_gate = (limbus_radius * 0.042).clamp(3.0, 5.5);
-                    let pending_same_ring = self.pending_relocation.is_some_and(|pending| {
-                        if pending.last_seen.is_some_and(|last| {
-                            now.saturating_duration_since(last)
-                                > PUPIL_CENTER_PENDING_RELOCATION_MAX_AGE
-                        }) {
-                            return false;
-                        }
-                        match (pending.canonical_center, measured_canonical, projection) {
-                            (Some(previous), Some(_), Some(projection)) => {
-                                pupil_projection_image_point(projection, previous).is_some_and(
-                                    |previous_image| {
-                                        (previous_image.0 - measurement.center.0)
-                                            .hypot(previous_image.1 - measurement.center.1)
-                                            <= pending_agreement_gate
-                                    },
-                                )
-                            }
-                            _ => {
-                                (pending.sensor_center.0 - measured_sensor.0)
-                                    .hypot(pending.sensor_center.1 - measured_sensor.1)
-                                    <= pending_agreement_gate
-                            }
-                        }
-                    });
-                    let bounded_canonical_relocation =
-                        self.pending_relocation.is_some_and(|pending| {
-                            pending
-                                .reference_canonical_center
-                                .zip(measured_canonical)
-                                .is_some_and(|(reference, current)| {
-                                    (current.0 - reference.0).hypot(current.1 - reference.1)
-                                        <= PUPIL_CENTER_UNSUPPORTED_MAX_CANONICAL_RELOCATION
-                                })
-                        });
-                    // The decoded fixation capture showed that agreement
-                    // between two proposal-local paths is not independent:
-                    // both can ride the same coherent iris texture.  Only
-                    // persistence of the actual RAW ring may advance this
-                    // no-saccade relocation counter.  Smooth pursuit retains
-                    // its separate three-position, direction/step-ratio test
-                    // above; classified high-jerk motion retains the immediate
-                    // saccade path.
-                    let pending_agrees = pending_same_ring;
-                    let agreeing_frames = if pending_agrees {
-                        self.pending_relocation
-                            .map_or(1, |pending| pending.agreeing_frames.saturating_add(1))
-                    } else {
-                        1
-                    };
-                    self.pending_relocation = Some(PendingPupilCenterRelocation {
-                        canonical_center: measured_canonical,
-                        reference_canonical_center: self.canonical_center,
-                        sensor_center: measured_sensor,
-                        agreeing_frames,
-                        last_seen: Some(now),
-                        decisive: pupil_center_orbital_measurement_decisive(measurement),
-                        measurement_score: measurement.score,
-                        proposal_agrees,
-                    });
-                    let decisive_confirmation = agreeing_frames >= 2
-                        && proposal_agrees
-                        && bounded_canonical_relocation
-                        && pupil_center_orbital_measurement_decisive(measurement);
-                    if decisive_confirmation {
-                        published = Some(measurement.center);
-                        self.pending_relocation = None;
-                        self.pursuit_velocity_canonical_per_second = None;
-                        self.pursuit_supported_at = None;
-                        self.fixation_streak = 0;
-                        regime = PupilCenterMotionRegime::Saccade;
-                        transported_hold = false;
-                    } else {
-                        regime = PupilCenterMotionRegime::RelocationPending;
-                    }
-                }
-            }
-        } else if !prediction.transported_track {
-            // A proposal is an acquisition coordinate, not state. Do not let
-            // an unverified dark basin become the temporal center merely
-            // because no better measurement was available this frame.
-            published = None;
-        }
-
-        if let Some(center) = published {
-            self.sensor_center = Some((
-                center.0 + f64::from(sensor_origin.0),
-                center.1 + f64::from(sensor_origin.1),
-            ));
-            let next_canonical = projection
-                .and_then(|projection| pupil_projection_canonical_point(projection, center));
-            if regime == PupilCenterMotionRegime::SmoothPursuit {
-                let observed_velocity = confirmed_pursuit_velocity.or_else(|| {
-                    previous_canonical_center
-                        .zip(next_canonical)
-                        .zip(previous_supported_at)
-                        .and_then(|((previous, current), previous_at)| {
-                            bounded_pupil_pursuit_velocity(
-                                previous,
-                                current,
-                                now.saturating_duration_since(previous_at),
-                            )
-                        })
-                });
-                if let Some(observed) = observed_velocity {
-                    let filtered =
-                        self.pursuit_velocity_canonical_per_second
-                            .map_or(observed, |previous| {
-                                (
-                                    0.35 * previous.0 + 0.65 * observed.0,
-                                    0.35 * previous.1 + 0.65 * observed.1,
-                                )
-                            });
-                    self.pursuit_velocity_canonical_per_second = Some(filtered);
-                    self.pursuit_supported_at = Some(now);
-                }
-            } else if matches!(
-                regime,
-                PupilCenterMotionRegime::Fixation
-                    | PupilCenterMotionRegime::Saccade
-                    | PupilCenterMotionRegime::Uninitialized
-            ) {
-                self.pursuit_velocity_canonical_per_second = None;
-                self.pursuit_supported_at = None;
-            }
-            if let Some(projection) = projection {
-                // A disagreeing material hold is not a new pupil/iris
-                // observation. Rewriting the relative coordinate here made
-                // one missed head-motion frame permanently move the pupil
-                // within the iris, poisoning subsequent transport.
-                let contradicted_hold = transported_hold
-                    && prediction.limbus_transport_disagreement_px
-                        > (0.035 * projection.fronto_parallel_limbus_radius_px.value()).clamp(2.5, 5.0);
-                if !contradicted_hold {
-                    self.canonical_center = pupil_projection_canonical_point(projection, center);
-                }
-            }
-            if !transported_hold {
-                self.last_supported = Some(now);
-            }
-        }
-        self.diagnostics = PupilCenterTrackDiagnostics {
-            regime,
-            transport_source: prediction.transport_source,
-            predicted_center: Some(prediction.center),
-            measured_center: measured.map(|measurement| measurement.center),
-            published_center: published,
-            limbus_transport_disagreement_px: prediction.limbus_transport_disagreement_px,
-            innovation_px: innovation,
-            fixation_gate_px: fixation_gate,
-            measurement_score: measurement.map_or(0.0, |measurement| measurement.score),
-            measurement_admissible: measured.is_some(),
-            transported_hold,
-            pending_relocation_frames: self
-                .pending_relocation
-                .map_or(0, |pending| pending.agreeing_frames),
-            saccade_likelihood: overlay.coupled_motion.saccade_likelihood,
-            relative_motion_confidence: relative.confidence,
-            relative_speed_px_s: relative.speed_px_s,
-            relative_acceleration_px_s2: relative_acceleration,
-            relative_jerk_px_s3: relative_jerk,
-            specular_layer_excluded: true,
-            pursuit_predicted: prediction.pursuit_predicted,
-            pursuit_velocity_canonical_per_second: self.pursuit_velocity_canonical_per_second,
-        };
-        published
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum PupilSizeSupportSource {
-    #[default]
-    LimbusFractionThresholds,
-    TemporalPupilRatio,
-}
-
-impl PupilSizeSupportSource {
-    fn label(self) -> &'static str {
-        match self {
-            Self::LimbusFractionThresholds => "limbus-fraction",
-            Self::TemporalPupilRatio => "temporal-pupil-ratio",
-        }
-    }
-}
-
-/// Quarter-octave bucket of the fronto-parallel limbus radius. This is an
-/// image-resolution coordinate, not an anatomical pupil-size estimate.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct FrontoParallelScaleBucket(u8);
-
-impl FrontoParallelScaleBucket {
-    fn from_radius(radius_px: f64) -> Option<Self> {
-        if !radius_px.is_finite() || radius_px <= 0.0 {
-            return None;
-        }
-        let logarithmic = (radius_px / PUPIL_EVIDENCE_SCALE_BASE_RADIUS_PX).log2()
-            * PUPIL_EVIDENCE_SCALE_BUCKETS_PER_OCTAVE;
-        let index = logarithmic
-            .floor()
-            .clamp(0.0, (PUPIL_EVIDENCE_SCALE_BUCKETS - 1) as f64) as u8;
-        Some(Self(index))
-    }
-
-    fn index(self) -> usize {
-        self.0 as usize
-    }
-
-    fn lower_radius_px(self) -> f64 {
-        PUPIL_EVIDENCE_SCALE_BASE_RADIUS_PX
-            * 2.0f64.powf(self.0 as f64 / PUPIL_EVIDENCE_SCALE_BUCKETS_PER_OCTAVE)
-    }
-
-    fn upper_radius_px(self) -> f64 {
-        PUPIL_EVIDENCE_SCALE_BASE_RADIUS_PX
-            * 2.0f64.powf((self.0 as f64 + 1.0) / PUPIL_EVIDENCE_SCALE_BUCKETS_PER_OCTAVE)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum OpticalFocusClass {
-    #[default]
-    Unknown,
-    Soft,
-    Usable,
-    Sharp,
-}
-
-impl OpticalFocusClass {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Unknown => "unknown",
-            Self::Soft => "soft",
-            Self::Usable => "usable",
-            Self::Sharp => "sharp",
-        }
-    }
-}
-
-/// Independent coordinates which determine how much authority current-frame
-/// pupil cues receive. Apparent scale controls spatial resolvability; optical
-/// focus controls edge/color reliability. Neither one changes the physical
-/// pupil/limbus ratio being estimated.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct PupilEvidenceCondition {
-    scale_bucket: Option<FrontoParallelScaleBucket>,
-    limbus_fronto_parallel_radius_px: Option<f64>,
-    expected_projected_pupil_radius_px: Option<f64>,
-    limbus_optical_sharpness: Option<f64>,
-    limbus_focus_reference: Option<f64>,
-    relative_focus: Option<f64>,
-    focus_measurement_confidence: f64,
-    spatial_resolution: f64,
-    cue_reliability: f64,
-    focus_verified: bool,
-    focus_class: OpticalFocusClass,
-}
-
-impl PupilEvidenceCondition {
-    fn fully_reliable(scale_radius_px: f64) -> Self {
-        let scale_bucket = FrontoParallelScaleBucket::from_radius(scale_radius_px);
-        Self {
-            scale_bucket,
-            limbus_fronto_parallel_radius_px: Some(scale_radius_px),
-            expected_projected_pupil_radius_px: Some(scale_radius_px * 0.40),
-            limbus_optical_sharpness: Some(1.0),
-            limbus_focus_reference: Some(1.0),
-            relative_focus: Some(1.0),
-            focus_measurement_confidence: 1.0,
-            spatial_resolution: 1.0,
-            cue_reliability: 1.0,
-            focus_verified: true,
-            focus_class: OpticalFocusClass::Sharp,
-        }
-    }
-
-    fn raw_solver_condition(self) -> raw_iris_focus::InnerIrisEvidenceCondition {
-        raw_iris_focus::InnerIrisEvidenceCondition::new(self.cue_reliability)
-    }
-
-    fn projected_boundary_radius_px(boundary: &raw_iris_focus::InnerIrisBoundary) -> Option<f64> {
-        let major = boundary.major_radius;
-        let minor = boundary.minor_radius;
-        if major.is_finite() && minor.is_finite() && major > 0.0 && minor > 0.0 {
-            Some((major * minor).sqrt())
-        } else if boundary.radius.is_finite() && boundary.radius > 0.0 {
-            Some(boundary.radius)
-        } else {
-            None
-        }
-    }
-
-    fn permits_posterior_training(self, boundary: &raw_iris_focus::InnerIrisBoundary) -> bool {
-        self.focus_verified
-            && self.scale_bucket.is_some()
-            && self.limbus_optical_sharpness.is_some_and(|sharpness| {
-                sharpness.is_finite() && sharpness >= PUPIL_EVIDENCE_MIN_TRAINING_ABSOLUTE_SHARPNESS
-            })
-            && self.relative_focus.is_some_and(|ratio| {
-                ratio.is_finite() && ratio >= PUPIL_EVIDENCE_MIN_TRAINING_FOCUS_RATIO
-            })
-            && self.focus_measurement_confidence >= 0.25
-            && Self::projected_boundary_radius_px(boundary)
-                .is_some_and(|radius| radius >= PUPIL_EVIDENCE_MIN_TRAINING_PROJECTED_RADIUS_PX)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct ScaleConditionedFocusReference {
-    smoothed_sharpness: f64,
-    sharp_reference: f64,
-    observations: u32,
-    last_observation: Option<Instant>,
-}
-
-#[derive(Default)]
-struct PupilEvidenceConditionTracker {
-    focus_by_scale: [ScaleConditionedFocusReference; PUPIL_EVIDENCE_SCALE_BUCKETS],
-}
-
-fn smooth_unit_interval(value: f64, lower: f64, upper: f64) -> f64 {
-    if !value.is_finite() || upper <= lower {
-        return 0.0;
-    }
-    let unit = ((value - lower) / (upper - lower)).clamp(0.0, 1.0);
-    unit * unit * (3.0 - 2.0 * unit)
-}
-
-impl PupilEvidenceConditionTracker {
-    fn observe(
-        &mut self,
-        now: Instant,
-        geometry: Option<PupilSizeGeometry>,
-        optical_focus: raw_iris_focus::LimbusOpticalFocus,
-        focus_verified: bool,
-    ) -> PupilEvidenceCondition {
-        let scale_radius =
-            geometry.map(|value| value.reference_limbus_fronto_parallel_radius_px.value());
-        let scale_bucket = scale_radius.and_then(FrontoParallelScaleBucket::from_radius);
-        let expected_projected_pupil_radius = geometry.map(|value| {
-            // Radius uncertainty is multiplicative, and the learned posterior
-            // itself lives in log-ratio space. Before temporal evidence is
-            // warm, use the geometric (log-space) center of the operator's
-            // broad hard interval. An arithmetic midpoint would assume a
-            // conspicuously large pupil and over-trust fixed-pixel detail on
-            // a genuinely small pupil.
-            let fronto_parallel = value
-                .estimated_fronto_parallel_radius_px
-                .unwrap_or_else(|| {
-                    (value.lower_fronto_parallel_radius_px * value.upper_fronto_parallel_radius_px)
-                        .sqrt()
-                });
-            fronto_parallel
-                * value
-                    .projection_minor_to_major
-                    .clamp(
-                        raw_iris_focus::PROVISIONAL_CENTRAL_CAMERA_LIMBUS_ENVELOPE
-                            .absolute_minimum_minor_to_major,
-                        1.0,
-                    )
-                    .sqrt()
-        });
-        let spatial_resolution = expected_projected_pupil_radius
-            .map_or(0.0, |radius| smooth_unit_interval(radius, 8.0, 20.0));
-        let measured_sharpness = (optical_focus.support >= PUPIL_EVIDENCE_MIN_FOCUS_SUPPORT
-            && optical_focus.sharpness.is_finite()
-            && optical_focus.sharpness > 0.0)
-            .then_some(optical_focus.sharpness);
-        let support_confidence = smooth_unit_interval(optical_focus.support as f64, 5.0, 20.0);
-        let contrast_confidence = smooth_unit_interval(optical_focus.contrast_raw10, 4.0, 36.0);
-        let focus_measurement_confidence = (support_confidence * contrast_confidence).sqrt();
-
-        let mut reference = None;
-        let mut relative_focus = None;
-        if let (Some(bucket), Some(sharpness)) = (scale_bucket, measured_sharpness) {
-            let state = &mut self.focus_by_scale[bucket.index()];
-            if focus_verified && focus_measurement_confidence >= 0.20 {
-                if state.observations == 0 {
-                    state.smoothed_sharpness = sharpness;
-                    state.sharp_reference = sharpness;
-                } else {
-                    state.smoothed_sharpness = 0.72 * state.smoothed_sharpness + 0.28 * sharpness;
-                    if state.smoothed_sharpness > state.sharp_reference {
-                        // A newly resolved edge raises the reference
-                        // deliberately, but one anomalous frame cannot replace
-                        // it outright.
-                        state.sharp_reference =
-                            0.75 * state.sharp_reference + 0.25 * state.smoothed_sharpness;
-                    } else {
-                        // Subject/lighting changes may lower the attainable
-                        // concentration over minutes. Defocus over a few
-                        // frames must not teach itself as the new "sharp".
-                        let elapsed = state.last_observation.map_or(0.0, |last| {
-                            now.saturating_duration_since(last).as_secs_f64()
-                        });
-                        let downward_alpha = (elapsed * 0.0005).clamp(0.0, 0.01);
-                        state.sharp_reference = state.sharp_reference * (1.0 - downward_alpha)
-                            + state.smoothed_sharpness * downward_alpha;
-                    }
-                }
-                state.observations = state.observations.saturating_add(1);
-                state.last_observation = Some(now);
-            }
-            if state.observations > 0 && state.sharp_reference > f64::EPSILON {
-                reference = Some(state.sharp_reference);
-                // Condition this frame from this frame's edge concentration.
-                // The EMA exists only to evolve the long-lived sharp
-                // reference; using it here would leave several blurry frames
-                // at full detail authority after a sudden focus loss.
-                relative_focus = Some((sharpness / state.sharp_reference).clamp(0.0, 1.25));
-            }
-        }
-
-        let absolute_focus =
-            measured_sharpness.map_or(0.0, |sharpness| smooth_unit_interval(sharpness, 0.04, 0.28));
-        let focus_reliability = relative_focus.map_or(0.55 * absolute_focus, |relative| {
-            (0.72 * relative.clamp(0.0, 1.0) + 0.28 * absolute_focus).clamp(0.0, 1.0)
-        });
-        let cue_reliability =
-            (spatial_resolution * focus_measurement_confidence * focus_reliability)
-                .sqrt()
-                .clamp(0.0, 1.0);
-        let focus_class = if measured_sharpness.is_none() || relative_focus.is_none() {
-            OpticalFocusClass::Unknown
-        } else if measured_sharpness.unwrap() < PUPIL_EVIDENCE_MIN_TRAINING_ABSOLUTE_SHARPNESS {
-            OpticalFocusClass::Soft
-        } else if relative_focus.unwrap() < PUPIL_EVIDENCE_MIN_TRAINING_FOCUS_RATIO {
-            OpticalFocusClass::Soft
-        } else if relative_focus.unwrap() < 0.82 {
-            OpticalFocusClass::Usable
-        } else {
-            OpticalFocusClass::Sharp
-        };
-
-        PupilEvidenceCondition {
-            scale_bucket,
-            limbus_fronto_parallel_radius_px: scale_radius,
-            expected_projected_pupil_radius_px: expected_projected_pupil_radius,
-            limbus_optical_sharpness: measured_sharpness,
-            limbus_focus_reference: reference,
-            relative_focus,
-            focus_measurement_confidence,
-            spatial_resolution,
-            cue_reliability,
-            focus_verified,
-            focus_class,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct PupilSizeReticle {
-    center: (f64, f64),
-    /// Center of the current affine limbus projection selected independently
-    /// of Y. This remains distinct from the Y-owned rough/search center above.
-    projection_center: (f64, f64),
-    lower_fronto_parallel_radius_px: f64,
-    upper_fronto_parallel_radius_px: f64,
-    preferred_lower_fronto_parallel_radius_px: Option<f64>,
-    preferred_upper_fronto_parallel_radius_px: Option<f64>,
-    estimated_fronto_parallel_radius_px: Option<f64>,
-    reference_limbus_fronto_parallel_radius_px: FrontoParallelCircleRadiusPx,
-    projection_minor_to_major: f64,
-    projection_angle: f64,
-    projection_source: PupilProjectionSource,
-    support_source: PupilSizeSupportSource,
-    scale_bucket: FrontoParallelScaleBucket,
-    temporal_scale_matched: bool,
-    temporal_observations: usize,
-    temporal_fractional_half_width: Option<f64>,
-    recomputed_this_frame: bool,
-    frozen: bool,
-}
-
 /// Presentation-only projection of the admissible fronto-parallel
 /// iris/limbus radius support. The bounds live in de-affined circle space;
 /// this reticle maps them back through the current limbus projection without
@@ -4743,7 +2810,7 @@ struct IrisRadiusReticle {
     nominal_cold_start: bool,
 }
 
-/// Presentation-only pupil radius guides. Unlike `PupilSizeReticle`, this
+/// Presentation-only pupil radius guides. Unlike `PupilSizeSupport`, this
 /// contains no detector ownership or temporal-admission fields, so a static
 /// manual-alignment guide can be derived from valid limbus scale support even
 /// while the selected rough pupil-center mechanism has no current prediction.
@@ -4812,402 +2879,9 @@ struct PupilSizeRuntimeStatus {
     observation_trajectory_updated: bool,
     observation_trained_posterior: bool,
     evidence_condition: PupilEvidenceCondition,
-    support: Option<PupilSizeReticle>,
+    support: Option<PupilSizeSupport>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct PupilSizeObservationAdmission {
-    rate_limited: bool,
-    focus_size_qualified: bool,
-    limbus_geometry_qualified: bool,
-    raw_diameter_qualified: bool,
-    trajectory_updated: bool,
-    trained_posterior: bool,
-}
-
-impl PupilSizeObservationAdmission {
-    fn current_boundary_publishable(self) -> bool {
-        self.focus_size_qualified && self.limbus_geometry_qualified && self.raw_diameter_qualified
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct PupilSizeGeometry {
-    projection_center: (f64, f64),
-    lower_fronto_parallel_radius_px: f64,
-    upper_fronto_parallel_radius_px: f64,
-    preferred_lower_fronto_parallel_radius_px: Option<f64>,
-    preferred_upper_fronto_parallel_radius_px: Option<f64>,
-    estimated_fronto_parallel_radius_px: Option<f64>,
-    reference_limbus_fronto_parallel_radius_px: FrontoParallelCircleRadiusPx,
-    projection_minor_to_major: f64,
-    projection_angle: f64,
-    projection_source: PupilProjectionSource,
-    support_source: PupilSizeSupportSource,
-    scale_bucket: FrontoParallelScaleBucket,
-    temporal_scale_matched: bool,
-    temporal_observations: usize,
-    temporal_fractional_half_width: Option<f64>,
-}
-
-struct PupilSizeTracker {
-    /// Robust history of the physical pupil/limbus radius ratio. Both radii
-    /// are measured after fronto-parallel rectification, so gross image-scale
-    /// changes cancel without coupling this state to MediaPipe or a specific
-    /// outer-iris detector.
-    strong_log_ratios: VecDeque<f64>,
-    last_strong_observation: Option<Instant>,
-    scale_log_ratios: [VecDeque<f64>; PUPIL_EVIDENCE_SCALE_BUCKETS],
-    scale_last_strong_observation: [Option<Instant>; PUPIL_EVIDENCE_SCALE_BUCKETS],
-    cached_geometry: Option<PupilSizeGeometry>,
-}
-
-impl Default for PupilSizeTracker {
-    fn default() -> Self {
-        Self {
-            strong_log_ratios: VecDeque::new(),
-            last_strong_observation: None,
-            scale_log_ratios: std::array::from_fn(|_| VecDeque::new()),
-            scale_last_strong_observation: [None; PUPIL_EVIDENCE_SCALE_BUCKETS],
-            cached_geometry: None,
-        }
-    }
-}
-
-fn pupil_size_median(mut values: Vec<f64>) -> Option<f64> {
-    values.retain(|value| value.is_finite());
-    if values.is_empty() {
-        return None;
-    }
-    values.sort_by(f64::total_cmp);
-    let middle = values.len() / 2;
-    Some(if values.len() % 2 == 0 {
-        0.5 * (values[middle - 1] + values[middle])
-    } else {
-        values[middle]
-    })
-}
-
-fn pupil_temporal_geometry(
-    reference_radius: f64,
-    hard_lower: f64,
-    hard_upper: f64,
-    temporal: Option<(f64, f64)>,
-) -> (
-    Option<f64>,
-    Option<f64>,
-    Option<f64>,
-    PupilSizeSupportSource,
-    Option<f64>,
-) {
-    let Some((ratio, half_width)) = temporal else {
-        return (
-            None,
-            None,
-            None,
-            PupilSizeSupportSource::LimbusFractionThresholds,
-            None,
-        );
-    };
-    let estimate = reference_radius * ratio;
-    if !estimate.is_finite() || !half_width.is_finite() {
-        return (
-            None,
-            None,
-            None,
-            PupilSizeSupportSource::LimbusFractionThresholds,
-            None,
-        );
-    }
-    let preferred_lower = hard_lower.max(estimate * (1.0 - half_width));
-    let preferred_upper = hard_upper.min(estimate * (1.0 + half_width));
-    if preferred_lower.is_finite()
-        && preferred_upper.is_finite()
-        && preferred_upper > preferred_lower + 0.5
-    {
-        (
-            Some(preferred_lower),
-            Some(preferred_upper),
-            Some(estimate),
-            PupilSizeSupportSource::TemporalPupilRatio,
-            Some(half_width),
-        )
-    } else {
-        // Keep drawing/reporting the posterior estimate when the operator's
-        // hard interval excludes it, but do not let it steer the search.
-        (
-            None,
-            None,
-            Some(estimate),
-            PupilSizeSupportSource::LimbusFractionThresholds,
-            Some(half_width),
-        )
-    }
-}
-
-impl PupilSizeTracker {
-    fn active_geometry(&self) -> Option<PupilSizeGeometry> {
-        self.cached_geometry
-    }
-
-    fn robust_temporal_ratio_support(
-        samples: &VecDeque<f64>,
-        last_observation: Option<Instant>,
-        now: Instant,
-    ) -> Option<(f64, f64)> {
-        if samples.len() < PUPIL_SIZE_TEMPORAL_MIN_OBSERVATIONS {
-            return None;
-        }
-        let center = pupil_size_median(samples.iter().copied().collect())?;
-        let mad = pupil_size_median(
-            samples
-                .iter()
-                .map(|sample| (sample - center).abs())
-                .collect(),
-        )?;
-        let observations = samples.len() as f64;
-        // Three agreeing native boundaries are enough to prune a grossly
-        // different radial branch, but not enough to claim sub-pixel size.
-        // Converge from about six percent at N=3 to the five-percent floor;
-        // the previous 8-11% interval still admitted conspicuous alternate
-        // lid/glasses solutions before the physiological limiter could act.
-        let sampling_half_width = 0.035 + 0.045 / observations.sqrt();
-        let residual_half_width = (2.8 * mad).exp() - 1.0;
-        let stale_half_width = last_observation.map_or(0.0, |last| {
-            now.saturating_duration_since(last).as_secs_f64()
-                * PUPIL_SIZE_STALE_EXPANSION_PER_SECOND
-        });
-        let fractional_half_width = sampling_half_width
-            .max(residual_half_width)
-            .max(stale_half_width)
-            .clamp(
-                PUPIL_SIZE_MIN_TEMPORAL_HALF_WIDTH,
-                PUPIL_SIZE_MAX_TEMPORAL_HALF_WIDTH,
-            );
-        Some((center.exp(), fractional_half_width))
-    }
-
-    fn temporal_ratio_support(
-        &self,
-        now: Instant,
-        scale_bucket: FrontoParallelScaleBucket,
-    ) -> (Option<(f64, f64)>, usize, bool) {
-        let index = scale_bucket.index();
-        let scale_samples = &self.scale_log_ratios[index];
-        if let Some(support) = Self::robust_temporal_ratio_support(
-            scale_samples,
-            self.scale_last_strong_observation[index],
-            now,
-        ) {
-            return (Some(support), scale_samples.len(), true);
-        }
-        (
-            Self::robust_temporal_ratio_support(
-                &self.strong_log_ratios,
-                self.last_strong_observation,
-                now,
-            ),
-            self.strong_log_ratios.len(),
-            false,
-        )
-    }
-
-    fn begin_frame(
-        &mut self,
-        now: Instant,
-        center: Option<(f64, f64)>,
-        projection: Option<PupilProjectionReference>,
-        recompute: bool,
-        lower_fraction: f64,
-        upper_fraction: f64,
-    ) -> Option<PupilSizeReticle> {
-        // Affine limbus projection geometry remains current even while the
-        // selected Y mechanism temporarily has no center. Center availability
-        // controls only whether a reticle/search support can be emitted below.
-        let center = center.filter(|value| value.0.is_finite() && value.1.is_finite());
-        let mut recomputed_this_frame = false;
-        if recompute {
-            if let Some(projection) = projection {
-                let reference = projection.fronto_parallel_limbus_radius_px;
-                let reference_px = reference.value();
-                if let Some(scale_bucket) = FrontoParallelScaleBucket::from_radius(reference_px) {
-                    let hard_lower = reference_px * lower_fraction.clamp(0.01, 0.90);
-                    let hard_upper = reference_px * upper_fraction.clamp(0.02, 0.95);
-                    let (temporal_support, temporal_observations, temporal_scale_matched) =
-                        self.temporal_ratio_support(now, scale_bucket);
-                    let (
-                        preferred_lower,
-                        preferred_upper,
-                        estimate,
-                        support_source,
-                        temporal_half_width,
-                    ) = pupil_temporal_geometry(
-                        reference_px,
-                        hard_lower,
-                        hard_upper,
-                        temporal_support,
-                    );
-                    if hard_lower.is_finite() && hard_upper.is_finite() && hard_upper > hard_lower {
-                        self.cached_geometry = Some(PupilSizeGeometry {
-                            projection_center: projection.center,
-                            lower_fronto_parallel_radius_px: hard_lower,
-                            upper_fronto_parallel_radius_px: hard_upper,
-                            preferred_lower_fronto_parallel_radius_px: preferred_lower,
-                            preferred_upper_fronto_parallel_radius_px: preferred_upper,
-                            estimated_fronto_parallel_radius_px: estimate,
-                            reference_limbus_fronto_parallel_radius_px: reference,
-                            projection_minor_to_major: projection.minor_to_major,
-                            projection_angle: projection.angle,
-                            projection_source: projection.source,
-                            support_source,
-                            scale_bucket,
-                            temporal_scale_matched,
-                            temporal_observations,
-                            temporal_fractional_half_width: temporal_half_width,
-                        });
-                        recomputed_this_frame = true;
-                    }
-                }
-            }
-        } else if let Some(mut geometry) = self.cached_geometry {
-            // R freezes automatic transport from new limbus fits, not an
-            // explicit operator adjustment. Move the hard guides immediately
-            // against the last frozen reference when a threshold key changes.
-            let reference = geometry.reference_limbus_fronto_parallel_radius_px;
-            let reference_px = reference.value();
-            let hard_lower = reference_px * lower_fraction.clamp(0.01, 0.90);
-            let hard_upper = reference_px * upper_fraction.clamp(0.02, 0.95);
-            if hard_lower.is_finite()
-                && hard_upper.is_finite()
-                && hard_upper > hard_lower
-                && ((hard_lower - geometry.lower_fronto_parallel_radius_px).abs() > f64::EPSILON
-                    || (hard_upper - geometry.upper_fronto_parallel_radius_px).abs() > f64::EPSILON)
-            {
-                let frozen_temporal = geometry
-                    .estimated_fronto_parallel_radius_px
-                    .zip(geometry.temporal_fractional_half_width)
-                    .map(|(estimate, half_width)| (estimate / reference_px, half_width));
-                let (
-                    preferred_lower,
-                    preferred_upper,
-                    estimate,
-                    support_source,
-                    temporal_half_width,
-                ) = pupil_temporal_geometry(reference_px, hard_lower, hard_upper, frozen_temporal);
-                geometry.lower_fronto_parallel_radius_px = hard_lower;
-                geometry.upper_fronto_parallel_radius_px = hard_upper;
-                geometry.preferred_lower_fronto_parallel_radius_px = preferred_lower;
-                geometry.preferred_upper_fronto_parallel_radius_px = preferred_upper;
-                geometry.estimated_fronto_parallel_radius_px = estimate;
-                geometry.support_source = support_source;
-                geometry.temporal_fractional_half_width = temporal_half_width;
-                self.cached_geometry = Some(geometry);
-            }
-        }
-        let geometry = self.cached_geometry?;
-        let center = center?;
-        Some(PupilSizeReticle {
-            center,
-            projection_center: geometry.projection_center,
-            lower_fronto_parallel_radius_px: geometry.lower_fronto_parallel_radius_px,
-            upper_fronto_parallel_radius_px: geometry.upper_fronto_parallel_radius_px,
-            preferred_lower_fronto_parallel_radius_px: geometry
-                .preferred_lower_fronto_parallel_radius_px,
-            preferred_upper_fronto_parallel_radius_px: geometry
-                .preferred_upper_fronto_parallel_radius_px,
-            estimated_fronto_parallel_radius_px: geometry.estimated_fronto_parallel_radius_px,
-            reference_limbus_fronto_parallel_radius_px: geometry
-                .reference_limbus_fronto_parallel_radius_px,
-            projection_minor_to_major: geometry.projection_minor_to_major,
-            projection_angle: geometry.projection_angle,
-            projection_source: geometry.projection_source,
-            support_source: geometry.support_source,
-            scale_bucket: geometry.scale_bucket,
-            temporal_scale_matched: geometry.temporal_scale_matched,
-            temporal_observations: geometry.temporal_observations,
-            temporal_fractional_half_width: geometry.temporal_fractional_half_width,
-            recomputed_this_frame,
-            frozen: !recompute,
-        })
-    }
-
-    fn observe_strong_boundary(
-        &mut self,
-        now: Instant,
-        boundary: &raw_iris_focus::InnerIrisBoundary,
-        support: Option<PupilSizeReticle>,
-        confidence: f64,
-        recompute: bool,
-        persistent_state_qualified: bool,
-    ) -> bool {
-        if !recompute || confidence < 0.25 || !persistent_state_qualified {
-            return false;
-        }
-        let Some(support) = support else {
-            return false;
-        };
-        let Some(radius) = fronto_parallel_area_equivalent_pupil_radius_px(boundary, Some(support))
-        else {
-            return false;
-        };
-        if !pupil_radius_within_bounds(radius.value(), Some(support)) {
-            return false;
-        }
-        let Some(ratio) = radius
-            .ratio_to(support.reference_limbus_fronto_parallel_radius_px)
-            .map(|ratio| ratio.value())
-        else {
-            return false;
-        };
-        if !ratio.is_finite() || !(0.01..=0.95).contains(&ratio) {
-            return false;
-        }
-        self.strong_log_ratios.push_back(ratio.ln());
-        while self.strong_log_ratios.len() > PUPIL_SIZE_RATIO_WINDOW {
-            self.strong_log_ratios.pop_front();
-        }
-        self.last_strong_observation = Some(now);
-        let scale_index = support.scale_bucket.index();
-        self.scale_log_ratios[scale_index].push_back(ratio.ln());
-        while self.scale_log_ratios[scale_index].len() > PUPIL_SIZE_RATIO_WINDOW {
-            self.scale_log_ratios[scale_index].pop_front();
-        }
-        self.scale_last_strong_observation[scale_index] = Some(now);
-        true
-    }
-}
-
-fn projected_pupil_major_radius_px(boundary: &raw_iris_focus::InnerIrisBoundary) -> Option<f64> {
-    let ellipse_radius = boundary.major_radius.max(boundary.minor_radius);
-    if ellipse_radius.is_finite() && ellipse_radius > 0.0 {
-        Some(ellipse_radius)
-    } else if boundary.radius.is_finite() && boundary.radius > 0.0 {
-        Some(boundary.radius)
-    } else {
-        None
-    }
-}
-
-/// Radius of the equal-area pupil circle after undoing the affine
-/// foreshortening measured from the selected limbus.
-///
-/// If the projected pupil ellipse has semi-axes `a_p`, `b_p` and the limbus
-/// projection has `q = b_l / a_l`, inverse rectification multiplies area by
-/// `1 / q`. Therefore `r = sqrt(a_p * b_p / q)`. This remains meaningful when
-/// partial occlusion makes the fitted pupil axes depart slightly from the
-/// limbus aspect ratio, whereas taking only the pupil major axis does not.
-fn fronto_parallel_area_equivalent_pupil_radius_px(
-    boundary: &raw_iris_focus::InnerIrisBoundary,
-    support: Option<PupilSizeReticle>,
-) -> Option<FrontoParallelCircleRadiusPx> {
-    let support = support?;
-    let major = boundary.major_radius.max(boundary.minor_radius);
-    let minor = boundary.major_radius.min(boundary.minor_radius);
-    let projected = ProjectedAreaEquivalentRadiusPx::from_ellipse_axes(major, minor)?;
-    let foreshortening =
-        AffineForeshortening::from_minor_to_major(support.projection_minor_to_major)?;
-    FrontoParallelCircleRadiusPx::from_projected_area(projected, foreshortening)
-}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct PupilDiameterArcEvidence {
@@ -5372,7 +3046,7 @@ fn pupil_diameter_arc_evidence(
 
 fn pupil_boundary_confidence(
     boundary: &raw_iris_focus::InnerIrisBoundary,
-    support: Option<PupilSizeReticle>,
+    support: Option<PupilSizeSupport>,
 ) -> f64 {
     if boundary.points.len() < 12 {
         return 0.0;
@@ -5414,7 +3088,7 @@ fn pupil_boundary_confidence(
 
 fn pupil_boundary_normalized_limbus_geometry(
     boundary: &raw_iris_focus::InnerIrisBoundary,
-    support: Option<PupilSizeReticle>,
+    support: Option<PupilSizeSupport>,
 ) -> Option<(f64, f64)> {
     let support = support?;
     if boundary.points.is_empty()
@@ -5469,7 +3143,7 @@ fn pupil_boundary_normalized_limbus_geometry(
 
 fn pupil_boundary_matches_limbus_geometry(
     boundary: &raw_iris_focus::InnerIrisBoundary,
-    support: Option<PupilSizeReticle>,
+    support: Option<PupilSizeSupport>,
 ) -> bool {
     pupil_boundary_normalized_limbus_geometry(boundary, support).is_some_and(
         |(normalized_offset, normalized_extent)| {
@@ -5481,7 +3155,7 @@ fn pupil_boundary_matches_limbus_geometry(
 
 fn pupil_boundary_passes_current_frame_geometry(
     boundary: &raw_iris_focus::InnerIrisBoundary,
-    support: Option<PupilSizeReticle>,
+    support: Option<PupilSizeSupport>,
 ) -> bool {
     !boundary.points.is_empty()
         && fronto_parallel_area_equivalent_pupil_radius_px(boundary, support)
@@ -5496,7 +3170,7 @@ fn pupil_boundary_passes_current_frame_geometry(
 /// for the physiological rate limiter.
 fn pupil_boundary_maximum_contained_scale(
     boundary: &raw_iris_focus::InnerIrisBoundary,
-    support: Option<PupilSizeReticle>,
+    support: Option<PupilSizeSupport>,
 ) -> Option<f64> {
     let support = support?;
     let outer_major = support.reference_limbus_fronto_parallel_radius_px.value();
@@ -5581,7 +3255,7 @@ fn stabilize_and_observe_pupil_size(
     radius_limiter: &mut RadiusRateLimiter,
     now: Instant,
     boundary: &mut raw_iris_focus::InnerIrisBoundary,
-    support: Option<PupilSizeReticle>,
+    support: Option<PupilSizeSupport>,
     confidence: f64,
     recompute: bool,
     evidence_condition: PupilEvidenceCondition,
@@ -5685,23 +3359,15 @@ fn stabilize_and_observe_pupil_size(
     }
 }
 
-fn pupil_radius_within_bounds(radius: f64, bounds: Option<PupilSizeReticle>) -> bool {
-    radius.is_finite()
-        && radius > 0.0
-        && bounds.is_some_and(|bounds| {
-            radius >= bounds.lower_fronto_parallel_radius_px
-                && radius <= bounds.upper_fronto_parallel_radius_px
-        })
-}
 
 /// Keep the sizing guide useful after the common RAW solver refines a rough
 /// center. This is presentation-only: search, admission, and temporal sizing
 /// continue to use the original per-frame support and never consume the
 /// recentered reticle.
 fn pupil_size_reticle_for_publication(
-    support: Option<PupilSizeReticle>,
+    support: Option<PupilSizeSupport>,
     boundary: &raw_iris_focus::InnerIrisBoundary,
-) -> Option<PupilSizeReticle> {
+) -> Option<PupilSizeSupport> {
     support.map(|mut support| {
         if !boundary.points.is_empty()
             && boundary.center.0.is_finite()
@@ -5773,7 +3439,7 @@ fn iris_radius_reticle_for_publication(
 }
 
 fn pupil_size_reticle_for_mode(
-    support: Option<PupilSizeReticle>,
+    support: Option<PupilSizeSupport>,
     iris_reticle: Option<IrisRadiusReticle>,
     lower_limbus_fraction: f64,
     upper_limbus_fraction: f64,
@@ -5846,7 +3512,7 @@ fn pupil_size_reticle_for_mode(
 /// sparse current-frame arc outside it must remain observable so that a bad
 /// carried radius can be disproved.
 fn inner_radius_prior_from_support(
-    support: Option<PupilSizeReticle>,
+    support: Option<PupilSizeSupport>,
 ) -> Option<raw_iris_focus::InnerIrisRadiusPrior> {
     let scale = support
         .map(|value| value.reference_limbus_fronto_parallel_radius_px.value())
@@ -5858,7 +3524,7 @@ fn inner_radius_prior_from_support(
 }
 
 fn inner_radius_envelope_from_support(
-    support: Option<PupilSizeReticle>,
+    support: Option<PupilSizeSupport>,
 ) -> Option<raw_iris_focus::InnerIrisRadiusEnvelope> {
     let support = support?;
     // This is a true admission envelope, so it contains only explicit
@@ -5888,7 +3554,7 @@ fn inner_radius_envelope_from_support(
 }
 
 fn inner_radius_prior_from_support_conditioned(
-    support: Option<PupilSizeReticle>,
+    support: Option<PupilSizeSupport>,
     evidence_condition: PupilEvidenceCondition,
 ) -> Option<raw_iris_focus::InnerIrisRadiusPrior> {
     let support = support?;
@@ -6045,7 +3711,7 @@ fn solve_pupil_boundary_from_rough_center(
     raw_focus: &raw_iris_focus::BorderFocus,
     projection: PupilProjectionReference,
     rough_center: (f64, f64),
-    support: Option<PupilSizeReticle>,
+    support: Option<PupilSizeSupport>,
     radius_prior: Option<raw_iris_focus::InnerIrisRadiusPrior>,
     evidence_condition: raw_iris_focus::InnerIrisEvidenceCondition,
 ) -> raw_iris_focus::InnerIrisBoundary {
@@ -6086,7 +3752,7 @@ fn solve_pupil_boundary_from_rough_center(
 
 fn pupil_boundary_is_usable_center_measurement(
     boundary: &raw_iris_focus::InnerIrisBoundary,
-    support: Option<PupilSizeReticle>,
+    support: Option<PupilSizeSupport>,
 ) -> bool {
     boundary.points.len() >= 8
         && boundary.radius.is_finite()
@@ -6117,7 +3783,7 @@ fn solve_pupil_boundary_from_temporal_state(
     prediction: PupilCenterPrediction,
     frame_proposal: Option<(f64, f64)>,
     motion: &raw_motion_octrees::MotionOctreeOverlay,
-    support: Option<PupilSizeReticle>,
+    support: Option<PupilSizeSupport>,
     radius_prior: Option<raw_iris_focus::InnerIrisRadiusPrior>,
     evidence_condition: raw_iris_focus::InnerIrisEvidenceCondition,
 ) -> raw_iris_focus::InnerIrisBoundary {
@@ -6391,6 +4057,31 @@ fn sam31_result_belongs_to_selection(
     selection_started_ns: Option<u64>,
 ) -> bool {
     selection_started_ns.is_some_and(|started| source_timestamp_ns >= started)
+}
+
+fn sam31_limbus_complete_in_source_roi(result: &sam31_outer::OuterResult) -> bool {
+    limbus_complete_in_roi(
+        result.sensor_outer_ellipse,
+        result.source_sensor_origin,
+        (result.proposal_masks.source_width, result.proposal_masks.source_height),
+    )
+}
+
+fn limbus_complete_in_roi(
+    ellipse: geometry::Ellipse,
+    sensor_origin: (u32, u32),
+    size: (usize, usize),
+) -> bool {
+    let (sine, cosine) = ellipse.angle.sin_cos();
+    let half_width = (ellipse.major_radius * cosine).hypot(ellipse.minor_radius * sine);
+    let half_height = (ellipse.major_radius * sine).hypot(ellipse.minor_radius * cosine);
+    let x = ellipse.center.0 - sensor_origin.0 as f64;
+    let y = ellipse.center.1 - sensor_origin.1 as f64;
+    // Flat-tire eyelid exclusions are valid; cropping at the actual sensor ROI
+    // is not independent evidence of the missing full limbus diameter.
+    x - half_width >= 1.0 && y - half_height >= 1.0
+        && x + half_width < size.0 as f64 - 1.0
+        && y + half_height < size.1 as f64 - 1.0
 }
 
 fn sam31_registered_ellipse_for_frame(
@@ -8331,7 +6022,7 @@ fn pupil_size_runtime_json(status: PupilSizeRuntimeStatus) -> String {
                 support.projection_angle,
                 json_string(support.projection_source.label()),
                 json_string(support.support_source.label()),
-                support.scale_bucket.0,
+                support.scale_bucket.index(),
                 support.scale_bucket.lower_radius_px(),
                 support.scale_bucket.upper_radius_px(),
                 support.temporal_scale_matched,
@@ -8345,7 +6036,7 @@ fn pupil_size_runtime_json(status: PupilSizeRuntimeStatus) -> String {
     let condition = status.evidence_condition;
     let scale_bucket = condition
         .scale_bucket
-        .map(|bucket| bucket.0.to_string())
+        .map(|bucket| bucket.index().to_string())
         .unwrap_or_else(|| "null".to_string());
     let observed_fronto_parallel_area_px2 = status
         .observed_fronto_parallel_radius_px
@@ -10896,12 +8587,6 @@ struct ScreenWindow {
     surface: Surface<DisplayHandle<'static>, Arc<Window>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct GazeAffine {
-    x: [f64; 3],
-    y: [f64; 3],
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum DisplayCursorMapping {
     #[default]
@@ -10975,123 +8660,6 @@ impl DisplayCursorStatus {
             "LIVE".to_string()
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct VirtualDisplayPlane {
-    /// Display center relative to the calibrated eye, in inches. Axes follow
-    /// RelativeGazeVector: camera-right, camera-down, and toward the camera.
-    center_inches: [f64; 3],
-    right_axis: [f64; 3],
-    down_axis: [f64; 3],
-    width_inches: f64,
-    height_inches: f64,
-}
-
-impl VirtualDisplayPlane {
-    /// Approximate eye-relative pose from the first accepted nine-target SAM
-    /// session (1788564758-560066510). This is a development convenience, not
-    /// a calibration for the current eye/sign epoch or a physical measurement.
-    /// Keep the centered nominal model separate for solver priors and tests.
-    fn development_default() -> Self {
-        let (width_inches, height_inches) = nominal_display_dimensions_inches();
-        Self {
-            center_inches: [-4.955731610639324, -17.47697340246995, 22.960904076603143],
-            right_axis: [-0.978837250471977, -0.18523052168150536, -0.08699017718143479],
-            down_axis: [-0.1458492733533812, 0.33327729220511837, 0.931479595032932],
-            width_inches,
-            height_inches,
-        }
-    }
-
-    fn nominal() -> Self {
-        let (width_inches, height_inches) = nominal_display_dimensions_inches();
-        Self {
-            center_inches: [0.0, 0.0, NOMINAL_DISPLAY_DISTANCE_INCHES],
-            right_axis: [1.0, 0.0, 0.0],
-            down_axis: [0.0, 1.0, 0.0],
-            width_inches,
-            height_inches,
-        }
-    }
-
-    fn target(self, relative_gaze: RelativeGazeVector) -> Option<(f64, f64)> {
-        let direction = relative_gaze.as_array();
-        let normal = cross3(self.right_axis, self.down_axis);
-        let denominator = dot3(direction, normal);
-        if !denominator.is_finite() || denominator.abs() < 1.0e-8 {
-            return None;
-        }
-        let distance = dot3(self.center_inches, normal) / denominator;
-        if !distance.is_finite() || distance <= 0.0 {
-            return None;
-        }
-        let hit = scale3(direction, distance);
-        let offset = sub3(hit, self.center_inches);
-        let target = (
-            0.5 + dot3(offset, self.right_axis) / self.width_inches,
-            0.5 + dot3(offset, self.down_axis) / self.height_inches,
-        );
-        (target.0.is_finite() && target.1.is_finite()).then_some(target)
-    }
-
-    fn distance_inches(self) -> f64 {
-        norm3(self.center_inches)
-    }
-}
-
-impl GazeAffine {
-    fn map(self, feature: (f64, f64)) -> (f64, f64) {
-        (
-            self.x[0] * feature.0 + self.x[1] * feature.1 + self.x[2],
-            self.y[0] * feature.0 + self.y[1] * feature.1 + self.y[2],
-        )
-    }
-}
-
-fn gaze_affine_linear_geometry_plausible(affine: GazeAffine) -> bool {
-    let [a, b, _] = affine.x;
-    let [c, d, _] = affine.y;
-    let trace = a * a + b * b + c * c + d * d;
-    let determinant_squared = (a * d - b * c).powi(2);
-    let discriminant = (trace * trace - 4.0 * determinant_squared).max(0.0);
-    let maximum = ((trace + discriminant.sqrt()) * 0.5).sqrt();
-    let minimum = ((trace - discriminant.sqrt()) * 0.5).max(0.0).sqrt();
-    minimum.is_finite()
-        && maximum.is_finite()
-        && minimum >= VIRTUAL_MOUSE_AFFINE_MIN_SINGULAR_GAIN
-        && maximum <= VIRTUAL_MOUSE_AFFINE_MAX_SINGULAR_GAIN
-        && maximum / minimum <= VIRTUAL_MOUSE_AFFINE_MAX_CONDITION
-}
-
-fn calibration_models_have_shared_support(
-    plane: VirtualDisplayPlane,
-    affine: GazeAffine,
-    observations: &[((f64, f64), (f64, f64))],
-) -> bool {
-    if !gaze_affine_linear_geometry_plausible(affine) {
-        return false;
-    }
-    let shared_targets = observations
-        .iter()
-        .filter_map(|observation| {
-            let plane_prediction =
-                RelativeGazeVector::from_projected(observation.0 .0, observation.0 .1)
-                    .and_then(|gaze| plane.target(gaze))?;
-            let affine_prediction = affine.map(observation.0);
-            let plane_residual = (plane_prediction.0 - observation.1 .0)
-                .hypot(plane_prediction.1 - observation.1 .1);
-            let affine_residual = (affine_prediction.0 - observation.1 .0)
-                .hypot(affine_prediction.1 - observation.1 .1);
-            let model_disagreement = (plane_prediction.0 - affine_prediction.0)
-                .hypot(plane_prediction.1 - affine_prediction.1);
-            (plane_residual <= VIRTUAL_MOUSE_PLANE_INLIER_RESIDUAL
-                && affine_residual <= VIRTUAL_MOUSE_AFFINE_INLIER_RESIDUAL
-                && model_disagreement <= VIRTUAL_MOUSE_MODEL_MAX_DISAGREEMENT)
-                .then_some(observation.1)
-        })
-        .collect::<Vec<_>>();
-    calibration_targets_have_required_coverage(shared_targets)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12461,1744 +10029,6 @@ fn admitted_pupil_limbus_gaze_anchor(
         && pupil_observation_confidence >= 0.25)
         .then(|| detected_gaze_feature(inner, outer))
         .flatten()
-}
-
-/// Unit gaze direction in the camera coordinate system. `right` and `down`
-/// follow sensor coordinates; positive `toward_camera` points out through the
-/// visible corneal surface. This is deliberately independent of ROI origin,
-/// display scale, and the authority which supplied the eye surface.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct RelativeGazeVector {
-    right: f64,
-    down: f64,
-    toward_camera: f64,
-}
-
-impl RelativeGazeVector {
-    fn from_projected(right: f64, down: f64) -> Option<Self> {
-        if !right.is_finite() || !down.is_finite() {
-            return None;
-        }
-        let projected_squared = right * right + down * down;
-        if !projected_squared.is_finite() || projected_squared > 1.0 + 1.0e-9 {
-            return None;
-        }
-        let gaze = Self {
-            right,
-            down,
-            toward_camera: (1.0 - projected_squared.min(1.0)).sqrt(),
-        };
-        gaze.is_camera_facing().then_some(gaze)
-    }
-
-    fn projected(self) -> (f64, f64) {
-        (self.right, self.down)
-    }
-
-    fn projected_direction(self) -> Option<(f64, f64)> {
-        let length = self.right.hypot(self.down);
-        (length.is_finite() && length >= 1.0e-9)
-            .then_some((self.right / length, self.down / length))
-    }
-
-    fn as_array(self) -> [f64; 3] {
-        [self.right, self.down, self.toward_camera]
-    }
-
-    fn is_camera_facing(self) -> bool {
-        let norm_squared =
-            self.right * self.right + self.down * self.down + self.toward_camera.powi(2);
-        self.right.is_finite()
-            && self.down.is_finite()
-            && self.toward_camera.is_finite()
-            && self.toward_camera > CAMERA_FACING_CONTACT_EPSILON
-            && norm_squared.is_finite()
-            && (norm_squared - 1.0).abs() <= RELATIVE_GAZE_UNIT_TOLERANCE
-    }
-}
-
-/// Intersect the eye-relative gaze ray with the uncalibrated physical display
-/// plane. The screen is centered on the camera-facing eye axis; calibration
-/// may later learn a correction for the real screen/camera/observer offsets.
-fn nominal_display_target(relative_gaze: RelativeGazeVector) -> Option<(f64, f64)> {
-    VirtualDisplayPlane::nominal().target(relative_gaze)
-}
-
-fn nominal_display_dimensions_inches() -> (f64, f64) {
-    let aspect_hypotenuse = NOMINAL_DISPLAY_ASPECT_WIDTH.hypot(NOMINAL_DISPLAY_ASPECT_HEIGHT);
-    (
-        NOMINAL_DISPLAY_DIAGONAL_INCHES * NOMINAL_DISPLAY_ASPECT_WIDTH / aspect_hypotenuse,
-        NOMINAL_DISPLAY_DIAGONAL_INCHES * NOMINAL_DISPLAY_ASPECT_HEIGHT / aspect_hypotenuse,
-    )
-}
-
-fn dot3(left: [f64; 3], right: [f64; 3]) -> f64 {
-    left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
-}
-
-fn sub3(left: [f64; 3], right: [f64; 3]) -> [f64; 3] {
-    [left[0] - right[0], left[1] - right[1], left[2] - right[2]]
-}
-
-fn add3(left: [f64; 3], right: [f64; 3]) -> [f64; 3] {
-    [left[0] + right[0], left[1] + right[1], left[2] + right[2]]
-}
-
-fn scale3(vector: [f64; 3], scale: f64) -> [f64; 3] {
-    [vector[0] * scale, vector[1] * scale, vector[2] * scale]
-}
-
-fn cross3(left: [f64; 3], right: [f64; 3]) -> [f64; 3] {
-    [
-        left[1] * right[2] - left[2] * right[1],
-        left[2] * right[0] - left[0] * right[2],
-        left[0] * right[1] - left[1] * right[0],
-    ]
-}
-
-fn norm3(vector: [f64; 3]) -> f64 {
-    dot3(vector, vector).sqrt()
-}
-
-fn normalized3(vector: [f64; 3]) -> Option<[f64; 3]> {
-    let length = norm3(vector);
-    (length.is_finite() && length > 1.0e-9).then(|| scale3(vector, 1.0 / length))
-}
-
-fn display_depth_residuals(
-    depths: [f64; 3],
-    directions: [[f64; 3]; 3],
-    squared_distances: [f64; 3],
-) -> ([f64; 3], [[f64; 3]; 3]) {
-    let pairs = [(0usize, 1usize), (0, 2), (1, 2)];
-    let mut residuals = [0.0; 3];
-    let mut jacobian = [[0.0; 3]; 3];
-    for (row, (left, right)) in pairs.into_iter().enumerate() {
-        let cosine = dot3(directions[left], directions[right]);
-        let scale = squared_distances[row].max(1.0);
-        residuals[row] = (depths[left] * depths[left] + depths[right] * depths[right]
-            - 2.0 * cosine * depths[left] * depths[right]
-            - squared_distances[row])
-            / scale;
-        jacobian[row][left] = (2.0 * depths[left] - 2.0 * cosine * depths[right]) / scale;
-        jacobian[row][right] = (2.0 * depths[right] - 2.0 * cosine * depths[left]) / scale;
-    }
-    (residuals, jacobian)
-}
-
-fn solve_display_ray_depths(
-    directions: [[f64; 3]; 3],
-    squared_distances: [f64; 3],
-) -> Vec<[f64; 3]> {
-    const SEEDS: [f64; 8] = [8.0, 12.0, 18.0, 24.0, 32.0, 44.0, 64.0, 92.0];
-    const PERTURBATIONS: [[f64; 3]; 7] = [
-        [1.0, 1.0, 1.0],
-        [0.82, 1.18, 1.0],
-        [1.18, 0.82, 1.0],
-        [0.90, 0.90, 1.15],
-        [1.10, 1.10, 0.85],
-        [0.80, 1.05, 1.20],
-        [1.20, 0.95, 0.80],
-    ];
-    let mut solutions = Vec::<[f64; 3]>::new();
-    for seed in SEEDS {
-        for perturbation in PERTURBATIONS {
-            let mut depths = [
-                seed * perturbation[0],
-                seed * perturbation[1],
-                seed * perturbation[2],
-            ];
-            for _ in 0..64 {
-                let (residuals, jacobian) =
-                    display_depth_residuals(depths, directions, squared_distances);
-                let error = dot3(residuals, residuals);
-                if error < 1.0e-18 {
-                    break;
-                }
-                let Some(delta) = solve_3x3([
-                    [
-                        jacobian[0][0],
-                        jacobian[0][1],
-                        jacobian[0][2],
-                        -residuals[0],
-                    ],
-                    [
-                        jacobian[1][0],
-                        jacobian[1][1],
-                        jacobian[1][2],
-                        -residuals[1],
-                    ],
-                    [
-                        jacobian[2][0],
-                        jacobian[2][1],
-                        jacobian[2][2],
-                        -residuals[2],
-                    ],
-                ]) else {
-                    break;
-                };
-                let mut accepted = false;
-                let mut step = 1.0;
-                while step >= 1.0 / 128.0 {
-                    let candidate = [
-                        depths[0] + step * delta[0],
-                        depths[1] + step * delta[1],
-                        depths[2] + step * delta[2],
-                    ];
-                    if candidate.iter().all(|depth| (4.0..=144.0).contains(depth)) {
-                        let candidate_residuals =
-                            display_depth_residuals(candidate, directions, squared_distances).0;
-                        if dot3(candidate_residuals, candidate_residuals) < error {
-                            depths = candidate;
-                            accepted = true;
-                            break;
-                        }
-                    }
-                    step *= 0.5;
-                }
-                if !accepted {
-                    break;
-                }
-            }
-            let residuals = display_depth_residuals(depths, directions, squared_distances).0;
-            let error = dot3(residuals, residuals);
-            if error < 1.0e-10
-                && !solutions.iter().any(|existing| {
-                    existing
-                        .iter()
-                        .zip(depths)
-                        .all(|(left, right)| (left - right).abs() < 1.0e-4)
-                })
-            {
-                solutions.push(depths);
-            }
-        }
-    }
-    solutions
-}
-
-fn display_object_coordinates(
-    target: (f64, f64),
-    width_inches: f64,
-    height_inches: f64,
-) -> (f64, f64) {
-    (
-        (target.0 - 0.5) * width_inches,
-        (target.1 - 0.5) * height_inches,
-    )
-}
-
-fn display_plane_from_three_rays(
-    directions: [[f64; 3]; 3],
-    targets: [(f64, f64); 3],
-    depths: [f64; 3],
-    width_inches: f64,
-    height_inches: f64,
-) -> Option<VirtualDisplayPlane> {
-    let object =
-        targets.map(|target| display_object_coordinates(target, width_inches, height_inches));
-    let dx10 = object[1].0 - object[0].0;
-    let dy10 = object[1].1 - object[0].1;
-    let dx20 = object[2].0 - object[0].0;
-    let dy20 = object[2].1 - object[0].1;
-    let determinant = dx10 * dy20 - dx20 * dy10;
-    if !determinant.is_finite() || determinant.abs() < width_inches * height_inches * 0.01 {
-        return None;
-    }
-    let points = [
-        scale3(directions[0], depths[0]),
-        scale3(directions[1], depths[1]),
-        scale3(directions[2], depths[2]),
-    ];
-    let p10 = sub3(points[1], points[0]);
-    let p20 = sub3(points[2], points[0]);
-    let right_raw = scale3(
-        sub3(scale3(p10, dy20), scale3(p20, dy10)),
-        1.0 / determinant,
-    );
-    let down_raw = scale3(
-        sub3(scale3(p20, dx10), scale3(p10, dx20)),
-        1.0 / determinant,
-    );
-    let right_axis = normalized3(right_raw)?;
-    let down_axis = normalized3(sub3(
-        down_raw,
-        scale3(right_axis, dot3(down_raw, right_axis)),
-    ))?;
-    let mut center_inches = [0.0; 3];
-    for index in 0..3 {
-        center_inches = add3(
-            center_inches,
-            sub3(
-                points[index],
-                add3(
-                    scale3(right_axis, object[index].0),
-                    scale3(down_axis, object[index].1),
-                ),
-            ),
-        );
-    }
-    center_inches = scale3(center_inches, 1.0 / 3.0);
-    let plane = VirtualDisplayPlane {
-        center_inches,
-        right_axis,
-        down_axis,
-        width_inches,
-        height_inches,
-    };
-    display_plane_geometry_plausible(plane).then_some(plane)
-}
-
-fn display_plane_geometry_plausible(plane: VirtualDisplayPlane) -> bool {
-    if !plane.center_inches.iter().all(|value| value.is_finite())
-        || plane.center_inches[2] <= 2.0
-        || !(4.0..=144.0).contains(&plane.distance_inches())
-        || (norm3(plane.right_axis) - 1.0).abs() > 1.0e-5
-        || (norm3(plane.down_axis) - 1.0).abs() > 1.0e-5
-        || dot3(plane.right_axis, plane.down_axis).abs() > 1.0e-5
-    {
-        return false;
-    }
-    [-0.5, 0.5].into_iter().all(|x| {
-        [-0.5, 0.5].into_iter().all(|y| {
-            add3(
-                plane.center_inches,
-                add3(
-                    scale3(plane.right_axis, x * plane.width_inches),
-                    scale3(plane.down_axis, y * plane.height_inches),
-                ),
-            )[2] > 2.0
-        })
-    })
-}
-
-fn display_plane_residual(
-    plane: VirtualDisplayPlane,
-    observation: &((f64, f64), (f64, f64)),
-) -> Option<[f64; 2]> {
-    let gaze = RelativeGazeVector::from_projected(observation.0 .0, observation.0 .1)?;
-    let mapped = plane.target(gaze)?;
-    Some([mapped.0 - observation.1 .0, mapped.1 - observation.1 .1])
-}
-
-fn display_plane_robust_cost(
-    plane: VirtualDisplayPlane,
-    observations: &[((f64, f64), (f64, f64))],
-) -> f64 {
-    const HUBER: f64 = 0.055;
-    observations
-        .iter()
-        .map(|observation| {
-            let residual = display_plane_residual(plane, observation)
-                .map(|value| value[0].hypot(value[1]))
-                .unwrap_or(2.0);
-            if residual <= HUBER {
-                0.5 * residual * residual
-            } else {
-                HUBER * (residual - 0.5 * HUBER)
-            }
-        })
-        .sum::<f64>()
-        / observations.len().max(1) as f64
-}
-
-fn solve_6x6(mut matrix: [[f64; 7]; 6]) -> Option<[f64; 6]> {
-    for pivot in 0..6 {
-        let best = (pivot..6).max_by(|left, right| {
-            matrix[*left][pivot]
-                .abs()
-                .total_cmp(&matrix[*right][pivot].abs())
-        })?;
-        if matrix[best][pivot].abs() < 1.0e-10 {
-            return None;
-        }
-        matrix.swap(pivot, best);
-        let divisor = matrix[pivot][pivot];
-        for column in pivot..7 {
-            matrix[pivot][column] /= divisor;
-        }
-        for row in 0..6 {
-            if row == pivot {
-                continue;
-            }
-            let factor = matrix[row][pivot];
-            for column in pivot..7 {
-                matrix[row][column] -= factor * matrix[pivot][column];
-            }
-        }
-    }
-    Some(std::array::from_fn(|row| matrix[row][6]))
-}
-
-fn apply_display_plane_delta(
-    plane: VirtualDisplayPlane,
-    delta: [f64; 6],
-    scale: f64,
-) -> Option<VirtualDisplayPlane> {
-    let translation = [delta[0] * scale, delta[1] * scale, delta[2] * scale];
-    let rotation = [delta[3] * scale, delta[4] * scale, delta[5] * scale];
-    let right_axis = normalized3(add3(plane.right_axis, cross3(rotation, plane.right_axis)))?;
-    let down_rotated = add3(plane.down_axis, cross3(rotation, plane.down_axis));
-    let down_axis = normalized3(sub3(
-        down_rotated,
-        scale3(right_axis, dot3(down_rotated, right_axis)),
-    ))?;
-    Some(VirtualDisplayPlane {
-        center_inches: add3(plane.center_inches, translation),
-        right_axis,
-        down_axis,
-        ..plane
-    })
-}
-
-fn refine_virtual_display_plane(
-    mut plane: VirtualDisplayPlane,
-    observations: &[((f64, f64), (f64, f64))],
-) -> VirtualDisplayPlane {
-    const HUBER: f64 = 0.055;
-    for _ in 0..18 {
-        let mut normal = [[0.0; 7]; 6];
-        let mut used = 0usize;
-        for observation in observations {
-            let Some(residual) = display_plane_residual(plane, observation) else {
-                continue;
-            };
-            let length = residual[0].hypot(residual[1]);
-            let weight = if length <= HUBER || length <= 1.0e-12 {
-                1.0
-            } else {
-                HUBER / length
-            };
-            let mut jacobian = [[0.0; 6]; 2];
-            for parameter in 0..6 {
-                let epsilon = if parameter < 3 { 1.0e-3 } else { 1.0e-5 };
-                let mut step = [0.0; 6];
-                step[parameter] = epsilon;
-                let Some(perturbed) = apply_display_plane_delta(plane, step, 1.0) else {
-                    continue;
-                };
-                let Some(next) = display_plane_residual(perturbed, observation) else {
-                    continue;
-                };
-                jacobian[0][parameter] = (next[0] - residual[0]) / epsilon;
-                jacobian[1][parameter] = (next[1] - residual[1]) / epsilon;
-            }
-            for row in 0..6 {
-                for column in 0..6 {
-                    normal[row][column] += weight
-                        * (jacobian[0][row] * jacobian[0][column]
-                            + jacobian[1][row] * jacobian[1][column]);
-                }
-                normal[row][6] -=
-                    weight * (jacobian[0][row] * residual[0] + jacobian[1][row] * residual[1]);
-            }
-            used += 1;
-        }
-        if used < 4 {
-            break;
-        }
-        for (index, row) in normal.iter_mut().enumerate() {
-            row[index] += 1.0e-7;
-        }
-        let Some(mut delta) = solve_6x6(normal) else {
-            break;
-        };
-        let translation_length = norm3([delta[0], delta[1], delta[2]]);
-        if translation_length > 2.0 {
-            let scale = 2.0 / translation_length;
-            for value in &mut delta[..3] {
-                *value *= scale;
-            }
-        }
-        let rotation_length = norm3([delta[3], delta[4], delta[5]]);
-        if rotation_length > 0.08 {
-            let scale = 0.08 / rotation_length;
-            for value in &mut delta[3..] {
-                *value *= scale;
-            }
-        }
-        if norm3([delta[0], delta[1], delta[2]]) < 1.0e-6
-            && norm3([delta[3], delta[4], delta[5]]) < 1.0e-7
-        {
-            break;
-        }
-        let previous_cost = display_plane_robust_cost(plane, observations);
-        let mut step_scale = 1.0;
-        let mut accepted = None;
-        while step_scale >= 1.0 / 64.0 {
-            if let Some(candidate) = apply_display_plane_delta(plane, delta, step_scale) {
-                if display_plane_geometry_plausible(candidate)
-                    && display_plane_robust_cost(candidate, observations) < previous_cost
-                {
-                    accepted = Some(candidate);
-                    break;
-                }
-            }
-            step_scale *= 0.5;
-        }
-        let Some(candidate) = accepted else {
-            break;
-        };
-        plane = candidate;
-    }
-    plane
-}
-
-#[derive(Clone, Copy, Debug)]
-struct DisplayPlaneScore {
-    inliers: usize,
-    rms: f64,
-    robust_cost: f64,
-}
-
-fn targets_are_distributed(targets: &[(f64, f64)]) -> bool {
-    if targets.len() < 4 {
-        return false;
-    }
-    let min_x = targets
-        .iter()
-        .map(|target| target.0)
-        .fold(f64::INFINITY, f64::min);
-    let max_x = targets
-        .iter()
-        .map(|target| target.0)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let min_y = targets
-        .iter()
-        .map(|target| target.1)
-        .fold(f64::INFINITY, f64::min);
-    let max_y = targets
-        .iter()
-        .map(|target| target.1)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let required_span = (1.0 - 2.0 * VIRTUAL_MOUSE_CALIBRATION_INSET) * 0.90;
-    if max_x - min_x < required_span || max_y - min_y < required_span {
-        return false;
-    }
-    for first in 0..targets.len() {
-        for second in first + 1..targets.len() {
-            for third in second + 1..targets.len() {
-                let area = (targets[second].0 - targets[first].0)
-                    * (targets[third].1 - targets[first].1)
-                    - (targets[third].0 - targets[first].0)
-                        * (targets[second].1 - targets[first].1);
-                // Judge two-dimensional coverage relative to the target
-                // region, including when calibration is confined to 20%.
-                if area.abs() >= 0.36 * (1.0 - 2.0 * VIRTUAL_MOUSE_CALIBRATION_INSET).powi(2) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-fn calibration_targets_have_required_coverage(
-    targets: impl IntoIterator<Item = (f64, f64)>,
-) -> bool {
-    let targets = targets.into_iter().collect::<Vec<_>>();
-    let contains = |expected: (f64, f64)| {
-        targets.iter().any(|target| {
-            (target.0 - expected.0).abs() <= 1.0e-9 && (target.1 - expected.1).abs() <= 1.0e-9
-        })
-    };
-    let corner_count = [0usize, 1, 3, 4]
-        .into_iter()
-        .filter(|&index| contains(VIRTUAL_MOUSE_CALIBRATION_TARGETS[index]))
-        .count();
-    targets.len() >= VIRTUAL_MOUSE_MIN_STABLE_TARGETS
-        && contains(VIRTUAL_MOUSE_CALIBRATION_TARGETS[2])
-        && corner_count >= 3
-        && targets_are_distributed(targets.as_slice())
-}
-
-fn score_virtual_display_plane(
-    plane: VirtualDisplayPlane,
-    observations: &[((f64, f64), (f64, f64))],
-) -> Option<DisplayPlaneScore> {
-    let mut squared = 0.0;
-    let mut inlier_targets = Vec::new();
-    for observation in observations {
-        let Some(residual) = display_plane_residual(plane, observation) else {
-            continue;
-        };
-        let length = residual[0].hypot(residual[1]);
-        if length <= VIRTUAL_MOUSE_PLANE_INLIER_RESIDUAL {
-            squared += length * length;
-            inlier_targets.push(observation.1);
-        }
-    }
-    if !calibration_targets_have_required_coverage(inlier_targets.iter().copied()) {
-        return None;
-    }
-    let rms = (squared / inlier_targets.len() as f64).sqrt();
-    Some(DisplayPlaneScore {
-        inliers: inlier_targets.len(),
-        rms,
-        robust_cost: display_plane_robust_cost(plane, observations),
-    })
-}
-
-fn fit_virtual_display_plane(
-    observations: &[((f64, f64), (f64, f64))],
-) -> Option<VirtualDisplayPlane> {
-    if observations.len() < VIRTUAL_MOUSE_MIN_STABLE_TARGETS {
-        return None;
-    }
-    let (width_inches, height_inches) = nominal_display_dimensions_inches();
-    let mut best: Option<(VirtualDisplayPlane, DisplayPlaneScore)> = None;
-    for first in 0..observations.len() {
-        for second in first + 1..observations.len() {
-            for third in second + 1..observations.len() {
-                let selected = [
-                    observations[first],
-                    observations[second],
-                    observations[third],
-                ];
-                let targets = selected.map(|observation| observation.1);
-                let seed_object = targets
-                    .map(|target| display_object_coordinates(target, width_inches, height_inches));
-                let seed_determinant = (seed_object[1].0 - seed_object[0].0)
-                    * (seed_object[2].1 - seed_object[0].1)
-                    - (seed_object[2].0 - seed_object[0].0) * (seed_object[1].1 - seed_object[0].1);
-                if seed_determinant.abs() < width_inches * height_inches * 0.01 {
-                    continue;
-                }
-                let directions = selected.map(|observation| {
-                    RelativeGazeVector::from_projected(observation.0 .0, observation.0 .1)
-                        .map(RelativeGazeVector::as_array)
-                });
-                let Some(directions) = directions
-                    .into_iter()
-                    .collect::<Option<Vec<_>>>()
-                    .and_then(|values| values.try_into().ok())
-                else {
-                    continue;
-                };
-                let object = targets
-                    .map(|target| display_object_coordinates(target, width_inches, height_inches));
-                let squared_distance = |left: usize, right: usize| {
-                    (object[left].0 - object[right].0).powi(2)
-                        + (object[left].1 - object[right].1).powi(2)
-                };
-                let squared_distances = [
-                    squared_distance(0, 1),
-                    squared_distance(0, 2),
-                    squared_distance(1, 2),
-                ];
-                for depths in solve_display_ray_depths(directions, squared_distances) {
-                    let Some(seed) = display_plane_from_three_rays(
-                        directions,
-                        targets,
-                        depths,
-                        width_inches,
-                        height_inches,
-                    ) else {
-                        continue;
-                    };
-                    let candidate = refine_virtual_display_plane(seed, observations);
-                    let Some(score) = score_virtual_display_plane(candidate, observations) else {
-                        continue;
-                    };
-                    let replace = match best.as_ref() {
-                        None => true,
-                        Some((_, prior)) if score.inliers != prior.inliers => {
-                            score.inliers > prior.inliers
-                        }
-                        Some((_, prior))
-                            if (score.robust_cost - prior.robust_cost).abs() > 1.0e-12 =>
-                        {
-                            score.robust_cost < prior.robust_cost
-                        }
-                        Some((_, prior)) if (score.rms - prior.rms).abs() > 1.0e-12 => {
-                            score.rms < prior.rms
-                        }
-                        Some((existing, _)) => {
-                            (candidate.distance_inches() - NOMINAL_DISPLAY_DISTANCE_INCHES).abs()
-                                < (existing.distance_inches() - NOMINAL_DISPLAY_DISTANCE_INCHES)
-                                    .abs()
-                        }
-                    };
-                    if replace {
-                        best = Some((candidate, score));
-                    }
-                }
-            }
-        }
-    }
-    if let Some((_, score)) = best.as_ref() {
-        eprintln!("mouse calibration best 3D candidate: {} inliers rms={:.4} limit={:.4}", score.inliers, score.rms, VIRTUAL_MOUSE_PLANE_MAX_RMS);
-    }
-    best.filter(|(_, score)| {
-        score.inliers >= VIRTUAL_MOUSE_MIN_STABLE_TARGETS
-            && score.rms <= VIRTUAL_MOUSE_PLANE_MAX_RMS
-    })
-        .map(|(plane, score)| {
-            eprintln!(
-                "mouse calibration robust 3D fit accepted {}/{} targets rms={:.4} screen-fraction cost={:.6}",
-                score.inliers,
-                observations.len(),
-                score.rms,
-                score.robust_cost,
-            );
-            plane
-        })
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct SurfaceGazeSample {
-    /// Source exposure which supplied the fitted surface. SAM results are
-    /// asynchronous and may be presented over several newer camera frames;
-    /// retaining this key prevents those repeats from masquerading as fresh
-    /// temporal or calibration evidence.
-    source_timestamp_ns: Option<u64>,
-    rectified_area_px2: f64,
-    area_bucket: i32,
-    bucketed_face_radius_px: f64,
-    camera_near_point_sensor: (f64, f64),
-    relative_gaze: RelativeGazeVector,
-    /// False while an anchorless ellipse still has two equally plausible
-    /// projected normal branches. Such a sample may be rendered provisionally,
-    /// but it must never train an eye-to-screen calibration.
-    sign_resolved: bool,
-    /// Changes whenever the persistent sign state is reset or changes branch.
-    /// A calibrated display is valid only for the epoch which trained it.
-    sign_epoch: u64,
-    kinematic_sign_correction: [bool; 2],
-}
-
-#[derive(Clone, Copy, Debug)]
-struct TimedGlobalSimilarity {
-    from_timestamp_ns: u64,
-    to_timestamp_ns: u64,
-    evidence: raw_motion_octrees::NativeGlobalSimilarityEvidence,
-}
-
-/// Adjacent whole-ROI motion indexed in the sensor clock domain. SAM
-/// finishes asynchronously, so the motion needed by its surface tracker is
-/// the composition from the previous SAM source exposure to the new source
-/// exposure, not the transform adjacent to whichever live frame happens to
-/// receive the answer.
-#[derive(Debug, Default)]
-struct GlobalSimilarityTimeline {
-    last_timestamp_ns: Option<u64>,
-    steps: VecDeque<TimedGlobalSimilarity>,
-}
-
-impl GlobalSimilarityTimeline {
-    fn observe_frame(
-        &mut self,
-        timestamp_ns: u64,
-        evidence: raw_motion_octrees::NativeGlobalSimilarityEvidence,
-    ) {
-        let Some(from_timestamp_ns) = self.last_timestamp_ns.replace(timestamp_ns) else {
-            return;
-        };
-        if timestamp_ns <= from_timestamp_ns {
-            self.steps.clear();
-            return;
-        }
-        if self
-            .steps
-            .back()
-            .is_some_and(|step| step.to_timestamp_ns != from_timestamp_ns)
-        {
-            self.steps.clear();
-        }
-        self.steps.push_back(TimedGlobalSimilarity {
-            from_timestamp_ns,
-            to_timestamp_ns: timestamp_ns,
-            evidence,
-        });
-        while self.steps.len() > GLOBAL_SIMILARITY_TIMELINE_STEPS {
-            self.steps.pop_front();
-        }
-    }
-
-    fn reliable_between(
-        &self,
-        from_timestamp_ns: u64,
-        to_timestamp_ns: u64,
-    ) -> Option<raw_motion_octrees::NativeGlobalSimilarityEvidence> {
-        if to_timestamp_ns < from_timestamp_ns {
-            return None;
-        }
-        if to_timestamp_ns == from_timestamp_ns {
-            return Some(raw_motion_octrees::NativeGlobalSimilarityEvidence {
-                reliable: true,
-                ..raw_motion_octrees::NativeGlobalSimilarityEvidence::default()
-            });
-        }
-
-        // Complex scalar `a + ib` plus translation represents the restricted
-        // affine used by SimilarityMotion:
-        //   x' = a*x - b*y + tx; y' = b*x + a*y + ty.
-        let mut accumulated = (1.0f64, 0.0f64, 0.0f64, 0.0f64);
-        let mut cursor = from_timestamp_ns;
-        let mut residual = 0.0f32;
-        let mut support = usize::MAX;
-        let mut stable_frames = u16::MAX;
-        let mut span = [f32::INFINITY; 2];
-        let mut quadrants = usize::MAX;
-        let mut used = 0usize;
-        for step in self.steps.iter().filter(|step| {
-            step.to_timestamp_ns > from_timestamp_ns && step.from_timestamp_ns < to_timestamp_ns
-        }) {
-            if step.from_timestamp_ns != cursor
-                || step.to_timestamp_ns > to_timestamp_ns
-                || !step.evidence.reliable
-            {
-                return None;
-            }
-            let motion = step.evidence.motion;
-            let step_a = 1.0 + f64::from(motion.scale_delta);
-            let step_b = f64::from(motion.rotation);
-            let center_x = f64::from(step.evidence.motion_center_sensor[0]);
-            let center_y = f64::from(step.evidence.motion_center_sensor[1]);
-            let step_tx =
-                f64::from(motion.translation[0]) + (1.0 - step_a) * center_x + step_b * center_y;
-            let step_ty =
-                f64::from(motion.translation[1]) - step_b * center_x + (1.0 - step_a) * center_y;
-            let (a, b, tx, ty) = accumulated;
-            accumulated = (
-                step_a * a - step_b * b,
-                step_b * a + step_a * b,
-                step_a * tx - step_b * ty + step_tx,
-                step_b * tx + step_a * ty + step_ty,
-            );
-            residual = residual.max(motion.residual);
-            support = support.min(motion.support);
-            stable_frames = stable_frames.min(step.evidence.stable_frames);
-            span[0] = span[0].min(step.evidence.spatial_span[0]);
-            span[1] = span[1].min(step.evidence.spatial_span[1]);
-            quadrants = quadrants.min(step.evidence.occupied_quadrants);
-            cursor = step.to_timestamp_ns;
-            used += 1;
-            if cursor == to_timestamp_ns {
-                break;
-            }
-        }
-        if cursor != to_timestamp_ns || used == 0 {
-            return None;
-        }
-        let (a, b, tx, ty) = accumulated;
-        if [a, b, tx, ty].into_iter().any(|value| !value.is_finite()) {
-            return None;
-        }
-        let motion = raw_motion_octrees::SimilarityMotion {
-            translation: [tx as f32, ty as f32],
-            rotation: b as f32,
-            scale_delta: (a - 1.0) as f32,
-            residual,
-            support,
-        };
-        Some(raw_motion_octrees::NativeGlobalSimilarityEvidence {
-            motion,
-            candidate_motion: motion,
-            candidate_matches: support,
-            reliable: true,
-            stable_frames,
-            spatial_span: span,
-            occupied_quadrants: quadrants,
-            // The composed translation is already expressed as an absolute
-            // sensor-space affine offset, so downstream prediction is about
-            // the origin rather than any one intermediate crop center.
-            motion_center_sensor: [0.0; 2],
-        })
-    }
-}
-
-#[derive(Debug, Default)]
-struct SurfaceGazeTracker {
-    floating_center_sensor: Option<(f64, f64)>,
-    floating_near_point_sensor: Option<(f64, f64)>,
-    area_bucket: Option<i32>,
-    pending_area_bucket: Option<i32>,
-    pending_area_bucket_frames: u8,
-    last_observed: Option<Instant>,
-    contact_sign_hypotheses: Option<[ContactSignHypothesis; 2]>,
-    selected_sign_hypothesis: usize,
-    pending_sign_hypothesis: Option<usize>,
-    pending_sign_frames: u8,
-    pending_kinematic_sign_hypothesis: Option<usize>,
-    pending_kinematic_sign_frames: u8,
-    sign_resolved: bool,
-    sign_epoch: u64,
-    kinematic_history: VecDeque<GazeKinematicFrame>,
-    /// Most recent source which actually produced an admitted surface. The
-    /// caller composes whole-ROI motion from this exposure to the next SAM
-    /// result, so a rejected intermediate proposal must not advance it.
-    last_keyed_source_timestamp_ns: Option<u64>,
-    /// Duplicate/out-of-order guard is separate from the successful source:
-    /// a rejected proposal must not be evaluated repeatedly on redraw.
-    last_keyed_attempted_source_timestamp_ns: Option<u64>,
-    last_keyed_sample: Option<SurfaceGazeSample>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ContactSignHypothesis {
-    pivot_sensor: (f64, f64),
-    near_sensor: (f64, f64),
-    residual_ema: f64,
-    observations: u16,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct GazeKinematicFrame {
-    observed_at: Instant,
-    source_timestamp_ns: Option<u64>,
-    ellipse_center_sensor: (f64, f64),
-    projected_gaze: (f64, f64),
-    implied_globe_center_sensor: (f64, f64),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct GazeSignCorrection {
-    projected_gaze: (f64, f64),
-    flipped_x: bool,
-    flipped_y: bool,
-    resolved: bool,
-}
-
-fn projected_gaze_angle_between(first: (f64, f64), second: (f64, f64)) -> f64 {
-    let first_z = (1.0 - first.0 * first.0 - first.1 * first.1)
-        .max(0.0)
-        .sqrt();
-    let second_z = (1.0 - second.0 * second.0 - second.1 * second.1)
-        .max(0.0)
-        .sqrt();
-    (first.0 * second.0 + first.1 * second.1 + first_z * second_z)
-        .clamp(-1.0, 1.0)
-        .acos()
-}
-
-/// Resolve the antipodal normal ambiguity of a projected circular surface
-/// from a short biomechanical motion history. A measured ellipse has exactly
-/// two possible camera-facing projected normals: `(x, y)` and `(-x, -y)`.
-/// Independent one-axis reflections describe a different ellipse and must
-/// not be manufactured here. The score compares constant-angular-velocity
-/// gaze, angular acceleration, and the translated globe center implied by the
-/// moving limbus ellipse.
-fn kinematic_gaze_sign_correction(
-    history: &VecDeque<GazeKinematicFrame>,
-    observed_at: Instant,
-    source_timestamp_ns: Option<u64>,
-    ellipse_center_sensor: (f64, f64),
-    slice_depth: f64,
-    observed_gaze: (f64, f64),
-    global_similarity: Option<raw_motion_octrees::NativeGlobalSimilarityEvidence>,
-) -> GazeSignCorrection {
-    let unchanged = GazeSignCorrection {
-        projected_gaze: observed_gaze,
-        flipped_x: false,
-        flipped_y: false,
-        resolved: false,
-    };
-    if history.is_empty()
-        || !slice_depth.is_finite()
-        || slice_depth <= 1.0e-6
-        || !observed_gaze.0.is_finite()
-        || !observed_gaze.1.is_finite()
-    {
-        return unchanged;
-    }
-    let last = history[history.len() - 1];
-    let elapsed_seconds =
-        |earlier: GazeKinematicFrame, later_at: Instant, later_source_timestamp_ns: Option<u64>| {
-            earlier
-                .source_timestamp_ns
-                .zip(later_source_timestamp_ns)
-                .and_then(|(earlier, later)| {
-                    later
-                        .checked_sub(earlier)
-                        .map(|nanoseconds| nanoseconds as f64 / 1_000_000_000.0)
-                })
-                .unwrap_or_else(|| {
-                    later_at
-                        .saturating_duration_since(earlier.observed_at)
-                        .as_secs_f64()
-                })
-        };
-    let current_dt = elapsed_seconds(last, observed_at, source_timestamp_ns);
-    if current_dt < 1.0e-4 || current_dt > 0.75 {
-        return unchanged;
-    }
-    let (predicted_gaze, velocity_center, velocity_globe_center, previous_angular_speed) =
-        if history.len() >= 2 {
-            let previous = history[history.len() - 2];
-            let history_dt = elapsed_seconds(previous, last.observed_at, last.source_timestamp_ns);
-            if history_dt < 1.0e-4 {
-                return unchanged;
-            }
-            let extrapolation = current_dt / history_dt;
-            (
-                (
-                    last.projected_gaze.0
-                        + (last.projected_gaze.0 - previous.projected_gaze.0) * extrapolation,
-                    last.projected_gaze.1
-                        + (last.projected_gaze.1 - previous.projected_gaze.1) * extrapolation,
-                ),
-                (
-                    last.ellipse_center_sensor.0
-                        + (last.ellipse_center_sensor.0 - previous.ellipse_center_sensor.0)
-                            * extrapolation,
-                    last.ellipse_center_sensor.1
-                        + (last.ellipse_center_sensor.1 - previous.ellipse_center_sensor.1)
-                            * extrapolation,
-                ),
-                (
-                    last.implied_globe_center_sensor.0
-                        + (last.implied_globe_center_sensor.0
-                            - previous.implied_globe_center_sensor.0)
-                            * extrapolation,
-                    last.implied_globe_center_sensor.1
-                        + (last.implied_globe_center_sensor.1
-                            - previous.implied_globe_center_sensor.1)
-                            * extrapolation,
-                ),
-                projected_gaze_angle_between(previous.projected_gaze, last.projected_gaze)
-                    / history_dt,
-            )
-        } else {
-            // With one prior frame there is no velocity estimate yet, but the
-            // implied fixed globe center already makes an ellipse translation
-            // an immediate component-sign cue away from a camera-normal pose.
-            (
-                last.projected_gaze,
-                last.ellipse_center_sensor,
-                last.implied_globe_center_sensor,
-                0.0,
-            )
-        };
-    let predict_global = |point: (f64, f64)| {
-        let Some(global) = global_similarity.filter(|evidence| evidence.reliable) else {
-            return point;
-        };
-        let x = point.0 - f64::from(global.motion_center_sensor[0]);
-        let y = point.1 - f64::from(global.motion_center_sensor[1]);
-        (
-            point.0
-                + f64::from(global.motion.translation[0])
-                + f64::from(global.motion.scale_delta) * x
-                - f64::from(global.motion.rotation) * y,
-            point.1
-                + f64::from(global.motion.translation[1])
-                + f64::from(global.motion.rotation) * x
-                + f64::from(global.motion.scale_delta) * y,
-        )
-    };
-    // A reliable whole-ROI transform removes head/camera translation from
-    // the biomechanical cue. Without it, retain the short velocity predictor
-    // as a presentation fallback, but do not let that fallback establish an
-    // otherwise unresolved physical sign in SurfaceGazeTracker.
-    let predicted_center = global_similarity
-        .filter(|evidence| evidence.reliable)
-        .map_or(velocity_center, |_| {
-            predict_global(last.ellipse_center_sensor)
-        });
-    let predicted_globe_center = global_similarity
-        .filter(|evidence| evidence.reliable)
-        .map_or(velocity_globe_center, |_| {
-            predict_global(last.implied_globe_center_sensor)
-        });
-    let translation_innovation = (ellipse_center_sensor.0 - predicted_center.0)
-        .hypot(ellipse_center_sensor.1 - predicted_center.1)
-        / slice_depth;
-
-    let candidates = [
-        (observed_gaze, false),
-        ((-observed_gaze.0, -observed_gaze.1), true),
-    ];
-    let score = |candidate: (f64, f64), flipped: bool| {
-        let gaze_prediction_error =
-            (candidate.0 - predicted_gaze.0).hypot(candidate.1 - predicted_gaze.1);
-        let angular_speed =
-            projected_gaze_angle_between(last.projected_gaze, candidate) / current_dt;
-        let angular_acceleration = (angular_speed - previous_angular_speed).abs() * current_dt;
-        let implied_globe_center = (
-            ellipse_center_sensor.0 - slice_depth * candidate.0,
-            ellipse_center_sensor.1 - slice_depth * candidate.1,
-        );
-        let globe_translation_error = (implied_globe_center.0 - predicted_globe_center.0)
-            .hypot(implied_globe_center.1 - predicted_globe_center.1)
-            / slice_depth;
-        3.0 * gaze_prediction_error
-            + 1.25 * angular_acceleration
-            + globe_translation_error / (1.0 + translation_innovation)
-            + 0.05 * f64::from(flipped)
-    };
-    let mut scored =
-        candidates.map(|(candidate, flipped)| (score(candidate, flipped), candidate, flipped));
-    scored.sort_by(|left, right| left.0.total_cmp(&right.0));
-    let required_improvement = 0.10 + 0.40 * translation_innovation.min(1.0);
-    if scored[1].0 - scored[0].0 < required_improvement {
-        unchanged
-    } else {
-        GazeSignCorrection {
-            projected_gaze: scored[0].1,
-            flipped_x: scored[0].2,
-            flipped_y: scored[0].2,
-            resolved: true,
-        }
-    }
-}
-
-fn rectified_ellipse_area_px2(major_radius: f64, minor_radius: f64) -> Option<f64> {
-    let (major_radius, minor_radius) = if major_radius >= minor_radius {
-        (major_radius, minor_radius)
-    } else {
-        (minor_radius, major_radius)
-    };
-    if !major_radius.is_finite()
-        || !minor_radius.is_finite()
-        || major_radius < 4.0
-        || minor_radius < 1.0
-        || !raw_iris_focus::projected_circular_limbus_axes_plausible(major_radius, minor_radius)
-    {
-        return None;
-    }
-    // Orthographic projection turns a circular disk into an ellipse whose
-    // minor/major ratio is the camera-normal cosine. Undo that foreshortening
-    // so tilted and front-facing observations of the same iris have the same
-    // area estimate: (pi*a*b)/(b/a) = pi*a^2.
-    let projected_area = std::f64::consts::PI * major_radius * minor_radius;
-    let camera_normal_cosine = minor_radius / major_radius;
-    let rectified_area = projected_area / camera_normal_cosine;
-    rectified_area.is_finite().then_some(rectified_area)
-}
-
-fn bucket_surface_area(rectified_area_px2: f64) -> Option<(i32, f64)> {
-    if !rectified_area_px2.is_finite() || rectified_area_px2 <= 0.0 {
-        return None;
-    }
-    let logarithmic_bucket =
-        (rectified_area_px2.ln() / GAZE_SURFACE_AREA_BUCKET_RATIO.ln()).round();
-    if logarithmic_bucket < i32::MIN as f64 || logarithmic_bucket > i32::MAX as f64 {
-        return None;
-    }
-    let bucket = logarithmic_bucket as i32;
-    let representative_area = GAZE_SURFACE_AREA_BUCKET_RATIO.powi(bucket);
-    representative_area
-        .is_finite()
-        .then_some((bucket, representative_area))
-}
-
-impl SurfaceGazeTracker {
-    fn clear_floating_point(&mut self) {
-        self.floating_center_sensor = None;
-        self.floating_near_point_sensor = None;
-        self.area_bucket = None;
-        self.contact_sign_hypotheses = None;
-        self.pending_area_bucket = None;
-        self.pending_area_bucket_frames = 0;
-        self.selected_sign_hypothesis = 0;
-        self.pending_sign_hypothesis = None;
-        self.pending_sign_frames = 0;
-        self.pending_kinematic_sign_hypothesis = None;
-        self.pending_kinematic_sign_frames = 0;
-        self.sign_resolved = false;
-        self.sign_epoch = self.sign_epoch.wrapping_add(1);
-    }
-
-    /// A missing asynchronous result is not evidence that the physical eye
-    /// changed antipodes. Drop only velocity and presentation interpolation;
-    /// retain the two transported contact identities, selected sign, and
-    /// accepted scale lineage. Explicit ROI/provider resets still replace the
-    /// whole tracker, while a sustained scale-family change still calls the
-    /// full reset above and advances the epoch.
-    fn clear_stale_motion_preserving_sign(&mut self) {
-        self.floating_center_sensor = None;
-        self.floating_near_point_sensor = None;
-        self.pending_area_bucket = None;
-        self.pending_area_bucket_frames = 0;
-        self.pending_sign_hypothesis = None;
-        self.pending_sign_frames = 0;
-        self.pending_kinematic_sign_hypothesis = None;
-        self.pending_kinematic_sign_frames = 0;
-        self.kinematic_history.clear();
-        if let Some(hypotheses) = self.contact_sign_hypotheses.as_mut() {
-            for hypothesis in hypotheses {
-                // Preserve spatial identity but do not compare a new motion
-                // interval with an EMA accumulated before the missing span.
-                hypothesis.residual_ema = 0.0;
-                hypothesis.observations = 1;
-            }
-        }
-    }
-
-    /// Return true only when a new, discontinuous scale family has persisted
-    /// long enough to replace the established physical surface. SAM can
-    /// occasionally fit the eye opening or an eyelid chord for one answer;
-    /// such a proposal remains visible in its diagnostic view but must not
-    /// reset gaze sign or enter calibration.
-    fn consider_area_bucket_jump(&mut self, candidate: i32) -> bool {
-        let continues_pending = self.pending_area_bucket.is_some_and(|pending| {
-            (pending - candidate).abs() <= GAZE_SURFACE_SCALE_SWITCH_BUCKET_TOLERANCE
-        });
-        if continues_pending {
-            self.pending_area_bucket_frames = self.pending_area_bucket_frames.saturating_add(1);
-            // Follow gradual noise within the candidate family without
-            // allowing that family to drift arbitrarily far before commit.
-            self.pending_area_bucket = Some(candidate);
-        } else {
-            self.pending_area_bucket = Some(candidate);
-            self.pending_area_bucket_frames = 1;
-        }
-        self.pending_area_bucket_frames >= GAZE_SURFACE_SCALE_SWITCH_FRAMES
-    }
-
-    fn consider_sign_hypothesis(&mut self, candidate: usize) {
-        if self.sign_resolved && candidate == self.selected_sign_hypothesis {
-            self.pending_sign_hypothesis = None;
-            self.pending_sign_frames = 0;
-            return;
-        }
-        if self.pending_sign_hypothesis == Some(candidate) {
-            self.pending_sign_frames = self.pending_sign_frames.saturating_add(1);
-        } else {
-            self.pending_sign_hypothesis = Some(candidate);
-            self.pending_sign_frames = 1;
-        }
-        if self.pending_sign_frames >= GAZE_SURFACE_SIGN_SWITCH_FRAMES {
-            if candidate != self.selected_sign_hypothesis {
-                self.selected_sign_hypothesis = candidate;
-                self.sign_epoch = self.sign_epoch.wrapping_add(1);
-            }
-            self.pending_sign_hypothesis = None;
-            self.pending_sign_frames = 0;
-            self.sign_resolved = true;
-        }
-    }
-
-    /// Kinematics may challenge an already resolved branch, but a single
-    /// discontinuity must never invert the physical surface. Keep this vote
-    /// separate from the pupil/contact vote so an anchorless frame cannot
-    /// erase a motion challenge before it has accumulated evidence.
-    fn consider_kinematic_sign_hypothesis(&mut self, candidate: usize) -> bool {
-        if candidate == self.selected_sign_hypothesis {
-            self.pending_kinematic_sign_hypothesis = None;
-            self.pending_kinematic_sign_frames = 0;
-            return false;
-        }
-        if self.pending_kinematic_sign_hypothesis == Some(candidate) {
-            self.pending_kinematic_sign_frames =
-                self.pending_kinematic_sign_frames.saturating_add(1);
-        } else {
-            self.pending_kinematic_sign_hypothesis = Some(candidate);
-            self.pending_kinematic_sign_frames = 1;
-        }
-        if self.pending_kinematic_sign_frames < GAZE_SURFACE_SIGN_SWITCH_FRAMES {
-            return false;
-        }
-        self.selected_sign_hypothesis = candidate;
-        self.pending_kinematic_sign_hypothesis = None;
-        self.pending_kinematic_sign_frames = 0;
-        self.pending_sign_hypothesis = None;
-        self.pending_sign_frames = 0;
-        self.sign_resolved = true;
-        self.sign_epoch = self.sign_epoch.wrapping_add(1);
-        self.kinematic_history.clear();
-        self.floating_center_sensor = None;
-        self.floating_near_point_sensor = None;
-        true
-    }
-
-    fn observe(
-        &mut self,
-        now: Instant,
-        sensor_origin: (u32, u32),
-        pupil_limbus_gaze_anchor: Option<(f64, f64)>,
-        outer: &raw_iris_focus::OuterIrisBoundary,
-    ) -> Option<SurfaceGazeSample> {
-        self.observe_with_global_similarity_at_source(
-            now,
-            None,
-            sensor_origin,
-            pupil_limbus_gaze_anchor,
-            outer,
-            None,
-        )
-    }
-
-    fn observe_with_global_similarity(
-        &mut self,
-        now: Instant,
-        sensor_origin: (u32, u32),
-        pupil_limbus_gaze_anchor: Option<(f64, f64)>,
-        outer: &raw_iris_focus::OuterIrisBoundary,
-        global_similarity: Option<raw_motion_octrees::NativeGlobalSimilarityEvidence>,
-    ) -> Option<SurfaceGazeSample> {
-        self.observe_with_global_similarity_at_source(
-            now,
-            None,
-            sensor_origin,
-            pupil_limbus_gaze_anchor,
-            outer,
-            global_similarity,
-        )
-    }
-
-    fn observe_with_global_similarity_at_source(
-        &mut self,
-        now: Instant,
-        source_timestamp_ns: Option<u64>,
-        sensor_origin: (u32, u32),
-        pupil_limbus_gaze_anchor: Option<(f64, f64)>,
-        outer: &raw_iris_focus::OuterIrisBoundary,
-        global_similarity: Option<raw_motion_octrees::NativeGlobalSimilarityEvidence>,
-    ) -> Option<SurfaceGazeSample> {
-        if outer.points.len() < 8 || !outer.angle.is_finite() {
-            return None;
-        }
-        let (major_radius, minor_radius, major_angle) = if outer.major_radius >= outer.minor_radius
-        {
-            (outer.major_radius, outer.minor_radius, outer.angle)
-        } else {
-            (
-                outer.minor_radius,
-                outer.major_radius,
-                outer.angle + std::f64::consts::FRAC_PI_2,
-            )
-        };
-        let rectified_area_px2 = rectified_ellipse_area_px2(major_radius, minor_radius)?;
-        let (area_bucket, bucketed_area_px2) = bucket_surface_area(rectified_area_px2)?;
-        let bucketed_face_radius_px = (bucketed_area_px2 / std::f64::consts::PI).sqrt();
-        let axis_ratio = (minor_radius / major_radius).clamp(0.0, 1.0);
-        let projected_normal_length = (1.0 - axis_ratio * axis_ratio).sqrt();
-        if !bucketed_face_radius_px.is_finite() || !projected_normal_length.is_finite() {
-            return None;
-        }
-
-        let stale = self
-            .last_observed
-            .is_some_and(|last| now.saturating_duration_since(last) > GAZE_SURFACE_RESET_AFTER);
-        let bucket_jump = self
-            .area_bucket
-            .is_some_and(|previous| (previous - area_bucket).abs() > GAZE_SURFACE_MAX_BUCKET_JUMP);
-        if stale {
-            self.clear_stale_motion_preserving_sign();
-        } else if bucket_jump {
-            if !self.consider_area_bucket_jump(area_bucket) {
-                // This source frame was processed and therefore keeps the
-                // established lineage alive, but its incompatible geometry
-                // is neither published nor allowed into motion history.
-                self.last_observed = Some(now);
-                self.kinematic_history.clear();
-                return None;
-            }
-            // A sustained new scale estimate invalidates both the floating
-            // contact and its direction/velocity arc. Commit one explicit
-            // epoch transition rather than resetting on every outlier.
-            self.clear_floating_point();
-            self.kinematic_history.clear();
-        } else {
-            self.pending_area_bucket = None;
-            self.pending_area_bucket_frames = 0;
-        }
-
-        let center_sensor = (
-            sensor_origin.0 as f64 + outer.center.0,
-            sensor_origin.1 as f64 + outer.center.1,
-        );
-        if !center_sensor.0.is_finite() || !center_sensor.1.is_finite() {
-            return None;
-        }
-        // The ellipse minor axis is the projected disk-normal axis. Its sign
-        // is ambiguous in one frame, yielding two possible camera-near
-        // surface points. Select the candidate conspicuously closer to the
-        // floating point; the independent pupil/limbus displacement seeds the
-        // sign on the first valid frame.
-        let projected_axis = (-major_angle.sin(), major_angle.cos());
-        let positive_offset = (
-            projected_axis.0 * bucketed_face_radius_px * projected_normal_length,
-            projected_axis.1 * bucketed_face_radius_px * projected_normal_length,
-        );
-        let negative_offset = (-positive_offset.0, -positive_offset.1);
-        let sign_anchor = pupil_limbus_gaze_anchor.filter(|anchor| {
-            let magnitude = anchor.0.hypot(anchor.1);
-            magnitude.is_finite()
-                && magnitude >= GAZE_SURFACE_MIN_SIGN_ANCHOR_MAGNITUDE
-                && projected_normal_length >= GAZE_SURFACE_MIN_SIGN_PROJECTION
-                && ((projected_axis.0 * anchor.0 + projected_axis.1 * anchor.1) / magnitude).abs()
-                    >= GAZE_SURFACE_MIN_SIGN_ANCHOR_ALIGNMENT
-        });
-        let previous_offset = self
-            .floating_center_sensor
-            .zip(self.floating_near_point_sensor)
-            .map(|(center, near)| (near.0 - center.0, near.1 - center.1));
-        let continuity_offset = if let Some(previous) = previous_offset {
-            let positive_distance =
-                (positive_offset.0 - previous.0).hypot(positive_offset.1 - previous.1);
-            let negative_distance =
-                (negative_offset.0 - previous.0).hypot(negative_offset.1 - previous.1);
-            if positive_distance <= negative_distance {
-                positive_offset
-            } else {
-                negative_offset
-            }
-        } else if let Some(anchor) = sign_anchor {
-            if positive_offset.0 * anchor.0 + positive_offset.1 * anchor.1 >= 0.0 {
-                positive_offset
-            } else {
-                negative_offset
-            }
-        } else if positive_offset.0 > 0.0
-            || (positive_offset.0.abs() <= 1.0e-12 && positive_offset.1 >= 0.0)
-        {
-            positive_offset
-        } else {
-            negative_offset
-        };
-        let sphere_radius = bucketed_face_radius_px * 1.83;
-        let slice_depth = (sphere_radius * sphere_radius
-            - bucketed_face_radius_px * bucketed_face_radius_px)
-            .max(0.0)
-            .sqrt();
-        let offsets = [positive_offset, negative_offset];
-        let candidates = offsets.map(|offset| {
-            let near = (center_sensor.0 + offset.0, center_sensor.1 + offset.1);
-            let normal = (
-                offset.0 / bucketed_face_radius_px,
-                offset.1 / bucketed_face_radius_px,
-            );
-            ContactSignHypothesis {
-                pivot_sensor: (
-                    center_sensor.0 - slice_depth * normal.0,
-                    center_sensor.1 - slice_depth * normal.1,
-                ),
-                near_sensor: near,
-                residual_ema: 0.0,
-                observations: 1,
-            }
-        });
-        let sign_state_before_contact = (
-            self.selected_sign_hypothesis,
-            self.sign_resolved,
-            self.sign_epoch,
-        );
-        if let Some(previous) = self.contact_sign_hypotheses {
-            let temporal_motion_reliable = global_similarity.is_some_and(|global| global.reliable);
-            let predict = |point: (f64, f64)| {
-                let Some(global) = global_similarity.filter(|global| global.reliable) else {
-                    return point;
-                };
-                let x = point.0 - f64::from(global.motion_center_sensor[0]);
-                let y = point.1 - f64::from(global.motion_center_sensor[1]);
-                (
-                    point.0
-                        + f64::from(global.motion.translation[0])
-                        + f64::from(global.motion.scale_delta) * x
-                        - f64::from(global.motion.rotation) * y,
-                    point.1
-                        + f64::from(global.motion.translation[1])
-                        + f64::from(global.motion.rotation) * x
-                        + f64::from(global.motion.scale_delta) * y,
-                )
-            };
-            let predicted = previous.map(|hypothesis| predict(hypothesis.pivot_sensor));
-            let error = |prediction: (f64, f64), candidate: ContactSignHypothesis| {
-                (prediction.0 - candidate.pivot_sensor.0)
-                    .hypot(prediction.1 - candidate.pivot_sensor.1)
-            };
-            let direction = |hypothesis: ContactSignHypothesis| {
-                let vector = (
-                    hypothesis.near_sensor.0 - hypothesis.pivot_sensor.0,
-                    hypothesis.near_sensor.1 - hypothesis.pivot_sensor.1,
-                );
-                let length = vector.0.hypot(vector.1);
-                (length.is_finite() && length > 1.0e-9)
-                    .then_some((vector.0 / length, vector.1 / length))
-            };
-            let direction_error = |left: ContactSignHypothesis, right: ContactSignHypothesis| {
-                direction(left)
-                    .zip(direction(right))
-                    .map(|(left, right)| {
-                        let transported = global_similarity
-                            .filter(|global| global.reliable)
-                            .map_or(left, |global| {
-                                let a = 1.0 + f64::from(global.motion.scale_delta);
-                                let b = f64::from(global.motion.rotation);
-                                let length = a.hypot(b).max(1.0e-12);
-                                (
-                                    (a * left.0 - b * left.1) / length,
-                                    (b * left.0 + a * left.1) / length,
-                                )
-                            });
-                        (transported.0 - right.0).hypot(transported.1 - right.1)
-                    })
-                    .unwrap_or(f64::INFINITY)
-            };
-            // Match physical identities by transported direction, including
-            // equivalent ellipse angles separated by PI. Absolute pivot
-            // proximity can exchange the two identities after a translation
-            // or fit jump, silently reversing gaze without a sign vote/epoch.
-            // Pivot residuals remain evidence for explicit sign decisions.
-            let (direct, crossed) = (
-                direction_error(previous[0], candidates[0])
-                    + direction_error(previous[1], candidates[1]),
-                direction_error(previous[0], candidates[1])
-                    + direction_error(previous[1], candidates[0]),
-            );
-            let assignment = if direct <= crossed { [0, 1] } else { [1, 0] };
-            let updated = std::array::from_fn(|index| {
-                let mut candidate = candidates[assignment[index]];
-                let residual = error(predicted[index], candidate);
-                candidate.residual_ema = if !temporal_motion_reliable {
-                    // Directional assignment is dimensionless. Do not mix it
-                    // into the pixel residual used to resolve a later frame
-                    // with independently measured whole-ROI motion.
-                    previous[index].residual_ema
-                } else if previous[index].observations <= 1 {
-                    residual
-                } else {
-                    0.75 * previous[index].residual_ema + 0.25 * residual
-                };
-                candidate.observations = previous[index].observations.saturating_add(1);
-                candidate
-            });
-            self.contact_sign_hypotheses = Some(updated);
-            let anchor_candidate = sign_anchor.map(|anchor| {
-                let score = |hypothesis: ContactSignHypothesis| {
-                    let offset = (
-                        hypothesis.near_sensor.0 - center_sensor.0,
-                        hypothesis.near_sensor.1 - center_sensor.1,
-                    );
-                    offset.0 * anchor.0 + offset.1 * anchor.1
-                };
-                usize::from(score(updated[1]) > score(updated[0]))
-            });
-            let temporal_residual_gap = (updated[0].residual_ema - updated[1].residual_ema).abs();
-            let temporal_resolution_threshold = global_similarity
-                .filter(|global| global.reliable)
-                .map_or(0.35, |global| {
-                    (4.0 * f64::from(global.motion.residual)).max(0.35)
-                });
-            let temporal_candidate = (sign_anchor.is_none()
-                && temporal_motion_reliable
-                && updated[0].observations >= 2
-                && temporal_residual_gap >= temporal_resolution_threshold)
-                .then(|| usize::from(updated[1].residual_ema < updated[0].residual_ema));
-            if let Some(candidate) = anchor_candidate {
-                // A RAW dark component may be an eyelid shadow. It can seed
-                // an unresolved branch, but overturning an established one
-                // also requires independent current-interval motion evidence.
-                let selected = self.selected_sign_hypothesis;
-                let corroborated = temporal_motion_reliable
-                    && error(predicted[selected], updated[selected])
-                        - error(predicted[candidate], updated[candidate])
-                        >= temporal_resolution_threshold;
-                if !self.sign_resolved || candidate == selected || corroborated {
-                    self.consider_sign_hypothesis(candidate);
-                } else {
-                    self.pending_sign_hypothesis = None;
-                    self.pending_sign_frames = 0;
-                }
-            } else if let Some(candidate) = temporal_candidate.filter(|_| !self.sign_resolved) {
-                // Whole-ROI motion can break the initial two-way tie, but the
-                // hypotheses above are persistent physical identities. Once a
-                // sign is resolved, re-ranking their historical residual EMAs
-                // must not hop from one identity to the other. Only a sustained
-                // pupil/contact anchor or the separate biomechanical validator
-                // below may overturn an established branch.
-                if candidate != self.selected_sign_hypothesis {
-                    self.selected_sign_hypothesis = candidate;
-                    self.sign_epoch = self.sign_epoch.wrapping_add(1);
-                }
-                self.pending_sign_hypothesis = None;
-                self.pending_sign_frames = 0;
-                self.sign_resolved = true;
-            } else {
-                self.pending_sign_hypothesis = None;
-                self.pending_sign_frames = 0;
-            }
-        } else {
-            self.contact_sign_hypotheses = Some(candidates);
-            self.selected_sign_hypothesis = usize::from(
-                (continuity_offset.0 - negative_offset.0)
-                    .hypot(continuity_offset.1 - negative_offset.1)
-                    < (continuity_offset.0 - positive_offset.0)
-                        .hypot(continuity_offset.1 - positive_offset.1),
-            );
-            self.pending_sign_hypothesis = None;
-            self.pending_sign_frames = 0;
-            self.sign_resolved = false;
-            if sign_anchor.is_some() {
-                // A single dark component can be a reflection or eyelid
-                // shadow.  Seed, but do not resolve, the selected antipode;
-                // only independent source frames can complete the vote.
-                self.consider_sign_hypothesis(self.selected_sign_hypothesis);
-            }
-        }
-        let mut reset_projection_smoothing = false;
-        if sign_state_before_contact
-            != (
-                self.selected_sign_hypothesis,
-                self.sign_resolved,
-                self.sign_epoch,
-            )
-        {
-            // The velocity history is expressed in the previously selected
-            // branch. Once independent pivot/anchor evidence establishes or
-            // changes the physical branch, that old history is not admissible
-            // evidence against the newly resolved sign.
-            self.kinematic_history.clear();
-            if sign_state_before_contact.0 != self.selected_sign_hypothesis {
-                self.floating_center_sensor = None;
-                self.floating_near_point_sensor = None;
-                reset_projection_smoothing = true;
-            }
-        }
-        // Always publish the persistent temporal identity. The pupil/limbus
-        // anchor seeds it and may challenge it over several frames, but must
-        // never bypass it for a one-frame sign decision.
-        let selected = self.contact_sign_hypotheses?[self.selected_sign_hypothesis];
-        let selected_offset = (
-            selected.near_sensor.0 - center_sensor.0,
-            selected.near_sensor.1 - center_sensor.1,
-        );
-        let raw_projected_gaze = (
-            selected_offset.0 / bucketed_face_radius_px,
-            selected_offset.1 / bucketed_face_radius_px,
-        );
-        let sign_correction = kinematic_gaze_sign_correction(
-            &self.kinematic_history,
-            now,
-            source_timestamp_ns,
-            center_sensor,
-            slice_depth,
-            raw_projected_gaze,
-            global_similarity,
-        );
-        let kinematic_candidate = if sign_correction.flipped_x {
-            1usize.saturating_sub(self.selected_sign_hypothesis)
-        } else {
-            self.selected_sign_hypothesis
-        };
-        let kinematic_switch_committed = sign_correction.resolved
-            && self.sign_resolved
-            && global_similarity.is_some_and(|global| global.reliable)
-            && self.consider_kinematic_sign_hypothesis(kinematic_candidate);
-        if kinematic_switch_committed {
-            // Never average opposite normals together. The first sample in a
-            // new sign epoch seeds both presentation smoothing and motion.
-            reset_projection_smoothing = true;
-        } else if !sign_correction.resolved
-            || !self.sign_resolved
-            || !global_similarity.is_some_and(|global| global.reliable)
-        {
-            self.pending_kinematic_sign_hypothesis = None;
-            self.pending_kinematic_sign_frames = 0;
-        }
-        // Publish only the persistent branch. A provisional kinematic vote is
-        // diagnostics, not an output sign; on the commit frame this lookup
-        // immediately moves to the newly selected antipode.
-        let selected = self.contact_sign_hypotheses?[self.selected_sign_hypothesis];
-        let selected_projected_gaze = (
-            (selected.near_sensor.0 - center_sensor.0) / bucketed_face_radius_px,
-            (selected.near_sensor.1 - center_sensor.1) / bucketed_face_radius_px,
-        );
-        let selected_offset = (
-            selected_projected_gaze.0 * bucketed_face_radius_px,
-            selected_projected_gaze.1 * bucketed_face_radius_px,
-        );
-        let implied_globe_center_sensor = (
-            center_sensor.0 - slice_depth * selected_projected_gaze.0,
-            center_sensor.1 - slice_depth * selected_projected_gaze.1,
-        );
-        self.kinematic_history.push_back(GazeKinematicFrame {
-            observed_at: now,
-            source_timestamp_ns,
-            ellipse_center_sensor: center_sensor,
-            projected_gaze: selected_projected_gaze,
-            implied_globe_center_sensor,
-        });
-        while self.kinematic_history.len() > GAZE_KINEMATIC_HISTORY_FRAMES {
-            self.kinematic_history.pop_front();
-        }
-        let camera_near_point_sensor = (
-            center_sensor.0 + selected_offset.0,
-            center_sensor.1 + selected_offset.1,
-        );
-        let alpha = if previous_offset.is_some() && !reset_projection_smoothing {
-            GAZE_SURFACE_AVERAGE_ALPHA
-        } else {
-            1.0
-        };
-        let floating_center_sensor = self
-            .floating_center_sensor
-            .map_or(center_sensor, |previous| {
-                blend_point(previous, center_sensor, alpha)
-            });
-        let floating_near_point_sensor = self
-            .floating_near_point_sensor
-            .map_or(camera_near_point_sensor, |previous| {
-                blend_point(previous, camera_near_point_sensor, alpha)
-            });
-        let projected_gaze = (
-            (floating_near_point_sensor.0 - floating_center_sensor.0) / bucketed_face_radius_px,
-            (floating_near_point_sensor.1 - floating_center_sensor.1) / bucketed_face_radius_px,
-        );
-        let relative_gaze = RelativeGazeVector::from_projected(projected_gaze.0, projected_gaze.1)?;
-
-        self.floating_center_sensor = Some(floating_center_sensor);
-        self.floating_near_point_sensor = Some(floating_near_point_sensor);
-        // Follow real perspective scale gradually. Comparing future fits to
-        // this slow physical anchor prevents a series of unrelated masks,
-        // each only moderately larger than the last, from ratcheting the
-        // accepted iris radius across the eye opening. A separately sustained
-        // discontinuity clears the anchor above and seeds its new family here.
-        self.area_bucket = Some(self.area_bucket.map_or(area_bucket, |previous| {
-            previous + (area_bucket - previous).clamp(-1, 1)
-        }));
-        self.last_observed = Some(now);
-        Some(SurfaceGazeSample {
-            source_timestamp_ns,
-            rectified_area_px2,
-            area_bucket,
-            bucketed_face_radius_px,
-            camera_near_point_sensor: floating_near_point_sensor,
-            relative_gaze,
-            sign_resolved: self.sign_resolved,
-            sign_epoch: self.sign_epoch,
-            kinematic_sign_correction: [kinematic_switch_committed; 2],
-        })
-    }
-
-    fn observe_keyed_with_global_similarity(
-        &mut self,
-        source_timestamp_ns: u64,
-        now: Instant,
-        sensor_origin: (u32, u32),
-        pupil_limbus_gaze_anchor: Option<(f64, f64)>,
-        outer: &raw_iris_focus::OuterIrisBoundary,
-        global_similarity: Option<raw_motion_octrees::NativeGlobalSimilarityEvidence>,
-    ) -> Option<SurfaceGazeSample> {
-        if self
-            .last_keyed_attempted_source_timestamp_ns
-            .is_some_and(|previous| source_timestamp_ns <= previous)
-        {
-            return self.last_keyed_sample;
-        }
-        let sample = self
-            .observe_with_global_similarity_at_source(
-                now,
-                Some(source_timestamp_ns),
-                sensor_origin,
-                pupil_limbus_gaze_anchor,
-                outer,
-                global_similarity,
-            )
-            .map(|mut sample| {
-                sample.source_timestamp_ns = Some(source_timestamp_ns);
-                sample
-            });
-        self.last_keyed_attempted_source_timestamp_ns = Some(source_timestamp_ns);
-        if sample.is_some() {
-            self.last_keyed_source_timestamp_ns = Some(source_timestamp_ns);
-        }
-        self.last_keyed_sample = sample;
-        sample
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -29309,258 +25139,6 @@ fn mouse_gaze_surface(frame: &EyeFrame) -> Option<SurfaceGazeSample> {
     .filter(|surface| surface.relative_gaze.is_camera_facing())
 }
 
-fn solve_3x3(mut matrix: [[f64; 4]; 3]) -> Option<[f64; 3]> {
-    for pivot in 0..3 {
-        let best = (pivot..3).max_by(|left, right| {
-            matrix[*left][pivot]
-                .abs()
-                .total_cmp(&matrix[*right][pivot].abs())
-        })?;
-        if matrix[best][pivot].abs() < 1.0e-9 {
-            return None;
-        }
-        matrix.swap(pivot, best);
-        let divisor = matrix[pivot][pivot];
-        for column in pivot..4 {
-            matrix[pivot][column] /= divisor;
-        }
-        for row in 0..3 {
-            if row == pivot {
-                continue;
-            }
-            let factor = matrix[row][pivot];
-            for column in pivot..4 {
-                matrix[row][column] -= factor * matrix[pivot][column];
-            }
-        }
-    }
-    Some([matrix[0][3], matrix[1][3], matrix[2][3]])
-}
-
-fn fit_affine_component(features: [(f64, f64); 4], outputs: [f64; 4]) -> Option<[f64; 3]> {
-    let mut normal = [[0.0; 4]; 3];
-    for (feature, output) in features.into_iter().zip(outputs) {
-        let row = [feature.0, feature.1, 1.0];
-        for y in 0..3 {
-            for x in 0..3 {
-                normal[y][x] += row[y] * row[x];
-            }
-            normal[y][3] += row[y] * output;
-        }
-    }
-    solve_3x3(normal)
-}
-
-fn fit_gaze_affine(features: [(f64, f64); 4], targets: [(f64, f64); 4]) -> Option<GazeAffine> {
-    if features
-        .iter()
-        .chain(targets.iter())
-        .any(|point| !point.0.is_finite() || !point.1.is_finite())
-    {
-        return None;
-    }
-    let mean = features.iter().fold((0.0, 0.0), |sum, feature| {
-        (sum.0 + feature.0, sum.1 + feature.1)
-    });
-    let mean = (
-        mean.0 / features.len() as f64,
-        mean.1 / features.len() as f64,
-    );
-    let scale = features.iter().fold((0.0, 0.0), |sum, feature| {
-        (
-            sum.0 + (feature.0 - mean.0).powi(2),
-            sum.1 + (feature.1 - mean.1).powi(2),
-        )
-    });
-    let scale = (
-        (scale.0 / features.len() as f64).sqrt(),
-        (scale.1 / features.len() as f64).sqrt(),
-    );
-    if !scale.0.is_finite() || !scale.1.is_finite() || scale.0 < 1.0e-9 || scale.1 < 1.0e-9 {
-        return None;
-    }
-    let normalized = features.map(|feature| {
-        (
-            (feature.0 - mean.0) / scale.0,
-            (feature.1 - mean.1) / scale.1,
-        )
-    });
-    let normalized_x = fit_affine_component(normalized, targets.map(|target| target.0))?;
-    let normalized_y = fit_affine_component(normalized, targets.map(|target| target.1))?;
-    let restore = |component: [f64; 3]| {
-        [
-            component[0] / scale.0,
-            component[1] / scale.1,
-            component[2] - component[0] * mean.0 / scale.0 - component[1] * mean.1 / scale.1,
-        ]
-    };
-    let x = restore(normalized_x);
-    let y = restore(normalized_y);
-    if x.iter()
-        .chain(y.iter())
-        .any(|coefficient| !coefficient.is_finite())
-    {
-        return None;
-    }
-    Some(GazeAffine { x, y })
-}
-
-fn fit_gaze_affine_least_squares(observations: &[((f64, f64), (f64, f64))]) -> Option<GazeAffine> {
-    if observations.len() < 3
-        || observations.iter().any(|(feature, target)| {
-            !feature.0.is_finite()
-                || !feature.1.is_finite()
-                || !target.0.is_finite()
-                || !target.1.is_finite()
-        })
-    {
-        return None;
-    }
-    let component = |axis: usize| {
-        let mut normal = [[0.0; 4]; 3];
-        for (feature, target) in observations {
-            let row = [feature.0, feature.1, 1.0];
-            let output = if axis == 0 { target.0 } else { target.1 };
-            for y in 0..3 {
-                for x in 0..3 {
-                    normal[y][x] += row[y] * row[x];
-                }
-                normal[y][3] += row[y] * output;
-            }
-        }
-        solve_3x3(normal)
-    };
-    let affine = GazeAffine {
-        x: component(0)?,
-        y: component(1)?,
-    };
-    affine
-        .x
-        .iter()
-        .chain(affine.y.iter())
-        .all(|coefficient| coefficient.is_finite())
-        .then_some(affine)
-}
-
-#[derive(Clone, Copy, Debug)]
-struct GazeAffineScore {
-    inliers: usize,
-    rms: f64,
-    robust_cost: f64,
-}
-
-fn gaze_affine_residual(affine: GazeAffine, observation: ((f64, f64), (f64, f64))) -> f64 {
-    let mapped = affine.map(observation.0);
-    (mapped.0 - observation.1 .0).hypot(mapped.1 - observation.1 .1)
-}
-
-fn score_gaze_affine(
-    affine: GazeAffine,
-    observations: &[((f64, f64), (f64, f64))],
-) -> Option<GazeAffineScore> {
-    let mut squared = 0.0;
-    let mut robust_cost = 0.0;
-    let mut inlier_targets = Vec::new();
-    for &observation in observations {
-        let residual = gaze_affine_residual(affine, observation);
-        if !residual.is_finite() {
-            continue;
-        }
-        let huber = VIRTUAL_MOUSE_AFFINE_INLIER_RESIDUAL;
-        robust_cost += if residual <= huber {
-            0.5 * residual * residual
-        } else {
-            huber * (residual - 0.5 * huber)
-        };
-        if residual <= VIRTUAL_MOUSE_AFFINE_INLIER_RESIDUAL {
-            squared += residual * residual;
-            inlier_targets.push(observation.1);
-        }
-    }
-    if !calibration_targets_have_required_coverage(inlier_targets.iter().copied()) {
-        return None;
-    }
-    Some(GazeAffineScore {
-        inliers: inlier_targets.len(),
-        rms: (squared / inlier_targets.len() as f64).sqrt(),
-        robust_cost,
-    })
-}
-
-fn fit_robust_gaze_affine(observations: &[((f64, f64), (f64, f64))]) -> Option<GazeAffine> {
-    if observations.len() < VIRTUAL_MOUSE_MIN_STABLE_TARGETS {
-        return None;
-    }
-    // Exact three-point seeds amplify noise in the small fixation field.
-    // Also consider the all-point least-squares fit, under the same gates.
-    let mut best: Option<(GazeAffine, GazeAffineScore)> =
-        fit_gaze_affine_least_squares(observations)
-            .filter(|affine| gaze_affine_linear_geometry_plausible(*affine))
-            .and_then(|affine| score_gaze_affine(affine, observations).map(|score| (affine, score)));
-    for first in 0..observations.len() {
-        for second in first + 1..observations.len() {
-            for third in second + 1..observations.len() {
-                let seed_observations = [
-                    observations[first],
-                    observations[second],
-                    observations[third],
-                ];
-                let Some(seed) = fit_gaze_affine_least_squares(&seed_observations) else {
-                    continue;
-                };
-                let inliers = observations
-                    .iter()
-                    .copied()
-                    .filter(|observation| {
-                        gaze_affine_residual(seed, *observation)
-                            <= VIRTUAL_MOUSE_AFFINE_INLIER_RESIDUAL
-                    })
-                    .collect::<Vec<_>>();
-                if !calibration_targets_have_required_coverage(
-                    inliers.iter().map(|observation| observation.1),
-                ) {
-                    continue;
-                }
-                let Some(refined) = fit_gaze_affine_least_squares(inliers.as_slice()) else {
-                    continue;
-                };
-                let Some(score) = score_gaze_affine(refined, observations) else {
-                    continue;
-                };
-                let replace = match best {
-                    None => true,
-                    Some((_, previous)) if score.inliers != previous.inliers => {
-                        score.inliers > previous.inliers
-                    }
-                    Some((_, previous))
-                        if (score.robust_cost - previous.robust_cost).abs() > 1.0e-12 =>
-                    {
-                        score.robust_cost < previous.robust_cost
-                    }
-                    Some((_, previous)) => score.rms < previous.rms,
-                };
-                if replace {
-                    best = Some((refined, score));
-                }
-            }
-        }
-    }
-    best.filter(|(affine, score)| {
-        score.inliers >= VIRTUAL_MOUSE_MIN_STABLE_TARGETS
-            && score.rms <= VIRTUAL_MOUSE_AFFINE_MAX_RMS
-            && gaze_affine_linear_geometry_plausible(*affine)
-    })
-    .map(|(affine, score)| {
-        eprintln!(
-            "mouse calibration robust 2D affine accepted {}/{} targets rms={:.4} screen fraction",
-            score.inliers,
-            observations.len(),
-            score.rms,
-        );
-        affine
-    })
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PacketKind {
     Context,
@@ -34623,6 +30201,7 @@ fn receive(
     let mut virtual_contact_surface_trackers: [SurfaceGazeTracker; 2] =
         std::array::from_fn(|_| SurfaceGazeTracker::default());
     let mut gaze_authority_generation = 0u64;
+    let mut source_clock_epoch = 0u64;
     let mut active_gaze_input_generation: Option<u64> = None;
     let mut shared_iris_radius_trackers: [SharedLimbusRadiusTracker; 2] =
         std::array::from_fn(|_| {
@@ -34918,6 +30497,7 @@ fn receive(
             // UI settings happen to be unchanged. Sequence numbers and the
             // receiver's surface/sign state must not bridge that boundary.
             gaze_authority_generation = gaze_authority_generation.wrapping_add(1);
+            source_clock_epoch = source_clock_epoch.wrapping_add(1);
             active_gaze_input_generation = None;
             sam31_tracking_epoch = sam31_tracking_epoch.wrapping_add(1);
             sam31_selection_started_ns = None;
@@ -36890,6 +32470,43 @@ fn receive(
                     && native_material_admissible
                     && native_specular_admissible
                     && native_scale_kinematically_supported;
+                let native_scale_admission = (segmentation_mode == SegmentationMode::Native
+                    && native_geometrically_strong && native_material_admissible && native_specular_admissible)
+                    .then(|| {
+                        shared_iris_radius_trackers[index].lock().map_or(
+                            LimbusRadiusAdmission::InvalidObservation,
+                            |mut tracker| tracker.observe_independent_ellipse_for_active_frame(
+                                now,
+                                LimbusRadiusObservation {
+                                    exposure: roi_evidence::ExposureKey {
+                                        roi: roi_evidence::RoiId(index as u32),
+                                        clock: roi_evidence::SourceClock { domain: 0, epoch: source_clock_epoch },
+                                        sequence: header.sequence,
+                                        timestamp_ns: header.timestamp_ns,
+                                    },
+                                    lineage: sam31_tracking_epoch,
+                                    ellipse_sensor_px: geometry::Ellipse {
+                                        center: (native_outer_iris.center.0 + header.sensor_x as f64,
+                                            native_outer_iris.center.1 + header.sensor_y as f64),
+                                        major_radius: native_outer_iris.major_radius,
+                                        minor_radius: native_outer_iris.minor_radius,
+                                        angle: native_outer_iris.angle,
+                                    },
+                                    confidence: (0.45 + 0.55 * native_diagnostics.analog_mean_certainty).clamp(0.0, 1.0),
+                                    complete_in_source_roi: limbus_complete_in_roi(
+                                        geometry::Ellipse {
+                                            center: native_outer_iris.center,
+                                            major_radius: native_outer_iris.major_radius,
+                                            minor_radius: native_outer_iris.minor_radius,
+                                            angle: native_outer_iris.angle,
+                                        },
+                                        (0, 0),
+                                        (header.width, header.height),
+                                    ),
+                                },
+                            ),
+                        )
+                    });
                 // A cold Native start is proposal-only until three mutually
                 // consistent strong conics establish the shared de-affined
                 // circular-radius posterior.  Feed those votes without
@@ -36897,7 +32514,7 @@ fn receive(
                 // An operator/fixed prior is already an independent authority
                 // and therefore bypasses this warm-up naturally.
                 let native_cold_radius_vote_recorded = if segmentation_mode
-                    != SegmentationMode::Driving
+                    == SegmentationMode::Clusters
                     && selected_iris_radius_prior.is_none()
                     && native_strong_limbus_measurement
                 {
@@ -37796,7 +33413,7 @@ fn receive(
                     // gaze, cursor, and temporal-radius consumers.
                     raw_iris_focus::OuterIrisBoundary::default()
                 } else if segmentation_mode == SegmentationMode::Native
-                    && (selected_iris_radius_prior.is_none() || !native_strong_limbus_measurement)
+                    && !native_scale_admission.is_some_and(LimbusRadiusAdmission::published)
                 {
                     // Keep the proposal visible in Native diagnostics, but do
                     // not publish it into pupil/gaze/cursor consumers until
@@ -37806,9 +33423,6 @@ fn receive(
                     native_outer_iris
                 };
                 let selected_iris_measurement_confidence = match segmentation_mode {
-                    SegmentationMode::Native if native_strong_limbus_measurement => Some(
-                        (0.45 + 0.55 * native_diagnostics.analog_mean_certainty).clamp(0.0, 1.0),
-                    ),
                     SegmentationMode::Sam31 if sam_boundary_selected => {
                         Some((sam_raw_support / SAM31_RAW_SUPPORT_DECISIVE).clamp(0.0, 1.0))
                     }
@@ -37820,18 +33434,40 @@ fn receive(
                     | SegmentationMode::Native
                     | SegmentationMode::ScleraRedCanny => None,
                 };
+                let mut selected_scale_admission = native_scale_admission;
                 if let Some(confidence) = selected_iris_measurement_confidence {
                     if !outer_iris.points.is_empty() {
                         let radius_admitted =
                             shared_iris_radius_trackers[index]
                                 .lock()
                                 .is_ok_and(|mut tracker| {
-                                    tracker.observe_strong_ellipse_for_active_frame(
-                                        now,
-                                        outer_iris.major_radius,
-                                        outer_iris.minor_radius,
-                                        confidence,
-                                    )
+                                    if sam_boundary_selected {
+                                        let result = sam_outer_result.expect("selected SAM boundary has a source result");
+                                        let admission = tracker.observe_independent_ellipse_for_active_frame(
+                                            now,
+                                            LimbusRadiusObservation {
+                                                exposure: roi_evidence::ExposureKey {
+                                                    roi: roi_evidence::RoiId(index as u32),
+                                                    clock: roi_evidence::SourceClock { domain: 0, epoch: source_clock_epoch },
+                                                    sequence: result.source_sequence,
+                                                    timestamp_ns: result.source_timestamp_ns,
+                                                },
+                                                lineage: result.tracking_epoch,
+                                                ellipse_sensor_px: result.sensor_outer_ellipse,
+                                                confidence,
+                                                complete_in_source_roi: sam31_limbus_complete_in_source_roi(result),
+                                            },
+                                        );
+                                        selected_scale_admission = Some(admission);
+                                        admission.published()
+                                    } else {
+                                        tracker.observe_strong_ellipse_for_active_frame(
+                                            now,
+                                            outer_iris.major_radius,
+                                            outer_iris.minor_radius,
+                                            confidence,
+                                        )
+                                    }
                                 });
                         if !radius_admitted {
                             // Keep the independently fitted conic in the
@@ -38027,6 +33663,15 @@ fn receive(
                                             )
                                         },
                                     )
+                                } else if native_scale_admission.is_some_and(|admission| !admission.published()) {
+                                    format!(
+                                        "NATIVE SCALE {}  OBS {:.1}PX EXPECT {}  PROPOSAL ONLY  G CYCLE",
+                                        native_scale_admission.unwrap().label(),
+                                        unbounded_native_radius_px.unwrap_or(0.0),
+                                        selected_iris_radius_prior.map_or_else(|| "COLD".to_string(), |prior| format!("{:.1}PX", prior.estimate_px)),
+                                    )
+                                } else if native_diagnostics.accepted && outer_iris.points.is_empty() {
+                                    "NATIVE CONTOUR FIT; ANATOMY NOT ADMITTED  PROPOSAL ONLY  G CYCLE".to_string()
                                 } else if native_diagnostics.accepted {
                                     format!(
                                         "NATIVE {}  RAYS {}/{} C{} O{} X{} L/R/B {}/{}/{}  FORCE {:+.1}PX P{:.2} C{:.2}{} N{}  {}US S{}X/{}X  G CYCLE",
@@ -38078,6 +33723,14 @@ fn receive(
                                         native_diagnostics.elapsed_us,
                                     )
                                 }
+                            }
+                            SegmentationMode::Sam31 if sam_boundary_selected && outer_iris.points.is_empty() => {
+                                format!(
+                                    "SAM31 SCALE {}  OBS {:.1}PX EXPECT {}  PROPOSAL ONLY  G CYCLE",
+                                    selected_scale_admission.map_or_else(|| "UNAVAILABLE".to_string(), LimbusRadiusAdmission::label),
+                                    unbounded_sam_radius_px.unwrap_or(0.0),
+                                    selected_iris_radius_prior.map_or_else(|| "COLD".to_string(), |prior| format!("{:.1}PX", prior.estimate_px)),
+                                )
                             }
                             SegmentationMode::Sam31 if sam_boundary_selected => {
                                 let result = sam_outer_result.unwrap();
@@ -38723,7 +34376,7 @@ fn receive(
                                     support.upper_fronto_parallel_radius_px,
                                     preferred,
                                     support.projection_source.label().to_ascii_uppercase(),
-                                    support.scale_bucket.0,
+                                    support.scale_bucket.index(),
                                     support.scale_bucket.lower_radius_px(),
                                     support.scale_bucket.upper_radius_px(),
                                     support.temporal_observations,
@@ -43396,7 +39049,9 @@ fn draw_eye_with_spatial_debug(
         // diagnostic pupil cannot infer the globe center. A manually locked
         // sphere may, however, visualize a directly observed clipped limbus
         // because the lock supplies the otherwise missing 3D authority.
-        let admitted_inner_ring: &[(f64, f64)] = if frame.detected_gaze_feature.is_some() {
+        let admitted_inner_ring: &[(f64, f64)] = if frame.segmentation_mode != SegmentationMode::Sam31
+            && frame.detected_gaze_feature.is_some()
+        {
             frame.inner_iris_points.as_slice()
         } else {
             &[]
@@ -43422,7 +39077,17 @@ fn draw_eye_with_spatial_debug(
                 })
             })
             .flatten();
-        let meridian_boundary: &[(f64, f64)] = if !frame.outer_iris_points.is_empty() {
+        let meridian_boundary: &[(f64, f64)] = if frame.segmentation_mode == SegmentationMode::Sam31 {
+            // Match virtual_contact_pose's lineage: the UI-only held SAM
+            // contact, or the exact SAM review ellipse. Native fallback rings
+            // must not deform an otherwise valid SAM cap (or its convexity
+            // proof) merely because they share this presentation frame.
+            if frame.presentation_pivot_held && frame.presentation_contact_boundary.len() >= 8 {
+                frame.presentation_contact_boundary.as_slice()
+            } else {
+                sam_contact_boundary.as_deref().unwrap_or(&[])
+            }
+        } else if !frame.outer_iris_points.is_empty() {
             frame.outer_iris_points.as_slice()
         } else if frame.segmentation_mode == SegmentationMode::Driving
             && frame.driving_limbus_edge_source_timestamp_ns == Some(frame.timestamp_ns)
@@ -43431,8 +39096,6 @@ fn draw_eye_with_spatial_debug(
             frame.driving_diagnostic_points.as_slice()
         } else if !frame.presentation_contact_boundary.is_empty() {
             frame.presentation_contact_boundary.as_slice()
-        } else if let Some(boundary) = sam_contact_boundary.as_deref() {
-            boundary
         } else if frame.projected_sphere_radius.is_some() {
             frame.roi_truncated_limbus_points.as_slice()
         } else {
@@ -44913,141 +40576,6 @@ fn draw_rotation_meridians(
     );
 }
 
-fn resolve_projected_surface_normal(
-    projected_gaze_pole: Option<(f64, f64)>,
-    boundary_center: (f64, f64),
-    rotation_center: (f64, f64),
-    slice_depth: f64,
-) -> Option<[f64; 3]> {
-    let projected_gaze_pole = projected_gaze_pole.filter(|pole| {
-        pole.0.is_finite() && pole.1.is_finite() && pole.0.hypot(pole.1) >= slice_depth * 0.03
-    });
-    let (mut normal_x, mut normal_y) = projected_gaze_pole
-        .map(|pole| (pole.0 / slice_depth, pole.1 / slice_depth))
-        .unwrap_or_else(|| {
-            (
-                (boundary_center.0 - rotation_center.0) / slice_depth,
-                (boundary_center.1 - rotation_center.1) / slice_depth,
-            )
-        });
-    let projected_length = normal_x.hypot(normal_y);
-    if !projected_length.is_finite() {
-        return None;
-    }
-    if projected_length < 0.03 {
-        return Some([0.0, 0.0, 1.0]);
-    }
-    if projected_length > 0.85 {
-        normal_x *= 0.85 / projected_length;
-        normal_y *= 0.85 / projected_length;
-    }
-    let normal_z_squared = 1.0 - normal_x * normal_x - normal_y * normal_y;
-    if !normal_z_squared.is_finite() || normal_z_squared <= 0.0 {
-        return None;
-    }
-    Some([normal_x, normal_y, normal_z_squared.sqrt()])
-}
-
-#[derive(Clone, Copy, Debug)]
-struct RotationRenderGeometry {
-    boundary_center: (f64, f64),
-    boundary_radius: f64,
-    sphere_radius: f64,
-    slice_depth: f64,
-    rotation_center: (f64, f64),
-}
-
-/// Proof that a proposed eye sphere exposes a convex surface to the camera.
-/// The limbus slice is the local Z=0 plane. A valid globe center is behind
-/// that plane, its outward pole is in the +Z half-space, and the supplied
-/// normal agrees with the radius from the globe center toward the visible
-/// limbus. Invalid higher-authority candidates must be discarded before
-/// scoring or presentation so a lower-authority valid branch can be tried.
-#[derive(Clone, Copy, Debug)]
-struct CameraFacingConvexContact {
-    rotation_center_z: f64,
-}
-
-/// Invalid solver candidates remain rejectable. An invalid contact submitted
-/// to the shared contact/laser renderer is a fatal invariant violation, even
-/// in an optimized build or on a worker thread.
-fn require_convex_contact_for_output(
-    geometry: RotationRenderGeometry,
-    relative_gaze: RelativeGazeVector,
-    rotation_center_z: Option<f64>,
-) -> CameraFacingConvexContact {
-    if let Some(proof) = camera_facing_convex_contact(geometry, relative_gaze, rotation_center_z) {
-        return proof;
-    }
-    let report = format!(
-        "FATAL CONTACT INVARIANT: inward/concave or invalid contact reached output\ngeometry={geometry:?}\ngaze={relative_gaze:?}\nrotation_center_z={rotation_center_z:?}\nbacktrace={}\n",
-        std::backtrace::Backtrace::force_capture(),
-    );
-    eprintln!("{report}");
-    #[cfg(not(test))]
-    {
-        // Runtime evidence stays outside the source checkout. Preserve each
-        // incident independently rather than overwriting the previous crash.
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
-        let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/outputs/contact-invariant");
-        let path = format!("{directory}/{}-{stamp}.txt", std::process::id());
-        let saved = std::fs::create_dir_all(directory)
-            .and_then(|()| std::fs::write(&path, &report));
-        match saved {
-            Ok(()) => eprintln!("fatal contact evidence saved: {path}"),
-            Err(error) => eprintln!("failed to save fatal contact evidence: {error}"),
-        }
-        // Abort is deliberate: a thread panic could otherwise leave the
-        // viewer running with a dead prediction or presentation worker.
-        std::process::abort();
-    }
-    #[cfg(test)]
-    panic!("{report}");
-}
-
-fn camera_facing_convex_contact(
-    geometry: RotationRenderGeometry,
-    relative_gaze: RelativeGazeVector,
-    proposed_rotation_center_z: Option<f64>,
-) -> Option<CameraFacingConvexContact> {
-    if !relative_gaze.is_camera_facing() {
-        return None;
-    }
-    let normal = relative_gaze.as_array();
-    let rotation_center_z =
-        proposed_rotation_center_z.unwrap_or(-geometry.slice_depth * relative_gaze.toward_camera);
-    if !rotation_center_z.is_finite() || rotation_center_z >= -CAMERA_FACING_CONTACT_EPSILON {
-        return None;
-    }
-
-    // The outward pole itself must emerge in front of the observed limbus
-    // plane; otherwise this is the rear/concave sphere intersection.
-    let apex_z = rotation_center_z + geometry.sphere_radius * relative_gaze.toward_camera;
-    if !apex_z.is_finite() || apex_z <= CAMERA_FACING_CONTACT_EPSILON {
-        return None;
-    }
-
-    let center_to_limbus = [
-        geometry.boundary_center.0 - geometry.rotation_center.0,
-        geometry.boundary_center.1 - geometry.rotation_center.1,
-        -rotation_center_z,
-    ];
-    let center_to_limbus_length =
-        (center_to_limbus[0].powi(2) + center_to_limbus[1].powi(2) + center_to_limbus[2].powi(2))
-            .sqrt();
-    if !center_to_limbus_length.is_finite()
-        || center_to_limbus_length <= CAMERA_FACING_CONTACT_EPSILON
-    {
-        return None;
-    }
-    let outward_alignment = dot3(normal, center_to_limbus) / center_to_limbus_length;
-    if !outward_alignment.is_finite() || outward_alignment <= CAMERA_FACING_CONTACT_EPSILON {
-        return None;
-    }
-    Some(CameraFacingConvexContact { rotation_center_z })
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EyeLaserStyle {
     /// A coupled, temporally constrained projected center is available.
@@ -45098,97 +40626,6 @@ impl VirtualContactAuthority {
             Self::SamEllipseProvisional => "SAM ELLIPSE",
         }
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ProvisionalSurfacePose {
-    rotation_center: (f64, f64),
-    relative_gaze: RelativeGazeVector,
-    sphere_radius: f64,
-}
-
-fn provisional_surface_pose(
-    surface_gaze: Option<SurfaceGazeSample>,
-    outer_prediction_points: &[(f64, f64)],
-) -> Option<ProvisionalSurfacePose> {
-    let surface_gaze = surface_gaze?;
-    if !surface_gaze.relative_gaze.is_camera_facing() {
-        return None;
-    }
-    if outer_prediction_points.len() < 8 {
-        return None;
-    }
-    let boundary_center = outer_prediction_points
-        .iter()
-        .fold((0.0, 0.0), |sum, point| (sum.0 + point.0, sum.1 + point.1));
-    let boundary_center = (
-        boundary_center.0 / outer_prediction_points.len() as f64,
-        boundary_center.1 / outer_prediction_points.len() as f64,
-    );
-    let projected_boundary_radius = outer_prediction_points
-        .iter()
-        .map(|point| (point.0 - boundary_center.0).hypot(point.1 - boundary_center.1))
-        .sum::<f64>()
-        / outer_prediction_points.len() as f64;
-    let sphere_radius = surface_gaze.bucketed_face_radius_px * 1.83;
-    let slice_depth_squared =
-        sphere_radius * sphere_radius - projected_boundary_radius * projected_boundary_radius;
-    if !sphere_radius.is_finite() || !slice_depth_squared.is_finite() || slice_depth_squared <= 0.0
-    {
-        return None;
-    }
-    let mut normal_x = surface_gaze.relative_gaze.right;
-    let mut normal_y = surface_gaze.relative_gaze.down;
-    let projected_length = normal_x.hypot(normal_y);
-    if !projected_length.is_finite() {
-        return None;
-    }
-    if projected_length > 0.85 {
-        normal_x *= 0.85 / projected_length;
-        normal_y *= 0.85 / projected_length;
-    }
-    let slice_depth = slice_depth_squared.sqrt();
-    Some(ProvisionalSurfacePose {
-        rotation_center: (
-            boundary_center.0 - slice_depth * normal_x,
-            boundary_center.1 - slice_depth * normal_y,
-        ),
-        relative_gaze: RelativeGazeVector::from_projected(normal_x, normal_y)?,
-        sphere_radius,
-    })
-}
-
-fn relative_gaze_for_contact(
-    rotation_center: (f64, f64),
-    projected_gaze_pole: Option<(f64, f64)>,
-    sphere_radius: Option<f64>,
-    boundary: &[(f64, f64)],
-    frame_width: usize,
-    frame_height: usize,
-    surface_fallback: Option<SurfaceGazeSample>,
-) -> Option<RelativeGazeVector> {
-    let geometry = resolve_rotation_render_geometry(
-        Some(rotation_center),
-        sphere_radius,
-        &[],
-        boundary,
-        frame_width,
-        frame_height,
-    );
-    if let Some(geometry) = geometry {
-        if let Some(normal) = resolve_projected_surface_normal(
-            projected_gaze_pole,
-            geometry.boundary_center,
-            geometry.rotation_center,
-            geometry.slice_depth,
-        ) {
-            return RelativeGazeVector::from_projected(normal[0], normal[1])
-                .filter(|gaze| gaze.is_camera_facing());
-        }
-    }
-    surface_fallback
-        .map(|surface| surface.relative_gaze)
-        .filter(|gaze| gaze.is_camera_facing())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -45552,69 +40989,6 @@ impl PresentationLaserLease {
     }
 }
 
-fn resolve_rotation_render_geometry(
-    rotation_center: Option<(f64, f64)>,
-    sphere_radius_override: Option<f64>,
-    inner_ring_points: &[(f64, f64)],
-    outer_prediction_points: &[(f64, f64)],
-    frame_width: usize,
-    frame_height: usize,
-) -> Option<RotationRenderGeometry> {
-    if outer_prediction_points.len() < 8 {
-        return None;
-    }
-    let boundary_center = outer_prediction_points
-        .iter()
-        .fold((0.0, 0.0), |sum, point| (sum.0 + point.0, sum.1 + point.1));
-    let boundary_center = (
-        boundary_center.0 / outer_prediction_points.len() as f64,
-        boundary_center.1 / outer_prediction_points.len() as f64,
-    );
-    let boundary_radius = outer_prediction_points
-        .iter()
-        .map(|point| (point.0 - boundary_center.0).hypot(point.1 - boundary_center.1))
-        .sum::<f64>()
-        / outer_prediction_points.len() as f64;
-    if !boundary_radius.is_finite() || boundary_radius < 4.0 {
-        return None;
-    }
-    let boundary_radius = boundary_radius.min(frame_width.min(frame_height) as f64 * 0.48);
-
-    const SPHERE_TO_RING_RADIUS: f64 = 1.83;
-    let sphere_radius = sphere_radius_override
-        .filter(|radius| radius.is_finite() && *radius > boundary_radius)
-        .unwrap_or(boundary_radius * SPHERE_TO_RING_RADIUS);
-    let slice_depth_squared = sphere_radius * sphere_radius - boundary_radius * boundary_radius;
-    if !slice_depth_squared.is_finite() || slice_depth_squared <= 0.0 {
-        return None;
-    }
-    let slice_depth = slice_depth_squared.sqrt();
-    let inferred_rotation_center = infer_rotation_center_from_inner_ring(
-        inner_ring_points,
-        boundary_center,
-        sphere_radius,
-        slice_depth,
-    );
-    // Callers only supply a projected center after an independently admitted
-    // motion lock, a manual XYZ lock, or the explicitly provisional limbus
-    // surface solve above. Coincidence with the ring center is the legitimate
-    // straight-at-camera case, not missing geometry.
-    let rotation_center = rotation_center
-        .filter(|center| center.0.is_finite() && center.1.is_finite())
-        .or(inferred_rotation_center)?;
-    if !rotation_center.0.is_finite() || !rotation_center.1.is_finite() {
-        return None;
-    }
-
-    Some(RotationRenderGeometry {
-        boundary_center,
-        boundary_radius,
-        sphere_radius,
-        slice_depth,
-        rotation_center,
-    })
-}
-
 fn ray_origin_lock_from_frame(eye: usize, frame: &EyeFrame) -> Option<LockedRayOrigin> {
     if !frame.presentation_contact_boundary.is_empty() {
         return None;
@@ -45837,42 +41211,6 @@ fn apply_presentation_pivot_contact(
             })
             .collect(),
     );
-}
-
-fn infer_rotation_center_from_inner_ring(
-    inner_ring_points: &[(f64, f64)],
-    boundary_center: (f64, f64),
-    sphere_radius: f64,
-    slice_depth: f64,
-) -> Option<(f64, f64)> {
-    if inner_ring_points.len() < 8 {
-        return None;
-    }
-    let inner_center = inner_ring_points
-        .iter()
-        .fold((0.0, 0.0), |sum, point| (sum.0 + point.0, sum.1 + point.1));
-    let apex = (
-        inner_center.0 / inner_ring_points.len() as f64,
-        inner_center.1 / inner_ring_points.len() as f64,
-    );
-    let apex_above_slice = sphere_radius - slice_depth;
-    if apex_above_slice <= 1.0e-6 {
-        return None;
-    }
-    let mut normal_x = (apex.0 - boundary_center.0) / apex_above_slice;
-    let mut normal_y = (apex.1 - boundary_center.1) / apex_above_slice;
-    let projected_length = normal_x.hypot(normal_y);
-    if !projected_length.is_finite() || projected_length < 0.03 {
-        return None;
-    }
-    if projected_length > 0.75 {
-        normal_x *= 0.75 / projected_length;
-        normal_y *= 0.75 / projected_length;
-    }
-    Some((
-        boundary_center.0 - slice_depth * normal_x,
-        boundary_center.1 - slice_depth * normal_y,
-    ))
 }
 
 fn timing_metric(
@@ -48555,9 +43893,21 @@ fn is_legacy_sam31_pupil_mode(value: &str) -> bool {
     )
 }
 
+fn startup_segmentation_mode(
+    requested: Option<SegmentationMode>,
+    sam_available: bool,
+) -> SegmentationMode {
+    requested.unwrap_or(if sam_available {
+        SegmentationMode::Sam31
+    } else {
+        SegmentationMode::Native
+    })
+}
+
 fn parse_config() -> Result<Config, String> {
     let segmentation_environment =
-        env::var("BUTTERCUP_SEGMENTATION_MODE").unwrap_or_else(|_| "native".to_string());
+        env::var("BUTTERCUP_SEGMENTATION_MODE").unwrap_or_default();
+    let mut requested_segmentation = SegmentationMode::parse(&segmentation_environment);
     let legacy_sam31_pupil = is_legacy_sam31_pupil_mode(&segmentation_environment);
     let environment_pair = |name: &str, default| {
         env::var(name)
@@ -48630,7 +43980,7 @@ fn parse_config() -> Result<Config, String> {
             .unwrap_or_default(),
         sam31_model: env::var_os("BUTTERCUP_SAM31_MODEL")
             .map(PathBuf::from)
-            .unwrap_or_default(),
+            .unwrap_or_else(sam31_outer::default_model_path),
         centimeter_scales: [None, None],
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -48660,6 +44010,7 @@ fn parse_config() -> Result<Config, String> {
                     "--segmentation must be native, sam31, clusters, driving, or vessel-features"
                         .to_string()
                 })?;
+                requested_segmentation = Some(config.segmentation);
                 if is_legacy_sam31_pupil_mode(requested) {
                     config.rough_pupil_center = RoughPupilCenterMode::Sam31;
                 }
@@ -48708,7 +44059,7 @@ fn parse_config() -> Result<Config, String> {
             }
             "-h" | "--help" => {
                 println!(
-                    "usage: buttercup-eye-viewer [OPTIONS]\n\nNo options are required for the standard Podbay camera. The default view uses a low-bandwidth GRAY16 sensor overview, two native RAW10 eye ROIs, Native segmentation, and automatic focus-eye selection.\n\noptional overrides: --camera HOST:PORT --vcm HOST:PORT --control PATH.sock --origin SENSOR_BAND_X,Y --left ABS_SENSOR_X,Y --right ABS_SENSOR_X,Y --eye WxH --window WxH --focus-eye auto|left|right --tracking FRAME.ppm --record FILE.tar --autofocus-armed --segmentation native|sam31|clusters|driving|vessel-features --rough-center iris-guided|raw-focus|sam31-center|mediapipe-acquire|mediapipe-continuous|driving-topology --driving-submode normal|double-sclera-10deg --global-format gray16|raw10 --model-stream PATH.sock --sam31-model FILE.pt\n\ncontrol commands: STATUS | SEGMENTATION NATIVE|SAM31|CLUSTERS|DRIVING|VESSEL-FEATURES | SEGMENTATION STATUS | IRIS STATUS | IRIS BOUNDS MINIMUM|MAXIMUM +/- | IRIS BOUNDS AUTO | PUPIL STATUS | PUPIL BOUNDS MINIMUM|MAXIMUM +/- | PUPIL BOUNDS DEFAULT | PUPIL CENTER MODE | PUPIL|IRIS RETICLE OFF|STATIC|PROJECTED|ON|TOGGLE | DRIVING NORMAL|DOUBLE-SCLERA-10DEG|STATUS | LEASE CLAIM OWNER TTL_MS | LEASE RENEW TOKEN TTL_MS | LEASE RELEASE TOKEN | LEASE STATUS | WITH TOKEN REACQUIRE | WITH TOKEN LINEAR SNAPSHOT | WITH TOKEN FOCUS EYE RIGHT|LEFT | WITH TOKEN FOCUS SET N | WITH TOKEN FOCUS AUTO | WITH TOKEN EXPORT RAW RIGHT /absolute/path.raw10 | EXPORT PRESENTATION /absolute/path.ppm | EXPORT STATUS"
+                    "usage: buttercup-eye-viewer [OPTIONS]\n\nNo options are required for the standard Podbay camera. The default view uses a low-bandwidth GRAY16 sensor overview, two native RAW10 eye ROIs, SAM31 segmentation when built with SAM support and local model/prompt/tracker assets (otherwise Native), and automatic focus-eye selection.\n\noptional overrides: --camera HOST:PORT --vcm HOST:PORT --control PATH.sock --origin SENSOR_BAND_X,Y --left ABS_SENSOR_X,Y --right ABS_SENSOR_X,Y --eye WxH --window WxH --focus-eye auto|left|right --tracking FRAME.ppm --record FILE.tar --autofocus-armed --segmentation native|sam31|clusters|driving|vessel-features --rough-center iris-guided|raw-focus|sam31-center|mediapipe-acquire|mediapipe-continuous|driving-topology --driving-submode normal|double-sclera-10deg --global-format gray16|raw10 --model-stream PATH.sock --sam31-model FILE.pt\n\ncontrol commands: STATUS | SEGMENTATION NATIVE|SAM31|CLUSTERS|DRIVING|VESSEL-FEATURES | SEGMENTATION STATUS | IRIS STATUS | IRIS BOUNDS MINIMUM|MAXIMUM +/- | IRIS BOUNDS AUTO | PUPIL STATUS | PUPIL BOUNDS MINIMUM|MAXIMUM +/- | PUPIL BOUNDS DEFAULT | PUPIL CENTER MODE | PUPIL|IRIS RETICLE OFF|STATIC|PROJECTED|ON|TOGGLE | DRIVING NORMAL|DOUBLE-SCLERA-10DEG|STATUS | LEASE CLAIM OWNER TTL_MS | LEASE RENEW TOKEN TTL_MS | LEASE RELEASE TOKEN | LEASE STATUS | WITH TOKEN REACQUIRE | WITH TOKEN LINEAR SNAPSHOT | WITH TOKEN FOCUS EYE RIGHT|LEFT | WITH TOKEN FOCUS SET N | WITH TOKEN FOCUS AUTO | WITH TOKEN EXPORT RAW RIGHT /absolute/path.raw10 | EXPORT PRESENTATION /absolute/path.ppm | EXPORT STATUS"
                 );
                 std::process::exit(0);
             }
@@ -48716,6 +44067,12 @@ fn parse_config() -> Result<Config, String> {
         }
         index += 1;
     }
+    // Resolve after CLI parsing so --sam31-model participates in availability,
+    // and both explicit CLI and environment mode selections take precedence.
+    config.segmentation = startup_segmentation_mode(
+        requested_segmentation,
+        sam31_outer::available_for_startup(&config.sam31_model),
+    );
     config
         .rough_pupil_center
         .compatibility(config.segmentation)
@@ -48900,6 +44257,9 @@ fn main() {
         Some("--offline-sam-sequence-eval") => {
             offline_segmentation_replay::sam_sequence_eval(env::args().skip(2))
         }
+        Some("--offline-sam-outline-export") => {
+            offline_segmentation_replay::sam_outline_export(env::args().skip(2))
+        }
         Some("--offline-sam-pupil-refit") => {
             offline_segmentation_replay::sam_pupil_refit(env::args().skip(2))
         }
@@ -48921,6 +44281,39 @@ fn main() {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn limbus_source_completeness_uses_rotated_extents_and_the_original_crop() {
+        let mut ellipse = geometry::Ellipse {
+            center: (3_210.0, 1_640.0),
+            major_radius: 110.0,
+            minor_radius: 60.0,
+            angle: 0.0,
+        };
+        assert!(limbus_complete_in_roi(ellipse, (3_000, 1_500), (420, 280)));
+        ellipse.center.0 = 3_100.0;
+        assert!(!limbus_complete_in_roi(ellipse, (3_000, 1_500), (420, 280)));
+        ellipse.angle = std::f64::consts::FRAC_PI_2;
+        assert!(limbus_complete_in_roi(ellipse, (3_000, 1_500), (420, 280)));
+        ellipse.center.1 = 1_600.0;
+        assert!(!limbus_complete_in_roi(ellipse, (3_000, 1_500), (420, 280)));
+    }
+
+    #[test]
+    fn startup_prefers_available_sam_and_otherwise_native() {
+        assert_eq!(startup_segmentation_mode(None, true), SegmentationMode::Sam31);
+        assert_eq!(startup_segmentation_mode(None, false), SegmentationMode::Native);
+    }
+
+    #[test]
+    fn startup_keeps_explicit_modes_even_when_sam_is_unavailable() {
+        for mode in [SegmentationMode::Native, SegmentationMode::Sam31,
+            SegmentationMode::Clusters, SegmentationMode::Driving, SegmentationMode::ScleraRedCanny] {
+            for available in [false, true] {
+                assert_eq!(startup_segmentation_mode(Some(mode), available), mode);
+            }
+        }
+    }
 
     #[test]
     fn wide_recovery_needs_joint_outer_and_semantic_non_regression() {
@@ -50372,8 +45765,20 @@ mod tests {
         // This independent posterior deliberately stands in for the shared
         // per-eye PupilSizeTracker owned by the receive loop.
         let mut pupil_size = PupilSizeTracker::default();
-        pupil_size.strong_log_ratios.extend([0.32f64.ln(); 3]);
-        let pupil_history_before = pupil_size.strong_log_ratios.clone();
+        let projection = test_pupil_projection((120.0, 90.0));
+        let pupil = test_supported_affine_pupil_boundary(
+            projection.center, 32.0, projection.minor_to_major, projection.angle,
+        );
+        for offset_ms in [0, 10, 20] {
+            let observed_at = now + Duration::from_millis(offset_ms);
+            let support = pupil_size.begin_frame(
+                observed_at, Some(projection.center), Some(projection), true, 0.08, 0.72,
+            );
+            assert!(pupil_size.observe_strong_boundary(
+                observed_at, &pupil, support, 1.0, true, true,
+            ));
+        }
+        let pupil_history_before = pupil_size.admitted_log_ratios().clone();
 
         driving.reset_mode_session();
         assert!(driving.pose.is_none());
@@ -50386,7 +45791,7 @@ mod tests {
             .begin_frame(now + Duration::from_millis(30), None)
             .expect("G mode changes must retain common physical-size evidence");
         assert!((retained.estimate_px - 62.0).abs() < 1.0e-9);
-        assert_eq!(pupil_size.strong_log_ratios, pupil_history_before);
+        assert_eq!(pupil_size.admitted_log_ratios(), &pupil_history_before);
     }
 
     fn synthetic_double_sclera_strip(center_degrees: f64) -> raw_iris_focus::LimbusPerimeterStrip {
@@ -53502,6 +48907,80 @@ mod tests {
     }
 
     #[test]
+    fn default_sam_view_draws_its_contact_without_laser_or_native_geometry() {
+        let ellipse = geometry::Ellipse {
+            center: (40.0, 30.0),
+            major_radius: 18.0,
+            minor_radius: 13.0,
+            angle: 0.2,
+        };
+        let proposals = sam31_outer::ProposalMasks {
+            source_sequence: 7,
+            source_timestamp_ns: 10_000,
+            source_sensor_origin: (3000, 2400),
+            source_width: 80,
+            source_height: 60,
+            source_raw: Arc::new(vec![512; 80 * 60]),
+            outer_fit: Some(sam31_outer::OuterMaskFitReview {
+                ellipse,
+                source_component_area_px: std::f64::consts::PI * 18.0 * 13.0,
+                retained_points: Arc::new(ellipse.dense_points(64)),
+                flat_tire_points: Arc::new(Vec::new()),
+                upper_flat_tire: false,
+                lower_flat_tire: false,
+            }),
+            ..sam31_outer::ProposalMasks::default()
+        };
+        let boundary = sam31_presentation_boundary_for_frame(
+            &proposals, 10_001, 3000, 2400, 80, 60,
+        ).unwrap();
+        let surface = SurfaceGazeTracker::default()
+            .observe(Instant::now(), (3000, 2400), None, &boundary).unwrap();
+        let mut frame = control_eye_frame(7);
+        frame.segmentation_mode = SegmentationMode::Sam31;
+        frame.timestamp_ns = 10_001;
+        frame.width = 80;
+        frame.height = 60;
+        frame.quad_color = Arc::new(vec![0x0012_3456; 80 * 60]);
+        frame.sam31_proposal_masks = Some(Arc::new(proposals));
+        frame.virtual_contact_surface_gaze = Some(surface);
+        frame.eye_laser_enabled = false;
+        let render = |frame: &EyeFrame, overlay| {
+            let mut pixels = vec![0; 200 * 160];
+            draw_eye_with_spatial_debug(
+                &mut pixels, 200, 160, frame, 20, 30, ViewMode::QuadColor,
+                "", true, true, 2, overlay, None,
+            );
+            pixels.iter().enumerate()
+                .filter_map(|(index, pixel)| (*pixel == 0x00ff_00ff).then_some(index))
+                .collect::<Vec<_>>()
+        };
+        let contact_pixels = render(&frame, RoiOverlayMode::default());
+        assert!(contact_pixels.len() > 40, "default SAM view must paint contact meridians with J off");
+
+        // A different Native circle may share the EyeFrame during fallback,
+        // but cannot change the SAM cap or its convexity proof.
+        frame.outer_iris_points = Arc::new(geometry::Ellipse {
+            center: (30.0, 26.0), major_radius: 29.0, minor_radius: 24.0, angle: 0.8,
+        }.dense_points(96));
+        assert_eq!(render(&frame, RoiOverlayMode::default()), contact_pixels);
+        assert!(render(&frame, RoiOverlayMode::Clean).is_empty());
+
+        frame.sensor_x += 1;
+        assert!(render(&frame, RoiOverlayMode::default()).is_empty(), "wrong-ROI SAM fit must not draw");
+        frame.sensor_x -= 1;
+        frame.timestamp_ns += SAM31_RESULT_MAX_AGE_NS + 1;
+        assert!(render(&frame, RoiOverlayMode::default()).is_empty(), "stale SAM fit must not draw");
+        frame.timestamp_ns = 10_001;
+        frame.virtual_contact_surface_gaze = Some(SurfaceGazeSample {
+            relative_gaze: RelativeGazeVector { toward_camera: -surface.relative_gaze.toward_camera,
+                ..surface.relative_gaze },
+            ..surface
+        });
+        assert!(render(&frame, RoiOverlayMode::default()).is_empty(), "concave contact must not draw");
+    }
+
+    #[test]
     fn sam_review_ellipse_exclusively_owns_virtual_contact_even_with_native_geometry() {
         let ellipse = sam31_outer::Ellipse {
             center: (40.0, 30.0),
@@ -54149,7 +49628,7 @@ mod tests {
 
     #[test]
     fn published_pupil_reticle_follows_the_common_raw_boundary_not_the_rough_seed() {
-        let support = PupilSizeReticle {
+        let support = PupilSizeSupport {
             center: (40.0, 45.0),
             projection_center: (50.0, 50.0),
             lower_fronto_parallel_radius_px: 10.0,
@@ -54443,7 +49922,7 @@ mod tests {
             assert!(!profile.show_native_diagnostics);
             assert!(!profile.show_censored_limbus);
             assert!(!profile.show_driving_diagnostics);
-            assert!(!profile.show_rotation_meridians);
+            assert!(profile.show_rotation_meridians);
             assert_eq!(profile.eyelid_overlay, SegmentationEyelidOverlay::None);
         }
 
@@ -57224,7 +52703,7 @@ mod tests {
             Some((202.0, 150.0)), &motion).unwrap();
         tracker.assimilate(now, origin, Some(projection), cold, Some((202.0, 150.0)),
             Some(decisive_pupil_center_measurement((202.0, 150.0))), &motion);
-        let original_relative = tracker.canonical_center;
+        let original_relative = tracker.canonical_center();
         let moved = test_pupil_projection((240.0, 116.0));
         let next = now + Duration::from_millis(33);
         let proposal = (252.0, 138.0);
@@ -57234,7 +52713,7 @@ mod tests {
         assert_eq!(prediction.transport_source, PupilCenterTransportSource::LimbusReacquisition);
         assert!(!prediction.transported_track, "paired proposals must not authorize held publication");
         assert!(tracker.assimilate(next, origin, Some(moved), prediction, Some(proposal), None, &motion).is_none());
-        assert_eq!(tracker.canonical_center, original_relative, "an unverified relocation trained relative state");
+        assert_eq!(tracker.canonical_center(), original_relative, "an unverified relocation trained relative state");
         assert_eq!(tracker.assimilate(next, origin, Some(moved), prediction, Some(proposal),
             Some(decisive_pupil_center_measurement(proposal)), &motion), Some(proposal));
     }
@@ -57250,7 +52729,7 @@ mod tests {
             Some((202.0, 150.0)), &motion).unwrap();
         tracker.assimilate(now, origin, Some(projection), cold, Some((202.0, 150.0)),
             Some(decisive_pupil_center_measurement((202.0, 150.0))), &motion);
-        let relative = tracker.canonical_center;
+        let relative = tracker.canonical_center();
         let jittered = test_pupil_projection((194.0, 128.0));
         let next = now + Duration::from_millis(33);
         let prediction = tracker.begin_frame(next, origin, (384, 256), Some(jittered),
@@ -57258,7 +52737,7 @@ mod tests {
         assert!(prediction.transported_track);
         assert_ne!(prediction.transport_source, PupilCenterTransportSource::LimbusReacquisition);
         tracker.assimilate(next, origin, Some(jittered), prediction, Some((206.0, 150.0)), None, &motion);
-        assert_eq!(tracker.canonical_center, relative);
+        assert_eq!(tracker.canonical_center(), relative);
     }
 
     #[test]
@@ -59129,7 +54608,7 @@ mod tests {
         assert_eq!(trained, 0);
         assert_eq!(rate_limited, 0);
         assert_eq!(trajectory_updates, 0);
-        assert_eq!(tracker.strong_log_ratios.len(), trained);
+        assert_eq!(tracker.admitted_log_ratios().len(), trained);
         let learned = tracker
             .begin_frame(
                 started + Duration::from_secs(3),
@@ -67563,7 +63042,7 @@ mod tests {
         assert!(!rejected.raw_diameter_qualified);
         assert!(!rejected.trajectory_updated);
         assert!(!rejected.trained_posterior);
-        assert!(radius_limiter.state.is_none());
+        assert!(radius_limiter.admitted_state().is_none());
 
         let mut opposed_arcs = test_affine_pupil_boundary_with_raw_classes(
             &[0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15],
@@ -67582,7 +63061,7 @@ mod tests {
         assert!(admitted.raw_diameter_qualified);
         assert!(admitted.trajectory_updated);
         assert!(admitted.trained_posterior);
-        assert!(radius_limiter.state.is_some());
+        assert!(radius_limiter.admitted_state().is_some());
     }
 
     #[test]
@@ -67671,7 +63150,7 @@ mod tests {
                 trained_posterior: true,
             }
         );
-        assert_eq!(size_tracker.strong_log_ratios.len(), 1);
+        assert_eq!(size_tracker.admitted_log_ratios().len(), 1);
 
         // This 50% jump is still inside the deliberately broad 8-72% hard
         // interval, so the physiological trajectory—not the hard gate—is
@@ -67699,7 +63178,7 @@ mod tests {
                 .abs()
                 < 1.0e-6
         );
-        assert_eq!(size_tracker.strong_log_ratios.len(), 1);
+        assert_eq!(size_tracker.admitted_log_ratios().len(), 1);
 
         // A later direct measurement on the admissible trajectory resumes
         // training normally; the rejection is not a sticky mode transition.
@@ -67717,7 +63196,7 @@ mod tests {
         );
         assert!(!recovered_admission.rate_limited);
         assert!(recovered_admission.trained_posterior);
-        assert_eq!(size_tracker.strong_log_ratios.len(), 2);
+        assert_eq!(size_tracker.admitted_log_ratios().len(), 2);
     }
 
     #[test]
@@ -67795,7 +63274,7 @@ mod tests {
             .unwrap()
             .value();
         assert!(stabilized <= 32.0 + 1.0e-9, "stabilized={stabilized}");
-        assert!((radius_limiter.state.unwrap().1 - stabilized / 50.0).abs() < 1.0e-12);
+        assert!((radius_limiter.admitted_state().unwrap().1 - stabilized / 50.0).abs() < 1.0e-12);
     }
 
     #[test]
@@ -67958,7 +63437,7 @@ mod tests {
             reliable,
         );
         assert!(baseline_admission.trajectory_updated);
-        let admitted_state = radius_limiter.state;
+        let admitted_state = radius_limiter.admitted_state();
 
         let soft = PupilEvidenceCondition {
             relative_focus: Some(0.10),
@@ -67980,7 +63459,7 @@ mod tests {
         assert!(!soft_admission.focus_size_qualified);
         assert!(!soft_admission.trajectory_updated);
         assert!(!soft_admission.trained_posterior);
-        assert_eq!(radius_limiter.state, admitted_state);
+        assert_eq!(radius_limiter.admitted_state(), admitted_state);
 
         // The limiter deliberately admits at most one ordinary 100 ms step
         // per publication even when the wall-clock gap is longer. Had the
@@ -68012,7 +63491,7 @@ mod tests {
 
         // R-frozen measurements are read-only for the same reason, even when
         // their focus and apparent resolution are otherwise excellent.
-        let frozen_state = radius_limiter.state;
+        let frozen_state = radius_limiter.admitted_state();
         let mut frozen_fit = make_boundary(18.0);
         let frozen_admission = stabilize_and_observe_pupil_size(
             &mut size_tracker,
@@ -68027,7 +63506,7 @@ mod tests {
         assert!(frozen_admission.focus_size_qualified);
         assert!(!frozen_admission.trajectory_updated);
         assert!(!frozen_admission.trained_posterior);
-        assert_eq!(radius_limiter.state, frozen_state);
+        assert_eq!(radius_limiter.admitted_state(), frozen_state);
     }
 
     #[test]
@@ -68086,8 +63565,8 @@ mod tests {
         );
         assert!(baseline_admission.trained_posterior);
         assert!(baseline_admission.limbus_geometry_qualified);
-        let admitted_state = radius_limiter.state;
-        assert_eq!(size_tracker.strong_log_ratios.len(), 1);
+        let admitted_state = radius_limiter.admitted_state();
+        assert_eq!(size_tracker.admitted_log_ratios().len(), 1);
 
         // This is a sharp, well-supported, plausibly sized circle, but its
         // center is 0.8 limbus major radii from G's projection center. It is
@@ -68107,8 +63586,8 @@ mod tests {
         assert!(!rejected.limbus_geometry_qualified);
         assert!(!rejected.trajectory_updated);
         assert!(!rejected.trained_posterior);
-        assert_eq!(radius_limiter.state, admitted_state);
-        assert_eq!(size_tracker.strong_log_ratios.len(), 1);
+        assert_eq!(radius_limiter.admitted_state(), admitted_state);
+        assert_eq!(size_tracker.admitted_log_ratios().len(), 1);
 
         let mut recovered = make_boundary((101.0, 80.0), 20.0);
         let recovered_admission = stabilize_and_observe_pupil_size(
@@ -68124,7 +63603,7 @@ mod tests {
         assert!(recovered_admission.limbus_geometry_qualified);
         assert!(recovered_admission.trajectory_updated);
         assert!(recovered_admission.trained_posterior);
-        assert_eq!(size_tracker.strong_log_ratios.len(), 2);
+        assert_eq!(size_tracker.admitted_log_ratios().len(), 2);
     }
 
     #[test]
@@ -68319,7 +63798,7 @@ mod tests {
                 .value();
         assert!((forced_radius - 25.0).abs() < 1.0e-9);
         assert!(pupil_radius_within_bounds(25.0, Some(tightened)));
-        assert_eq!(size_tracker.strong_log_ratios.len(), 1);
+        assert_eq!(size_tracker.admitted_log_ratios().len(), 1);
 
         // Resuming R recomputes the same explicit hard range. Because the
         // limiter restarted at that guide, a direct confirming measurement is
@@ -68347,7 +63826,7 @@ mod tests {
         );
         assert!(!confirmed_admission.rate_limited);
         assert!(confirmed_admission.trained_posterior);
-        assert_eq!(size_tracker.strong_log_ratios.len(), 2);
+        assert_eq!(size_tracker.admitted_log_ratios().len(), 2);
     }
 
     #[test]
@@ -68491,7 +63970,7 @@ mod tests {
             .is_none());
         assert_eq!(
             tracker
-                .cached_geometry
+                .active_geometry()
                 .unwrap()
                 .reference_limbus_fronto_parallel_radius_px
                 .value(),
@@ -69200,7 +64679,7 @@ mod tests {
             observation_trajectory_updated: true,
             observation_trained_posterior: true,
             evidence_condition: PupilEvidenceCondition::fully_reliable(60.0),
-            support: Some(PupilSizeReticle {
+            support: Some(PupilSizeSupport {
                 center: (90.0, 70.0),
                 projection_center: (90.0, 70.0),
                 lower_fronto_parallel_radius_px: 6.0,

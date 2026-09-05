@@ -13,30 +13,7 @@ pub const FLAG_FOCUS_SETTLED: u32 = 1 << 3;
 pub const FLAG_IDENTITY_PRESENT: u32 = 1 << 4;
 pub const FLAG_MOTION_COMPARABLE: u32 = 1 << 5;
 
-#[derive(Clone, Debug)]
-pub struct RawModelFrame {
-    pub eye_id: u32,
-    pub sequence: u64,
-    pub timestamp_ns: u64,
-    pub sensor_x: u32,
-    pub sensor_y: u32,
-    pub width: u32,
-    pub height: u32,
-    pub stride: u32,
-    pub flags: u32,
-    pub focus_target: u16,
-    pub focus_position: u16,
-    pub focus_generation: u32,
-    pub focus_score: f32,
-    pub motion_score: f32,
-    pub center_x: f32,
-    pub center_y: f32,
-    pub iris_radius: f32,
-    pub axis_ratio: f32,
-    pub axis_angle: f32,
-    pub point_count: u32,
-    pub payload: Arc<Vec<u8>>,
-}
+pub use crate::roi_evidence::RawModelFrame;
 
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes(bytes[offset..offset + 2].try_into().expect("u16 field"))
@@ -238,6 +215,8 @@ mod tests {
         frame.write_to(&mut bytes).unwrap();
         let decoded = RawModelFrame::read_from(&mut Cursor::new(bytes)).unwrap();
         assert_eq!(decoded.sequence, 42);
+        assert_eq!(decoded.timestamp_ns, frame.timestamp_ns);
+        assert_eq!(decoded.eye_id, frame.eye_id);
         assert_eq!(decoded.sensor_x, 1000);
         assert_eq!(decoded.payload.as_slice(), [1, 2, 3, 4, 5]);
     }

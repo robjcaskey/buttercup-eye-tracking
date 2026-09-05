@@ -8,7 +8,6 @@
 //! exist in the live path. Offline diagnostics retain the legacy multi-adapter
 //! filmstrip machinery for controlled comparisons.
 
-use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -18,6 +17,27 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 #[cfg(feature = "sam31")]
 use std::time::Instant;
+
+pub use crate::geometry::Ellipse;
+pub use crate::conic_solver::OuterContourScaleContext;
+// Compatibility entry point for the existing offline tools.
+#[allow(unused_imports)]
+pub use crate::conic_solver::fit_trusted_arc_points;
+pub use crate::outline_conic_segments::ContourFitEvidence as OuterMaskFitReview;
+use crate::geometry::ellipse_coordinate;
+use crate::conic_solver::{
+    moments_ellipse, normalize_ellipse, plausible_ellipse, ellipse_support_summary, median,
+};
+#[cfg(test)]
+use crate::conic_solver::{
+    robust_contour_fit, NumpyPcg64, ConicArcConstraints, robust_ransac_ellipse,
+};
+use crate::outline_conic_segments::{
+    native_component_contour, sample_closed_contour,
+    deflattened_mask_fit_with_context, deflattened_mask_fit_with_noise,
+};
+#[cfg(test)]
+use crate::outline_conic_segments::deflattened_mask_fit;
 
 pub const HISTORY_FRAMES: usize = 5;
 pub const FRAME_WIDTH: usize = 384;
@@ -50,6 +70,28 @@ pub fn default_model_path() -> PathBuf {
     } else {
         PathBuf::from("data/models/sam31_semantic_video_features_u8.pt")
     }
+}
+
+fn prompt_bundle_path(model: &Path) -> PathBuf {
+    std::env::var_os("BUTTERCUP_SAM31_PROMPT_BUNDLE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| model.with_file_name("sam31_semantic_prompts_cuda_bf16.pt"))
+}
+
+fn tracker_bundle_path() -> PathBuf {
+    std::env::var_os("BUTTERCUP_SAM31_TRACKER_BUNDLE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("data/models/sam31_tracker_weights.pt"))
+}
+
+/// Cheap startup eligibility check, not a model/CUDA warmup. Explicit SAM
+/// requests still report runtime errors instead of silently changing modes.
+pub fn available_for_startup(model: &Path) -> bool {
+    startup_assets_available(model, &prompt_bundle_path(model), &tracker_bundle_path())
+}
+
+fn startup_assets_available(model: &Path, prompts: &Path, tracker: &Path) -> bool {
+    cfg!(feature = "sam31") && model.is_file() && prompts.is_file() && tracker.is_file()
 }
 
 /// Keep offline reports explicit about the otherwise process-local settings.
@@ -288,33 +330,6 @@ fn corrected_hot_pixel_frames(
         .collect()
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Ellipse {
-    pub center: (f64, f64),
-    pub major_radius: f64,
-    pub minor_radius: f64,
-    pub angle: f64,
-}
-
-impl Ellipse {
-    pub fn dense_points(self, count: usize) -> Vec<(f64, f64)> {
-        let count = count.max(8);
-        let (sin_angle, cos_angle) = self.angle.sin_cos();
-        (0..count)
-            .map(|index| {
-                let phase = std::f64::consts::TAU * index as f64 / count as f64;
-                let (sin_phase, cos_phase) = phase.sin_cos();
-                let x = self.major_radius * cos_phase;
-                let y = self.minor_radius * sin_phase;
-                (
-                    self.center.0 + cos_angle * x - sin_angle * y,
-                    self.center.1 + sin_angle * x + cos_angle * y,
-                )
-            })
-            .collect()
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProposalAdapter {
     QuadRgb,
@@ -459,61 +474,6 @@ pub struct SemanticProposalMasks {
     pub masks: Vec<ProposalMask>,
 }
 
-/// Exact geometric evidence extracted from the selected OUTER IRIS DISK
-/// answer.  Points are expressed in the native RAW ROI coordinate system,
-/// after scaling the model mask back to the source allocation.  A flat-tire
-/// point belongs to a long, physically implausible low-curvature occlusion
-/// chord at any orientation (including upper/lower lids) and is deliberately
-/// excluded from the ellipse fit.
-#[derive(Clone, Debug)]
-pub struct OuterMaskFitReview {
-    pub ellipse: Ellipse,
-    /// Area of the connected semantic-mask component in native ROI pixels.
-    /// Comparing this with PI*a*b exposes fits extrapolated from a much
-    /// larger eyelid/whole-eye object without assuming the projected limbus
-    /// itself must be circular.
-    pub source_component_area_px: f64,
-    pub retained_points: Arc<Vec<(f64, f64)>>,
-    pub flat_tire_points: Arc<Vec<(f64, f64)>>,
-    pub upper_flat_tire: bool,
-    pub lower_flat_tire: bool,
-}
-
-/// Frozen current-frame support for recovering a physical limbus from an
-/// occluded semantic-mask contour.  Radii are the fronto-parallel radius of
-/// the circular limbus (the larger projected semi-axis under weak
-/// perspective), after transporting the previous frame by independent 2D
-/// affine image scale.  The contour itself never widens this interval.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct OuterContourScaleContext {
-    pub estimated_fronto_parallel_radius_px: f64,
-    pub minimum_fronto_parallel_radius_px: f64,
-    pub maximum_fronto_parallel_radius_px: f64,
-}
-
-impl OuterContourScaleContext {
-    pub fn new(estimate: f64, minimum: f64, maximum: f64) -> Option<Self> {
-        (estimate.is_finite()
-            && minimum.is_finite()
-            && maximum.is_finite()
-            && minimum >= 4.0
-            && maximum > minimum
-            && (minimum..=maximum).contains(&estimate))
-        .then_some(Self {
-            estimated_fronto_parallel_radius_px: estimate,
-            minimum_fronto_parallel_radius_px: minimum,
-            maximum_fronto_parallel_radius_px: maximum,
-        })
-    }
-
-    fn admits(self, ellipse: Ellipse) -> bool {
-        let radius = ellipse.major_radius.max(ellipse.minor_radius);
-        radius.is_finite()
-            && (self.minimum_fronto_parallel_radius_px..=self.maximum_fronto_parallel_radius_px)
-                .contains(&radius)
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct ProposalMasks {
     /// Caller-owned tracking session generation. Results from a previous
@@ -646,22 +606,23 @@ pub struct OfflineVideoReviewFrame {
     pub propagated: bool,
 }
 
-/// Deterministically refit an ellipse to contour samples admitted by an
-/// offline semantic evidence gate.  The caller remains responsible for
-/// enforcing its scale/pose prior before publishing the result.
-pub fn fit_trusted_arc_points(points: &[(f64, f64)]) -> Option<Ellipse> {
-    if points.len() < 10 {
-        return None;
-    }
-    let mut random = NumpyPcg64::baseline_fit_stream();
-    let robust = robust_ransac_ellipse(points, &mut random)?;
-    let inliers = points
-        .iter()
-        .zip(robust.inliers.iter())
-        .filter_map(|(&point, &inlier)| inlier.then_some(point))
-        .collect::<Vec<_>>();
-    let ellipse = robust_contour_fit(&inliers, robust.ellipse).unwrap_or(robust.ellipse);
-    plausible_ellipse(ellipse).then_some(ellipse)
+/// Offline-only inspection before any contour/ellipse rejection. This keeps
+/// failed detector outlines available for testing alternate arc combiners.
+/// It does not change live selection, tracking memory, or publication gates.
+#[cfg(feature = "sam31")]
+pub fn export_native_outline_sequence(
+    model: &Path,
+    frames: &[Arc<RawFrame>],
+) -> Result<serde_json::Value, String> {
+    runtime::export_native_outline_sequence(model, frames)
+}
+
+#[cfg(not(feature = "sam31"))]
+pub fn export_native_outline_sequence(
+    _model: &Path,
+    _frames: &[Arc<RawFrame>],
+) -> Result<serde_json::Value, String> {
+    Err("SAM31 support is not compiled in; rebuild with --features sam31".to_string())
 }
 
 /// Run an arbitrary-size prompt bundle synchronously for an offline trial.
@@ -1103,8 +1064,7 @@ impl Client {
         }
         let prompt_bundle = prompt_bundle_override
             .map(|path| path.as_ref().to_path_buf())
-            .or_else(|| std::env::var_os("BUTTERCUP_SAM31_PROMPT_BUNDLE").map(PathBuf::from))
-            .unwrap_or_else(|| model.with_file_name("sam31_semantic_prompts_cuda_bf16.pt"));
+            .unwrap_or_else(|| prompt_bundle_path(&model));
         if !prompt_bundle.is_file() {
             return Err(format!(
                 "SAM31 semantic prompt bundle not found: {}",
@@ -1415,7 +1375,6 @@ fn pupil_raw_support_is_sufficient(support: RawRingSupport) -> bool {
         && support.strong_sectors >= 4
 }
 
-
 fn raw_ring_support_below_ceiling(
     image: &FloatImage,
     ellipse: Ellipse,
@@ -1526,17 +1485,6 @@ fn model_review_in_source(mut review: OuterMaskFitReview, width: usize) -> Outer
     }
     review.source_component_area_px *= scale * scale;
     review
-}
-
-fn ellipse_coordinate(point: (f64, f64), ellipse: Ellipse) -> f64 {
-    let (angle_sine, angle_cosine) = ellipse.angle.sin_cos();
-    let dx = point.0 - ellipse.center.0;
-    let dy = point.1 - ellipse.center.1;
-    let local_x = angle_cosine * dx + angle_sine * dy;
-    let local_y = -angle_sine * dx + angle_cosine * dy;
-    ((local_x / ellipse.major_radius.max(1.0)).powi(2)
-        + (local_y / ellipse.minor_radius.max(1.0)).powi(2))
-    .sqrt()
 }
 
 fn outer_limbus_candidate_supersedes(
@@ -1818,7 +1766,6 @@ fn deflattened_pupil_component(
         angle: fitted.angle,
     })
 }
-
 
 #[derive(Default, Debug)]
 pub struct PupilFitDiagnostics {
@@ -2899,6 +2846,20 @@ fn single_frame_mask_contour(
     ordered_component_contour(&component, wide_width, mask_height, HISTORY_FRAMES - 1)
 }
 
+fn native_outline_points(
+    mask: &[u8], mask_width: usize, mask_height: usize,
+    source_width: usize, source_height: usize,
+) -> Vec<(f64, f64)> {
+    if source_width == 0 || source_height == 0 {
+        return Vec::new();
+    }
+    let contour = single_frame_mask_contour(mask, mask_width, mask_height);
+    sample_closed_contour(&contour, 256).into_iter().map(|(x, y)| (
+        (x + 0.5) * source_width as f64 / FRAME_WIDTH as f64 - 0.5,
+        (y + 0.5) * source_height as f64 / FRAME_HEIGHT as f64 - 0.5,
+    )).collect()
+}
+
 #[derive(Clone, Copy)]
 struct MaskCandidate {
     query: usize,
@@ -3048,13 +3009,6 @@ fn largest_tile_component(
     best
 }
 
-#[derive(Clone, Copy)]
-struct BoundaryEdge {
-    start: (i32, i32),
-    end: (i32, i32),
-    owner: usize,
-}
-
 fn ordered_component_contour_fallback(
     component: &[usize],
     mask_width: usize,
@@ -3072,149 +3026,6 @@ fn ordered_component_contour_fallback(
             )
         })
         .collect()
-}
-
-fn native_component_contour(
-    component: &[usize],
-    mask_width: usize,
-    mask_height: usize,
-) -> Vec<(f64, f64)> {
-    if component.len() < 5 {
-        return Vec::new();
-    }
-    let mut membership = vec![false; mask_width * mask_height];
-    for &index in component {
-        membership[index] = true;
-    }
-    let mut sorted_component = component.to_vec();
-    sorted_component.sort_unstable();
-    let mut edges = Vec::<BoundaryEdge>::new();
-    for index in sorted_component {
-        let x = index % mask_width;
-        let y = index / mask_width;
-        let x0 = x as i32;
-        let y0 = y as i32;
-        if y == 0 || !membership[index - mask_width] {
-            edges.push(BoundaryEdge {
-                start: (x0, y0),
-                end: (x0 + 1, y0),
-                owner: index,
-            });
-        }
-        if x + 1 == mask_width || !membership[index + 1] {
-            edges.push(BoundaryEdge {
-                start: (x0 + 1, y0),
-                end: (x0 + 1, y0 + 1),
-                owner: index,
-            });
-        }
-        if y + 1 == mask_height || !membership[index + mask_width] {
-            edges.push(BoundaryEdge {
-                start: (x0 + 1, y0 + 1),
-                end: (x0, y0 + 1),
-                owner: index,
-            });
-        }
-        if x == 0 || !membership[index - 1] {
-            edges.push(BoundaryEdge {
-                start: (x0, y0 + 1),
-                end: (x0, y0),
-                owner: index,
-            });
-        }
-    }
-    let mut outgoing = HashMap::<(i32, i32), Vec<usize>>::new();
-    for (index, edge) in edges.iter().enumerate() {
-        outgoing.entry(edge.start).or_default().push(index);
-    }
-    let mut used = vec![false; edges.len()];
-    let mut best_vertices = Vec::<(i32, i32)>::new();
-    let mut best_owners = Vec::<usize>::new();
-    let mut best_area = 0.0f64;
-    for first in 0..edges.len() {
-        if used[first] {
-            continue;
-        }
-        let start = edges[first].start;
-        let mut current = first;
-        let mut vertices = Vec::new();
-        let mut owners = Vec::new();
-        for _ in 0..=edges.len() {
-            if used[current] {
-                break;
-            }
-            let edge = edges[current];
-            used[current] = true;
-            vertices.push(edge.start);
-            owners.push(edge.owner);
-            if edge.end == start {
-                break;
-            }
-            let Some(candidates) = outgoing.get(&edge.end) else {
-                break;
-            };
-            let incoming = (edge.end.0 - edge.start.0, edge.end.1 - edge.start.1);
-            let next = candidates
-                .iter()
-                .copied()
-                .filter(|&candidate| !used[candidate])
-                .max_by_key(|&candidate| {
-                    let candidate = edges[candidate];
-                    let direction = (
-                        candidate.end.0 - candidate.start.0,
-                        candidate.end.1 - candidate.start.1,
-                    );
-                    let cross = incoming.0 * direction.1 - incoming.1 * direction.0;
-                    let dot = incoming.0 * direction.0 + incoming.1 * direction.1;
-                    match (cross.signum(), dot.signum()) {
-                        (1, _) => 3,
-                        (0, 1) => 2,
-                        (-1, _) => 1,
-                        _ => 0,
-                    }
-                });
-            let Some(next) = next else {
-                break;
-            };
-            current = next;
-        }
-        if vertices.len() < 5 || edges[current].end != start {
-            continue;
-        }
-        let twice_area = vertices
-            .iter()
-            .zip(vertices.iter().cycle().skip(1))
-            .take(vertices.len())
-            .map(|(first, second)| {
-                first.0 as f64 * second.1 as f64 - second.0 as f64 * first.1 as f64
-            })
-            .sum::<f64>();
-        let area = 0.5 * twice_area.abs();
-        if area > best_area {
-            best_area = area;
-            best_vertices = vertices;
-            best_owners = owners;
-        }
-    }
-    let _ = best_vertices;
-    let mut contour = Vec::with_capacity(best_owners.len());
-    for owner in best_owners {
-        let point = ((owner % mask_width) as f64, (owner / mask_width) as f64);
-        if contour.last().copied() != Some(point) {
-            contour.push(point);
-        }
-    }
-    if contour.len() >= 5 {
-        if let Some(start) = (0..contour.len()).min_by(|&first, &second| {
-            contour[first]
-                .1
-                .total_cmp(&contour[second].1)
-                .then_with(|| contour[first].0.total_cmp(&contour[second].0))
-        }) {
-            contour.rotate_left(start);
-        }
-    }
-    contour
 }
 
 #[cfg(feature = "sam31")]
@@ -3302,1099 +3113,6 @@ fn low_to_tile_point(
             - tile as f64 * FRAME_WIDTH as f64,
         (y as f64 + 0.5) * FRAME_HEIGHT as f64 / mask_height as f64 - 0.5,
     )
-}
-
-fn moments_ellipse(points: &[(f64, f64)]) -> Option<Ellipse> {
-    if points.len() < 20 {
-        return None;
-    }
-    let count = points.len() as f64;
-    let center = points
-        .iter()
-        .fold((0.0, 0.0), |sum, point| (sum.0 + point.0, sum.1 + point.1));
-    let center = (center.0 / count, center.1 / count);
-    let mut xx = 0.0;
-    let mut xy = 0.0;
-    let mut yy = 0.0;
-    for &(x, y) in points {
-        let dx = x - center.0;
-        let dy = y - center.1;
-        xx += dx * dx;
-        xy += dx * dy;
-        yy += dy * dy;
-    }
-    xx /= count;
-    xy /= count;
-    yy /= count;
-    let root = ((xx - yy).powi(2) + 4.0 * xy * xy).sqrt();
-    let lambda_major = ((xx + yy + root) * 0.5).max(1.0);
-    let lambda_minor = ((xx + yy - root) * 0.5).max(1.0);
-    Some(Ellipse {
-        center,
-        major_radius: 2.0 * lambda_major.sqrt(),
-        minor_radius: 2.0 * lambda_minor.sqrt(),
-        angle: 0.5 * (2.0 * xy).atan2(xx - yy),
-    })
-}
-
-fn solve_five(mut matrix: [[f64; 5]; 5], mut rhs: [f64; 5]) -> Option<[f64; 5]> {
-    for pivot in 0..5 {
-        let row = (pivot..5).max_by(|&first, &second| {
-            matrix[first][pivot]
-                .abs()
-                .partial_cmp(&matrix[second][pivot].abs())
-                .unwrap_or(CmpOrdering::Equal)
-        })?;
-        if matrix[row][pivot].abs() < 1e-12 {
-            return None;
-        }
-        if row != pivot {
-            matrix.swap(row, pivot);
-            rhs.swap(row, pivot);
-        }
-        let divisor = matrix[pivot][pivot];
-        for column in pivot..5 {
-            matrix[pivot][column] /= divisor;
-        }
-        rhs[pivot] /= divisor;
-        for row in 0..5 {
-            if row == pivot {
-                continue;
-            }
-            let factor = matrix[row][pivot];
-            for column in pivot..5 {
-                matrix[row][column] -= factor * matrix[pivot][column];
-            }
-            rhs[row] -= factor * rhs[pivot];
-        }
-    }
-    Some(rhs)
-}
-
-fn robust_contour_fit(points: &[(f64, f64)], initial: Ellipse) -> Option<Ellipse> {
-    if points.len() < 24 {
-        return None;
-    }
-    let mut parameters = [
-        initial.center.0,
-        initial.center.1,
-        initial.major_radius.max(8.0),
-        initial.minor_radius.max(8.0),
-        initial.angle,
-    ];
-    for _ in 0..14 {
-        let (sin_angle, cos_angle) = parameters[4].sin_cos();
-        let major = parameters[2].max(8.0);
-        let minor = parameters[3].max(8.0);
-        let major2 = major * major;
-        let minor2 = minor * minor;
-        let mut normal = [[0.0f64; 5]; 5];
-        let mut gradient = [0.0f64; 5];
-        for &(x, y) in points {
-            let dx = x - parameters[0];
-            let dy = y - parameters[1];
-            let xp = cos_angle * dx + sin_angle * dy;
-            let yp = -sin_angle * dx + cos_angle * dy;
-            let residual = xp * xp / major2 + yp * yp / minor2 - 1.0;
-            let weight = if residual.abs() <= 0.18 {
-                1.0
-            } else {
-                0.18 / residual.abs()
-            };
-            let jacobian = [
-                -2.0 * xp * cos_angle / major2 + 2.0 * yp * sin_angle / minor2,
-                -2.0 * xp * sin_angle / major2 - 2.0 * yp * cos_angle / minor2,
-                -2.0 * xp * xp / major.powi(3),
-                -2.0 * yp * yp / minor.powi(3),
-                2.0 * xp * yp * (1.0 / major2 - 1.0 / minor2),
-            ];
-            for row in 0..5 {
-                gradient[row] += weight * jacobian[row] * residual;
-                for column in 0..5 {
-                    normal[row][column] += weight * jacobian[row] * jacobian[column];
-                }
-            }
-        }
-        for index in 0..5 {
-            normal[index][index] += 1e-7 * normal[index][index].abs().max(1.0);
-        }
-        let mut step = solve_five(normal, gradient.map(|value| -value))?;
-        step[0] = step[0].clamp(-5.0, 5.0);
-        step[1] = step[1].clamp(-5.0, 5.0);
-        step[2] = step[2].clamp(-8.0, 8.0);
-        step[3] = step[3].clamp(-8.0, 8.0);
-        step[4] = step[4].clamp(-0.15, 0.15);
-        for index in 0..5 {
-            parameters[index] += step[index];
-        }
-        parameters[2] = parameters[2].clamp(12.0, FRAME_WIDTH as f64 * 0.55);
-        parameters[3] = parameters[3].clamp(12.0, FRAME_HEIGHT as f64 * 0.70);
-        if step.iter().map(|value| value.abs()).sum::<f64>() < 1e-4 {
-            break;
-        }
-    }
-    let mut ellipse = Ellipse {
-        center: (parameters[0], parameters[1]),
-        major_radius: parameters[2],
-        minor_radius: parameters[3],
-        angle: parameters[4],
-    };
-    normalize_ellipse(&mut ellipse);
-    plausible_ellipse(ellipse).then_some(ellipse)
-}
-
-fn normalize_ellipse(ellipse: &mut Ellipse) {
-    if ellipse.minor_radius > ellipse.major_radius {
-        std::mem::swap(&mut ellipse.major_radius, &mut ellipse.minor_radius);
-        ellipse.angle += std::f64::consts::FRAC_PI_2;
-    }
-    ellipse.angle = (ellipse.angle + std::f64::consts::FRAC_PI_2).rem_euclid(std::f64::consts::PI)
-        - std::f64::consts::FRAC_PI_2;
-}
-
-fn plausible_ellipse(ellipse: Ellipse) -> bool {
-    ellipse.center.0.is_finite()
-        && ellipse.center.1.is_finite()
-        && ellipse.major_radius.is_finite()
-        && ellipse.minor_radius.is_finite()
-        && ellipse.center.0 > -(FRAME_WIDTH as f64) * 0.1
-        && ellipse.center.0 < FRAME_WIDTH as f64 * 1.1
-        && ellipse.center.1 > -(FRAME_HEIGHT as f64) * 0.1
-        && ellipse.center.1 < FRAME_HEIGHT as f64 * 1.1
-        && (30.0..=FRAME_WIDTH as f64 * 0.52).contains(&ellipse.major_radius)
-        && (24.0..=FRAME_HEIGHT as f64 * 0.65).contains(&ellipse.minor_radius)
-        && ellipse.minor_radius / ellipse.major_radius >= 0.28
-}
-
-fn direct_conic_fit(points: &[(f64, f64)]) -> Option<Ellipse> {
-    if points.len() < 5 {
-        return None;
-    }
-    let count = points.len() as f64;
-    let center = points
-        .iter()
-        .fold((0.0, 0.0), |sum, point| (sum.0 + point.0, sum.1 + point.1));
-    let center = (center.0 / count, center.1 / count);
-    let scale = (points
-        .iter()
-        .map(|point| (point.0 - center.0).powi(2) + (point.1 - center.1).powi(2))
-        .sum::<f64>()
-        / count)
-        .sqrt()
-        .max(1.0);
-    let mut normal = [[0.0f64; 5]; 5];
-    let mut rhs = [0.0f64; 5];
-    for &(point_x, point_y) in points {
-        let x = (point_x - center.0) / scale;
-        let y = (point_y - center.1) / scale;
-        let terms = [x * x, x * y, y * y, x, y];
-        for row in 0..5 {
-            rhs[row] += terms[row];
-            for column in 0..5 {
-                normal[row][column] += terms[row] * terms[column];
-            }
-        }
-    }
-    for index in 0..5 {
-        normal[index][index] += 1e-10;
-    }
-    let [quadratic_x, cross, quadratic_y, linear_x, linear_y] = solve_five(normal, rhs)?;
-    let off_diagonal = cross * 0.5;
-    let determinant = quadratic_x * quadratic_y - off_diagonal * off_diagonal;
-    if determinant <= 1e-10 {
-        return None;
-    }
-    let local_center_x = -0.5 * (quadratic_y * linear_x - off_diagonal * linear_y) / determinant;
-    let local_center_y = -0.5 * (-off_diagonal * linear_x + quadratic_x * linear_y) / determinant;
-    let level = 1.0
-        + quadratic_x * local_center_x * local_center_x
-        + 2.0 * off_diagonal * local_center_x * local_center_y
-        + quadratic_y * local_center_y * local_center_y;
-    let trace = quadratic_x + quadratic_y;
-    let discriminant = ((quadratic_x - quadratic_y).powi(2) + 4.0 * off_diagonal.powi(2)).sqrt();
-    let eigen_minimum = (trace - discriminant) * 0.5;
-    let eigen_maximum = (trace + discriminant) * 0.5;
-    if level <= 0.0 || eigen_minimum <= 1e-10 || eigen_maximum <= eigen_minimum {
-        return None;
-    }
-    let major_vector = if off_diagonal.abs() > 1e-10 {
-        (off_diagonal, eigen_minimum - quadratic_x)
-    } else if quadratic_x <= quadratic_y {
-        (1.0, 0.0)
-    } else {
-        (0.0, 1.0)
-    };
-    let mut ellipse = Ellipse {
-        center: (
-            center.0 + local_center_x * scale,
-            center.1 + local_center_y * scale,
-        ),
-        major_radius: scale * (level / eigen_minimum).sqrt(),
-        minor_radius: scale * (level / eigen_maximum).sqrt(),
-        angle: major_vector.1.atan2(major_vector.0),
-    };
-    normalize_ellipse(&mut ellipse);
-    (ellipse.center.0.is_finite()
-        && ellipse.center.1.is_finite()
-        && ellipse.major_radius.is_finite()
-        && ellipse.minor_radius.is_finite()
-        && ellipse.major_radius < 2000.0
-        && ellipse.minor_radius >= 2.0
-        && ellipse.minor_radius / ellipse.major_radius >= 0.05)
-        .then_some(ellipse)
-}
-
-#[cfg(feature = "sam31")]
-fn least_squares_ellipse(points: &[(f64, f64)]) -> Option<Ellipse> {
-    use opencv::core::{Point2f, Vector};
-
-    if points.len() < 5 {
-        return None;
-    }
-    let mut input = Vector::<Point2f>::with_capacity(points.len());
-    for &(x, y) in points {
-        input.push(Point2f::new(x as f32, y as f32));
-    }
-    let fitted = opencv::imgproc::fit_ellipse(&input).ok()?;
-    let mut ellipse = Ellipse {
-        center: (fitted.center.x as f64, fitted.center.y as f64),
-        major_radius: fitted.size.width as f64 * 0.5,
-        minor_radius: fitted.size.height as f64 * 0.5,
-        angle: (fitted.angle as f64).to_radians(),
-    };
-    normalize_ellipse(&mut ellipse);
-    (ellipse.center.0.is_finite()
-        && ellipse.center.1.is_finite()
-        && ellipse.major_radius.is_finite()
-        && ellipse.minor_radius.is_finite()
-        && ellipse.major_radius < 2000.0
-        && ellipse.minor_radius >= 2.0
-        && ellipse.minor_radius / ellipse.major_radius >= 0.05)
-        .then_some(ellipse)
-}
-
-#[cfg(not(feature = "sam31"))]
-fn least_squares_ellipse(points: &[(f64, f64)]) -> Option<Ellipse> {
-    direct_conic_fit(points)
-}
-
-fn ellipse_residual(point: (f64, f64), ellipse: Ellipse) -> f64 {
-    let (sin_angle, cos_angle) = ellipse.angle.sin_cos();
-    let dx = point.0 - ellipse.center.0;
-    let dy = point.1 - ellipse.center.1;
-    let x = cos_angle * dx + sin_angle * dy;
-    let y = -sin_angle * dx + cos_angle * dy;
-    let radial = ((x / ellipse.major_radius.max(1e-6)).powi(2)
-        + (y / ellipse.minor_radius.max(1e-6)).powi(2))
-    .sqrt();
-    (radial - 1.0).abs() * (ellipse.major_radius * ellipse.minor_radius).sqrt()
-}
-
-struct RobustFit {
-    ellipse: Ellipse,
-    residuals: Vec<f64>,
-    inliers: Vec<bool>,
-    cutoff: f64,
-}
-
-struct NumpyPcg64 {
-    state: u128,
-    increment: u128,
-    buffered_upper: Option<u32>,
-}
-
-impl NumpyPcg64 {
-    const MULTIPLIER: u128 =
-        ((2_549_297_995_355_413_924u128) << 64) | 4_865_540_595_714_422_341u128;
-
-    fn baseline_fit_stream() -> Self {
-        // np.random.default_rng(20260812).bit_generator.state after NumPy's
-        // SeedSequence expansion. Keeping this tiny PCG stream in Rust avoids
-        // a Python dependency while preserving the accepted six-query fit.
-        Self {
-            state: 94_368_598_227_006_152_144_556_554_533_211_010_852u128,
-            increment: 174_605_511_227_888_025_715_320_101_340_171_151_329u128,
-            buffered_upper: None,
-        }
-    }
-
-    fn vertical_cull_stream() -> Self {
-        // np.random.default_rng(20260813).bit_generator.state.
-        Self {
-            state: 32_836_341_824_432_678_873_702_219_582_571_864_733u128,
-            increment: 70_717_288_352_767_355_186_512_493_438_108_981_773u128,
-            buffered_upper: None,
-        }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.state = self
-            .state
-            .wrapping_mul(Self::MULTIPLIER)
-            .wrapping_add(self.increment);
-        let high = (self.state >> 64) as u64;
-        let low = self.state as u64;
-        (high ^ low).rotate_right((self.state >> 122) as u32)
-    }
-
-    fn next_u32(&mut self) -> u32 {
-        if let Some(value) = self.buffered_upper.take() {
-            return value;
-        }
-        let value = self.next_u64();
-        self.buffered_upper = Some((value >> 32) as u32);
-        value as u32
-    }
-
-    fn bounded_inclusive(&mut self, maximum: u32) -> u32 {
-        if maximum == 0 {
-            return 0;
-        }
-        let range = maximum + 1;
-        let threshold = (u32::MAX - maximum) % range;
-        loop {
-            let product = self.next_u32() as u64 * range as u64;
-            if product as u32 >= threshold {
-                return (product >> 32) as u32;
-            }
-        }
-    }
-
-    fn choice_five(&mut self, population: usize) -> Option<[usize; 5]> {
-        if population < 5 || population > u32::MAX as usize {
-            return None;
-        }
-        // Generator.choice uses Floyd's algorithm here. For a five-element
-        // draw its 1.2x hash table always rounds up to eight slots.
-        let mut hash = [usize::MAX; 8];
-        let mut choice = [0usize; 5];
-        for (slot, candidate) in ((population - 5)..population).enumerate() {
-            let value = self.bounded_inclusive(candidate as u32) as usize;
-            let mut location = value & 7;
-            while hash[location] != usize::MAX && hash[location] != value {
-                location = (location + 1) & 7;
-            }
-            if hash[location] == usize::MAX {
-                hash[location] = value;
-                choice[slot] = value;
-            } else {
-                location = candidate & 7;
-                while hash[location] != usize::MAX {
-                    location = (location + 1) & 7;
-                }
-                hash[location] = candidate;
-                choice[slot] = candidate;
-            }
-        }
-        for index in (1..5).rev() {
-            let other = self.bounded_inclusive(index as u32) as usize;
-            choice.swap(index, other);
-        }
-        Some(choice)
-    }
-}
-
-fn robust_ransac_ellipse_with_context(
-    points: &[(f64, f64)],
-    random: &mut NumpyPcg64,
-    scale_context: Option<OuterContourScaleContext>,
-) -> Option<RobustFit> {
-    robust_ransac_ellipse_with_noise(points, random, scale_context, 1.0)
-}
-
-fn robust_ransac_ellipse_with_noise(
-    points: &[(f64, f64)],
-    random: &mut NumpyPcg64,
-    scale_context: Option<OuterContourScaleContext>,
-    pixel_scale: f64,
-) -> Option<RobustFit> {
-    constrained_ransac_ellipse(points, random, scale_context, pixel_scale, None)
-}
-
-/// Geometry from the ordered boundary. Only trusted arcs constrain the fit;
-/// censored mask extensions into an eyelid must never attract the conic.
-struct ConicArcConstraints {
-    tangents: Vec<Option<(f64, f64)>>,
-}
-
-impl ConicArcConstraints {
-    fn tangent_agrees(&self, index: usize, point: (f64, f64), ellipse: Ellipse) -> bool {
-        let Some(tangent) = self.tangents[index] else {
-            return false;
-        };
-        let p = ellipse_axis_point(point, ellipse);
-        let (s, c) = ellipse.angle.sin_cos();
-        let normal = (
-            c * p.0 / ellipse.major_radius.powi(2) - s * p.1 / ellipse.minor_radius.powi(2),
-            s * p.0 / ellipse.major_radius.powi(2) + c * p.1 / ellipse.minor_radius.powi(2),
-        );
-        // The observed tangent must be within 25 degrees of the conic's
-        // tangent. Position agreement alone can join incompatible lid arcs.
-        (normal.0 * tangent.0 + normal.1 * tangent.1).abs()
-            <= 0.423 * normal.0.hypot(normal.1) * tangent.0.hypot(tangent.1)
-    }
-
-    fn admits(
-        &self,
-        points: &[(f64, f64)],
-        inliers: &[bool],
-        ellipse: Ellipse,
-        tolerance: f64,
-    ) -> bool {
-        let mut phases = points
-            .iter()
-            .zip(inliers)
-            .filter_map(|(&p, &keep)| {
-                if !keep {
-                    return None;
-                }
-                let p = ellipse_axis_point(p, ellipse);
-                Some(
-                    (p.1 / ellipse.minor_radius)
-                        .atan2(p.0 / ellipse.major_radius)
-                        .rem_euclid(std::f64::consts::TAU),
-                )
-            })
-            .collect::<Vec<_>>();
-        if phases.len() < 20 {
-            return false;
-        }
-        phases.sort_unstable_by(f64::total_cmp);
-        let max_gap = phases.windows(2).map(|p| p[1] - p[0]).fold(
-            phases[0] + std::f64::consts::TAU - phases[phases.len() - 1],
-            f64::max,
-        );
-        // One short arc admits many radically different conics. Require
-        // observations spanning at least half the candidate's circumference.
-        if max_gap > std::f64::consts::PI {
-            return false;
-        }
-        // Linearized conic information, expressed in normal pixel distance.
-        // Unlike an angle/radius parameterization this stays nonsingular for
-        // circles. Opposed but nearly straight tiny arcs still leave the poles
-        // unconstrained; counting points or occupied quadrants misses that.
-        let row = |phase: f64| {
-            let (v, u) = phase.sin_cos();
-            let gradient = 2.0 * (u / ellipse.major_radius).hypot(v / ellipse.minor_radius);
-            [u * u, v * v, 2.0 * u * v, u, v].map(|value| value / gradient)
-        };
-        let mut information = [[0.0; 5]; 5];
-        for &phase in &phases {
-            let h = row(phase);
-            for i in 0..5 {
-                for j in 0..5 {
-                    information[i][j] += h[i] * h[j];
-                }
-            }
-        }
-        let mut inverse = [[0.0; 5]; 5];
-        for column in 0..5 {
-            let mut unit = [0.0; 5];
-            unit[column] = 1.0;
-            let Some(solution) = solve_five(information, unit) else {
-                return false;
-            };
-            for i in 0..5 {
-                inverse[i][column] = solution[i];
-            }
-        }
-        // Use the residual ceiling as conservative effective noise, allowing
-        // for correlation between adjacent contour samples. This is a local
-        // conditioning test, not a calibrated statistical confidence interval.
-        let limit = (0.10 * ellipse.minor_radius).max(tolerance);
-        (0..24).all(|i| {
-            let h = row(std::f64::consts::TAU * i as f64 / 24.0);
-            let variance = (0..5)
-                .map(|i| (0..5).map(|j| h[i] * inverse[i][j] * h[j]).sum::<f64>())
-                .sum::<f64>();
-            variance.is_finite()
-                && variance >= -1e-8
-                && tolerance * variance.max(0.0).sqrt() <= limit
-        })
-    }
-}
-
-fn constrained_ransac_ellipse(
-    points: &[(f64, f64)],
-    random: &mut NumpyPcg64,
-    scale_context: Option<OuterContourScaleContext>,
-    pixel_scale: f64,
-    constraints: Option<&ConicArcConstraints>,
-) -> Option<RobustFit> {
-    if points.len() < 5 {
-        return None;
-    }
-    let mut best: Option<(isize, f64, Ellipse, Vec<bool>)> = None;
-    for _ in 0..4000 {
-        let indices = random.choice_five(points.len())?;
-        let subset = indices.map(|index| points[index]);
-        let Some(ellipse) = least_squares_ellipse(&subset) else {
-            continue;
-        };
-        if scale_context.is_some_and(|context| !context.admits(ellipse)) {
-            continue;
-        }
-        let residuals = points
-            .iter()
-            .map(|&point| ellipse_residual(point, ellipse))
-            .collect::<Vec<_>>();
-        let inliers = residuals
-            .iter()
-            .enumerate()
-            .map(|(i, residual)| {
-                *residual <= 2.5 * pixel_scale
-                    && constraints.is_none_or(|g| g.tangent_agrees(i, points[i], ellipse))
-            })
-            .collect::<Vec<_>>();
-        let count = inliers.iter().filter(|&&inlier| inlier).count();
-        if count < 5 {
-            continue;
-        }
-        if constraints.is_some_and(|g| !g.admits(points, &inliers, ellipse, 4.0 * pixel_scale)) {
-            continue;
-        }
-        // Occlusion removes disk area. A hypothesis that cuts inside other
-        // uncensored arcs is less plausible than one completing behind them.
-        // This is a ranking cost, not a veto based on the whole SAM mask:
-        // explicitly censored lid/chord points never reach this search.
-        let outside = if constraints.is_some() {
-            points
-                .iter()
-                .zip(&residuals)
-                .filter(|(p, r)| **r > 4.0 * pixel_scale && ellipse_coordinate(**p, ellipse) > 1.0)
-                .count()
-        } else {
-            0
-        };
-        let score = count as isize - 2 * outside as isize;
-        let sum = residuals
-            .iter()
-            .zip(inliers.iter())
-            .filter_map(|(residual, inlier)| inlier.then_some(*residual))
-            .sum::<f64>();
-        if best.as_ref().is_none_or(|candidate| {
-            score > candidate.0 || (score == candidate.0 && sum < candidate.1)
-        }) {
-            best = Some((score, sum, ellipse, inliers));
-        }
-    }
-    let (_, _, best_ellipse, first_inliers) = best?;
-    let first_points = points
-        .iter()
-        .zip(first_inliers.iter())
-        .filter_map(|(&point, &inlier)| inlier.then_some(point))
-        .collect::<Vec<_>>();
-    let mut ellipse = least_squares_ellipse(&first_points)
-        .filter(|ellipse| scale_context.is_none_or(|context| context.admits(*ellipse)))
-        .filter(|ellipse| {
-            constraints
-                .is_none_or(|g| g.admits(points, &first_inliers, *ellipse, 4.0 * pixel_scale))
-        })
-        .unwrap_or(best_ellipse);
-    let mut residuals = points
-        .iter()
-        .map(|&point| ellipse_residual(point, ellipse))
-        .collect::<Vec<_>>();
-    let residual_median = median(residuals.clone());
-    let mad = median(
-        residuals
-            .iter()
-            .map(|residual| (residual - residual_median).abs())
-            .collect(),
-    );
-    // Outliers must not enlarge their own admission threshold without bound.
-    // Tolerances follow source pixels when a small contour is normalized.
-    let cutoff = (residual_median + 3.5 * (1.4826 * mad).max(0.5 * pixel_scale))
-        .clamp(2.5 * pixel_scale, 4.0 * pixel_scale);
-    let mut inliers = residuals
-        .iter()
-        .enumerate()
-        .map(|(i, residual)| {
-            *residual <= cutoff
-                && constraints.is_none_or(|g| g.tangent_agrees(i, points[i], ellipse))
-        })
-        .collect::<Vec<_>>();
-    let final_points = points
-        .iter()
-        .zip(inliers.iter())
-        .filter_map(|(&point, &inlier)| inlier.then_some(point))
-        .collect::<Vec<_>>();
-    ellipse = least_squares_ellipse(&final_points)
-        .filter(|ellipse| scale_context.is_none_or(|context| context.admits(*ellipse)))
-        .filter(|ellipse| {
-            constraints.is_none_or(|g| g.admits(points, &inliers, *ellipse, 4.0 * pixel_scale))
-        })
-        .unwrap_or(ellipse);
-    residuals = points
-        .iter()
-        .map(|&point| ellipse_residual(point, ellipse))
-        .collect();
-    inliers = residuals
-        .iter()
-        .enumerate()
-        .map(|(i, residual)| {
-            *residual <= cutoff
-                && constraints.is_none_or(|g| g.tangent_agrees(i, points[i], ellipse))
-        })
-        .collect();
-    if constraints.is_some_and(|g| !g.admits(points, &inliers, ellipse, 4.0 * pixel_scale)) {
-        return None;
-    }
-    Some(RobustFit {
-        ellipse,
-        residuals,
-        inliers,
-        cutoff,
-    })
-}
-
-fn robust_ransac_ellipse(points: &[(f64, f64)], random: &mut NumpyPcg64) -> Option<RobustFit> {
-    robust_ransac_ellipse_with_context(points, random, None)
-}
-
-fn sample_closed_contour(points: &[(f64, f64)], count: usize) -> Vec<(f64, f64)> {
-    if points.len() <= 1 || count == 0 {
-        return points.to_vec();
-    }
-    let mut cumulative = Vec::with_capacity(points.len() + 1);
-    cumulative.push(0.0);
-    for index in 0..points.len() {
-        let next = (index + 1) % points.len();
-        let length = (points[next].0 - points[index].0).hypot(points[next].1 - points[index].1);
-        cumulative.push(cumulative.last().copied().unwrap() + length);
-    }
-    let total = *cumulative.last().unwrap();
-    if total <= 1e-9 {
-        return points.iter().copied().take(count).collect();
-    }
-    (0..count)
-        .map(|sample| {
-            let target = (sample as f64 + 0.5) * total / count as f64;
-            let segment = cumulative
-                .partition_point(|value| *value <= target)
-                .saturating_sub(1)
-                .min(points.len() - 1);
-            let next = (segment + 1) % points.len();
-            let span = (cumulative[segment + 1] - cumulative[segment]).max(1e-9);
-            let blend = (target - cumulative[segment]) / span;
-            (
-                (points[segment].0 * (1.0 - blend) + points[next].0 * blend) as f32 as f64,
-                (points[segment].1 * (1.0 - blend) + points[next].1 * blend) as f32 as f64,
-            )
-        })
-        .collect()
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FlatTireSide {
-    Upper,
-    Lower,
-    Other,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct FlatTireRun {
-    side: FlatTireSide,
-    start: usize,
-    length: usize,
-    chord_length: f64,
-}
-
-fn smooth_closed_contour(points: &[(f64, f64)], radius: usize) -> Vec<(f64, f64)> {
-    if points.is_empty() || radius == 0 {
-        return points.to_vec();
-    }
-    let count = points.len();
-    (0..count)
-        .map(|index| {
-            let mut sum = (0.0, 0.0);
-            for offset in 0..=(2 * radius) {
-                let sample = (index + count + offset - radius) % count;
-                sum.0 += points[sample].0;
-                sum.1 += points[sample].1;
-            }
-            let denominator = (2 * radius + 1) as f64;
-            (sum.0 / denominator, sum.1 / denominator)
-        })
-        .collect()
-}
-
-fn ellipse_axis_point(point: (f64, f64), reference: Ellipse) -> (f64, f64) {
-    let (sine, cosine) = reference.angle.sin_cos();
-    let dx = point.0 - reference.center.0;
-    let dy = point.1 - reference.center.1;
-    (cosine * dx + sine * dy, -sine * dx + cosine * dy)
-}
-
-/// Find the longest nearly straight, predominantly major-axis-aligned run on
-/// one vertical extreme of the selected disk contour.  A real ellipse may be
-/// locally horizontal at its pole, but it bends away from its endpoint chord;
-/// an eyelid-clipped mask instead contains a long low-sagitta chord.  Testing
-/// the whole ordered run (rather than individual pixel tangents) is stable in
-/// the presence of the one-pixel staircase left by mask rasterization.
-fn best_flat_tire_run(
-    smoothed: &[(f64, f64)],
-    reference: Ellipse,
-    side: FlatTireSide,
-) -> Option<FlatTireRun> {
-    let count = smoothed.len();
-    if count < 24 {
-        return None;
-    }
-    let local = smoothed
-        .iter()
-        .copied()
-        .map(|point| ellipse_axis_point(point, reference))
-        .collect::<Vec<_>>();
-    let minimum_u = local
-        .iter()
-        .map(|point| point.0)
-        .fold(f64::INFINITY, f64::min);
-    let maximum_u = local
-        .iter()
-        .map(|point| point.0)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let minimum_v = local
-        .iter()
-        .map(|point| point.1)
-        .fold(f64::INFINITY, f64::min);
-    let maximum_v = local
-        .iter()
-        .map(|point| point.1)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let horizontal_span = maximum_u - minimum_u;
-    let vertical_span = maximum_v - minimum_v;
-    if horizontal_span < 30.0 || vertical_span < 20.0 {
-        return None;
-    }
-    let in_extreme_band = |point: (f64, f64)| match side {
-        FlatTireSide::Upper => point.1 <= minimum_v + 0.40 * vertical_span,
-        FlatTireSide::Lower => point.1 >= maximum_v - 0.40 * vertical_span,
-        FlatTireSide::Other => true,
-    };
-    // A rasterized ellipse has a short, superficially straight plateau at its
-    // true top and bottom.  Only a chord spanning roughly a quarter of the
-    // observed diameter is long enough to be treated as occlusion here; the
-    // all-orientation physical-curvature pass below handles other cases.
-    let minimum_chord = (0.24 * horizontal_span).max(20.0);
-    let minimum_samples = (count / 24).max(6);
-    let maximum_samples = count / 2;
-    let mut best: Option<FlatTireRun> = None;
-
-    for start in 0..count {
-        for length in minimum_samples..=maximum_samples {
-            let first = local[start];
-            let last = local[(start + length - 1) % count];
-            let chord = (last.0 - first.0, last.1 - first.1);
-            let chord_length = chord.0.hypot(chord.1);
-            if chord_length < minimum_chord || chord.0.abs() / chord_length.max(1.0e-9) < 0.76 {
-                continue;
-            }
-            let residual_limit = (0.032 * chord_length).clamp(1.35, 4.0);
-            let mut maximum_residual = 0.0f64;
-            let mut mean_residual = 0.0f64;
-            let mut valid = true;
-            for offset in 0..length {
-                let point = local[(start + offset) % count];
-                if !in_extreme_band(point) {
-                    valid = false;
-                    break;
-                }
-                let residual = ((point.0 - first.0) * chord.1 - (point.1 - first.1) * chord.0)
-                    .abs()
-                    / chord_length.max(1.0e-9);
-                maximum_residual = maximum_residual.max(residual);
-                mean_residual += residual;
-                if maximum_residual > residual_limit {
-                    valid = false;
-                    break;
-                }
-            }
-            mean_residual /= length as f64;
-            if !valid || mean_residual > residual_limit * 0.52 {
-                continue;
-            }
-            let candidate = FlatTireRun {
-                side,
-                start,
-                length,
-                chord_length,
-            };
-            let replace = best.is_none_or(|incumbent| {
-                candidate.chord_length > incumbent.chord_length + 1.0e-9
-                    || ((candidate.chord_length - incumbent.chord_length).abs() <= 1.0e-9
-                        && candidate.length > incumbent.length)
-            });
-            if replace {
-                best = Some(candidate);
-            }
-        }
-    }
-    best
-}
-
-/// A conservative, orientation-independent curvature veto.  `reference` is
-/// intentionally only a crude scale observation: by allowing a 0.30 axis
-/// ratio, the comparison admits a much more oblique projected iris than is
-/// usual in a useful eye ROI.  Even under that permissive projection, a long
-/// ellipse arc has a minimum sagitta.  A contour run substantially straighter
-/// than that cannot belong to an iris of this apparent size.
-fn best_impossible_conic_run(
-    smoothed: &[(f64, f64)],
-    reference: Ellipse,
-    already_censored: &[bool],
-) -> Option<FlatTireRun> {
-    let count = smoothed.len();
-    if count < 24 || already_censored.len() != count {
-        return None;
-    }
-    let apparent_radius = reference
-        .major_radius
-        .clamp(30.0, FRAME_WIDTH as f64 * 0.60);
-    let maximum_plausible_curvature_radius = apparent_radius / 0.30;
-    let minimum_samples = (count / 24).max(6);
-    let maximum_samples = count / 2;
-    let minimum_chord = (0.34 * apparent_radius).max(24.0);
-    let mut best: Option<FlatTireRun> = None;
-
-    for start in 0..count {
-        for length in minimum_samples..=maximum_samples {
-            // An earlier chord may share its two physical junctions with a
-            // second occluder, but its interior must never be rediscovered.
-            if (1..length.saturating_sub(1))
-                .any(|offset| already_censored[(start + offset) % count])
-            {
-                continue;
-            }
-            let first = smoothed[start];
-            let last = smoothed[(start + length - 1) % count];
-            let chord = (last.0 - first.0, last.1 - first.1);
-            let chord_length = chord.0.hypot(chord.1);
-            if chord_length < minimum_chord
-                || chord_length >= 1.90 * maximum_plausible_curvature_radius
-            {
-                continue;
-            }
-            let half_chord = 0.5 * chord_length;
-            let minimum_ellipse_sagitta = maximum_plausible_curvature_radius
-                - (maximum_plausible_curvature_radius.powi(2) - half_chord.powi(2)).sqrt();
-            if minimum_ellipse_sagitta < 2.0 {
-                continue;
-            }
-            // Permit raster stair-steps and a gently bowed real occluder, but
-            // demand a large margin below the least-curved plausible iris arc.
-            let residual_limit = (0.52 * minimum_ellipse_sagitta).clamp(1.35, 6.0);
-            let mut maximum_residual = 0.0f64;
-            let mut mean_residual = 0.0f64;
-            let mut valid = true;
-            for offset in 0..length {
-                let point = smoothed[(start + offset) % count];
-                let residual = ((point.0 - first.0) * chord.1 - (point.1 - first.1) * chord.0)
-                    .abs()
-                    / chord_length.max(1.0e-9);
-                maximum_residual = maximum_residual.max(residual);
-                mean_residual += residual;
-                if maximum_residual > residual_limit {
-                    valid = false;
-                    break;
-                }
-            }
-            mean_residual /= length as f64;
-            if !valid || mean_residual > residual_limit * 0.55 {
-                continue;
-            }
-            let candidate = FlatTireRun {
-                side: FlatTireSide::Other,
-                start,
-                length,
-                chord_length,
-            };
-            let replace = best.is_none_or(|incumbent| {
-                candidate.chord_length > incumbent.chord_length + 1.0e-9
-                    || ((candidate.chord_length - incumbent.chord_length).abs() <= 1.0e-9
-                        && candidate.length > incumbent.length)
-            });
-            if replace {
-                best = Some(candidate);
-            }
-        }
-    }
-    best
-}
-
-fn deflattened_mask_fit_with_context(
-    contour: Vec<(f64, f64)>,
-    reference: Ellipse,
-    scale_context: Option<OuterContourScaleContext>,
-) -> Option<OuterMaskFitReview> {
-    deflattened_mask_fit_with_noise(contour, reference, scale_context, 1.0, true)
-}
-
-fn deflattened_mask_fit_with_noise(
-    contour: Vec<(f64, f64)>,
-    reference: Ellipse,
-    scale_context: Option<OuterContourScaleContext>,
-    pixel_scale: f64,
-    constrain_arcs: bool,
-) -> Option<OuterMaskFitReview> {
-    // Preserve boundary order: polar sorting can jump between the true limbus
-    // and an occluding lid chord and manufacture exactly the flattened conic
-    // this stage is intended to reject.
-    let samples = sample_closed_contour(&contour, 128);
-    if samples.len() < 24 {
-        return None;
-    }
-    let smoothed = smooth_closed_contour(&samples, 2);
-    let upper = best_flat_tire_run(&smoothed, reference, FlatTireSide::Upper);
-    let lower = best_flat_tire_run(&smoothed, reference, FlatTireSide::Lower);
-    let mut flat_tire = vec![false; samples.len()];
-    for run in [upper, lower].into_iter().flatten() {
-        // Keep each junction sample: it is normally the last directly visible
-        // limbus point on either side.  Only the chord interior is censored.
-        for offset in 1..run.length.saturating_sub(1) {
-            flat_tire[(run.start + offset) % samples.len()] = true;
-        }
-    }
-    // A selected outer-disk component can still be clipped by a nose, jaw,
-    // glasses rim, image boundary, or unrelated foreground edge.  Censor up
-    // to four disjoint physically impossible-curvature runs, regardless of
-    // their position or orientation.  A mostly polygonal false component is
-    // consequently left without enough arc support and fails closed.
-    for _ in 0..4 {
-        let Some(run) = best_impossible_conic_run(&smoothed, reference, &flat_tire) else {
-            break;
-        };
-        for offset in 1..run.length.saturating_sub(1) {
-            flat_tire[(run.start + offset) % samples.len()] = true;
-        }
-    }
-    let retained_indices = (0..samples.len())
-        .filter(|&i| !flat_tire[i])
-        .collect::<Vec<_>>();
-    let retained = retained_indices
-        .iter()
-        .map(|&i| samples[i])
-        .collect::<Vec<_>>();
-    if retained.len() < 20 {
-        return None;
-    }
-    let constraints = ConicArcConstraints {
-        tangents: (0..samples.len())
-            .filter(|&i| !flat_tire[i])
-            .map(|i| {
-                let n = samples.len();
-                if (-2isize..=2)
-                    .any(|d| flat_tire[(i as isize + d).rem_euclid(n as isize) as usize])
-                {
-                    return None;
-                }
-                let a = smoothed[(i + n - 2) % n];
-                let b = smoothed[(i + 2) % n];
-                Some((b.0 - a.0, b.1 - a.1))
-            })
-            .collect(),
-    };
-    let mut random = NumpyPcg64::baseline_fit_stream();
-    let robust = constrained_ransac_ellipse(
-        &retained,
-        &mut random,
-        scale_context,
-        pixel_scale,
-        constrain_arcs.then_some(&constraints),
-    )?;
-    // The adaptive RANSAC cutoff is useful for locating a basin but must not
-    // turn every non-flat part of an eyelid-shaped mask into usable limbus.
-    // Reclassify against a pixel-scale ceiling and require local contour
-    // continuity.  This classification is frame-local and therefore
-    // defeasible on the next exposure.
-    let strict_cutoff = robust.cutoff.min(4.0 * pixel_scale);
-    let mut usable = retained
-        .iter()
-        .enumerate()
-        .map(|(i, &point)| {
-            ellipse_residual(point, robust.ellipse) <= strict_cutoff
-                && (!constrain_arcs || constraints.tangent_agrees(i, point, robust.ellipse))
-        })
-        .collect::<Vec<_>>();
-    if usable.len() >= 3 {
-        let snapshot = usable.clone();
-        for index in 0..usable.len() {
-            let previous = (index + usable.len() - 1) % usable.len();
-            let next = (index + 1) % usable.len();
-            let has_previous = snapshot[previous]
-                && (retained_indices[previous] + 1) % samples.len() == retained_indices[index];
-            let has_next = snapshot[next]
-                && (retained_indices[index] + 1) % samples.len() == retained_indices[next];
-            if snapshot[index] && !has_previous && !has_next {
-                usable[index] = false;
-            }
-        }
-    }
-    let inlier_points = retained
-        .iter()
-        .zip(usable.iter())
-        .filter_map(|(&point, &inlier)| inlier.then_some(point))
-        .collect::<Vec<_>>();
-    if inlier_points.len() < 12
-        || (constrain_arcs
-            && !constraints.admits(&retained, &usable, robust.ellipse, strict_cutoff))
-    {
-        return None;
-    }
-    // A final numerical polish must obey the same support constraints as the
-    // search. It may remove support, but must never reinstate excluded points.
-    let final_support = |ellipse| {
-        retained
-            .iter()
-            .enumerate()
-            .map(|(i, &p)| {
-                usable[i]
-                    && ellipse_residual(p, ellipse) <= strict_cutoff
-                    && (!constrain_arcs || constraints.tangent_agrees(i, p, ellipse))
-            })
-            .collect::<Vec<_>>()
-    };
-    let ellipse = robust_contour_fit(&inlier_points, robust.ellipse)
-        .filter(|ellipse| scale_context.is_none_or(|context| context.admits(*ellipse)))
-        .filter(|ellipse| {
-            !constrain_arcs
-                || constraints.admits(&retained, &final_support(*ellipse), *ellipse, strict_cutoff)
-        })
-        .unwrap_or(robust.ellipse);
-    if !plausible_ellipse(ellipse) || scale_context.is_some_and(|context| !context.admits(ellipse))
-    {
-        return None;
-    }
-    let supported = final_support(ellipse);
-    let retained_points = retained
-        .iter()
-        .zip(&supported)
-        .filter_map(|(&p, &keep)| keep.then_some(p))
-        .collect();
-    let mut final_kept = vec![false; samples.len()];
-    for (&index, &keep) in retained_indices.iter().zip(&supported) {
-        final_kept[index] = keep;
-    }
-    let flat_tire_points = samples
-        .iter()
-        .zip(final_kept.iter())
-        .filter_map(|(&point, &keep)| (!keep).then_some(point))
-        .collect::<Vec<_>>();
-    Some(OuterMaskFitReview {
-        ellipse,
-        source_component_area_px: 0.0,
-        retained_points: Arc::new(retained_points),
-        flat_tire_points: Arc::new(flat_tire_points),
-        upper_flat_tire: upper.is_some_and(|run| run.side == FlatTireSide::Upper),
-        lower_flat_tire: lower.is_some_and(|run| run.side == FlatTireSide::Lower),
-    })
-}
-
-fn deflattened_mask_fit(
-    contour: Vec<(f64, f64)>,
-    reference: Ellipse,
-) -> Option<OuterMaskFitReview> {
-    deflattened_mask_fit_with_context(contour, reference, None)
 }
 
 fn fit_mask_component(
@@ -4591,63 +3309,6 @@ fn temporal_contour_support(
         center_motion <= prior.ellipse.major_radius * 0.24 && (0.78..=1.28).contains(&minor_ratio);
     ordinary_motion
         || (strong && center_motion <= prior.ellipse.major_radius * 0.38 && axis_ratio >= 0.72)
-}
-
-#[derive(Clone, Copy, Debug)]
-struct EllipseSupportSummary {
-    occupied_sectors: usize,
-    largest_empty_run: usize,
-    opposite_pairs: usize,
-}
-
-fn ellipse_support_summary(points: &[(f64, f64)], ellipse: Ellipse) -> EllipseSupportSummary {
-    const SECTORS: usize = 16;
-    let mut occupied = [false; SECTORS];
-    let (sine, cosine) = ellipse.angle.sin_cos();
-    for &(x, y) in points {
-        let dx = x - ellipse.center.0;
-        let dy = y - ellipse.center.1;
-        let local_x = cosine * dx + sine * dy;
-        let local_y = -sine * dx + cosine * dy;
-        let phase = (local_y / ellipse.minor_radius.max(1.0))
-            .atan2(local_x / ellipse.major_radius.max(1.0));
-        let unit = (phase + std::f64::consts::PI) / std::f64::consts::TAU;
-        let sector =
-            ((unit * SECTORS as f64).floor() as isize).rem_euclid(SECTORS as isize) as usize;
-        occupied[sector] = true;
-    }
-    let occupied_sectors = occupied.iter().filter(|&&value| value).count();
-    let opposite_pairs = (0..SECTORS / 2)
-        .filter(|&sector| occupied[sector] && occupied[sector + SECTORS / 2])
-        .count();
-    let mut largest_empty_run = 0;
-    let mut run = 0;
-    for index in 0..SECTORS * 2 {
-        if occupied[index % SECTORS] {
-            run = 0;
-        } else {
-            run += 1;
-            largest_empty_run = largest_empty_run.max(run.min(SECTORS));
-        }
-    }
-    EllipseSupportSummary {
-        occupied_sectors,
-        largest_empty_run,
-        opposite_pairs,
-    }
-}
-
-fn median(mut values: Vec<f64>) -> f64 {
-    values.retain(|value| value.is_finite());
-    if values.is_empty() {
-        return f64::NAN;
-    }
-    values.sort_unstable_by(|first, second| first.total_cmp(second));
-    if values.len() & 1 == 1 {
-        values[values.len() / 2]
-    } else {
-        0.5 * (values[values.len() / 2 - 1] + values[values.len() / 2])
-    }
 }
 
 fn consensus(ellipses: &[Ellipse]) -> Option<Ellipse> {
@@ -5579,6 +4240,82 @@ mod runtime {
         })
     }
 
+    pub(super) fn export_native_outline_sequence(
+        model_path: &Path,
+        frames: &[Arc<RawFrame>],
+    ) -> Result<serde_json::Value, String> {
+        if frames.is_empty() || frames.iter().any(|f| f.width == 0 || f.height == 0
+            || f.width.checked_mul(f.height) != Some(f.pixels.len())
+            || f.width * FRAME_HEIGHT != f.height * FRAME_WIDTH) {
+            return Err("outline export needs nonempty, same-aspect native RAW frames".into());
+        }
+        load_cuda_dispatch_library()?;
+        configure_cuda_bfloat16_autocast();
+        let _no_grad = tch::no_grad_guard();
+        tch::autocast(true, || {
+            let device = Device::Cuda(0);
+            let mut module = CModule::load_on_device(model_path, device)
+                .map_err(|e| format!("load outline detector: {e}"))?;
+            module.set_eval();
+            let bundle = std::env::var_os("BUTTERCUP_SAM31_PROMPT_BUNDLE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("data/models/sam31_semantic_prompts_cuda_bf16.pt"));
+            let prompts = load_runtime_prompts(&bundle, device, SEMANTIC_PROMPT_COUNT)?;
+            let regime = PreprocessRegime::configured_live()?;
+            let staging = Tensor::zeros(
+                [1, 3, FRAME_HEIGHT as i64, FRAME_WIDTH as i64],
+                (Kind::Uint8, Device::Cpu),
+            ).pin_memory(device);
+            let ellipse_json = |e: Ellipse| serde_json::json!({
+                "center": e.center, "major_radius": e.major_radius,
+                "minor_radius": e.minor_radius, "angle": e.angle,
+            });
+            let mut cases = Vec::new();
+            for (index, frame) in frames.iter().enumerate() {
+                let started = Instant::now();
+                write_preprocessed_filmstrip(std::slice::from_ref(frame), regime,
+                    staging_bytes_len(&staging, FRAME_WIDTH * FRAME_HEIGHT * 3))?;
+                let output = infer(&module, &staging, device, &prompts, OUTER_IRIS_PROMPT)?;
+                let luma = raw_luma(std::slice::from_ref(frame)).into_iter().next()
+                    .ok_or("outline export could not decode RAW luma")?;
+                let mut candidates = Vec::new();
+                for query in ranked_finite_query_indices(&output.scores).into_iter().take(12) {
+                    let count = output.mask_width * output.mask_height;
+                    let mask = &output.masks[query*count..(query+1)*count];
+                    let area_fraction = mask.iter().filter(|&&v| v != 0).count() as f64 / count as f64;
+                    if area_fraction == 0.0 { continue; }
+                    let outline = native_outline_points(mask, output.mask_width, output.mask_height,
+                        frame.width, frame.height);
+                    let old = diagnostic_fit_single_frame_mask(mask, output.mask_width, output.mask_height)
+                        .map(|r| model_review_in_source(r, frame.width));
+                    let support = old.as_ref().map(|r| raw_ring_support(&luma, r.ellipse));
+                    candidates.push(serde_json::json!({
+                        "query": query, "semantic_score": output.scores[query],
+                        "mask_area_fraction": area_fraction, "outline": outline,
+                        "baseline_ellipse": old.as_ref().map(|r| ellipse_json(r.ellipse)),
+                        "baseline_retained": old.as_ref().map(|r| r.retained_points.as_ref()),
+                        "baseline_censored": old.as_ref().map(|r| r.flat_tire_points.as_ref()),
+                        "baseline_raw_admitted": support.is_some_and(live_detector_raw_gate_passes),
+                        "baseline_raw_score": support.map(|s| s.score),
+                    }));
+                }
+                cases.push(serde_json::json!({
+                    "sequence": frame.sequence, "timestamp_ns": frame.timestamp_ns,
+                    "sensor_origin": [frame.sensor_x, frame.sensor_y],
+                    "width": frame.width, "height": frame.height, "candidates": candidates,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                }));
+                eprintln!("SAM outline export {}/{} sequence={}", index+1, frames.len(), frame.sequence);
+            }
+            Ok(serde_json::json!({
+                "schema": "buttercup-native-sam-outlines-v1", "model": model_path,
+                "configuration": live_configuration(),
+                "contract": "Current-frame detector masks before contour rejection, using live native-ROI preprocessing and canonical outer prompt. No video-memory propagation, prediction seeds, human labels, or live state changes. Baseline is the production stateless mask fitter, not end-to-end live acceptance. Coordinates are native ROI pixels.",
+                "cases": cases,
+            }))
+        })
+    }
+
     pub(super) fn offline_semantic_suite(
         model_path: &Path,
         outer_prompt_bundle_path: &Path,
@@ -5805,9 +4542,7 @@ mod runtime {
                 ));
             }
             let prompts = load_runtime_prompts(prompt_bundle_path, device, video_prompt_count)?;
-            let tracker_bundle = std::env::var_os("BUTTERCUP_SAM31_TRACKER_BUNDLE")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("data/models/sam31_tracker_weights.pt"));
+            let tracker_bundle = tracker_bundle_path();
             let mask_memory_encoder = NativeMaskMemoryEncoder::load(&tracker_bundle, device)?;
 
             // Keep the percentile/tone transform common across the sequence,
@@ -6598,7 +5333,6 @@ mod runtime {
         outer_support: RawRingSupport,
     }
 
-
     fn live_temporal_outer_proposal(
         module: &CModule,
         staging: &Tensor,
@@ -7153,9 +5887,7 @@ mod runtime {
                     }
                 }
                 if tracker_encoder.is_none() {
-                    let tracker_bundle = std::env::var_os("BUTTERCUP_SAM31_TRACKER_BUNDLE")
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| PathBuf::from("data/models/sam31_tracker_weights.pt"));
+                    let tracker_bundle = tracker_bundle_path();
                     match NativeMaskMemoryEncoder::load(&tracker_bundle, device) {
                         Ok(loaded) => tracker_encoder = Some(loaded),
                         Err(error) => {
@@ -8287,6 +7019,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn startup_requires_native_support_and_all_three_asset_files() {
+        // This checks presence only; model loading remains the worker's job.
+        let present = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+        let missing = Path::new("");
+        assert_eq!(startup_assets_available(present, present, present), cfg!(feature = "sam31"));
+        assert!(!startup_assets_available(missing, present, present));
+        assert!(!startup_assets_available(present, missing, present));
+        assert!(!startup_assets_available(present, present, missing));
+        assert!(!startup_assets_available(present.parent().unwrap(), present, present));
+    }
+
+    #[test]
+    fn exported_outlines_keep_native_pixel_center_coordinates() {
+        let mut mask = vec![0; 64 * 64];
+        for y in 12..48 {
+            for x in 10..50 { mask[y * 64 + x] = 1; }
+        }
+        let model = native_outline_points(&mask, 64, 64, FRAME_WIDTH, FRAME_HEIGHT);
+        let native = native_outline_points(&mask, 64, 64, 420, 280);
+        assert_eq!(model.len(), 256);
+        assert_eq!(native.len(), model.len());
+        for (a, b) in model.iter().zip(&native) {
+            assert!((b.0 - ((a.0 + 0.5) * 420.0 / FRAME_WIDTH as f64 - 0.5)).abs() < 1e-8);
+            assert!((b.1 - ((a.1 + 0.5) * 280.0 / FRAME_HEIGHT as f64 - 0.5)).abs() < 1e-8);
+        }
+    }
+
+    #[test]
+    fn exported_outlines_reject_empty_and_malformed_masks() {
+        assert!(native_outline_points(&[], 0, 0, 420, 280).is_empty());
+        assert!(native_outline_points(&[1, 1], 64, 64, 420, 280).is_empty());
+        assert!(native_outline_points(&[0; 64 * 64], 64, 64, 420, 280).is_empty());
+        assert!(native_outline_points(&[1; 64 * 64], 64, 64, 0, 280).is_empty());
+    }
+
+    #[test]
     fn enlarged_roi_model_projection_preserves_gaze_shape_and_native_pixels() {
         let ellipse = Ellipse {
             center: (191.5, 127.5),
@@ -8712,7 +7480,6 @@ mod tests {
         assert!(pupil_ellipse_plausible(tolerated,near_frontal));
     }
 
-
     #[test]
     fn pupil_continuity_rejects_size_flashes_but_not_head_translation_or_scale() {
         let outer=Ellipse {center:(192.0,128.0),major_radius:100.0,minor_radius:80.0,angle:0.1};
@@ -8940,8 +7707,6 @@ mod tests {
         );
         assert!((reference.center.1 - expected.center.1).abs() > 3.0);
     }
-
-
 
     #[test]
     fn pupil_flat_tire_rejects_a_polygonal_shadow_without_curved_support() {

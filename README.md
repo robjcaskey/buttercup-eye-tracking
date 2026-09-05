@@ -10,6 +10,13 @@ its motion, segmentation, and projected-geometry state visible. The approach
 could be useful for low-latency gaze input, calibration, and related
 camera-space interaction work, but it is still a research prototype.
 
+The [geometry architecture and type inventory](docs/geometry-architecture.md)
+records the extracted module boundaries, coordinate/uncertainty contracts,
+and which joint conic/binocular capabilities remain unimplemented.
+The [iris-area validation guide](docs/flat-tire-area-and-motion.md) defines
+scale-normalized frontal-equivalent iris disk area (SN-FEIDA), its uncertainty,
+and the matched corpus checks used to evaluate geometry changes.
+
 Buttercup expects a compatible external RAW camera service over TCP. Camera
 firmware and device-side control live elsewhere.
 
@@ -35,6 +42,15 @@ scripts/run-viewer.sh
 ```
 
 SAM3.1 uses the native LibTorch/CUDA runtime under `data/runtime`. The launcher
+starts in SAM31 when built with SAM support and the model, semantic prompts,
+and tracker weights are present; otherwise startup defaults to Native.
+`--segmentation native` (or `BUTTERCUP_SEGMENTATION_MODE=native`) overrides
+that choice. `BUTTERCUP_ENABLE_SAM31=0` skips the optional SAM build;
+`BUTTERCUP_ENABLE_SAM31=1` requires its runtime/assets instead of allowing
+the launcher's automatic fallback. Explicit SAM requests still report errors
+if loading or CUDA initialization fails.
+
+The launcher
 prefers `data/models/sam31_semantic_video_shared_features_u8.pt` when available,
 and falls back to the older `sam31_semantic_video_features_u8.pt` export. The
 shared export runs the image encoder once, then performs separate iris and
@@ -66,6 +82,19 @@ scripts/run-viewer.sh --offline-sam-sequence-eval \
 Replay includes the post-SAM pupil solver under an explicitly optimistic
 settled-focus assumption. Candidate counts are not accuracy measurements;
 pupil accuracy needs pupil-specific human reference.
+
+For offline arc-combination experiments, export the ordered native-pixel SAM
+outlines before the existing ellipse fitter can discard them:
+
+```bash
+scripts/run-viewer.sh --offline-sam-outline-export \
+  outputs/iris-outlines.json outputs/EXTRACTED_CAPTURE subject-right
+```
+
+This uses the live single-frame preprocessing and outer-iris prompt but not
+video-memory propagation. The report includes rejected candidates and the
+existing stateless fit for comparison; it never reads recorded predictions or
+human labels, and does not change the live fitter.
 
 When Keyboard Peeper is running, the viewer optionally publishes its current
 hotkeys over the versioned binary KPP/1 Unix-socket protocol. Mode-dependent
