@@ -537,3 +537,151 @@ fitter/localization improvement. Register readback and fixed buffer discards
 do not independently prove a same-sized DMA buffer's physical origin. Camera
 timestamps remain post-extraction wall-clock samples, not hardware exposure
 timestamps. Continuous transport is therefore not a zero-frame-loss claim.
+# Projected-separation re-admission
+
+## September 6, 14:27 recording regression: resident crop lost the eye
+
+The two new clips `both-eyes-1788719209-118558106.tar` (303 frames) and
+`both-eyes-1788719226-570180881.tar` (95 frames) both retain mask 3 throughout.
+Native RAW10 temporal previews show the subject-left crop moving onto eyebrow
+and skin, while the right eye remains visible. This is **not transport eviction**.
+
+At sequence 1119 the verified-limbus log requests centering around sensor
+(5839,3415), but reports a (-100,-212) crop move from (5580,3254) to
+(5480,3042). The stale trusted-anchor clamp forced a small correction outside
+its old envelope back to the old bound, reversing and enlarging the requested
+motion. The new bound intersects its result with the current-to-requested
+movement interval: it can limit a correction, never create a backwards jump.
+A recorded-value regression exercises both the bound and the real verified
+centering entry point; the source eye center remains within the retained crop.
+
+Recovery also now considers a **resident but stale** eye (no admitted pivot for
+1.5 seconds). Once two independently observed iris-cap centers have established
+a pair, current survivor motion translates that configuration. This avoids
+treating opposite pivot-to-cap gaze offsets as physical IPD. Pair snapshots
+require new clocks for both eyes, source skew <=400 ms, fresh bounded support,
+and coarse separation plausibility. Survivor age is capped at the same 900 ms
+as admitted SAM results. A predicted center already inside the existing crop
+does not trigger relocation: occlusion alone must not make the camera chase.
+
+`region_resident_recovery_recorded_trace_replay` compares the old eviction-only
+policy to the candidate on identical recorded applied states, maintaining pair
+history across clips in the same camera session. The baseline has zero eligible
+resident-recovery rows. The candidate has 97 rows (first sequence 1139, about
+two seconds after the bad move) and 55 rows (first sequence 1257), respectively.
+Rows are counterfactual **one-step eligibility**, not 152 commands: the live
+four-second cooldown remains. Recorded cap coordinates are real; the adapter
+replay uses a fixed radius/quality because the old trace did not preserve those.
+The test does not invent counterfactual RAW pixels or claim successful SAM
+re-detection after a crop that was never recorded.
+
+Artifacts: `outputs/new-recovery-inventory.json`, `outputs/resident-trace-replay.log`,
+`outputs/resident-recovery-tests.log`, and `outputs/both-eyes-1788719209-118558106-review.mp4`.
+The preview decodes little-endian packed RAW10 with fixed linear intensity; it
+does not use ImageMagick or per-frame histogram equalization. No limbus fitting,
+SN-FEIDA definition or calibration gate was changed by these recovery fixes;
+there are no human limbus labels or independent scale labels for this subset.
+
+## Offline evidence and the next capture
+
+`scripts/audit-readmission-corpus.py` inventories RAW offsets, exact sensor-clock
+pairs and residency transitions without extracting recordings into the source
+tree. The 24 newest calibration/hotkey archives included the left-only failure
+and several usable paired captures. Results are in
+`outputs/readmission-corpus-inventory.json`.
+
+A bounded translation-correlation experiment temporarily withholds one eye,
+uses the sibling's measured sensor displacement, then scores against a separate
+match of the withheld eye's RAW pixels. It compares against retaining the old
+location. The decoder directly handles the camera's little-endian packed RAW10;
+fixed 4x4 cell averaging provides a phase-independent intensity proxy.
+
+| Capture | Exact-clock pairs | Accepted withheld tests | Baseline median / p90 px | Translated median / p90 px |
+| --- | ---: | ---: | ---: | ---: |
+| `both-eyes-1788711073-007816481.tar` | 2960 | 126 | 11.3 / 31.2 | 5.7 / 24.0 |
+| `both-eyes-1788708986-351731719.tar` | 221 | 20 | 12.0 / 40.9 | 6.8 / 9.2 |
+
+The first run examines 100 disjoint half-second-ish windows from the first 1000
+pairs; 37 fail temporal/correlation checks. The second rejects 12 of 22 windows.
+The first has 19/126 regressions, with a worst error increase of 35.5 px.
+This is supportive **translation-proxy evidence**, not replay of the live SAM
+pivot code, anatomical labels, a calibrated error probability, or an SN-FEIDA
+comparison. The archive lacks the original recovery state. Later unrecorded,
+evicted-eye pixels cannot be reconstructed. Full behavioral validation remains.
+
+New RAW recordings also include `recovery.jsonl`: source sequence/time, applied
+session/generation/mask/crops, proposed crops, enabled mask, coarse seed, refined
+separation, observed pivot timestamps/offsets, and probe/hold timing. The manifest
+names this file. Predicted crops are explicitly not detections. Both hotkey and
+mouse-calibration recordings use it; recording does not invent absent RAW frames.
+
+For the next offline-debug capture: enable both eyes with **3**, press **S** to
+start, hold both eyes visible briefly, then move/tilt enough to lose one and
+return to the initial pose. Repeat in the other direction and press **S** to
+finish. Aim for 30–60 seconds, including several seconds of stable bilateral
+visibility before and after each loss. This provides withheld-eye counterfactual
+pixels plus actual eviction/re-admission transitions without requiring the user
+to remain present during later replay. Human labels, if needed, still go through
+the canonical paired-limbus annotator with predictions hidden until SAVE + DONE.
+
+Reproduce either correlation report with:
+
+```sh
+python3 scripts/audit-readmission-corpus.py outputs --correlate outputs/raw-eye-hotkey/both-eyes-1788711073-007816481.tar
+```
+
+### Production proposer replay
+
+`region_readmission_corpus_policy_replay` runs the actual Rust
+`RawRoiTracker::propose_readmission` on the independently matched displacement
+cases, simulating each eye's eviction. It proposes a containing crop in 126/126
+cases from the source-region archive and 20/20 from the older archive. The latter
+uses the initial manifest band, explicitly an assumption because per-frame
+region metadata is absent. The seed is the recorded before-frame crop pair;
+these are not recovered original MediaPipe landmarks or SAM pivot trajectories.
+
+Every proposal preserves the survivor crop and band and creates no observation
+for the missing eye. The measured point is a correlated patch center, not a
+human-labeled limbus center. Containment does not establish whole-iris coverage,
+focus, sign resolution, or successful live SAM re-detection. Together with the
+34 region regression tests this validates the bounded crop recovery mechanics;
+the new trace format supports subsequent full-sequence optical replay.
+
+Reproduce with the two correlation JSON reports under the runtime outputs link:
+
+```sh
+BUTTERCUP_READMISSION_REPORTS="$PWD/outputs/readmission-correlation.json:$PWD/outputs/readmission-correlation-check.json" \
+  cargo test --no-default-features --bin buttercup-eye-viewer region_readmission_corpus_policy_replay -- --ignored --nocapture
+```
+
+See `outputs/readmission-policy-replay.log` for per-capture counts. This test is
+explicitly ignored in ordinary unit runs because it requires external corpus
+artifacts; absence of those artifacts must not be reported as a passing replay.
+
+An evicted ROI cannot provide the fresh pivot that would otherwise bring it
+back. The host now seeds a **projected inter-eye separation** from the initial
+coarse-acquisition crop pair (normally MediaPipe), including signed vertical
+separation. This is a sensor-pixel proxy, not a measured physical IPD. Manual
+initial crops remain an approximate seed, not independent anatomical evidence.
+
+Fresh low-motion pivots from both eyes can refine this separation with a bounded
+10% update. Both source timestamps must advance, differ by at most 150 ms, and
+be no more than 300 ms old. Large contradictions do not update the seed.
+The estimate is used only to nominate a recovery crop, never to label an eye,
+resolve a gaze sign, or admit a calibration sample.
+
+When one enabled eye is evicted, an observed surviving pivot predicts the missing
+eye location. If a conservative 32-pixel neighborhood fits the resident sensor
+band, the host reopens its crop without shifting the surviving crop or sensor
+band. Probes are limited to one per four seconds and receive a short 1.8-second
+scheduling hold for fresh inference. Existing source-keyed transaction and
+post-eviction result gates still apply. W pause, disabled second-eye analysis,
+manual ROI hold and checkerboard mode retain their existing controls.
+
+The UI clears absent frames instead of retaining a frozen calibration thumbnail.
+Synthetic tests cover both directions, out-of-band abstention, stale sources,
+retry cooldown, disabled-eye policy and independent paired refinement. The
+latest failure recording contained 65 left-only packets while calibration
+targeted the right eye. No matched RAW-corpus fit/area improvement is claimed:
+this change alters transport recovery, not the limbus fit. Live recovery under
+large head tilt and a badly wrong coarse seed still needs operator testing.

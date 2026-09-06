@@ -31,6 +31,10 @@ pub struct ContourFitEvidence {
     /// itself must be circular.
     pub source_component_area_px: f64,
     pub retained_points: Arc<Vec<(f64, f64)>>,
+    /// Contiguous supported runs, indexing retained_points in contour order.
+    /// No run crosses a rejected sample; these are observed arc supports,
+    /// not independently solved ellipses or a completed stereo posterior.
+    pub conic_segments: Arc<Vec<Vec<usize>>>,
     pub flat_tire_points: Arc<Vec<(f64, f64)>>,
     pub upper_flat_tire: bool,
     pub lower_flat_tire: bool,
@@ -41,6 +45,38 @@ pub(crate) struct BoundaryEdge {
     pub(crate) start: (i32, i32),
     pub(crate) end: (i32, i32),
     pub(crate) owner: usize,
+}
+
+fn supported_conic_runs(kept: &[bool]) -> Vec<Vec<usize>> {
+    let mut runs = Vec::new();
+    let mut run = Vec::new();
+    let mut retained_index = 0;
+    for &keep in kept {
+        if keep { run.push(retained_index); retained_index += 1; }
+        else if !run.is_empty() { runs.push(std::mem::take(&mut run)); }
+    }
+    if !run.is_empty() { runs.push(run); }
+    // The contour is cyclic. Merge its end only when both boundary samples
+    // were retained; rejected samples anywhere else still split the arc.
+    if runs.len() > 1 && kept.first() == Some(&true) && kept.last() == Some(&true) {
+        let mut last = runs.pop().unwrap();
+        last.extend(std::mem::take(&mut runs[0]));
+        runs[0] = last;
+    }
+    runs.into_iter().filter(|run| run.len() >= 3).collect()
+}
+
+#[cfg(test)]
+mod segment_tests {
+    use super::*;
+    #[test]
+    fn conic_segments_do_not_bridge_rejected_samples() {
+        assert_eq!(supported_conic_runs(&[false,true,true,true,false,true,true,true,false]),
+            vec![vec![0,1,2],vec![3,4,5]]);
+        assert_eq!(supported_conic_runs(&[true,true,false,true,true,true]),vec![vec![2,3,4,0,1]]);
+        assert!(supported_conic_runs(&[true,false,true,false]).is_empty());
+        assert!(supported_conic_runs(&[]).is_empty());
+    }
 }
 
 pub(crate) fn native_component_contour(
@@ -611,6 +647,7 @@ pub(crate) fn deflattened_mask_fit_with_noise(
         ellipse,
         source_component_area_px: 0.0,
         retained_points: Arc::new(retained_points),
+        conic_segments: Arc::new(supported_conic_runs(&final_kept)),
         flat_tire_points: Arc::new(flat_tire_points),
         upper_flat_tire: upper.is_some_and(|run| run.side == FlatTireSide::Upper),
         lower_flat_tire: lower.is_some_and(|run| run.side == FlatTireSide::Lower),

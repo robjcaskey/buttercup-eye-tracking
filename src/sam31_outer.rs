@@ -1261,6 +1261,48 @@ struct Batch {
 enum WorkerRequest {
     Batch(Batch),
     ReloadPrompts(PathBuf),
+    Scene(SceneRequest),
+}
+
+struct SceneRequest {
+    pixels: Arc<Vec<u32>>,
+    width: usize,
+    height: usize,
+    prompt_bundle: Option<PathBuf>,
+    reply: SyncSender<Result<Option<SceneCandidate>, String>>,
+}
+
+/// Generic object evidence, deliberately incapable of asserting eye presence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SceneCandidate {
+    /// Normalized image bounds, x0/y0 inclusive and x1/y1 exclusive.
+    pub bounds: [f64; 4],
+    pub score: f32,
+    pub mask: Arc<Vec<u8>>,
+    pub mask_size: (usize, usize),
+}
+
+fn scene_candidate(masks: &[u8], scores: &[f32], width: usize, height: usize) -> Option<SceneCandidate> {
+    let plane = width.checked_mul(height).filter(|n| *n > 0)?;
+    scores.iter().enumerate().filter_map(|(query, &score)| {
+        if !score.is_finite() || score < 0.5 { return None; }
+        let mask = masks.get(query.checked_mul(plane)?..query.checked_add(1)?.checked_mul(plane)?)?;
+        let mut bounds = [width, height, 0, 0];
+        let mut count = 0;
+        for (i, &value) in mask.iter().enumerate() {
+            if value == 0 { continue; }
+            count += 1;
+            bounds[0] = bounds[0].min(i % width);
+            bounds[1] = bounds[1].min(i / width);
+            bounds[2] = bounds[2].max(i % width + 1);
+            bounds[3] = bounds[3].max(i / width + 1);
+        }
+        // Generic support only: no ellipse, iris size, darkness or eye-side tests.
+        if count < 16 || count as f64 > plane as f64 * 0.98 { return None; }
+        Some(SceneCandidate { bounds: [bounds[0] as f64/width as f64, bounds[1] as f64/height as f64,
+            bounds[2] as f64/width as f64, bounds[3] as f64/height as f64], score,
+            mask: Arc::new(mask.to_vec()), mask_size: (width, height) })
+    }).max_by(|a,b| a.score.total_cmp(&b.score))
 }
 
 pub struct Client {
@@ -1273,6 +1315,18 @@ pub struct Client {
 }
 
 impl Client {
+    /// Uses the existing serial GPU worker, never a second model or eye tracker.
+    pub fn submit_scene(&self, pixels: Arc<Vec<u32>>, width: usize, height: usize,
+        prompt_bundle: Option<PathBuf>) -> Result<Receiver<Result<Option<SceneCandidate>, String>>, String> {
+        if width == 0 || height == 0 || width.checked_mul(height) != Some(pixels.len()) {
+            return Err("invalid scene image".into());
+        }
+        let (reply, result) = sync_channel(1);
+        self.request.as_ref().ok_or("SAM worker stopped")?
+            .try_send(WorkerRequest::Scene(SceneRequest { pixels, width, height, prompt_bundle, reply }))
+            .map_err(|_| "SAM worker busy or stopped".to_string())?;
+        Ok(result)
+    }
     pub fn start(model: impl AsRef<Path>) -> Result<Self, String> {
         Self::start_with_prompt_bundle(model, None::<&Path>)
     }
@@ -6833,6 +6887,33 @@ mod runtime {
                     break;
                 }
                 let batch = match request {
+                    WorkerRequest::Scene(scene) => {
+                        let result = (|| -> Result<Option<SceneCandidate>, String> {
+                            if module.is_none() {
+                                let mut loaded = CModule::load_on_device(&model_path, device)
+                                    .map_err(|e| format!("load scene SAM: {e}"))?;
+                                loaded.set_eval(); module = Some(loaded);
+                            }
+                            // Explicit bundle per request prevents a late prompt reload from
+                            // associating a global crop with the wrong operator text.
+                            let scene_prompts = load_runtime_prompts(
+                                scene.prompt_bundle.as_deref().unwrap_or(&prompt_bundle_path), device, SEMANTIC_PROMPT_COUNT)?;
+                            let mut rgb = vec![0u8; FRAME_WIDTH * FRAME_HEIGHT * 3];
+                            for y in 0..FRAME_HEIGHT {
+                                for x in 0..FRAME_WIDTH {
+                                    let p = scene.pixels[(y * scene.height / FRAME_HEIGHT) * scene.width + x * scene.width / FRAME_WIDTH];
+                                    for (c, shift) in [16,8,0].into_iter().enumerate() {
+                                        rgb[c * FRAME_WIDTH * FRAME_HEIGHT + y * FRAME_WIDTH + x] = (p >> shift) as u8;
+                                    }
+                                }
+                            }
+                            let input = Tensor::from_slice(&rgb).reshape([1,3,FRAME_HEIGHT as i64,FRAME_WIDTH as i64]);
+                            let output = infer(module.as_ref().unwrap(), &input, device, &scene_prompts, OUTER_IRIS_PROMPT)?;
+                            Ok(scene_candidate(&output.masks, &output.scores, output.mask_width, output.mask_height))
+                        })();
+                        let _ = scene.reply.try_send(result);
+                        continue;
+                    }
                     WorkerRequest::Batch(batch) => batch,
                     WorkerRequest::ReloadPrompts(path) => {
                         update_status(&status, "loading", "loading custom SAM prompt embedding");
@@ -8245,6 +8326,28 @@ mod runtime {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scene_candidate_accepts_non_elliptical_objects_and_rejects_empty_or_weak_masks() {
+        let mut mask=vec![0;100*100];
+        // A wide, thin hat-brim-like rectangle, not a plausible iris.
+        for y in 10..15 { for x in 5..95 { mask[y*100+x]=1; } }
+        let result=super::scene_candidate(&mask,&[0.8],100,100).unwrap();
+        assert_eq!(result.bounds,[0.05,0.1,0.95,0.15]);
+        assert_eq!(result.mask_size,(100,100));
+        assert!(super::scene_candidate(&mask,&[0.2],100,100).is_none());
+        assert!(super::scene_candidate(&mask,&[f32::NAN],100,100).is_none());
+        assert!(super::scene_candidate(&[],&[0.9],100,100).is_none());
+        assert!(super::scene_candidate(&vec![1;10000],&[0.9],100,100).is_none());
+        assert!(super::scene_candidate(&mask,&[0.9],0,100).is_none());
+    }
+
+    #[test]
+    fn scene_candidate_selects_score_not_eye_shape() {
+        let mut masks=vec![0;2*100*100];
+        for y in 20..80 { for x in 20..80 { masks[y*100+x]=1; } }
+        for y in 10..15 { for x in 5..95 { masks[10000+y*100+x]=1; } }
+        assert_eq!(super::scene_candidate(&masks,&[0.7,0.9],100,100).unwrap().bounds,[0.05,0.1,0.95,0.15]);
+    }
     #[test]
     fn arbitration_uses_sensor_motion_and_keeps_missing_support_unknown() {
         use crate::roi_evidence::{GlobalSimilarityTimeline, NativeGlobalSimilarityEvidence, SimilarityMotion, SourceClock};

@@ -23,12 +23,14 @@ mapfile -t unexpected_files < <(
       ./docs/roi-reframe-continuity.md \
       ./scripts/audit-tree.sh \
       ./scripts/run-viewer.sh \
+      ./scripts/audit-readmission-corpus.py \
       ./scripts/run-sam31-arc-trial.sh \
       ./scripts/run-sam31-prompt-lab.sh \
       ./scripts/prompt-lab-troublesome-3.txt \
       ./scripts/prompt-lab-troublesome-20.txt \
       ./src/checkerboard_calibration.rs \
       ./src/geometry.rs \
+      ./src/display_pose_wireframe.rs \
       ./src/conic_solver.rs \
       ./src/conic_solver/fidelity.rs \
       ./src/conic_solver/constraint_tests.rs \

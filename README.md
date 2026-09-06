@@ -157,3 +157,47 @@ cargo run --release --bin buttercup-screen-reflection-raw-decode -- \
   --host-phase-prior \
   --output outputs/screen-reflection-calibration/RECOVERED.jsonl
 ```
+# Optional second-eye analysis
+
+Press **3** to toggle subject-left (second ROI) analysis. It starts off; subject-right
+remains enabled. Both enabled eyes may submit SAM requests with separate source
+histories. The worker currently processes these serially without a stale-frame FIFO.
+This is not yet a joint stereo solve: the joint-conic and binocular coordinator
+interfaces remain unimplemented. Enabling the second ROI can increase inference
+contention; physical sensor-band eviction still takes precedence.
+
+In SAM mode, **F → SAM CUSTOM PROMPT: SEGMENTATION ONLY** is a generic object
+inspector: **Enter** edits the shared custom prompt, including objects such as
+hat, mouth or ear. It exclusively captures a fresh full-sensor presentation,
+runs the prompt through the existing serial SAM worker, and shows the selected
+mask plus a 10%-padded object crop. The global view is always visible; a miss
+clears the old crop and retries after a two-second cooldown. Scores >=0.5 and
+nontrivial mask support are heuristic acceptance gates, not calibrated confidence.
+There are no iris shape/size, eye-side or darkness gates in this path.
+
+The object crop is a **software crop of the global capture**, not a newly moved
+high-resolution physical sensor ROI. Global inference currently resizes the
+presentation to 384x256, so small objects may be missed. This explicit inspection
+mode captures independently of the eye-specific R recovery switch; it pauses
+fine-eye analysis and cannot supply eye presence, gaze or mouse calibration.
+F leaves inspection and resumes eye revalidation. It shares the custom prompt
+with the other SAM views: restore an iris prompt before returning to eye tracking.
+Normal eye recovery also publishes each global thumbnail before MediaPipe runs,
+including detection failures.
+
+In SAM mode, **F → CONIC SEGMENTS** shows the de-flat-tire points and colored
+contiguous support arcs for each available ROI, including single-eye operation.
+Green dots are retained support, magenta dots are rejected, and colored lines
+identify runs which never cross rejected contour samples. These are current
+outer-limbus fit supports, not independently solved pupil/inner-limbus arcs or
+an implemented joint stereo solution. Each tile retains its own SAM source image
+and sequence/lag annotation; two visible answers need not share an exposure.
+
+After successful **M** calibration, the result screen shows the estimated monitor
+wireframe, pitch/yaw/roll, physical gaze intersection and eye-to-center/hit distances.
+Yellow physical gaze and the white affine cursor are distinct. Screen size comes
+from the selected monitor's EDID when readable, otherwise the labeled nominal
+27-inch fallback. Angles are eye/camera-relative, not gravity-referenced.
+The reconstruction viewpoint slowly oscillates ±45° horizontally (24-second
+cycle) and ±10° vertically (32-second cycle). This is presentation-only: the
+monitor fit, gaze hit, distances and printed pose angles do not rotate with it.

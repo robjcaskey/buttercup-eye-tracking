@@ -705,10 +705,21 @@ pub(crate) fn score_virtual_display_plane(
 pub(crate) fn fit_virtual_display_plane(
     observations: &[((f64, f64), (f64, f64))],
 ) -> Option<VirtualDisplayPlane> {
+    fit_virtual_display_plane_with_dimensions(observations, nominal_display_dimensions_inches())
+}
+
+pub(crate) fn fit_virtual_display_plane_with_dimensions(
+    observations: &[((f64, f64), (f64, f64))],
+    dimensions: (f64, f64),
+) -> Option<VirtualDisplayPlane> {
     if observations.len() < VIRTUAL_MOUSE_MIN_STABLE_TARGETS {
         return None;
     }
-    let (width_inches, height_inches) = nominal_display_dimensions_inches();
+    let (width_inches, height_inches) = dimensions;
+    if !width_inches.is_finite() || !height_inches.is_finite()
+        || !(1.0..=150.0).contains(&width_inches) || !(1.0..=150.0).contains(&height_inches) {
+        return None;
+    }
     let mut best: Option<(VirtualDisplayPlane, DisplayPlaneScore)> = None;
     for first in 0..observations.len() {
         for second in first + 1..observations.len() {

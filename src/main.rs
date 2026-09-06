@@ -4,6 +4,7 @@ use softbuffer::{Context, Surface};
 mod binocular_coordinator;
 mod checkerboard_calibration;
 mod conic_solver;
+mod display_pose_wireframe;
 mod eye_scene_model;
 mod gaze_target_solver;
 mod geometry;
@@ -633,8 +634,8 @@ fn subject_eye_label(index: usize) -> &'static str {
     }
 }
 
-fn subject_eye_analysis_enabled(index: usize) -> bool {
-    index == 0
+fn subject_eye_analysis_enabled(index: usize, second_roi_enabled: bool) -> bool {
+    index == 0 || (index == 1 && second_roi_enabled)
 }
 
 fn has_eye_border_structure(score: f64, point_count: usize) -> bool {
@@ -5375,6 +5376,7 @@ struct EyePresenceStackStatus {
 fn eye_presence_stack_text_rows(
     stacks: &[EyePresenceStackStatus; 2],
     selected_mode_status: &str,
+    second_roi_enabled: bool,
 ) -> Vec<String> {
     let mut rows = vec!["EYE PRESENCE AUTHORITY STACKS".to_string()];
     for (index, stack) in stacks.iter().enumerate() {
@@ -5402,10 +5404,10 @@ fn eye_presence_stack_text_rows(
                 } else {
                     stack.active_mode.as_str()
                 },
-                if subject_eye_analysis_enabled(index) {
+                if subject_eye_analysis_enabled(index, second_roi_enabled) {
                     stack.active_mode_state.as_str()
                 } else {
-                    "DISPLAY-ONLY"
+                    "DISABLED"
                 },
             )
         });
@@ -5425,6 +5427,8 @@ struct SharedState {
     manual_roi_hold: bool,
     /// Session-only W hotkey; false means automatic following starts enabled.
     region_follow_paused: bool,
+    /// Session-only hotkey 3. Primary (subject-right) analysis stays enabled.
+    second_roi_enabled: bool,
     exposure_action: Option<ExposureAction>,
     reacquire_request: Option<String>,
     linear_snapshot_request: bool,
@@ -5516,6 +5520,8 @@ struct SharedState {
     sam31_prompt_compile_epoch: u64,
     sam31_prompt_text: String,
     sam31_prompt_status: String,
+    sam31_object_inspection: bool,
+    sam31_scene_candidate: Option<sam31_outer::SceneCandidate>,
     pupil_size_runtime: PupilSizeRuntimeStatus,
     checkerboard_active: bool,
     checkerboard_generation: u64,
@@ -5661,6 +5667,8 @@ fn set_segmentation_mode(
     state.segmentation_mode = mode;
     if mode != SegmentationMode::Sam31 {
         state.sam31_semantic_prompt = None;
+        state.sam31_object_inspection = false;
+        state.sam31_scene_candidate = None;
     }
     state.segmentation_status = match mode {
         SegmentationMode::Native => format!(
@@ -8229,15 +8237,19 @@ enum RoiOverlayMode {
     #[default]
     FullDiagnostics,
     SamOuterIrisMasks,
+    SamSegmentationOnly,
     SamOuterIrisFit,
+    SamConicSegments,
     SamDeflattenedVirtualContact,
     Clean,
 }
 
 impl RoiOverlayMode {
-    const SAM31_MODES: [Self; 5] = [
+    const SAM31_MODES: [Self; 7] = [
         Self::SamOuterIrisMasks,
+        Self::SamSegmentationOnly,
         Self::SamOuterIrisFit,
+        Self::SamConicSegments,
         Self::SamDeflattenedVirtualContact,
         Self::Clean,
         Self::FullDiagnostics,
@@ -8286,7 +8298,9 @@ impl RoiOverlayMode {
         match self {
             Self::FullDiagnostics => "FULL DIAGNOSTICS",
             Self::SamOuterIrisMasks => "SAM PROMPT: OUTER IRIS DISK  ENTER EDIT",
+            Self::SamSegmentationOnly => "SAM CUSTOM PROMPT: SEGMENTATION ONLY  ENTER EDIT",
             Self::SamOuterIrisFit => "SAM OUTER IRIS: DE-FLAT-TIRE FIT",
+            Self::SamConicSegments => "CONIC SEGMENTS",
             Self::SamDeflattenedVirtualContact => "VIRTUAL CONTACT: DE-FLAT-TIRE FIT",
             Self::Clean => "CLEAN ROI",
         }
@@ -8295,7 +8309,9 @@ impl RoiOverlayMode {
     fn sam31_prompt_index(self) -> Option<usize> {
         match self {
             Self::SamOuterIrisMasks
+            | Self::SamSegmentationOnly
             | Self::SamOuterIrisFit
+            | Self::SamConicSegments
             | Self::SamDeflattenedVirtualContact => Some(0),
             _ => None,
         }
@@ -9057,6 +9073,7 @@ struct VirtualMouseMode {
     /// not its storage; only an explicit new calibration may replace it.
     completed_basis_pause: Option<&'static str>,
     display_plane: Option<VirtualDisplayPlane>,
+    display_dimensions: Option<(f64, f64)>,
     gaze_affine: Option<GazeAffine>,
     reticle: Option<(f64, f64)>,
     last_timestamp_ns: Option<u64>,
@@ -9090,6 +9107,7 @@ impl VirtualMouseMode {
             calibration_authority_restarts: 0,
             completed_basis_pause: None,
             display_plane: None,
+            display_dimensions: None,
             gaze_affine: None,
             reticle: None,
             last_timestamp_ns: None,
@@ -9462,7 +9480,10 @@ impl VirtualMouseMode {
                 .then(|| fit_robust_gaze_affine(measured.as_slice()))
                 .flatten();
             self.display_plane = coverage_ready
-                .then(|| fit_virtual_display_plane(measured.as_slice()))
+                .then(|| match self.display_dimensions {
+                    Some(dimensions) => gaze_target_solver::fit_virtual_display_plane_with_dimensions(measured.as_slice(), dimensions),
+                    None => fit_virtual_display_plane(measured.as_slice()),
+                })
                 .flatten();
             let affine_ready = self.gaze_affine.is_some();
             let plane_ready = self.display_plane.is_some();
@@ -9719,6 +9740,7 @@ fn compile_live_sam31_outer_prompt(shared: Arc<Mutex<SharedState>>, prompt: Stri
                         state.sam31_prompt_bundle_generation =
                             state.sam31_prompt_bundle_generation.wrapping_add(1);
                         state.sam31_prompt_text = prompt;
+                        state.sam31_scene_candidate = None;
                         state.sam31_prompt_status =
                             "CUSTOM PROMPT ENCODED; WAITING FOR SAM BATCH BOUNDARY".to_string();
                     }
@@ -9997,8 +10019,9 @@ impl App {
             }),
             "targets": VIRTUAL_MOUSE_CALIBRATION_TARGETS,
             "target_statistics": target_statistics,
-            "display_diagonal_inches": NOMINAL_DISPLAY_DIAGONAL_INCHES,
-            "display_aspect": [NOMINAL_DISPLAY_ASPECT_WIDTH, NOMINAL_DISPLAY_ASPECT_HEIGHT],
+            "display_diagonal_inches": self.virtual_mouse.as_ref().and_then(|mode| mode.display_dimensions).map_or(NOMINAL_DISPLAY_DIAGONAL_INCHES, |(w,h)| w.hypot(h)),
+            "display_aspect": self.virtual_mouse.as_ref().and_then(|mode| mode.display_dimensions).map_or([NOMINAL_DISPLAY_ASPECT_WIDTH, NOMINAL_DISPLAY_ASPECT_HEIGHT], |(w,h)| [w,h]),
+            "display_size_source": if self.virtual_mouse.as_ref().is_some_and(|mode| mode.display_dimensions.is_some()) { "selected-monitor-edid-dtd-mm" } else { "nominal-27-inch-16x9" },
             "display_pose": display_pose,
             "gaze_affine": gaze_affine,
             "focus_eye": capture.focus_eye,
@@ -26148,6 +26171,7 @@ struct Recorder {
     temp: PathBuf,
     jsonl: File,
     predictions: File,
+    recovery: File,
     raw: [File; 2],
     offsets: [u64; 2],
     pending_predictions: BTreeMap<(u32, u64, u64), RecordedRoiFrame>,
@@ -26193,10 +26217,14 @@ impl Recorder {
             config.eye_size.0,
             config.eye_size.1
         );
-        fs::write(temp.join("manifest.json"), manifest).map_err(|error| error.to_string())?;
+        let mut manifest: serde_json::Value = serde_json::from_str(&manifest).map_err(|error|error.to_string())?;
+        manifest["recovery_index"] = serde_json::json!("recovery.jsonl");
+        manifest["recovery_schema"] = serde_json::json!("buttercup-roi-recovery-frame-v1");
+        fs::write(temp.join("manifest.json"), serde_json::to_vec_pretty(&manifest).map_err(|error|error.to_string())?).map_err(|error| error.to_string())?;
         let jsonl = File::create(temp.join("frames.jsonl")).map_err(|error| error.to_string())?;
         let predictions =
             File::create(temp.join("predictions.jsonl")).map_err(|error| error.to_string())?;
+        let recovery = File::create(temp.join("recovery.jsonl")).map_err(|error| error.to_string())?;
         let right =
             File::create(temp.join("subject-right.raw10")).map_err(|error| error.to_string())?;
         let left =
@@ -26206,11 +26234,37 @@ impl Recorder {
             temp,
             jsonl,
             predictions,
+            recovery,
             raw: [right, left],
             offsets: [0, 0],
             pending_predictions: BTreeMap::new(),
             finalized: false,
         })
+    }
+
+    fn record_recovery(&mut self, header: &PacketHeader, tracker: &RawRoiTracker) -> Result<(), String> {
+        let event = serde_json::json!({
+            "schema":"buttercup-roi-recovery-frame-v1",
+            "sequence":header.sequence,"timestamp_ns":header.timestamp_ns,
+            "applied_region":header.region.map(|r|serde_json::json!({"session":r.session,"generation":r.generation,"mask":r.active_mask,"band_y":r.band_y,"eyes":r.eyes})),
+            "proposed_mask":tracker.region_active_mask,"proposed_eyes":tracker.absolute,
+            "proposed_band_y":tracker.planned_region_origin_y,
+            "enabled_mask":tracker.readmission_enabled_mask,
+            "following_paused":tracker.region_follow_paused,
+            "coarse_seed_projected_separation_px":tracker.readmission_seed,
+            "seed_has_coarse_context":tracker.context_bootstrap,
+            "projected_separation_px":tracker.readmission_separation,
+            "observed_pivots_timestamp_sensor_offset":tracker.readmission_pivots,
+            "refinement_pair":tracker.readmission_pair,
+            "recovery_cap_pair_sensor":tracker.readmission_pair_centers,
+            "recovery_cap_pair_clock":tracker.readmission_center_pair_clock,
+            "refinable":tracker.readmission_refinable,
+            "probe_age_ms":tracker.readmission_last_probe.map(|at|at.elapsed().as_millis()),
+            "probe_hold_remaining_ms":tracker.readmission_hold_until.map(|until|until.saturating_duration_since(Instant::now()).as_millis()),
+            "prediction_is_detection":false,
+        });
+        serde_json::to_writer(&mut self.recovery,&event).map_err(|e|e.to_string())?;
+        self.recovery.write_all(b"\n").map_err(|e|e.to_string())
     }
 
     fn record(&mut self, header: &PacketHeader, payload: &[u8]) -> Result<(), String> {
@@ -26326,6 +26380,7 @@ impl Recorder {
         self.finalized = true;
         self.flush_unavailable_predictions()?;
         self.jsonl.flush().map_err(|error| error.to_string())?;
+        self.recovery.flush().map_err(|error|error.to_string())?;
         self.predictions
             .flush()
             .map_err(|error| error.to_string())?;
@@ -26341,6 +26396,7 @@ impl Recorder {
                 "manifest.json",
                 "frames.jsonl",
                 "predictions.jsonl",
+                "recovery.jsonl",
                 "subject-left.raw10",
                 "subject-right.raw10",
             ])
@@ -28337,6 +28393,16 @@ struct RawRoiTracker {
     region_follow_paused: bool,
     /// Desired residency, not evidence that an evicted eye disappeared.
     region_active_mask: u8,
+    readmission_last_probe: Option<Instant>,
+    readmission_hold_until: Option<Instant>,
+    readmission_separation: [f64; 2],
+    readmission_seed: [f64; 2],
+    readmission_pivots: [Option<(u64, [f64; 2], [f64; 2])>; 2],
+    readmission_pair: Option<[u64; 2]>,
+    readmission_pair_centers: Option<[[f64;2];2]>,
+    readmission_center_pair_clock: Option<[u64;2]>,
+    readmission_refinable: [bool; 2],
+    readmission_enabled_mask: u8,
     /// Proposed origin. Only source-keyed camera acknowledgement applies it.
     planned_region_origin_y: Option<u32>,
     pivot_scheduler: Option<pivot_region_scheduler::PivotRegionScheduler>,
@@ -28376,6 +28442,61 @@ struct RawRoiTracker {
 }
 
 impl RawRoiTracker {
+    /// Re-open a bounded crop in the already resident sensor band. A probe
+    /// renews transport availability, never identity or gaze authority.
+    fn propose_readmission(&mut self, survivor: usize, timestamp_ns: u64, now: Instant) -> bool {
+        if survivor >= 2 || !self.live_region_transactions || self.region_follow_paused
+            || self.region_active_mask & (1 << survivor) == 0
+            || self.readmission_enabled_mask & (1 << (1-survivor)) == 0
+            || self.readmission_last_probe.is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(4)) {
+            return false;
+        }
+        let missing = 1-survivor;
+        let Some((source, pivot, offset)) = self.readmission_pivots[survivor] else { return false; };
+        if timestamp_ns < source || timestamp_ns-source > SAM31_RESULT_MAX_AGE_NS { return false; }
+        let resident = self.region_active_mask & (1 << missing) != 0;
+        if resident && (self.readmission_pair_centers.is_none()
+            || self.readmission_pivots[missing].is_none_or(|p|timestamp_ns.saturating_sub(p.0) < 1_500_000_000)) {
+            return false;
+        }
+        let sign = if missing == 1 { 1.0 } else { -1.0 };
+        let missing_offset = self.readmission_pivots[missing].map_or(offset,|p|p.2);
+        let center: [f64;2] = if let Some(pair) = self.readmission_pair_centers {
+            // Translate a previously observed two-eye cap configuration. The
+            // uncertain pivot-to-cap offsets need not agree between eyes.
+            std::array::from_fn(|axis|pair[missing][axis]+pivot[axis]+offset[axis]-pair[survivor][axis])
+        } else {
+            std::array::from_fn(|axis| pivot[axis]+sign*self.readmission_separation[axis]+missing_offset[axis])
+        };
+        if resident && center[0] >= (self.absolute[missing].0+32) as f64
+            && center[0] <= (self.absolute[missing].0+self.eye_size.0-32) as f64
+            && center[1] >= (self.absolute[missing].1+32) as f64
+            && center[1] <= (self.absolute[missing].1+self.eye_size.1-32) as f64 {
+            return false; // Still captured: let SAM check it; do not steer on an occlusion alone.
+        }
+        let band_top = self.origin.1;
+        let band_bottom = band_top+self.window.1;
+        // Conservative feasibility interval. No band jump or displacement of
+        // the surviving ROI just to manufacture an admissible prediction.
+        let uncertainty = 32.0;
+        if !center.iter().all(|x|x.is_finite()) || center[0]-uncertainty < 0.0
+            || center[0]+uncertainty >= SENSOR_WIDTH as f64
+            || center[1]-uncertainty < band_top as f64 || center[1]+uncertainty >= band_bottom as f64
+            || self.window.1 < self.eye_size.1 { return false; }
+        let x = ((center[0]-self.eye_size.0 as f64*0.5).round() as i32)
+            .clamp(0,SENSOR_WIDTH as i32-self.eye_size.0) & !3;
+        let y = ((center[1]-self.eye_size.1 as f64*0.5).round() as i32)
+            .clamp(band_top,band_bottom-self.eye_size.1) & !1;
+        self.absolute[missing] = (x,y);
+        self.region_active_mask |= 1 << missing;
+        self.planned_region_origin_y = Some(band_top as u32);
+        self.positions_dirty = true;
+        self.readmission_last_probe = Some(now);
+        self.readmission_hold_until = Some(now+Duration::from_millis(1800));
+        eprintln!("ROI READMISSION PROBE {} at {x},{y} from {} projected separation {:?}; no identity assertion",subject_eye_label(missing),subject_eye_label(survivor),self.readmission_separation);
+        true
+    }
+
     fn sync_region_follow_pause(&mut self, paused: bool, eyes: [(u32, u32); 2],
         origin: (u32, u32), active_mask: u8) {
         if self.region_follow_paused == paused { return; }
@@ -28390,6 +28511,12 @@ impl RawRoiTracker {
     }
 
     fn reset_pivot_source_clock(&mut self) {
+        self.readmission_pivots = [None; 2];
+        self.readmission_pair = None;
+        self.readmission_pair_centers = None;
+        self.readmission_center_pair_clock = None;
+        self.readmission_refinable = [false;2];
+        self.readmission_hold_until = None;
         if let Some(scheduler) = self.pivot_scheduler.as_mut() { scheduler.reset(); }
         self.pivot_motion_history = std::array::from_fn(|_| VecDeque::new());
         self.pivot_scheduled_eyes = [false; 2];
@@ -28448,8 +28575,46 @@ impl RawRoiTracker {
         while self.pivot_motion_history[index].len() > 3 {
             self.pivot_motion_history[index].pop_front();
         }
+        self.readmission_pivots[index] = Some((source_timestamp_ns,
+            [pivot_sensor.0, pivot_sensor.1], support_offset_px));
+        self.readmission_refinable[index] = quality >= 0.6 && velocity_sensor_px_s.iter().all(|v| v.abs() < 10.0);
+        if let [Some(a),Some(b)] = self.readmission_pivots {
+            let clocks=[a.0,b.0];
+            if self.readmission_refinable.iter().all(|v|*v)
+                && a.0.abs_diff(b.0) <= 400_000_000
+                && current_timestamp_ns.saturating_sub(a.0.min(b.0)) <= SAM31_RESULT_MAX_AGE_NS
+                && self.readmission_center_pair_clock.is_none_or(|last|clocks[0]>last[0] && clocks[1]>last[1]) {
+                let centers=[std::array::from_fn(|axis|a.1[axis]+a.2[axis]),std::array::from_fn(|axis|b.1[axis]+b.2[axis])];
+                let separation=centers[1][0]-centers[0][0];
+                if separation > self.readmission_seed[0]*0.5 && separation < self.readmission_seed[0]*1.5
+                    && (centers[1][1]-centers[0][1]).abs() < self.eye_size.1 as f64+self.readmission_seed[1].abs() {
+                    self.readmission_pair_centers=Some(centers);
+                    self.readmission_center_pair_clock=Some(clocks);
+                }
+            }
+        }
+        // Projected inter-eye separation, NOT a measured metric IPD. Only
+        // two fresh, nearly simultaneous, low-motion observed pivots refine
+        // the coarse semantic seed. Crop locations/probe ACKs never train it.
+        if self.readmission_refinable.iter().all(|ready| *ready) {
+            if let [Some(a),Some(b)] = self.readmission_pivots {
+                let pair = [a.0,b.0];
+                if a.0.abs_diff(b.0) <= 150_000_000
+                    && current_timestamp_ns.saturating_sub(a.0.min(b.0)) <= 300_000_000
+                    && self.readmission_pair.is_none_or(|last| pair[0] > last[0] && pair[1] > last[1]) {
+                    let delta = [b.1[0]-a.1[0],b.1[1]-a.1[1]];
+                    if (delta[0]-self.readmission_separation[0]).abs() < self.eye_size.0 as f64*0.5
+                        && (delta[1]-self.readmission_separation[1]).abs() < self.eye_size.1 as f64*0.5 {
+                        for axis in 0..2 { self.readmission_separation[axis] += 0.1*(delta[axis]-self.readmission_separation[axis]); }
+                        self.readmission_pair = Some(pair);
+                    }
+                }
+            }
+        }
+        if self.readmission_hold_until.is_some_and(|until| Instant::now() < until) { return; }
+        if self.propose_readmission(index, current_timestamp_ns, Instant::now()) { return; }
         self.pivot_scheduled_eyes[index] = true;
-        let plan = scheduler.plan(current_timestamp_ns, self.origin.1.max(0) as u32);
+        let plan = self.pivot_scheduler.as_mut().unwrap().plan(current_timestamp_ns, self.origin.1.max(0) as u32);
         let mut desired = self.absolute;
         let mut mask = 0u8;
         for region in plan.regions {
@@ -28521,6 +28686,16 @@ impl RawRoiTracker {
             live_region_transactions: false,
             region_follow_paused: false,
             region_active_mask: 3,
+            readmission_last_probe: None,
+            readmission_hold_until: None,
+            readmission_separation: [(absolute[1].0-absolute[0].0) as f64,(absolute[1].1-absolute[0].1) as f64],
+            readmission_seed: [(absolute[1].0-absolute[0].0) as f64,(absolute[1].1-absolute[0].1) as f64],
+            readmission_pivots: [None;2],
+            readmission_pair: None,
+            readmission_pair_centers: None,
+            readmission_center_pair_clock: None,
+            readmission_refinable: [false;2],
+            readmission_enabled_mask: 1,
             planned_region_origin_y: None,
             pivot_scheduler: pivot_region_scheduler::PivotRegionScheduler::new(
                 pivot_region_scheduler::Config::for_geometry(
@@ -28577,15 +28752,17 @@ impl RawRoiTracker {
         requested: (i32, i32),
     ) -> (i32, i32) {
         let trusted = self.trusted_absolute[eye_index.min(1)];
+        let current = self.absolute[eye_index.min(1)];
+        let bound = |wanted: i32, at: i32, anchor: i32, envelope: i32| {
+            // A stale anchor can lie entirely behind the current crop after a
+            // valid sensor-space reframe. It may veto further outward travel,
+            // but cannot turn a small correction into a backwards teleport.
+            let clamped = wanted.clamp(anchor-envelope,anchor+envelope);
+            clamped.clamp(at.min(wanted),at.max(wanted))
+        };
         (
-            requested.0.clamp(
-                trusted.0 - EYE_INTERNAL_FINE_RECOVERY_ENVELOPE.0,
-                trusted.0 + EYE_INTERNAL_FINE_RECOVERY_ENVELOPE.0,
-            ),
-            requested.1.clamp(
-                trusted.1 - EYE_INTERNAL_FINE_RECOVERY_ENVELOPE.1,
-                trusted.1 + EYE_INTERNAL_FINE_RECOVERY_ENVELOPE.1,
-            ),
+            bound(requested.0,current.0,trusted.0,EYE_INTERNAL_FINE_RECOVERY_ENVELOPE.0),
+            bound(requested.1,current.1,trusted.1,EYE_INTERNAL_FINE_RECOVERY_ENVELOPE.1),
         )
     }
 
@@ -29596,7 +29773,8 @@ impl RawRoiTracker {
             return Ok(None);
         }
         if !self.positions_dirty
-            || !self.has_tracking_lock()
+            || (!self.has_tracking_lock()
+                && !self.readmission_hold_until.is_some_and(|until| Instant::now() < until))
             || self.last_command.elapsed() < Duration::from_millis(250)
         {
             return Ok(None);
@@ -30624,11 +30802,69 @@ fn write_franken_context_snapshot(frame: &ContextFrame) -> Result<PathBuf, Strin
     Ok(path)
 }
 
+fn scene_crop_bounds(bounds: [f64;4], width: usize, height: usize) -> (usize,usize,usize,usize) {
+    let dx=(bounds[2]-bounds[0])*0.1;
+    let dy=(bounds[3]-bounds[1])*0.1;
+    let x=((bounds[0]-dx).clamp(0.0,1.0)*width as f64).floor() as usize;
+    let y=((bounds[1]-dy).clamp(0.0,1.0)*height as f64).floor() as usize;
+    let x1=((bounds[2]+dx).clamp(0.0,1.0)*width as f64).ceil() as usize;
+    let y1=((bounds[3]+dy).clamp(0.0,1.0)*height as f64).ceil() as usize;
+    (x,y,x1.saturating_sub(x).max(1),y1.saturating_sub(y).max(1))
+}
+
+fn inspect_prompt_scene(config: &Config, shared: &Mutex<SharedState>, client: Option<&sam31_outer::Client>,
+    stop: &AtomicBool) -> Result<(), String> {
+    let client = client.ok_or("SAM worker unavailable")?;
+    let (generation, bundle) = {
+        let mut state = shared.lock().map_err(|_| "viewer lock poisoned")?;
+        state.reacquire_status = Some("OBJECT GLOBAL SEARCH: CAPTURING FULL SENSOR".into());
+        (state.sam31_prompt_bundle_generation, state.sam31_prompt_bundle_override.clone())
+    };
+    let capture = capture_global_presentation(config)?;
+    let backdrop = load_ppm(&capture.path)?;
+    let current = || !stop.load(Ordering::Relaxed) && shared.lock().is_ok_and(|state|
+        state.sam31_object_inspection && state.sam31_prompt_bundle_generation == generation);
+    if !current() { return Ok(()); }
+    if let Ok(mut state) = shared.lock() {
+        state.presentation_backdrop = Some(backdrop.clone());
+        state.reacquire_status = Some("OBJECT GLOBAL SEARCH: SEGMENTING CUSTOM PROMPT".into());
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let pending = loop {
+        if !current() { return Ok(()); }
+        match client.submit_scene(Arc::clone(&backdrop.pixels), backdrop.width, backdrop.height, bundle.clone()) {
+            Ok(pending) => break pending,
+            Err(error) if Instant::now() >= deadline => return Err(error),
+            Err(_) => thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    let candidate = loop {
+        if !current() { return Ok(()); }
+        match pending.recv_timeout(Duration::from_millis(100)) {
+            Ok(result) => break result?,
+            Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => {},
+            Err(error) => return Err(format!("SAM scene result: {error}")),
+        }
+    };
+    if let Ok(mut state) = shared.lock() {
+        if state.sam31_object_inspection && state.sam31_prompt_bundle_generation == generation {
+            state.reacquire_status = Some(if let Some(candidate) = &candidate {
+                format!("OBJECT ROI: GLOBAL-IMAGE CROP; SCORE {:.2} (HEURISTIC)", candidate.score)
+            } else {
+                "OBJECT GLOBAL SEARCH: NO CANDIDATE; RETRYING".into()
+            });
+            state.sam31_scene_candidate = candidate;
+        }
+    }
+    Ok(())
+}
+
 fn reacquire_with_mediapipe(
     current: &Config,
     restore_ready: &std::sync::mpsc::SyncSender<()>,
     _context_snapshot: Option<&Path>,
     task_kind: MediaPipeTaskKind,
+    shared: &Mutex<SharedState>,
 ) -> Result<Config, String> {
     let phase_started = Instant::now();
     eprintln!("REACQUIRE_PHASE task={task_kind:?} phase=spawn_acquisition elapsed_ms=0");
@@ -30637,6 +30873,16 @@ fn reacquire_with_mediapipe(
     // completed capture packet. Release the eye receiver immediately; native
     // inference runs in parallel with the newly resumed fine stream.
     let _ = restore_ready.try_send(());
+    // Publish the new global image even when the following anatomical search
+    // fails. A successful detection is not required to show what was searched.
+    if let Ok(backdrop) = load_ppm(&capture.path) {
+        if let Ok(mut state) = shared.lock() {
+            state.presentation_backdrop = Some(backdrop);
+            if task_kind != MediaPipeTaskKind::LinearSnapshot {
+                state.reacquire_status = Some("GLOBAL SEARCH: NEW SENSOR THUMBNAIL; FINDING EYES".to_string());
+            }
+        }
+    }
     eprintln!(
         "REACQUIRE_PHASE task={task_kind:?} phase=global_capture_complete elapsed_ms={}",
         phase_started.elapsed().as_millis(),
@@ -30998,7 +31244,44 @@ fn receive(
     let mut last_driving_presence_timestamp_ns = [None::<u64>; 2];
     let mut host_telemetry = HostTelemetry::new(Instant::now());
     let mut display_color_balance = DisplayColorBalance::default();
+    let mut scene_inspection_was_active = false;
     while !stop.load(Ordering::Relaxed) {
+        // Generic object inspection owns coarse captures exclusively. It never
+        // passes a hat/ear/mouth to the anatomical tracker or calibration.
+        if mediapipe_task.is_none() && shared.lock().is_ok_and(|state| state.sam31_object_inspection) {
+            scene_inspection_was_active = true;
+            if let Ok(mut state) = shared.lock() {
+                state.eyes = [None, None];
+                state.eye_identity_present = [false; 2];
+                state.sam31_scene_candidate = None;
+            }
+            let result = inspect_prompt_scene(&config, &shared, sam31_client.as_ref(), &stop);
+            if let Err(error) = result {
+                if let Ok(mut state) = shared.lock() {
+                    state.reacquire_status = Some(format!("OBJECT GLOBAL SEARCH: {error}"));
+                }
+            }
+            // No tight failed-detection loop and no blocked UI while waiting.
+            for _ in 0..20 {
+                if stop.load(Ordering::Relaxed) || !shared.lock().is_ok_and(|state| state.sam31_object_inspection) { break; }
+                thread::sleep(Duration::from_millis(100));
+            }
+            continue;
+        }
+        if scene_inspection_was_active {
+            scene_inspection_was_active = false;
+            roi_tracker = RawRoiTracker::new(&config);
+            previous = [None, None];
+            sam31_latest = [None, None];
+            sam31_latest_proposals = [None, None];
+            for history in &mut sam31_histories { history.clear(); }
+            no_anatomy_since = [None, None];
+            active_mode_presence_seen = [None, None];
+            if let Ok(mut state) = shared.lock() {
+                state.sam31_scene_candidate = None;
+                state.reacquire_request = Some("return from generic object inspection; revalidate eyes".into());
+            }
+        }
         if let Some(restore_gate) = mediapipe_restore_gate.take() {
             match restore_gate.recv_timeout(Duration::from_millis(250)) {
                 Ok(()) => {
@@ -31140,6 +31423,7 @@ fn receive(
             host_telemetry.last_packet_arrival = None;
             loop {
                 let follow_paused = shared.lock().map(|state| state.region_follow_paused).unwrap_or(true);
+                roi_tracker.readmission_enabled_mask = if shared.lock().is_ok_and(|state| state.second_roi_enabled) { 3 } else { 1 };
                 roi_tracker.sync_region_follow_pause(follow_paused, config.eyes, config.origin, applied_region_mask);
                 if pending_region.is_some_and(|pending| Instant::now() > pending.deadline)
                     && packet_reader.transition.lock().map_err(|_| "region transition lock poisoned")?.pending.is_some() {
@@ -31157,6 +31441,9 @@ fn receive(
                 }
                 if stop.load(Ordering::Relaxed) {
                     return Ok(());
+                }
+                if mediapipe_task.is_none() && shared.lock().is_ok_and(|state| state.sam31_object_inspection) {
+                    return Err("SAM_OBJECT_INSPECTION".into());
                 }
                 let checkerboard_active = shared
                     .lock()
@@ -31778,6 +32065,7 @@ fn receive(
                 }
                 if let Some(recorder) = recorder.as_mut() {
                     recorder.record(&header, &payload)?;
+                    recorder.record_recovery(&header, &roi_tracker)?;
                 }
                 if first_in_set {
                     let request = shared
@@ -31939,7 +32227,7 @@ fn receive(
                 }
                 let mut timed_completion = None;
                 if let Some(active) = timed_recording.as_mut() {
-                    match active.recorder.record(&header, &payload) {
+                    match active.recorder.record(&header, &payload).and_then(|()|active.recorder.record_recovery(&header,&roi_tracker)) {
                         Ok(()) => {
                             active.frames = active.frames.saturating_add(1);
                             if last_in_set {
@@ -31986,7 +32274,7 @@ fn receive(
                 }
                 let mut hotkey_error = None;
                 if let Some(active) = hotkey_recording.as_mut() {
-                    match active.recorder.record(&header, &payload) {
+                    match active.recorder.record(&header, &payload).and_then(|()|active.recorder.record_recovery(&header,&roi_tracker)) {
                         Ok(()) => {
                             active.frames = active.frames.saturating_add(1);
                             if last_in_set {
@@ -32152,17 +32440,27 @@ fn receive(
                         });
                     }
                 }
-                // Temporary single-eye mode: the camera transport remains a
+                // Optional single-eye analysis: the camera transport remains a
                 // paired shared-exposure stream, so subject-left packets must
                 // still be drained for cadence and optional lossless bundle
                 // recording. Discard them before RAW10 unpacking, anatomy,
                 // autofocus, segmentation, preview generation, and model
                 // publication. This also guarantees that the incremental 3D
                 // iris/lens builders receive subject-right evidence only.
-                if !subject_eye_analysis_enabled(index) {
+                let second_roi_enabled = shared.lock().is_ok_and(|state| state.second_roi_enabled);
+                if !subject_eye_analysis_enabled(index, second_roi_enabled) {
+                    // Never let a result from a previous enabled interval
+                    // re-enter after toggling back on. Preserve primary history.
+                    sam31_sessions[index].invalidate();
+                    sam31_histories[index].clear();
+                    sam31_latest[index] = None;
+                    sam31_latest_proposals[index] = None;
+                    surface_gaze_trackers[index] = SurfaceGazeTracker::default();
+                    virtual_contact_surface_trackers[index] = SurfaceGazeTracker::default();
                     if let Ok(mut state) = shared.lock() {
                         state.eyes[index] = None;
                         state.eye_identity_present[index] = false;
+                        state.eye_presence_stacks[index] = EyePresenceStackStatus::default();
                     }
                     counts[index] = counts[index].saturating_add(1);
                     fine_sets_since_mediapipe = fine_sets_since_mediapipe.saturating_add(1);
@@ -32939,11 +33237,9 @@ fn receive(
                         }
                     }
                 }
-                // Until right-eye tracking is solved end to end, reserve the
-                // promptable graph exclusively for anatomical subject-right
-                // (index 0).  The left viewport remains display-only and must
-                // not consume the bounded inference queue.
-                if let (Some(target), 0) = (sam31_target, index) {
+                // Each enabled eye has independent source/session history.
+                // The shared worker still admits only current, nonqueued work.
+                if let Some(target) = sam31_target {
                     if let Some(client) = sam31_client.as_ref() {
                         let motion = sam31_outer::memory_arbitration_enabled().then(||
                             sam31_outer::SourceMotionSnapshot {
@@ -36684,6 +36980,7 @@ fn receive(
             }
         })();
         if let Err(error) = result {
+            if error == "SAM_OBJECT_INSPECTION" { continue; }
             if error == MANUAL_ROI_UPDATE {
                 let action = shared
                     .lock()
@@ -37561,6 +37858,7 @@ fn receive(
                     ));
                 }
                 let task_config = config.clone();
+                let task_shared = Arc::clone(&shared);
                 fine_sets_since_mediapipe = 0;
                 let (sender, receiver) = sync_channel(1);
                 let (restore_sender, restore_receiver) = sync_channel(1);
@@ -37580,6 +37878,7 @@ fn receive(
                             &restore_sender,
                             context_snapshot.as_deref(),
                             task_kind,
+                            &task_shared,
                         );
                         // A capture failure must still release the receiver so
                         // it can inspect the result and restore explicitly.
@@ -38677,6 +38976,7 @@ fn draw_sam31_proposal_masks(
     pixel_scale: usize,
     current_sequence: u64,
     requested_prompt: usize,
+    show_geometry: bool,
     proposals: Option<&sam31_outer::ProposalMasks>,
 ) -> usize {
     let Some(proposals) = proposals else {
@@ -38851,7 +39151,7 @@ fn draw_sam31_proposal_masks(
     // fit; pink points are long flat-tire/foreground chords that cannot be an
     // iris arc at the observed scale.  The cyan loop is inferred exclusively
     // from the retained points.  Other semantic questions remain mask-only.
-    if requested_prompt == sam31_outer::OUTER_IRIS_PROMPT {
+    if show_geometry && requested_prompt == sam31_outer::OUTER_IRIS_PROMPT {
         if let Some(review) = proposals.outer_fit.as_ref() {
             let ellipse_points = review.ellipse.dense_points(180);
             for index in 0..ellipse_points.len() {
@@ -38926,7 +39226,7 @@ fn draw_sam31_proposal_masks(
         height,
         origin_x + 4,
         origin_y + (proposals.source_height * pixel_scale) as i32 - 12,
-        &if requested_prompt == sam31_outer::OUTER_IRIS_PROMPT {
+        &if show_geometry && requested_prompt == sam31_outer::OUTER_IRIS_PROMPT {
             let (retained, censored, flags) =
                 proposals
                     .outer_fit
@@ -39187,6 +39487,15 @@ fn draw_sam31_deflattened_virtual_contact(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn conic_segment_color(index: usize, count: usize) -> u32 {
+    const COLORS: [u32;4] = [0x00ff_d860,0x0060_a0ff,0x00ff_8840,0x00c0_80ff];
+    let mut slot = index % COLORS.len();
+    // A contour is cyclic: palette wrap must not give its last and first
+    // runs the same color (5, 9, ... segments). The predecessor is slot 3.
+    if count > 1 && index == count-1 && slot == 0 { slot = 1; }
+    COLORS[slot]
+}
+
 fn draw_eye_with_spatial_debug(
     pixels: &mut [u32],
     width: usize,
@@ -39308,6 +39617,32 @@ fn draw_eye_with_spatial_debug(
                 frame.sequence,
                 frame.sam31_proposal_masks.as_deref(),
             ),
+            RoiOverlayMode::SamConicSegments => {
+                let count = draw_sam31_outer_iris_fit(pixels,width,height,x,y,pixel_scale,
+                    frame.sequence,frame.sam31_proposal_masks.as_deref());
+                if let Some(review) = frame.sam31_proposal_masks.as_ref().and_then(|p| p.outer_fit.as_ref()) {
+                    for (segment_index,segment) in review.conic_segments.iter().enumerate() {
+                        let color = conic_segment_color(segment_index, review.conic_segments.len());
+                        for pair in segment.windows(2) {
+                            let (Some(a),Some(b)) = (review.retained_points.get(pair[0]),review.retained_points.get(pair[1])) else { continue; };
+                            draw_line_clipped(pixels,width,height,x+(a.0*pixel_scale as f64).round() as i32,
+                                y+(a.1*pixel_scale as f64).round() as i32,x+(b.0*pixel_scale as f64).round() as i32,
+                                y+(b.1*pixel_scale as f64).round() as i32,color);
+                        }
+                        // Color support dots too; short adjacent arcs must not
+                        // disappear into the common green flat-tire point layer.
+                        for &point in segment {
+                            if let Some(p)=review.retained_points.get(point) {
+                                let marker=pixel_scale.max(3) as i32;
+                                fill_rect(pixels,width,height,x+(p.0*pixel_scale as f64).round() as i32-marker/2,
+                                    y+(p.1*pixel_scale as f64).round() as i32-marker/2,marker,marker,color);
+                            }
+                        }
+                    }
+                    draw_text(pixels,width,height,x+4,y+6,&format!("{} SUPPORTED ARCS",review.conic_segments.len()),0x00ff_d860);
+                }
+                count
+            },
             RoiOverlayMode::SamDeflattenedVirtualContact => draw_sam31_deflattened_virtual_contact(
                 pixels,
                 width,
@@ -39317,7 +39652,7 @@ fn draw_eye_with_spatial_debug(
                 pixel_scale,
                 frame,
             ),
-            RoiOverlayMode::SamOuterIrisMasks => draw_sam31_proposal_masks(
+            RoiOverlayMode::SamOuterIrisMasks | RoiOverlayMode::SamSegmentationOnly => draw_sam31_proposal_masks(
                 pixels,
                 width,
                 height,
@@ -39328,6 +39663,7 @@ fn draw_eye_with_spatial_debug(
                 roi_overlay_mode
                     .sam31_prompt_index()
                     .expect("SAM semantic overlay has a prompt"),
+                roi_overlay_mode != RoiOverlayMode::SamSegmentationOnly,
                 frame.sam31_proposal_masks.as_deref(),
             ),
             RoiOverlayMode::Clean => 0,
@@ -42328,6 +42664,73 @@ fn draw_calibration_eye_thumbnail(
     Some(image_rect)
 }
 
+fn completed_display_wireframe(mode: &VirtualMouseMode) -> Option<display_pose_wireframe::DisplayPoseWireframe> {
+    if !mode.sequence_started || !mode.sequence_completed { return None; }
+    let gaze = mode.surface_gaze.filter(|sample|
+        mode.gaze_available && mode.completed_basis_pause.is_none()
+        && sample.sign_resolved && Some(sample.sign_epoch) == mode.calibration_sign_epoch
+    ).map(|sample| sample.relative_gaze);
+    display_pose_wireframe::DisplayPoseWireframe::new(mode.display_plane?, gaze)
+}
+
+fn draw_completed_display_wireframe(mode: &VirtualMouseMode, pixels: &mut [u32], width: usize, height: usize) {
+    let Some(scene) = completed_display_wireframe(mode) else { return; };
+    let cyan = 0x0040_dfff;
+    let yellow = 0x00ff_d860;
+    let gray = 0x0070_8088;
+    let top = 190.0_f64.min(height as f64 * 0.4);
+    let project = scene.orbit_projector([20.0, top, (width as f64 - 40.0).max(1.0), (height as f64 - top - 90.0).max(1.0)], mode.target_started.elapsed().as_secs_f64());
+    // Bound every segment to the diagram rectangle, including off-screen rays.
+    let mut line = |a, b, color| {
+        let a = project(a); let b = project(b);
+        let delta = [b[0]-a[0], b[1]-a[1]];
+        let mut lo: f64 = 0.0; let mut hi: f64 = 1.0;
+        for (p,q) in [(-delta[0], a[0]), (delta[0], width.saturating_sub(1) as f64-a[0]),
+                      (-delta[1], a[1]-top), (delta[1], (height as f64-65.0)-a[1])] {
+            if p.abs() < 1e-12 { if q < 0.0 { return; } }
+            else if p < 0.0 { lo = lo.max(q/p); } else { hi = hi.min(q/p); }
+        }
+        if lo > hi { return; }
+        draw_line_clipped(pixels, width, height, (a[0]+lo*delta[0]).round() as i32,
+            (a[1]+lo*delta[1]).round() as i32, (a[0]+hi*delta[0]).round() as i32,
+            (a[1]+hi*delta[1]).round() as i32, color);
+    };
+    for i in 1..4 {
+        let t = i as f64 / 4.0;
+        line(scene.point(t,0.0),scene.point(t,1.0),0x0020_5058);
+        line(scene.point(0.0,t),scene.point(1.0,t),0x0020_5058);
+    }
+    for i in 0..4 { line(scene.corners[i],scene.corners[(i+1)%4],cyan); }
+    line([0.0;3],scene.plane.center_inches,gray);
+    line(scene.plane.center_inches,scene.normal_end,gray);
+    if let Some(end) = scene.ray_end { line([0.0;3],end,yellow); }
+    let eye = project([0.0;3]);
+    fill_rect(pixels,width,height,eye[0] as i32-3,eye[1] as i32-3,7,7,VIRTUAL_MOUSE_INK);
+    draw_text(pixels,width,height,eye[0] as i32+8,eye[1] as i32,"EYE",VIRTUAL_MOUSE_INK);
+    let tl = project(scene.corners[0]);
+    draw_text(pixels,width,height,tl[0] as i32,tl[1] as i32-20,"TOP LEFT",cyan);
+    if let Some(hit) = scene.hit {
+        let p = project(hit);
+        fill_rect(pixels,width,height,p[0] as i32-4,p[1] as i32-4,9,9,yellow);
+    }
+    let angles = scene.pitch_yaw_roll_degrees.map(|[p,y,r]| format!("PITCH {p:+.1}  YAW {y:+.1}  ROLL {r:+.1} DEG"))
+        .unwrap_or_else(|| "ROTATION NEAR GIMBAL LOCK - SEE AXES".to_string());
+    let distance = scene.hit.map(|hit| format!("GAZE HIT {:.1} IN", geometry::norm3(hit)))
+        .unwrap_or_else(|| format!("GAZE {}", match scene.ray_status {
+            display_pose_wireframe::RayStatus::OffScreen => "OFF SCREEN",
+            display_pose_wireframe::RayStatus::ParallelOrBehind => "NO FORWARD HIT",
+            _ => "UNAVAILABLE",
+        }));
+    for (y,text,color) in [
+        (76,angles,cyan),
+        (98,format!("CENTER {:.1} IN  {distance}",scene.plane.distance_inches()),yellow),
+        (120,format!("{} SIZE {:.2} X {:.2} IN",if mode.display_dimensions.is_some() { "EDID" } else { "NOMINAL" },scene.plane.width_inches,scene.plane.height_inches),gray),
+        (142,"ESTIMATED EYE-RELATIVE POSE / NOT ROOM LEVEL".to_string(),gray),
+        (height as i32-68,"CYAN SCREEN  YELLOW PHYSICAL GAZE".to_string(),cyan),
+        (height as i32-48,"WHITE CURSOR USES SEPARATE AFFINE MAP".to_string(),VIRTUAL_MOUSE_INK),
+    ] { draw_centered_text(pixels,width,height,y,&text,color); }
+}
+
 fn draw_virtual_mouse(
     mode: &VirtualMouseMode,
     focused_frame: Option<&EyeFrame>,
@@ -42582,7 +42985,7 @@ fn draw_virtual_mouse(
         pixels,
         width,
         height,
-        (height as f64 * 0.30) as i32,
+        12,
         "CALIBRATION ACCEPTED - M EXITS",
         VIRTUAL_MOUSE_INK,
     );
@@ -42613,6 +43016,7 @@ fn draw_virtual_mouse(
         VIRTUAL_MOUSE_INK,
     );
 
+    draw_completed_display_wireframe(mode, pixels, width, height);
     if let Some(reticle) = mode.reticle {
         let x = (reticle.0.clamp(0.0, 1.0) * width.saturating_sub(1) as f64).round() as i32;
         let y = (reticle.1.clamp(0.0, 1.0) * height.saturating_sub(1) as f64).round() as i32;
@@ -42706,6 +43110,8 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
                     app.sequences[index] = frame.sequence;
                     app.eyes[index] = Some(frame.clone());
                 }
+            } else {
+                app.eyes[index] = None;
             }
         }
     }
@@ -42844,6 +43250,49 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
         return buffer.present().map_err(|error| error.to_string());
     }
     pixels.fill(0x0007_0b10);
+    if app.shared.lock().is_ok_and(|shared| shared.sam31_object_inspection) {
+        let (backdrop, candidate, status, prompt, prompt_status) = {
+            let shared = app.shared.lock().map_err(|_| "viewer lock poisoned")?;
+            (shared.presentation_backdrop.clone(), shared.sam31_scene_candidate.clone(),
+                shared.reacquire_status.clone().unwrap_or_default(), shared.sam31_prompt_text.clone(), shared.sam31_prompt_status.clone())
+        };
+        draw_text(pixels,width,height,12,12,"SAM CUSTOM OBJECT  F NEXT VIEW  ENTER PROMPT  ESC CANCEL EDIT",0x00ff_ffff);
+        draw_text(pixels,width,height,12,34,&format!("PROMPT> {}",app.sam31_prompt_editor.as_deref().unwrap_or(&prompt)),0x00ff_d860);
+        draw_text(pixels,width,height,12,56,&status,0x00ff_d860);
+        draw_text(pixels,width,height,12,74,&prompt_status,0x00c8_d6e5);
+        if let Some(backdrop) = backdrop {
+            let mut tinted = (*backdrop.pixels).clone();
+            if let Some(candidate) = &candidate {
+                let (mw,mh)=candidate.mask_size;
+                for y in 0..backdrop.height {
+                    for x in 0..backdrop.width {
+                        if candidate.mask[y*mh/backdrop.height*mw+x*mw/backdrop.width] != 0 {
+                            let i=y*backdrop.width+x;
+                            tinted[i]=((tinted[i]&0x00fe_fefe)>>1)+0x0000_6040;
+                        }
+                    }
+                }
+            }
+            let overview_height = if candidate.is_some() { height.saturating_sub(120)/2 } else { height.saturating_sub(110) };
+            let rect=blit_scaled(pixels,width,height,&tinted,backdrop.width,backdrop.height,8,90,width.saturating_sub(16),overview_height);
+            if let Some(candidate) = candidate {
+                let [x0,y0,x1,y1]=candidate.bounds;
+                let crop=scene_crop_bounds(candidate.bounds,backdrop.width,backdrop.height);
+                draw_outline(pixels,width,height,(rect.0+(x0*rect.2 as f64) as usize,
+                    rect.1+(y0*rect.3 as f64) as usize,((x1-x0)*rect.2 as f64).ceil() as usize,
+                    ((y1-y0)*rect.3 as f64).ceil() as usize),2,0x0000_ff80);
+                let mut crop_pixels=Vec::with_capacity(crop.2*crop.3);
+                for y in crop.1..crop.1+crop.3 {
+                    crop_pixels.extend_from_slice(&tinted[y*backdrop.width+crop.0..y*backdrop.width+crop.0+crop.2]);
+                }
+                let y=100+overview_height;
+                blit_scaled(pixels,width,height,&crop_pixels,crop.2,crop.3,8,y,width.saturating_sub(16),height.saturating_sub(y+12));
+            }
+        }
+        fulfill_pending_presentation_export(&app.shared,pixels,width,height);
+        state.window.pre_present_notify();
+        return buffer.present().map_err(|error| error.to_string());
+    }
     let mut presented_eyes = app.eyes.clone();
     // Prompt compilation and CUDA inference are asynchronous. Clear any
     // prior-prompt answer immediately when a replacement bundle is ready,
@@ -43427,7 +43876,7 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
     ];
     if matches!(
         app.roi_overlay_mode,
-        RoiOverlayMode::SamOuterIrisMasks | RoiOverlayMode::SamOuterIrisFit
+        RoiOverlayMode::SamOuterIrisMasks | RoiOverlayMode::SamSegmentationOnly | RoiOverlayMode::SamOuterIrisFit
     ) {
         let shown_prompt = app
             .sam31_prompt_editor
@@ -43508,7 +43957,9 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
         ),
     ]);
 
-    let presence_rows = eye_presence_stack_text_rows(&eye_presence_stacks, &segmentation_status)
+    let second_roi_enabled = app.shared.lock().is_ok_and(|state| state.second_roi_enabled);
+    roi_rows.push((format!("3 SECOND ROI {} (SUBJECT LEFT)", if second_roi_enabled { "ON" } else { "OFF" }), core_background));
+    let presence_rows = eye_presence_stack_text_rows(&eye_presence_stacks, &segmentation_status, second_roi_enabled)
         .into_iter()
         .enumerate()
         .map(|(row, text)| {
@@ -43900,7 +44351,7 @@ impl ApplicationHandler for App {
                 }
                 if event.physical_key == PhysicalKey::Code(KeyCode::Enter)
                     && !event.repeat
-                    && self.roi_overlay_mode == RoiOverlayMode::SamOuterIrisMasks
+                    && matches!(self.roi_overlay_mode, RoiOverlayMode::SamOuterIrisMasks | RoiOverlayMode::SamSegmentationOnly)
                 {
                     self.sam31_prompt_editor = Some(String::new());
                     if let Ok(mut shared) = self.shared.lock() {
@@ -43917,6 +44368,9 @@ impl ApplicationHandler for App {
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyM) => {
+                        if self.shared.lock().is_ok_and(|shared| shared.sam31_object_inspection) {
+                            return;
+                        }
                         if !event.repeat {
                             if self.virtual_mouse.is_some() {
                                 self.main_lightbox =
@@ -43957,6 +44411,11 @@ impl ApplicationHandler for App {
                                         )
                                     });
                                 let mut mode = VirtualMouseMode::new(now);
+                                mode.display_dimensions = self.window_state.as_ref()
+                                    .and_then(|state| state.window.current_monitor())
+                                    .and_then(|monitor| monitor.name())
+                                    .and_then(|name| display_pose_wireframe::monitor_dimensions_inches(&name));
+                                eprintln!("Calibration display dimensions: {:?} (None = nominal 27-inch fallback)", mode.display_dimensions);
                                 match capture {
                                     Ok(capture) => {
                                         self.calibration_capture = Some(capture);
@@ -44141,6 +44600,8 @@ impl ApplicationHandler for App {
                                     self.roi_overlay_mode.cycled_for(shared.segmentation_mode);
                                 shared.sam31_semantic_prompt =
                                     self.roi_overlay_mode.sam31_prompt_index();
+                                shared.sam31_object_inspection = self.roi_overlay_mode == RoiOverlayMode::SamSegmentationOnly;
+                                shared.sam31_scene_candidate = None;
                                 let (ordinal, count) =
                                     self.roi_overlay_mode.position_for(shared.segmentation_mode);
                                 eprintln!(
@@ -44148,6 +44609,16 @@ impl ApplicationHandler for App {
                                     self.roi_overlay_mode.label(),
                                     shared.segmentation_mode.label(),
                                 );
+                            }
+                            if self.roi_overlay_mode == RoiOverlayMode::SamSegmentationOnly {
+                                if let Some(mode) = self.virtual_mouse.take() {
+                                    self.main_lightbox = mode.lightbox;
+                                    self.stop_calibration_capture(false);
+                                    if let Some(state) = self.window_state.as_ref() {
+                                        state.window.set_fullscreen(None);
+                                    }
+                                }
+                                self.presentation_laser_lease = None;
                             }
                         }
                     }
@@ -44178,6 +44649,19 @@ impl ApplicationHandler for App {
                                     EdgeMapVariant::COUNT,
                                     variant.label(),
                                 );
+                            }
+                        }
+                    }
+                    PhysicalKey::Code(KeyCode::Digit3) => {
+                        if !event.repeat {
+                            if let Ok(mut shared) = self.shared.lock() {
+                                shared.second_roi_enabled = !shared.second_roi_enabled;
+                                if !shared.second_roi_enabled {
+                                    shared.eyes[1] = None;
+                                    shared.eye_identity_present[1] = false;
+                                    shared.eye_presence_stacks[1] = EyePresenceStackStatus::default();
+                                }
+                                eprintln!("Second ROI (subject-left) analysis {} by 3; joint stereo solver not yet implemented", if shared.second_roi_enabled { "enabled" } else { "disabled" });
                             }
                         }
                     }
@@ -44911,6 +45395,8 @@ fn run() -> Result<(), String> {
         pupil_radius_upper_fraction: DEFAULT_PUPIL_RADIUS_UPPER_FRACTION,
         sam31_prompt_text: sam31_outer::DEFAULT_OUTER_IRIS_PROMPT_TEXT.to_string(),
         sam31_prompt_status: "CANONICAL OUTER-IRIS PROMPT".to_string(),
+        sam31_object_inspection: false,
+        sam31_scene_candidate: None,
         segmentation_status: match config.segmentation {
             SegmentationMode::Native => format!(
                 "IRIS NATIVE + CENTER {} (startup)",
@@ -47373,6 +47859,213 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires external RAW-correlation corpus reports"]
+    fn region_readmission_corpus_policy_replay() {
+        let paths = std::env::var("BUTTERCUP_READMISSION_REPORTS").expect("colon-separated report paths");
+        for path in paths.split(':') {
+            let report: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            let cases=report["comparisons"].as_array().unwrap();
+            let (mut proposed,mut covered,mut abstained)=(0,0,0);
+            for case in cases {
+                let missing=case["missing_eye"].as_u64().unwrap() as usize-1;
+                let survivor=1-missing;
+                let seed: [[i32;2];2]=serde_json::from_value(case["seed_eyes"].clone()).unwrap();
+                let size: [i32;2]=serde_json::from_value(case["eye_size"].clone()).unwrap();
+                let motion: [[f64;2];2]=serde_json::from_value(case["observed_translations_px"].clone()).unwrap();
+                let timestamp=case["source_timestamp_ns"].as_u64().unwrap();
+                let band=&case["sensor_band"];
+                if band.is_null() { continue; }
+                let mut tracker=synthetic_tracker();
+                tracker.live_region_transactions=true;
+                tracker.readmission_enabled_mask=3;
+                tracker.region_active_mask=1<<survivor;
+                tracker.origin=(0,band["y"].as_i64().unwrap() as i32);
+                tracker.window=(8000,band["height"].as_i64().unwrap() as i32);
+                tracker.eye_size=(size[0],size[1]);
+                tracker.absolute=seed.map(|p|(p[0],p[1]));
+                tracker.readmission_separation=[(seed[1][0]-seed[0][0]) as f64,(seed[1][1]-seed[0][1]) as f64];
+                let pivot=std::array::from_fn(|axis|seed[survivor][axis] as f64+size[axis] as f64/2.0+motion[survivor][axis]);
+                tracker.readmission_pivots[survivor]=Some((timestamp,pivot,[0.0;2]));
+                let old_survivor=tracker.absolute[survivor];
+                if tracker.propose_readmission(survivor,timestamp,Instant::now()) {
+                    proposed+=1;
+                    assert_eq!(tracker.absolute[survivor],old_survivor);
+                    assert_eq!(tracker.planned_region_origin_y,Some(tracker.origin.1 as u32));
+                    assert!(tracker.readmission_pivots[missing].is_none());
+                    let crop=tracker.absolute[missing];
+                    assert!(crop.1>=tracker.origin.1 && crop.1+size[1]<=tracker.origin.1+tracker.window.1);
+                    let truth: [f64;2]=std::array::from_fn(|axis|seed[missing][axis] as f64+size[axis] as f64/2.0+motion[missing][axis]);
+                    if truth[0]>=crop.0 as f64 && truth[0]<(crop.0+size[0]) as f64
+                        && truth[1]>=crop.1 as f64 && truth[1]<(crop.1+size[1]) as f64 { covered+=1; }
+                } else { abstained+=1; }
+            }
+            eprintln!("READMISSION_CORPUS {}",serde_json::json!({"path":path,"cases":cases.len(),"proposed":proposed,"withheld_template_center_covered":covered,"abstained":abstained}));
+            assert!(proposed>0,"no recorded case exercised the proposer");
+            assert!(covered>0,"no recovery crop contained the independently matched center");
+        }
+    }
+
+    #[test]
+    fn region_readmission_uses_projected_pair_without_moving_survivor() {
+        for survivor in 0..2 {
+            let mut tracker = synthetic_tracker();
+            tracker.live_region_transactions = true;
+            tracker.readmission_enabled_mask = 3;
+            tracker.region_active_mask = 1 << survivor;
+            let now = Instant::now();
+            let old = tracker.absolute;
+            let center = [old[survivor].0 as f64+192.0,old[survivor].1 as f64+128.0];
+            tracker.readmission_pivots[survivor] = Some((1_000_000_000,center,[0.0;2]));
+            let evidence_before = tracker.readmission_pivots;
+            tracker.absolute[1-survivor].1 = 4000; // stale, out-of-band crop
+            assert!(tracker.propose_readmission(survivor,1_100_000_000,now));
+            assert_eq!(tracker.region_active_mask,3);
+            assert_eq!(tracker.absolute,old);
+            assert_eq!(tracker.readmission_pivots,evidence_before,"probe must not manufacture observation");
+            assert_eq!(tracker.planned_region_origin_y,Some(2000));
+            tracker.region_active_mask = 1 << survivor;
+            assert!(!tracker.propose_readmission(survivor,1_100_000_000,now+Duration::from_secs(1)));
+            assert!(!tracker.propose_readmission(survivor,2_000_000_000,now+Duration::from_secs(5)),"stale source");
+            tracker.readmission_pivots[survivor] = Some((2_000_000_000,center,[0.0;2]));
+            assert!(tracker.propose_readmission(survivor,2_000_000_000,now+Duration::from_secs(5)));
+        }
+    }
+
+    #[test]
+    fn region_resident_recovery_uses_observed_pair_not_opposed_gaze_offsets() {
+        let mut tracker=synthetic_tracker();
+        tracker.live_region_transactions=true;
+        tracker.readmission_enabled_mask=3;
+        tracker.origin=(0,3042);
+        tracker.absolute=[(4404,3184),(5480,3042)];
+        tracker.eye_size=(420,280);
+        tracker.readmission_pair_centers=Some([[4558.0,3336.0],[5857.0,3415.0]]);
+        tracker.readmission_pivots=[Some((3_000_000_000,[4599.0,3401.0],[-41.0,-65.0])),
+            Some((1_000_000_000,[5885.0,3323.0],[-28.0,92.0]))];
+        let survivor=tracker.absolute[0];
+        assert!(tracker.propose_readmission(0,3_400_000_000,Instant::now()));
+        assert_eq!(tracker.region_active_mask,3,"resident recovery is not eviction");
+        assert_eq!(tracker.absolute[0],survivor);
+        let crop=tracker.absolute[1];
+        assert!((crop.0..crop.0+420).contains(&5857));
+        assert!((crop.1..crop.1+280).contains(&3415));
+        tracker.readmission_last_probe=None;
+        assert!(!tracker.propose_readmission(0,3_400_000_000,Instant::now()),"do not keep moving a containing crop");
+    }
+
+    #[test]
+    fn region_readmission_respects_band_and_disabled_eye() {
+        let mut tracker=synthetic_tracker();
+        tracker.live_region_transactions=true;
+        tracker.region_active_mask=1;
+        tracker.readmission_pivots[0]=Some((1,[1360.0,2256.0],[0.0;2]));
+        assert!(!tracker.propose_readmission(0,1,Instant::now()),"second ROI defaults disabled");
+        tracker.readmission_enabled_mask=3;
+        tracker.readmission_separation[1]=1000.0;
+        assert!(!tracker.propose_readmission(0,1,Instant::now()),"no sensor movement to force fit");
+        assert_eq!(tracker.region_active_mask,1);
+    }
+
+    #[test]
+    fn region_corpus_stale_anchor_cannot_teleport_visible_eye_onto_eyebrow() {
+        let mut tracker=synthetic_tracker();
+        // Capture both-eyes-1788719209, sequence 1119: the old clamp
+        // converted a small centering request into (-100,-212).
+        tracker.absolute[1]=(5580,3254);
+        tracker.trusted_absolute[1]=(5352,2914);
+        let requested=(5628,3254);
+        let old=(requested.0.clamp(5224,5480),requested.1.clamp(2786,3042));
+        assert_eq!(old,(5480,3042));
+        assert_eq!(tracker.bound_eye_internal_fine_position(1,requested),(5580,3254));
+        for dx in -200..=200 {
+            for dy in [-200,-20,0,20,200] {
+                let requested=(5580+dx,3254+dy);
+                let bounded=tracker.bound_eye_internal_fine_position(1,requested);
+                assert!((5580.min(requested.0)..=5580.max(requested.0)).contains(&bounded.0));
+                assert!((3254.min(requested.1)..=3254.max(requested.1)).contains(&bounded.1));
+            }
+        }
+        tracker.eye_size=(420,280);
+        tracker.positions_dirty=false;
+        for frame in 1..=9 {
+            tracker.observe_verified_center_with_step(1,frame*100_000_000,(5580,3254),(420,280),
+                (259.0,161.0),false,(96,96),false).unwrap();
+        }
+        assert_eq!(tracker.absolute[1],(5580,3254),"real verified-centering entry point must not send the bad crop");
+        assert!(!tracker.positions_dirty);
+    }
+
+    #[test]
+    #[ignore = "requires newly recorded external recovery archives"]
+    fn region_resident_recovery_recorded_trace_replay() {
+        let archives=std::env::var("BUTTERCUP_RECOVERY_ARCHIVES").unwrap();
+        let mut total_proposals=0;
+        let mut tracker=synthetic_tracker();
+        let mut session=None;
+        for path in archives.split(':') {
+            let output=Command::new("tar").args(["-xOf",path,"recovery.jsonl"]).output().unwrap();
+            assert!(output.status.success());
+            let mut proposals=0;
+            let mut first=None;
+            for line in String::from_utf8(output.stdout).unwrap().lines() {
+                let row: serde_json::Value=serde_json::from_str(line).unwrap();
+                let time=row["timestamp_ns"].as_u64().unwrap();
+                let applied=&row["applied_region"];
+                if session != applied["session"].as_u64() {
+                    session=applied["session"].as_u64();
+                    tracker=synthetic_tracker();
+                    tracker.live_region_transactions=true;
+                    tracker.eye_size=(420,280);
+                    tracker.readmission_separation=serde_json::from_value(row["projected_separation_px"].clone()).unwrap();
+                    tracker.pivot_scheduler=pivot_region_scheduler::PivotRegionScheduler::new(
+                        pivot_region_scheduler::Config::for_geometry([SENSOR_WIDTH,SENSOR_HEIGHT],576,[420,280])).ok();
+                }
+                let eyes: [[i32;2];2]=serde_json::from_value(applied["eyes"].clone()).unwrap();
+                tracker.origin=(0,applied["band_y"].as_i64().unwrap() as i32);
+                tracker.readmission_enabled_mask=row["enabled_mask"].as_u64().unwrap() as u8;
+                tracker.readmission_seed=serde_json::from_value(row["coarse_seed_projected_separation_px"].clone()).unwrap();
+                let observations: [Option<(u64,[f64;2],[f64;2])>;2]=serde_json::from_value(row["observed_pivots_timestamp_sensor_offset"].clone()).unwrap();
+                for (eye,observation) in observations.into_iter().enumerate() {
+                    if let Some((source,pivot,offset))=observation {
+                        tracker.observe_projected_pivot(eye,source,time,(pivot[0],pivot[1]),offset,[0.0;2],75.0,8.0,0.6,0);
+                    }
+                }
+                // Matched one-step policy comparison, NOT counterfactual RAW:
+                // both candidates receive the same recorded applied state.
+                tracker.absolute=eyes.map(|p|(p[0],p[1]));
+                tracker.region_active_mask=applied["mask"].as_u64().unwrap() as u8;
+                tracker.readmission_last_probe=None;
+                for survivor in 0..2 {
+                    let before=tracker.absolute[survivor];
+                    if tracker.propose_readmission(survivor,time,Instant::now()) {
+                        assert_eq!(tracker.absolute[survivor],before);
+                        proposals+=1;
+                        if first.is_none() { first=Some(row["sequence"].clone()); }
+                        break;
+                    }
+                }
+            }
+            total_proposals+=proposals;
+            eprintln!("RECOVERY_TRACE_REPLAY {}",serde_json::json!({"archive":path,"candidate_eligible_rows":proposals,"first_sequence":first,"baseline_eligible_rows":0,"assumption":"recorded cap positions; fixed radius/quality for adapter replay; one-step not detector rollout"}));
+        }
+        assert!(total_proposals>0,"new resident recovery never became eligible in the recorded failure");
+    }
+
+    #[test]
+    fn region_readmission_refines_only_fresh_bilateral_support() {
+        let mut tracker=synthetic_tracker();
+        tracker.live_region_transactions=true;
+        let seed=tracker.readmission_separation;
+        tracker.observe_projected_pivot(0,1_000_000_000,1_000_000_000,(1360.0,2256.0),[0.0;2],[0.0;2],75.0,4.0,0.8,0);
+        assert_eq!(tracker.readmission_separation,seed);
+        tracker.observe_projected_pivot(1,1_000_000_000,1_000_000_000,(5060.0,2276.0),[0.0;2],[0.0;2],75.0,4.0,0.8,0);
+        assert_eq!(tracker.readmission_separation,[seed[0]+2.0,seed[1]+2.0]);
+        let learned=tracker.readmission_separation;
+        tracker.observe_projected_pivot(0,1_050_000_000,1_050_000_000,(1360.0,2256.0),[0.0;2],[0.0;2],75.0,4.0,0.8,0);
+        assert_eq!(tracker.readmission_separation,learned,"do not reuse one eye to retrain pair");
+    }
+
+    #[test]
     fn pivot_region_adapter_keeps_contained_peer_without_fresh_surface() {
         let mut tracker = synthetic_tracker();
         tracker.live_region_transactions = true;
@@ -49458,8 +50151,12 @@ mod tests {
 
     #[test]
     fn temporary_analysis_and_incremental_model_input_are_subject_right_only() {
-        assert!(subject_eye_analysis_enabled(0));
-        assert!(!subject_eye_analysis_enabled(1));
+        assert!(!SharedState::default().second_roi_enabled);
+        assert!(subject_eye_analysis_enabled(0, false));
+        assert!(!subject_eye_analysis_enabled(1, false));
+        assert!(subject_eye_analysis_enabled(0, true));
+        assert!(subject_eye_analysis_enabled(1, true));
+        assert!(!subject_eye_analysis_enabled(2, true));
         assert_eq!(subject_eye_label(0), "subject-right");
     }
 
@@ -49794,7 +50491,9 @@ mod tests {
     fn roi_overlay_cycle_separates_labels_from_pixel_and_algorithm_modes() {
         let expected = [
             RoiOverlayMode::SamOuterIrisMasks,
+            RoiOverlayMode::SamSegmentationOnly,
             RoiOverlayMode::SamOuterIrisFit,
+            RoiOverlayMode::SamConicSegments,
             RoiOverlayMode::SamDeflattenedVirtualContact,
             RoiOverlayMode::Clean,
             RoiOverlayMode::FullDiagnostics,
@@ -49841,6 +50540,8 @@ mod tests {
 
     #[test]
     fn sam_proposal_overlay_modes_identify_each_semantic_question() {
+        assert_eq!(RoiOverlayMode::SamSegmentationOnly.sam31_prompt_index(), Some(0));
+        assert_eq!(RoiOverlayMode::SamSegmentationOnly.position_for(SegmentationMode::Sam31), (2, 7));
         assert_eq!(
             RoiOverlayMode::SamOuterIrisMasks.sam31_prompt_index(),
             Some(0)
@@ -49857,20 +50558,99 @@ mod tests {
         assert_eq!(RoiOverlayMode::Clean.sam31_prompt_index(), None);
         assert_eq!(
             RoiOverlayMode::SamOuterIrisMasks.position_for(SegmentationMode::Sam31),
-            (1, 5)
+            (1, 7)
         );
         assert_eq!(
             RoiOverlayMode::SamOuterIrisFit.position_for(SegmentationMode::Sam31),
-            (2, 5)
+            (3, 7)
         );
         assert_eq!(
             RoiOverlayMode::SamDeflattenedVirtualContact.position_for(SegmentationMode::Sam31),
-            (3, 5)
+            (5, 7)
         );
         assert_eq!(
             RoiOverlayMode::FullDiagnostics.position_for(SegmentationMode::Sam31),
-            (5, 5)
+            (7, 7)
         );
+    }
+
+    #[test]
+    fn scene_crop_padding_is_bounded_and_not_anatomical() {
+        assert_eq!(scene_crop_bounds([0.0,0.0,1.0,1.0],512,384),(0,0,512,384));
+        for bounds in [[0.1,0.1,0.9,0.2], [0.8,0.0,1.0,0.9], [0.0,0.8,0.2,1.0]] {
+            let (x,y,w,h)=scene_crop_bounds(bounds,512,384);
+            assert!(w>0 && h>0 && x+w<=512 && y+h<=384);
+            assert!(x as f64 <= bounds[0]*512.0 && y as f64 <= bounds[1]*384.0);
+            assert!((x+w) as f64 >= bounds[2]*512.0 && (y+h) as f64 >= bounds[3]*384.0);
+        }
+    }
+
+    #[cfg(feature = "sam31")]
+    #[test]
+    #[ignore = "requires external SAM model, CUDA and a global presentation image"]
+    fn scene_inference_external_snapshot_smoke() {
+        let path=std::env::var("BUTTERCUP_SCENE_TEST_IMAGE").expect("external snapshot path");
+        let backdrop=load_ppm(Path::new(&path)).unwrap();
+        let client=sam31_outer::Client::start(sam31_outer::default_model_path()).unwrap();
+        let deadline=Instant::now()+Duration::from_secs(30);
+        let receiver=loop {
+            match client.submit_scene(Arc::clone(&backdrop.pixels),backdrop.width,backdrop.height,None) {
+                Ok(receiver)=>break receiver,
+                Err(error)=>{ assert!(Instant::now()<deadline,"{error}"); thread::sleep(Duration::from_millis(50)); }
+            }
+        };
+        let result=receiver.recv_timeout(Duration::from_secs(60)).unwrap().unwrap();
+        eprintln!("SCENE_SMOKE {}x{} candidate={:?}",backdrop.width,backdrop.height,
+            result.as_ref().map(|c| (c.bounds,c.score,c.mask_size)));
+        if let Some(candidate)=result {
+            let (x,y,w,h)=scene_crop_bounds(candidate.bounds,backdrop.width,backdrop.height);
+            assert!(x+w<=backdrop.width && y+h<=backdrop.height);
+        }
+    }
+
+    #[test]
+    fn conic_segments_adjacent_colors_differ_including_contour_wrap() {
+        for count in 2..=128 {
+            for index in 0..count {
+                assert_ne!(conic_segment_color(index,count),conic_segment_color((index+1)%count,count),
+                    "count={count} index={index}");
+            }
+        }
+    }
+
+    #[test]
+    fn conic_segments_view_renders_each_roi_from_its_own_source() {
+        let mut pixels = vec![0; 800*320];
+        for eye in 0..2 {
+            let ellipse = geometry::Ellipse { center:(80.0,60.0),major_radius:50.0,minor_radius:30.0,angle:0.2 };
+            let points = ellipse.dense_points(64);
+            let mut frame = control_eye_frame(10+eye as u64);
+            frame.segmentation_mode=SegmentationMode::Sam31;
+            frame.width=160; frame.height=120;
+            frame.quad_color=Arc::new(vec![0;160*120]);
+            frame.sam31_proposal_masks=Some(Arc::new(sam31_outer::ProposalMasks {
+                eye_index:eye, source_sequence:7+eye as u64,source_width:160,source_height:120,
+                source_raw:Arc::new(vec![512;160*120]),
+                outer_fit:Some(sam31_outer::OuterMaskFitReview {
+                    ellipse,source_component_area_px:4000.0,
+                    retained_points:Arc::new(points),
+                    conic_segments:Arc::new(vec![(0..16).collect(),(32..48).collect()]),
+                    flat_tire_points:Arc::new(vec![(80.0,35.0)]),upper_flat_tire:true,lower_flat_tire:false,
+                }), ..sam31_outer::ProposalMasks::default()
+            }));
+            draw_eye_with_spatial_debug(&mut pixels,800,320,&frame,20+eye as i32*390,45,
+                ViewMode::QuadColor,"",true,true,2,RoiOverlayMode::SamConicSegments,None);
+        }
+        for x in [20,410] {
+            let colors = (100..240).flat_map(|y| (x..x+320).map(move |x| y*800+x))
+                .map(|i|pixels[i]).collect::<Vec<_>>();
+            assert!(colors.contains(&0x00ff_d860),"first support arc missing");
+            assert!(colors.contains(&0x0060_a0ff),"second support arc missing");
+            assert!(colors.contains(&0x00ff_3ca6),"excluded point missing");
+        }
+        if let Some(path)=std::env::var_os("BUTTERCUP_CONIC_VIEW_TEST_EXPORT") {
+            export_eye_ppm(Path::new(&path),&pixels,800,320).unwrap();
+        }
     }
 
     #[test]
@@ -49924,6 +50704,7 @@ mod tests {
                 scale,
                 109,
                 4,
+                true,
                 Some(&proposals),
             ),
             1
@@ -49940,6 +50721,34 @@ mod tests {
             source_preview[sample_y * source_width + sample_x]
         );
         assert!(pixels.contains(&0x00ff_4050));
+    }
+
+    #[test]
+    fn sam_proposal_overlay_mask_only_never_draws_fitted_geometry() {
+        let proposals = sam31_outer::ProposalMasks {
+            source_width: 160, source_height: 120,
+            source_raw: Arc::new(vec![512; 160 * 120]),
+            semantic: Some(sam31_outer::SemanticProposalMasks {
+                prompt_index: 0, width: 160, height: 120,
+                selected_query: None, masks: vec![],
+            }),
+            outer_fit: Some(sam31_outer::OuterMaskFitReview {
+                ellipse: geometry::Ellipse { center: (80.0,60.0), major_radius:40.0, minor_radius:25.0, angle:0.0 },
+                source_component_area_px: 3000.0,
+                retained_points: Arc::new(vec![(80.0,35.0)]),
+                conic_segments: Arc::new(vec![]),
+                flat_tire_points: Arc::new(vec![(80.0,85.0)]),
+                upper_flat_tire: false, lower_flat_tire: true,
+            }),
+            ..sam31_outer::ProposalMasks::default()
+        };
+        for show_geometry in [false, true] {
+            let mut pixels = vec![0; 400 * 300];
+            draw_sam31_proposal_masks(&mut pixels,400,300,10,10,2,0,0,show_geometry,Some(&proposals));
+            for color in [0x0000_ffff, 0x005f_ff69, 0x00ff_3ca6] {
+                assert_eq!(pixels.contains(&color), show_geometry, "geometry color {color:x}");
+            }
+        }
     }
 
     #[test]
@@ -49961,6 +50770,7 @@ mod tests {
                 ellipse,
                 source_component_area_px: std::f64::consts::PI * 18.0 * 13.0,
                 retained_points: Arc::new(ellipse.dense_points(64)),
+                conic_segments: Arc::new(vec![(0..64).collect()]),
                 flat_tire_points: Arc::new(Vec::new()),
                 upper_flat_tire: false,
                 lower_flat_tire: false,
@@ -50045,6 +50855,7 @@ mod tests {
                     * ellipse.major_radius
                     * ellipse.minor_radius,
                 retained_points: Arc::new(ellipse.dense_points(64)),
+                conic_segments: Arc::new(vec![(0..64).collect()]),
                 flat_tire_points: Arc::new(Vec::new()),
                 upper_flat_tire: false,
                 lower_flat_tire: false,
@@ -50222,6 +51033,7 @@ mod tests {
                 ellipse,
                 source_component_area_px: std::f64::consts::PI * 18.0 * 13.0,
                 retained_points: Arc::new(ellipse.dense_points(64)),
+                conic_segments: Arc::new(vec![(0..64).collect()]),
                 flat_tire_points: Arc::new(Vec::new()),
                 upper_flat_tire: false,
                 lower_flat_tire: false,
@@ -50397,6 +51209,7 @@ mod tests {
                     * outer.major_radius
                     * outer.minor_radius,
                 retained_points: Arc::new(outer.dense_points(64)),
+                conic_segments: Arc::new(vec![(0..64).collect()]),
                 flat_tire_points: Arc::new(Vec::new()),
                 upper_flat_tire: false,
                 lower_flat_tire: false,
@@ -51595,12 +52408,12 @@ mod tests {
             },
         ];
 
-        let rows = eye_presence_stack_text_rows(&stacks, "SAM31 VIDEO MEMORY");
+        let rows = eye_presence_stack_text_rows(&stacks, "SAM31 VIDEO MEMORY", false);
         assert_eq!(rows.len(), 5);
         assert!(rows[1].starts_with("RIGHT ID+ OWNER NONE"));
         assert_eq!(rows[2], "RIGHT ACTIVE MODE SAM31 VIDEO MEMORY");
         assert!(rows[3].starts_with("LEFT ID- OWNER WAIT"));
-        assert_eq!(rows[4], "LEFT ACTIVE MODE SAM31 DISPLAY-ONLY");
+        assert_eq!(rows[4], "LEFT ACTIVE MODE SAM31 DISABLED");
     }
 
     fn test_outer_boundary(
@@ -61124,6 +61937,45 @@ mod tests {
     }
 
     #[test]
+    fn completed_monitor_wireframe_gates_ray_and_renders_result_only() {
+        let mut mode = completed_mouse_calibration_fixture(Instant::now());
+        let roll = 0.7_f64.to_radians();
+        let tilt = 12.0_f64.to_radians();
+        let plane = mode.display_plane.as_mut().unwrap();
+        plane.right_axis = [roll.cos(),roll.sin(),0.0];
+        plane.down_axis = [-roll.sin()*tilt.cos(),roll.cos()*tilt.cos(),tilt.sin()];
+        mode.gaze_available = true;
+        mode.surface_gaze = Some(SurfaceGazeSample {
+            source_timestamp_ns: Some(1), rectified_area_px2: 100.0, area_bucket: 1,
+            bucketed_face_radius_px: 10.0, camera_near_point_sensor: (0.0,0.0),
+            relative_gaze: RelativeGazeVector::from_projected(0.1,0.05).unwrap(),
+            sign_resolved: true, sign_epoch: 0, kinematic_sign_correction: [false;2],
+        });
+        let scene = completed_display_wireframe(&mode).unwrap();
+        assert!(scene.hit.is_some());
+        let [pitch,_,r] = scene.pitch_yaw_roll_degrees.unwrap();
+        assert!((pitch-12.0).abs()<1e-8 && (r-0.7).abs()<1e-8);
+        assert!(geometry::norm3(scene.hit.unwrap()) > 24.0);
+        let mut pixels = vec![0; 1200*850];
+        draw_virtual_mouse(&mode,None,&mut pixels,1200,850);
+        assert!(pixels.iter().filter(|&&p| p == 0x0040_dfff).count()>100);
+        assert!(pixels.iter().filter(|&&p| p == 0x00ff_d860).count()>100);
+        if let Some(path) = std::env::var_os("BUTTERCUP_WIREFRAME_TEST_EXPORT") {
+            export_eye_ppm(Path::new(&path),&pixels,1200,850).unwrap();
+        }
+        mode.gaze_available = false;
+        assert!(completed_display_wireframe(&mode).unwrap().ray_end.is_none());
+        mode.gaze_available = true;
+        mode.calibration_sign_epoch = Some(1);
+        assert!(completed_display_wireframe(&mode).unwrap().ray_end.is_none());
+        mode.calibration_sign_epoch = Some(0);
+        mode.completed_basis_pause = Some("TEST PAUSE");
+        assert!(completed_display_wireframe(&mode).unwrap().ray_end.is_none());
+        mode.sequence_completed = false;
+        assert!(completed_display_wireframe(&mode).is_none());
+    }
+
+    #[test]
     fn completed_calibration_sign_change_preserves_fit_and_never_restarts_targets() {
         let now = Instant::now();
         let mut mode = completed_mouse_calibration_fixture(now);
@@ -66417,11 +67269,19 @@ mod tests {
             .as_nanos() as u64;
         let mut recorder = Recorder::new(&output, &config).unwrap();
         recorder.record(&header, &[1, 2, 3, 4, 5]).unwrap();
+        recorder.record_recovery(&header, &synthetic_tracker()).unwrap();
         let after = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
         recorder.finalize().unwrap();
+        let recovery = Command::new("tar").args(["-xOf"]).arg(&output).arg("recovery.jsonl").output().unwrap();
+        assert!(recovery.status.success());
+        let trace: serde_json::Value = serde_json::from_slice(&recovery.stdout).unwrap();
+        assert_eq!(trace["timestamp_ns"].as_u64(),Some(header.timestamp_ns));
+        assert_eq!(trace["prediction_is_detection"],false);
+        assert_eq!(trace["enabled_mask"],1);
+        assert!(trace["observed_pivots_timestamp_sensor_offset"][0].is_null());
         let extracted = Command::new("tar")
             .args(["-xOf"])
             .arg(&output)
