@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
+use crate::roi_visibility::{SensorOverlap, SensorRect};
+
 pub use crate::eye_scene_model::{
     CoupledEyeKinematics, CoupledMotionStatus, GlobeMotionRegime, KinematicDerivatives,
     ProjectedGlobePoseStatus, ProjectedIrisGeometry, RotationCenterStatus,
@@ -7123,21 +7125,47 @@ fn shared_native_corner_score(frame: &SharedNativeRawFrame, x: i32, y: i32) -> f
     }
 }
 
-fn shared_native_global_features(frame: &SharedNativeRawFrame) -> Vec<[f32; 2]> {
+fn shared_native_global_features(
+    frame: &SharedNativeRawFrame,
+    current: &SharedNativeRawFrame,
+) -> Vec<[f32; 2]> {
     if frame.width < 64 || frame.height < 48 || frame.pixels.len() < frame.width * frame.height {
         return Vec::new();
     }
-    let margin = 10usize;
-    let usable_width = frame.width.saturating_sub(2 * margin);
-    let usable_height = frame.height.saturating_sub(2 * margin);
+    // Spend the same bounded 10x8 feature budget in the sensor overlap.
+    // Corners that left the new crop cannot supply motion evidence. Spreading
+    // the budget over them starves an otherwise usable reframe of inliers.
+    // No RAW resampling, crop translation as eye motion, or relaxed fidelity
+    // gate: the final support still has to span the original whole ROI.
+    let sensor_rect = |frame: &SharedNativeRawFrame| Some(SensorRect {
+        x: frame.sensor_x,
+        y: frame.sensor_y,
+        width: u32::try_from(frame.width).ok()?,
+        height: u32::try_from(frame.height).ok()?,
+    });
+    let Some(supported) = sensor_rect(frame).zip(sensor_rect(current))
+        .and_then(|(source, current)| SensorOverlap::between(source, current))
+        .and_then(|overlap| overlap.supports_margin(10))
+    else {
+        return Vec::new();
+    };
+    let start_x = (supported.x - frame.sensor_x) as usize;
+    let start_y = (supported.y - frame.sensor_y) as usize;
+    let end_x = start_x + supported.width as usize;
+    let end_y = start_y + supported.height as usize;
+    let usable_width = end_x - start_x;
+    let usable_height = end_y - start_y;
+    if usable_width < NATIVE_GLOBAL_FEATURE_COLUMNS || usable_height < NATIVE_GLOBAL_FEATURE_ROWS {
+        return Vec::new();
+    }
     let mut features =
         Vec::with_capacity(NATIVE_GLOBAL_FEATURE_COLUMNS * NATIVE_GLOBAL_FEATURE_ROWS);
     for row in 0..NATIVE_GLOBAL_FEATURE_ROWS {
-        let top = margin + row * usable_height / NATIVE_GLOBAL_FEATURE_ROWS;
-        let bottom = margin + (row + 1) * usable_height / NATIVE_GLOBAL_FEATURE_ROWS;
+        let top = start_y + row * usable_height / NATIVE_GLOBAL_FEATURE_ROWS;
+        let bottom = start_y + (row + 1) * usable_height / NATIVE_GLOBAL_FEATURE_ROWS;
         for column in 0..NATIVE_GLOBAL_FEATURE_COLUMNS {
-            let left = margin + column * usable_width / NATIVE_GLOBAL_FEATURE_COLUMNS;
-            let right = margin + (column + 1) * usable_width / NATIVE_GLOBAL_FEATURE_COLUMNS;
+            let left = start_x + column * usable_width / NATIVE_GLOBAL_FEATURE_COLUMNS;
+            let right = start_x + (column + 1) * usable_width / NATIVE_GLOBAL_FEATURE_COLUMNS;
             let mut best = None::<(f32, i32, i32)>;
             for y in (top..bottom).step_by(4) {
                 for x in (left..right).step_by(4) {
@@ -7245,7 +7273,7 @@ impl NativeGlobalSimilarityTracker {
         }
 
         let mut matches = Vec::<Match>::new();
-        for (track_index, previous_local) in shared_native_global_features(&previous)
+        for (track_index, previous_local) in shared_native_global_features(&previous, &current)
             .into_iter()
             .enumerate()
         {
@@ -16073,6 +16101,103 @@ mod tests {
         assert!(third.stable_frames >= 2, "{third:?}");
         assert!(third.reliable, "{third:?}");
         assert!(third.occupied_quadrants >= 3, "{third:?}");
+    }
+
+    fn synthetic_sensor_crop(
+        plane: &[u16], plane_width: usize, offset: (usize, usize), width: usize, height: usize,
+    ) -> Arc<Vec<u16>> {
+        Arc::new((offset.1..offset.1 + height).flat_map(|y| {
+            plane[y * plane_width + offset.0..y * plane_width + offset.0 + width].iter().copied()
+        }).collect())
+    }
+
+    #[test]
+    fn native_global_reframe_does_not_invent_translation_rotation_or_scale() {
+        let plane = synthetic_shared_similarity_frame(512, 384, 1.0, (0.0, 0.0));
+        let mut tracker = NativeGlobalSimilarityTracker::default();
+        for (index, offset) in [(48, 48), (80, 72), (64, 56), (32, 72), (48, 48)].into_iter().enumerate() {
+            let evidence = tracker.observe(synthetic_sensor_crop(&plane, 512, offset, 384, 256),
+                384, 256, 4_000 + offset.0 as u32, 3_000 + offset.1 as u32);
+            if index == 0 { continue; }
+            assert!(evidence.reliable, "step={index} {evidence:?}");
+            assert_eq!(usize::from(evidence.stable_frames), index);
+            assert!(evidence.motion.translation[0].hypot(evidence.motion.translation[1]) < 0.20, "{evidence:?}");
+            assert!(evidence.motion.rotation.abs() < 0.002, "{evidence:?}");
+            assert!(evidence.motion.scale_delta.abs() < 0.002, "{evidence:?}");
+            let independent_scale = (1.0 + evidence.motion.scale_delta).hypot(evidence.motion.rotation);
+            // Exact same scene/iris scale: SN-FEIDA must not acquire a crop
+            // area factor. This scale comes from separate RAW texture.
+            assert!((independent_scale.powi(-2) - 1.0).abs() < 0.004, "{evidence:?}");
+        }
+    }
+
+    #[test]
+    fn native_global_reframe_preserves_real_motion_and_independent_scale() {
+        let mut fixed = NativeGlobalSimilarityTracker::default();
+        let mut moving = NativeGlobalSimilarityTracker::default();
+        for (index, offset) in [(48, 48), (80, 72), (64, 56), (32, 72), (48, 48)].into_iter().enumerate() {
+            let scale = 1.015f64.powi(index as i32);
+            let translation = (index as f64, -(index as f64));
+            let plane = synthetic_shared_similarity_frame(512, 384, scale, translation);
+            let control = fixed.observe(synthetic_sensor_crop(&plane, 512, (48, 48), 384, 256),
+                384, 256, 4_048, 3_048);
+            let reframed = moving.observe(synthetic_sensor_crop(&plane, 512, offset, 384, 256),
+                384, 256, 4_000 + offset.0 as u32, 3_000 + offset.1 as u32);
+            if index == 0 { continue; }
+            assert!(control.reliable && reframed.reliable, "step={index} control={control:?} reframe={reframed:?}");
+            let point = [4_256.0 + (index - 1) as f32, 3_192.0 - (index - 1) as f32];
+            let predicted = reframed.motion.predict(point, reframed.motion_center_sensor);
+            let expected = [point[0] + 1.0, point[1] - 1.0];
+            assert!((predicted[0] - expected[0]).hypot(predicted[1] - expected[1]) < 0.6, "{reframed:?}");
+            let fixed_prediction = control.motion.predict(point, control.motion_center_sensor);
+            assert!((predicted[0] - fixed_prediction[0]).hypot(predicted[1] - fixed_prediction[1]) < 0.6,
+                "control={control:?} reframe={reframed:?}");
+            let independent_scale = (1.0 + reframed.motion.scale_delta).hypot(reframed.motion.rotation);
+            assert!((independent_scale - 1.015).abs() < 0.006, "{reframed:?}");
+            assert_eq!(usize::from(reframed.stable_frames), index);
+        }
+    }
+
+    #[test]
+    fn native_global_reframe_does_not_claim_precision_from_a_tiny_overlap() {
+        let plane = synthetic_shared_similarity_frame(800, 384, 1.0, (0.0, 0.0));
+        let mut tracker = NativeGlobalSimilarityTracker::default();
+        tracker.observe(synthetic_sensor_crop(&plane, 800, (0, 0), 384, 256), 384, 256, 4_000, 3_000);
+        let clipped = tracker.observe(synthetic_sensor_crop(&plane, 800, (320, 0), 384, 256),
+            384, 256, 4_320, 3_000);
+        assert!(!clipped.reliable && clipped.motion.support == 0, "{clipped:?}");
+        let unrelated = tracker.observe(synthetic_sensor_crop(&plane, 800, (0, 0), 384, 256),
+            384, 256, 8_000, 3_000);
+        assert!(!unrelated.reliable && unrelated.candidate_matches == 0, "{unrelated:?}");
+    }
+
+    #[test]
+    fn native_global_visibility_budget_uses_only_real_common_patch_support() {
+        let plane = synthetic_shared_similarity_frame(640, 480, 1.0, (0.0, 0.0));
+        let previous = SharedNativeRawFrame {
+            sensor_x: 3_596,
+            sensor_y: 2_836,
+            width: 420,
+            height: 280,
+            pixels: synthetic_sensor_crop(&plane, 640, (48, 48), 420, 280),
+        };
+        let current = SharedNativeRawFrame {
+            sensor_x: 3_628,
+            sensor_y: 2_860,
+            width: 420,
+            height: 280,
+            pixels: synthetic_sensor_crop(&plane, 640, (80, 72), 420, 280),
+        };
+        let features = shared_native_global_features(&previous, &current);
+        assert!(features.len() >= NATIVE_GLOBAL_MIN_SUPPORT);
+        assert!(features.len() <= NATIVE_GLOBAL_FEATURE_COLUMNS * NATIVE_GLOBAL_FEATURE_ROWS);
+        for point in features {
+            // Current's left/top patch margins expressed in previous-local
+            // coordinates. Outgoing and newly entering border pixels cannot
+            // be substituted for two genuinely observed patch neighborhoods.
+            assert!((42.0..410.0).contains(&point[0]), "{point:?}");
+            assert!((34.0..270.0).contains(&point[1]), "{point:?}");
+        }
     }
 
     #[test]

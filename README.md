@@ -103,6 +103,20 @@ are atomic. The registration clears as soon as the viewer loses focus. No
 peeper installation or library is required; set
 `BUTTERCUP_KEYBOARD_PEEPER=0` to disable the silent background publisher.
 
+`W` pauses/resumes automatic ROI and sensor-slice following, which starts on
+at every launch. This is a host-only session control: the camera transaction
+protocol stays active, and no environment/config option selects it. An already
+queued move can finish after pausing. Global reacquisition remains separately
+controlled by `R`.
+
+Press `M` for eye-to-screen calibration. Its nine targets stay in the central
+20% of the screen and advance after a minimum 1.5-second hold once six distinct,
+stable gaze readings are available. A 500 ms settling interval excludes target
+transitions; slow or unstable tracking can extend a step. The compact live-eye
+thumbnail is one-third its former width and height, with a matching small
+fixation spinner. Status text stays hidden for the first three seconds of each
+point, and paired RAW recording remains automatic during calibration.
+
 Press `Z` in the viewer to start the full-screen optical screen clock. It
 shows a smoothly moving fixation target over a locally balanced chromatic
 frame code and writes a presentation manifest under

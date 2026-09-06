@@ -135,6 +135,7 @@ pub fn buttercup_map(virtual_mouse: bool, driving: bool) -> HotkeyMap {
     add("Z", "Screen clock", true);
     add("K", "Edge map", true);
     add("J", "Eye laser", true);
+    add("W", "ROI/sensor follow", true);
     add("G", "Segment", true);
     add("Y", "Pupil source", true);
     add("U", "Reticle", true);

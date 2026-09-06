@@ -211,7 +211,7 @@ pub(crate) struct TimedGlobalSimilarity {
 /// the composition from the previous SAM source exposure to the new source
 /// exposure, not the transform adjacent to whichever live frame happens to
 /// receive the answer.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct GlobalSimilarityTimeline {
     pub(crate) last_timestamp_ns: Option<u64>,
     pub(crate) steps: VecDeque<TimedGlobalSimilarity>,
@@ -343,6 +343,56 @@ impl GlobalSimilarityTimeline {
 #[cfg(test)]
 mod clock_contract_tests {
     use super::*;
+
+    #[test]
+    fn submitted_motion_snapshot_survives_live_eviction_and_reset() {
+        let evidence = NativeGlobalSimilarityEvidence {
+            reliable: true,
+            motion: SimilarityMotion {
+                translation: [2.0, -1.0],
+                support: 12,
+                residual: 0.5,
+                ..SimilarityMotion::default()
+            },
+            ..NativeGlobalSimilarityEvidence::default()
+        };
+        let mut live = GlobalSimilarityTimeline::default();
+        for timestamp in [100, 200, 300] {
+            live.observe_frame(timestamp, evidence);
+        }
+        let submitted = live.clone();
+        let assert_pinned = || {
+            assert_eq!(submitted.last_timestamp_ns, Some(300));
+            assert_eq!(submitted.steps.len(), 2);
+            let retained = submitted.reliable_between(100, 300).unwrap();
+            assert_eq!(retained.motion.translation, [4.0, -2.0]);
+            assert_eq!(retained.motion.support, 12);
+            assert!(submitted.reliable_between(100, 400).is_none());
+        };
+        assert_pinned();
+
+        // Evict every originally submitted link from the mutable live queue.
+        for index in 1..=GLOBAL_SIMILARITY_TIMELINE_STEPS + 1 {
+            live.observe_frame(300 + index as u64 * 100, evidence);
+        }
+        let current = live.last_timestamp_ns.unwrap();
+        assert_eq!(live.steps.len(), GLOBAL_SIMILARITY_TIMELINE_STEPS);
+        assert!(live.reliable_between(100, 300).is_none());
+        assert!(live.reliable_between(current - 100, current).is_some());
+        assert!(submitted.reliable_between(100, current).is_none());
+        assert_pinned();
+
+        // A source-time restart clears the live links, and an explicit session
+        // reset drops the live timeline entirely. Neither mutates the batch.
+        live.observe_frame(50, evidence);
+        assert!(live.steps.is_empty());
+        assert_eq!(live.last_timestamp_ns, Some(50));
+        assert_pinned();
+        live = GlobalSimilarityTimeline::default();
+        assert!(live.steps.is_empty());
+        assert_eq!(live.last_timestamp_ns, None);
+        assert_pinned();
+    }
 
     #[test]
     fn co_clocked_rois_compare_timestamps_not_local_sequences() {

@@ -21,6 +21,12 @@ use native::{conic_solver, outline_conic_segments, roi_evidence};
 #[path = "../raw10.rs"]
 mod raw10;
 #[cfg(feature = "sam31")]
+#[path = "../roi_continuity.rs"]
+mod roi_continuity;
+#[cfg(feature = "sam31")]
+#[path = "../roi_visibility.rs"]
+mod roi_visibility;
+#[cfg(feature = "sam31")]
 #[path = "../sam31_outer.rs"]
 mod sam31_outer;
 #[cfg(feature = "sam31")]

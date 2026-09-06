@@ -20,6 +20,7 @@ mapfile -t unexpected_files < <(
       ./docs/viewer-overview.png \
       ./docs/geometry-architecture.md \
       ./docs/flat-tire-area-and-motion.md \
+      ./docs/roi-reframe-continuity.md \
       ./scripts/audit-tree.sh \
       ./scripts/run-viewer.sh \
       ./scripts/run-sam31-arc-trial.sh \
@@ -35,6 +36,8 @@ mapfile -t unexpected_files < <(
       ./src/outline_conic_segments/recent_exclusion.rs \
       ./src/roi_evidence.rs \
       ./src/roi_evidence/timing.rs \
+      ./src/roi_continuity.rs \
+      ./src/roi_visibility.rs \
       ./src/eye_scene_model.rs \
       ./src/eye_scene_model/limbus_scale.rs \
       ./src/eye_scene_model/pupil_center.rs \
@@ -55,6 +58,7 @@ mapfile -t unexpected_files < <(
       ./src/native_mediapipe.rs \
       ./src/offline_segmentation_replay.rs \
       ./src/pupil_clock_supervision.rs \
+      ./src/pivot_region_scheduler.rs \
       ./src/raw10.rs \
       ./src/raw_eye_model_protocol.rs \
       ./src/raw_iris_focus.rs \
@@ -62,6 +66,7 @@ mapfile -t unexpected_files < <(
       ./src/raw_sclera_vein_graph.rs \
       ./src/raw_sclera_red_canny.rs \
       ./src/sam31_outer.rs \
+      ./src/sam31_photometric.rs \
       ./src/sam31_text.rs \
       ./src/screen_reflection_clock.rs \
       ./src/screen_reflection_code.rs \

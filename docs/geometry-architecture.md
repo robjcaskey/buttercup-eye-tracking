@@ -122,6 +122,8 @@ For real-data development, use the definition and matched corpus workflow in
 [Scale-normalized frontal-equivalent iris disk area](flat-tire-area-and-motion.md).
 Area consistency, conditional localization fidelity and anatomical validity
 are complementary diagnostics, never substitutes for one another.
+For crop-motion transport, the enabled sparse overlap sampler and the disabled
+SAM identity-carry experiment, see [ROI reframe continuity](roi-reframe-continuity.md).
 
 ### Shared conventions
 

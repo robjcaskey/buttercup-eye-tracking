@@ -4962,14 +4962,188 @@ where I: Iterator<Item = String> {
     fs::write(output, serde_json::to_vec_pretty(&report).map_err(|e|e.to_string())?).map_err(|e|e.to_string())
 }
 
+/// Optional lossless, CFA-aligned inset crops exercise repeated reframes on
+/// recorded motion and canonical labels. They are derived views of the SAME
+/// exposures, not newly manufactured sensor reads. No resizing or padding.
+fn sequence_replay_crop(mode: &str, index: usize, width: usize, height: usize)
+    -> Result<((usize, usize), (usize, usize)), String>
+{
+    if mode == "native" { return Ok(((0, 0), (width, height))); }
+    if width <= 24 || height <= 16 || width * 2 != height * 3 {
+        return Err("inset replay requires a native 3:2 ROI larger than 24x16".into());
+    }
+    let offset = match mode {
+        "inset-fixed" => (12, 8),
+        "inset-cycle" => [(12, 8), (24, 16), (0, 0), (24, 0), (0, 16)][index % 5],
+        // Independent runs use exactly the same first nine crops/exposures
+        // before diverging. Never submit both views of one exposure as new
+        // sequential observations to a single tracker.
+        "inset-step-x" | "inset-step-y" | "inset-step-xy" if index < 9 => (12, 8),
+        "inset-step-x" => (24, 8),
+        "inset-step-y" => (12, 16),
+        "inset-step-xy" => (24, 16),
+        _ => return Err("replay crop must be native, inset-fixed, inset-cycle, inset-step-x, inset-step-y or inset-step-xy".into()),
+    };
+    Ok((offset, (width - 24, height - 16)))
+}
+
+fn sequence_crop_pixels(raw: &[u16], source_width: usize, offset: (usize, usize), size: (usize, usize)) -> Vec<u16> {
+    (offset.1..offset.1 + size.1).flat_map(|y| {
+        raw[y * source_width + offset.0..y * source_width + offset.0 + size.0].iter().copied()
+    }).collect()
+}
+
+/// Replay-declared clock domain, not a recovered hardware boot identifier.
+/// A recorded lineage (or one continuous capture) is the conservative boundary:
+/// paired eyes and alternative crops retain the domain, but distinct archives
+/// cannot lend each other a motion chain merely because timestamps are nearby.
+fn replay_motion_clock(capture: &Path, record: &Value) -> roi_evidence::SourceClock {
+    let capture_name = capture.to_string_lossy();
+    let lineage = record["lineage"].as_str().unwrap_or(&capture_name);
+    let domain = lineage.as_bytes().iter().fold(0xcbf29ce484222325u64, |hash, byte|
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3));
+    roi_evidence::SourceClock { domain, epoch: 0 }
+}
+
+fn sequence_replay_source_transition(
+    session: &mut crate::roi_continuity::RoiContinuitySession,
+    previous_clock: &mut Option<roi_evidence::SourceClock>,
+    clock: roi_evidence::SourceClock,
+    source: crate::roi_continuity::RoiSource,
+    legacy_caller_crop_reset: bool,
+) -> (crate::roi_continuity::RoiTransition, bool, bool) {
+    let clock_changed = previous_clock.is_some_and(|previous| previous != clock);
+    let legacy_reset = legacy_caller_crop_reset && session.last_source().is_some_and(|previous|
+        (previous.sensor_x,previous.sensor_y) != (source.sensor_x,source.sensor_y)
+            && source.timestamp_ns > previous.timestamp_ns && source.sequence > previous.sequence);
+    // A clock change is a true session boundary for learned and contact state,
+    // not only for motion. Nearby numbers in different domains prove nothing.
+    if clock_changed || legacy_reset { session.invalidate(); }
+    let transition = session.observe(source, SAM31_RESULT_MAX_AGE_NS);
+    if transition.accepts_source() { *previous_clock = Some(clock); }
+    (transition, clock_changed, legacy_reset)
+}
+
+#[cfg(test)]
+mod reframe_replay_tests {
+    use super::*;
+
+    #[test]
+    fn lossless_reframe_crops_preserve_raw_samples_and_cfa_phase() {
+        let raw = (0..384 * 256).map(|i|(i % 1024) as u16).collect::<Vec<_>>();
+        for index in 0..10 {
+            let (offset, size) = sequence_replay_crop("inset-cycle",index,384,256).unwrap();
+            assert_eq!((offset.0 % 4, offset.1 % 4), (0, 0));
+            assert_eq!(size, (360, 240));
+            let crop = sequence_crop_pixels(&raw,384,offset,size);
+            assert_eq!(crop.len(),size.0 * size.1);
+            for y in 0..size.1 { for x in 0..size.0 {
+                assert_eq!(crop[y * size.0 + x],raw[(y+offset.1)*384+x+offset.0]);
+            } }
+            // Exact coordinate transport back to the SAME source exposure.
+            let sensor_origin = (3_460u32,2_234u32);
+            let source_point = (180.25,120.75);
+            let crop_point = (source_point.0-offset.0 as f64,source_point.1-offset.1 as f64);
+            assert_eq!(crop_point.0 + f64::from(sensor_origin.0) + offset.0 as f64,
+                source_point.0 + f64::from(sensor_origin.0));
+            assert_eq!(crop_point.1 + f64::from(sensor_origin.1) + offset.1 as f64,
+                source_point.1 + f64::from(sensor_origin.1));
+        }
+    }
+
+    #[test]
+    fn reframe_replay_control_has_identical_crop_size_without_motion() {
+        assert_eq!(sequence_replay_crop("native",0,384,256).unwrap(), ((0,0),(384,256)));
+        for index in 0..10 {
+            assert_eq!(sequence_replay_crop("inset-fixed",index,384,256).unwrap(), ((12,8),(360,240)));
+        }
+        assert!(sequence_replay_crop("typo",0,384,256).is_err());
+        assert!(sequence_replay_crop("inset-cycle",0,384,240).is_err());
+        assert!(sequence_replay_crop("inset-cycle",0,24,16).is_err());
+    }
+
+    #[test]
+    fn same_exposure_reframe_branches_have_identical_warmup_and_no_resampling() {
+        let raw = (0..420 * 280).map(|i| ((i * 71 + i / 420) % 1024) as u16)
+            .collect::<Vec<_>>();
+        for mode in ["inset-step-x", "inset-step-y", "inset-step-xy"] {
+            for index in 0..9 {
+                assert_eq!(sequence_replay_crop(mode,index,420,280).unwrap(),
+                    sequence_replay_crop("inset-fixed",index,420,280).unwrap());
+            }
+            let (control_offset, size) = sequence_replay_crop("inset-fixed",9,420,280).unwrap();
+            let (moved_offset, moved_size) = sequence_replay_crop(mode,9,420,280).unwrap();
+            assert_eq!(size, moved_size);
+            assert_ne!(control_offset, moved_offset);
+            assert_eq!((moved_offset.0 % 4,moved_offset.1 % 4),(0,0));
+            let control = sequence_crop_pixels(&raw,420,control_offset,size);
+            let moved = sequence_crop_pixels(&raw,420,moved_offset,size);
+            let start = (control_offset.0.max(moved_offset.0),control_offset.1.max(moved_offset.1));
+            let end = ((control_offset.0+size.0).min(moved_offset.0+size.0),
+                (control_offset.1+size.1).min(moved_offset.1+size.1));
+            for y in start.1..end.1 { for x in start.0..end.0 {
+                assert_eq!(control[(y-control_offset.1)*size.0+x-control_offset.0],
+                    moved[(y-moved_offset.1)*size.0+x-moved_offset.0]);
+            } }
+        }
+    }
+
+    #[test]
+    fn replay_clock_belongs_to_capture_lineage_not_crop_eye_or_tracking_epoch() {
+        let capture = Path::new("capture-a");
+        let first = json!({"lineage":"camera-read-session-a","sequence":10,
+            "timestamp_ns":100,"eye_id":1,"sensor_x":100,"tracking_epoch":3});
+        let derived = json!({"lineage":"camera-read-session-a","sequence":10,
+            "timestamp_ns":100,"eye_id":2,"sensor_x":132,"tracking_epoch":9});
+        assert_eq!(replay_motion_clock(capture,&first),replay_motion_clock(capture,&derived));
+        assert_ne!(replay_motion_clock(capture,&first),
+            replay_motion_clock(capture,&json!({"lineage":"camera-read-session-b"})));
+        assert_eq!(replay_motion_clock(capture,&json!({})),
+            replay_motion_clock(capture,&json!({"sequence":999,"eye_id":2})));
+        assert_ne!(replay_motion_clock(capture,&json!({})),
+            replay_motion_clock(Path::new("capture-b"),&json!({})));
+    }
+
+    #[test]
+    fn replay_clock_change_invalidates_the_whole_tracking_session() {
+        use crate::roi_continuity::{RoiContinuitySession, RoiResultSource, RoiSource, RoiTransition};
+        let mut session = RoiContinuitySession::default();
+        let mut previous_clock = None;
+        let clock = roi_evidence::SourceClock { domain:1, epoch:0 };
+        let source = RoiSource { sequence:10,timestamp_ns:1_000_000_000,
+            sensor_x:100,sensor_y:200,width:420,height:280 };
+        let (transition, changed, _) = sequence_replay_source_transition(
+            &mut session,&mut previous_clock,clock,source,false);
+        assert_eq!(transition,RoiTransition::First);
+        assert!(!changed);
+        let old = RoiResultSource { tracking_epoch:session.epoch(),
+            sequence:source.sequence,timestamp_ns:source.timestamp_ns };
+        let moved = RoiSource { sequence:11,timestamp_ns:1_020_000_000,sensor_x:132,..source };
+        let (transition, changed, _) = sequence_replay_source_transition(
+            &mut session,&mut previous_clock,clock,moved,false);
+        assert_eq!(transition,RoiTransition::CompatibleTranslation);
+        assert!(!changed);
+        assert_eq!(session.epoch(),old.tracking_epoch);
+        let (transition, changed, _) = sequence_replay_source_transition(
+            &mut session,&mut previous_clock,
+            roi_evidence::SourceClock { domain:2,..clock },moved,false);
+        assert_eq!(transition,RoiTransition::First);
+        assert!(changed && transition.resets_tracking());
+        assert_ne!(session.epoch(),old.tracking_epoch);
+        assert!(!session.admits_result(old,None,SAM31_RESULT_MAX_AGE_NS));
+    }
+}
+
 pub(super) fn sam_sequence_eval<I>(mut args: I) -> Result<(), String>
 where I: Iterator<Item = String> {
-    let output = PathBuf::from(args.next().ok_or("expected OUTPUT.json CAPTURE_DIR LABEL [START] [COUNT] [STRIDE]")?);
+    let output = PathBuf::from(args.next().ok_or("expected OUTPUT.json CAPTURE_DIR LABEL [START] [COUNT] [STRIDE] [native|inset-fixed|inset-cycle|inset-step-x|inset-step-y|inset-step-xy]")?);
     let capture = PathBuf::from(args.next().ok_or("missing capture directory")?);
     let label = args.next().ok_or("missing eye label")?;
     let start = parse_usize(args.next(), 0, "start")?;
     let count = parse_usize(args.next(), usize::MAX, "count")?;
     let stride = parse_usize(args.next(), 1, "stride")?;
+    let crop_mode = args.next().unwrap_or_else(|| "native".into());
+    sequence_replay_crop(&crop_mode, 0, 384, 256)?;
     if stride == 0 { return Err("sequence stride must be positive".into()); }
     if args.next().is_some() { return Err("unexpected sequence argument".into()); }
     if output.exists() { return Err(format!("output already exists: {}", output.display())); }
@@ -4988,38 +5162,88 @@ where I: Iterator<Item = String> {
     let mut previous_ratio = None::<f64>;
     let mut ratio_steps = Vec::new();
     let mut ratios = Vec::new();
-    let mut previous_time = None;
-    let mut epoch = 1;
+    let mut session = crate::roi_continuity::RoiContinuitySession::default();
+    // Diagnostic ablation of the old live caller's reset. The old sequence
+    // replay omitted this behavior, so its baseline cannot measure the cost
+    // of discarding host-side contact/sign state on every crop move.
+    let legacy_caller_crop_reset = env::var("BUTTERCUP_ROI_REPLAY_LEGACY_CROP_RESET")
+        .is_ok_and(|value| value == "1");
+    let mut ignored_sources = Vec::new();
     let mut post_replay = PostSamPupilReplay::default();
+    let mut motion_tracker = raw_motion_octrees::NativeGlobalSimilarityTracker::default();
+    let mut motion_timeline = GlobalSimilarityTimeline::default();
+    let mut previous_motion_clock = None;
+    let mut gaze_authority_generation = 0u64;
+    let mut surface_tracker = SurfaceGazeTracker::default();
+    let mut contact_tracker = SurfaceGazeTracker::default();
+    let mut latest = None::<sam31_outer::OuterResult>;
+    let mut latest_proposals = None::<Arc<sam31_outer::ProposalMasks>>;
+    let mut source_clock = None::<(u64, Instant)>;
+    let mut previous_roi = None;
+    let mut previous_radius = None::<f64>;
     for (index, record) in records.iter().enumerate() {
-        let width = integer(record,"width")? as usize;
-        let height = integer(record,"height")? as usize;
-        let origin = (integer(record,"sensor_x")? as u32,integer(record,"sensor_y")? as u32);
+        let source_width = integer(record,"width")? as usize;
+        let source_height = integer(record,"height")? as usize;
+        let source_origin = (integer(record,"sensor_x")? as u32,integer(record,"sensor_y")? as u32);
+        let (crop_offset, (width, height)) = sequence_replay_crop(&crop_mode, index, source_width, source_height)?;
+        let origin = (source_origin.0.checked_add(crop_offset.0 as u32).ok_or("crop x overflow")?,
+            source_origin.1.checked_add(crop_offset.1 as u32).ok_or("crop y overflow")?);
         let timestamp = integer(record,"timestamp_ns")?;
-        if previous_time.is_some_and(|t| timestamp <= t || timestamp - t > 1_000_000_000) {
-            history.clear(); epoch += 1;
-            previous_ratio = None;
+        let sequence = integer(record,"sequence")?;
+        let motion_clock = replay_motion_clock(&capture, record);
+        let (transition, clock_changed, legacy_reset) = sequence_replay_source_transition(
+            &mut session,&mut previous_motion_clock,motion_clock,
+            crate::roi_continuity::RoiSource {
+                sequence, timestamp_ns: timestamp, sensor_x: origin.0, sensor_y: origin.1,
+                width, height,
+            },legacy_caller_crop_reset);
+        if !transition.accepts_source() {
+            ignored_sources.push(json!({"frame":record,"transition":format!("{transition:?}")}));
+            continue;
         }
-        previous_time = Some(timestamp);
+        apply_sam31_source_transition(transition,&mut gaze_authority_generation,
+            &mut surface_tracker,&mut contact_tracker,&mut history,&mut latest,&mut latest_proposals);
+        if transition.resets_tracking() {
+            previous_ratio = None;
+            motion_tracker.clear(); previous_radius = None; previous_roi = None;
+            outer_summary.previous = None; pupil_summary.previous = None;
+            post_replay = PostSamPupilReplay::default();
+            motion_timeline = GlobalSimilarityTimeline::default();
+            source_clock = None;
+        }
+        let epoch = session.epoch();
         let member = record["stream"].as_str().ok_or("missing RAW stream")?;
         if Path::new(member).components().count() != 1 { return Err("invalid RAW stream member".into()); }
         let mut file = File::open(capture.join(member)).map_err(|e|e.to_string())?;
         file.seek(SeekFrom::Start(integer(record,"offset")?)).map_err(|e|e.to_string())?;
         let mut packed = vec![0; integer(record,"length")? as usize];
         file.read_exact(&mut packed).map_err(|e|e.to_string())?;
+        let unpacked = raw10::try_unpack_raw10(&packed,source_width,source_height,integer(record,"stride")? as usize)?;
+        let pixels = if crop_mode == "native" { unpacked } else {
+            sequence_crop_pixels(&unpacked,source_width,crop_offset,(width,height))
+        };
         let frame = Arc::new(sam31_outer::RawFrame {
-            eye_index: 0, sequence: integer(record,"sequence")?, timestamp_ns: timestamp,
+            eye_index: 0, sequence, timestamp_ns: timestamp,
             sensor_x: origin.0, sensor_y: origin.1, width, height,
             registration_anchor: None, pupil_component_seed: None,
-            pixels: Arc::new(raw10::try_unpack_raw10(&packed,width,height,integer(record,"stride")? as usize)?),
+            pixels: Arc::new(pixels),
         });
+        let independent_motion = motion_tracker.observe(frame.pixels.clone(),width,height,origin.0,origin.1);
+        motion_timeline.observe_frame(timestamp, independent_motion);
+        let roi = (origin, width, height);
+        let reframed = previous_roi.is_some_and(|previous| previous != roi);
+        previous_roi = Some(roi);
         history.push_back(frame.clone());
         while history.len() > 8 { history.pop_front(); }
         let completed = client.status().completed_batches;
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            match client.submit_history(&history,sam31_outer::Target::OuterLimbusAndInnerPupilVoid,
-                sam31_outer::OUTER_IRIS_PROMPT,0,epoch) {
+            let motion = sam31_outer::memory_arbitration_enabled().then(||
+                sam31_outer::SourceMotionSnapshot {
+                    eye_index:0,tracking_epoch:epoch,clock:motion_clock,timeline:motion_timeline.clone(),
+                });
+            match client.submit_history_with_motion(&history,sam31_outer::Target::OuterLimbusAndInnerPupilVoid,
+                sam31_outer::OUTER_IRIS_PROMPT,0,epoch,motion) {
                 sam31_outer::SubmitOutcome::Accepted => break,
                 sam31_outer::SubmitOutcome::Invalid => return Err(client.status().detail),
                 _ => {},
@@ -5031,8 +5255,19 @@ where I: Iterator<Item = String> {
             if Instant::now() > deadline { return Err(format!("SAM sequence timed out: {}",client.status().detail)); }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let proposal = client.drain_proposal_masks().into_iter().find(|p|p.source_timestamp_ns == timestamp);
-        let result = client.drain_results().into_iter().find(|r|r.source_timestamp_ns == timestamp);
+        // Use the same source/session admission gate as the live caller, not
+        // timestamp matching alone. This replay waits for each completion;
+        // asynchronous arrival permutations are covered by caller tests.
+        let proposal = client.drain_proposal_masks().into_iter().find(|p|
+            p.eye_index == 0 && p.prompt_generation == 0 && p.source_timestamp_ns == timestamp
+            && session.admits_result(sam31_proposal_source(p),
+                latest_proposals.as_deref().map(sam31_proposal_source),SAM31_RESULT_MAX_AGE_NS));
+        let result = client.drain_results().into_iter().find(|r|
+            r.eye_index == 0 && r.prompt_generation == 0 && r.source_timestamp_ns == timestamp
+            && session.admits_result(sam31_result_source(r),
+                latest.as_ref().map(sam31_result_source),SAM31_RESULT_MAX_AGE_NS));
+        if let Some(proposals) = proposal.as_ref() { latest_proposals = Some(Arc::clone(proposals)); }
+        if let Some(result) = result.as_ref() { latest = Some(result.clone()); }
         let outer = proposal.as_ref().and_then(|p|p.outer_fit.as_ref()).map(|p|p.ellipse);
         let pupil = proposal.as_ref().and_then(|p|p.inner_pupil_fit);
         // Isolate the same post-SAM RAW pupil solver used live, giving it an
@@ -5043,6 +5278,15 @@ where I: Iterator<Item = String> {
         let projection = boundary.as_ref().and_then(|b|PupilProjectionReference::from_outer(b,PupilProjectionSource::SelectedIris));
         let rough = result.as_ref().and_then(|r|sam31_pupil_center_for_frame(r,timestamp,origin.0,origin.1,None));
         let post = post_replay.observe(&frame,projection,rough);
+        let (first_source, started) = *source_clock.get_or_insert_with(|| (timestamp,Instant::now()));
+        let now = started + Duration::from_nanos(timestamp-first_source);
+        let contact = latest_proposals.as_deref().and_then(|proposals| {
+            let boundary = sam31_presentation_boundary_for_frame(proposals,timestamp,origin.0,origin.1,width,height)?;
+            let source_motion = contact_tracker.last_keyed_source_timestamp_ns
+                .and_then(|previous|motion_timeline.reliable_between(previous,proposals.source_timestamp_ns));
+            contact_tracker.observe_keyed_with_global_similarity(proposals.source_timestamp_ns,now,origin,
+                sam31_proposal_pupil_limbus_anchor(proposals),&boundary,source_motion)
+        });
         let ratio = outer.zip(pupil).map(|(o,p)| (p.ellipse.major_radius * p.ellipse.minor_radius / (o.major_radius * o.minor_radius)).sqrt());
         if let Some(ratio) = ratio {
             ratios.push(ratio);
@@ -5053,20 +5297,64 @@ where I: Iterator<Item = String> {
         outer_summary.observe(outer.is_some(),result.is_some(),outer.map(|o|o.center),outer.map(|o|o.major_radius),origin,elapsed);
         pupil_summary.observe(pupil.is_some(),pupil.is_some(),pupil.map(|p|p.ellipse.center),
             pupil.map(|p|(p.ellipse.major_radius*p.ellipse.minor_radius).sqrt()),origin,elapsed);
-        let ellipse_json = |e: sam31_outer::Ellipse| json!({"center":e.center,"major_radius":e.major_radius,"minor_radius":e.minor_radius,"angle":e.angle});
-        cases.push(json!({"frame":record,"epoch":epoch,"outer":outer.map(ellipse_json),
+        // Keep reported ellipses in the ORIGINAL recorded frame coordinates
+        // even for derived crops, so human labels and sensor positions align.
+        let ellipse_json = |e: sam31_outer::Ellipse| json!({
+            "center":(e.center.0+crop_offset.0 as f64,e.center.1+crop_offset.1 as f64),
+            "major_radius":e.major_radius,"minor_radius":e.minor_radius,"angle":e.angle});
+        let scale_ratio = independent_motion.reliable.then(||
+            (1.0f64 + f64::from(independent_motion.motion.scale_delta)).hypot(f64::from(independent_motion.motion.rotation)));
+        let admitted_radius = result.as_ref().and(outer).map(|e|e.major_radius);
+        let sn_feida_log_step = previous_radius.zip(admitted_radius).zip(scale_ratio)
+            .map(|((previous,current),scale)|2.0*((current/previous).ln()-scale.ln()));
+        previous_radius = admitted_radius;
+        cases.push(json!({"frame":record,"epoch":epoch,"source_transition":format!("{transition:?}"),
+            "legacy_caller_crop_reset":legacy_reset,
+            "gaze_authority_generation":gaze_authority_generation,
+            "motion_clock":{"domain":motion_clock.domain,"epoch":motion_clock.epoch},
+            "source_clock_changed":clock_changed,
+            "selection_started_ns":session.selection_started_ns(),"outer":outer.map(ellipse_json),
+            "processed_roi":{"origin":origin,"width":width,"height":height,"source_crop_offset":crop_offset,
+                "source_timestamp_ns":timestamp,"reframed":reframed},
+            "independent_motion":{"reliable":independent_motion.reliable,"scale_ratio":scale_ratio,
+                "center_sensor":independent_motion.motion_center_sensor,"translation":independent_motion.motion.translation,
+                "rotation_coefficient":independent_motion.motion.rotation,"support":independent_motion.motion.support,
+                "residual_px":independent_motion.motion.residual},
+            "sn_feida_log_step":sn_feida_log_step,
             "raw_admitted":result.is_some(),"pupil":pupil.map(|p|ellipse_json(p.ellipse)),
             "pupil_support":pupil.map(|p|json!({"score":p.raw_support.score,"positive_fraction":p.raw_support.positive_fraction,"strong_sectors":p.raw_support.strong_sectors})),
-            "pupil_radius_ratio":ratio,"post_sam":post,"pupil_diagnostics":outer.map(|o|sam31_outer::inspect_pupil_fit(frame,o)),
+            "pupil_radius_ratio":ratio,"post_sam":post,"virtual_contact":json_surface_gaze(contact),
+            "contact_fresh_source":contact.is_some_and(|sample|sample.source_timestamp_ns==Some(timestamp)),
+            "pupil_diagnostics":outer.map(|o|sam31_outer::inspect_pupil_fit(frame,o)),
             "status":client.status().detail,"elapsed_ms":elapsed}));
         if index % 10 == 0 || index+1 == records.len() {
             eprintln!("SAM sequence {} {}/{} outer={} pupil={}",label,index+1,records.len(),outer.is_some(),pupil.is_some());
         }
     }
+    // The entire sequence has finished before any human annotation is read.
+    // A label cannot select the query, seed memory, or move a fitted boundary.
+    for case in &mut cases {
+        let Some(path) = case["frame"]["canonical_label"].as_str() else { continue; };
+        let annotation: Value = serde_json::from_slice(&fs::read(path).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+        let points = labeled_limbus_points(&annotation,"visible");
+        let e = &case["outer"];
+        let pose = e["center"][0].as_f64().zip(e["center"][1].as_f64()).and_then(|center| {
+            Some(DrivingAffinePose { center, major_radius:e["major_radius"].as_f64()?,
+                minor_radius:e["minor_radius"].as_f64()?, angle:e["angle"].as_f64()? })
+        });
+        let distances = labeled_ellipse_residuals(&points,pose);
+        case["human_visible_limbus"] = json!({"points":points.len(),"rms_px":labeled_rms(&distances),
+            "distances_px":distances,"contract":"visible human limbus points in original source-frame coordinates; includes proposal-only fits, consult raw_admitted"});
+    }
     let report = json!({"schema":"buttercup-sam-sequence-eval-v1","capture":capture,"label":label,
         "model":model,"configuration":sam31_outer::live_configuration(),
-        "sampling":{"start":start,"maximum_samples":count,"source_frame_stride":stride},
-        "contract":"production video worker, sequential native RAW exposures, no prediction/label seeds; proposal-only pupil metrics, not final UI publication or accuracy ground truth",
+        "sampling":{"start":start,"maximum_samples":count,"source_frame_stride":stride,"crop_mode":crop_mode},
+        "caller_policy":if legacy_caller_crop_reset {"legacy-crop-reset-ablation"} else {"shared-live-roi-continuity"},
+        "contract":"production source/session and result-admission policy, video worker, sensor registration and keyed contact tracker; sequential native RAW exposures with no prediction/label seeds; blocking completion cadence, optimistic post-SAM focus, not full UI/AF/calibration publication or accuracy ground truth",
+        "crop_contract":"lossless native RAW inset views retain source clocks; outer/pupil ellipses are in original frame coordinates; post_sam and pupil_diagnostics use processed_roi-local coordinates",
+        "scale_contract":"signed SN-FEIDA log steps on consecutive RAW-admitted limbus fits only, using independent reliable native texture similarity; no bridging missing observations or unsupported scale, not metric anatomy or calibrated confidence",
+        "motion_clock_contract":"replay-declared recording-lineage domain (or capture when lineage absent), not recovered hardware boot provenance; same-source crops and paired eyes share it, no cross-lineage motion bridge",
+        "ignored_sources":ignored_sources,
         "outer_summary":outer_summary.json(cases.len()),"pupil_summary":pupil_summary.json(cases.len()),
         "pupil_radius_ratio":distribution(&ratios),"consecutive_pupil_ratio_log_step":distribution(&ratio_steps),"cases":cases});
     fs::write(output,serde_json::to_vec_pretty(&report).map_err(|e|e.to_string())?).map_err(|e|e.to_string())

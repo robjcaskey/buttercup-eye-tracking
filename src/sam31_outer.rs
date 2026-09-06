@@ -98,6 +98,14 @@ fn startup_assets_available(model: &Path, prompts: &Path, tracker: &Path) -> boo
 pub fn live_configuration() -> serde_json::Value {
     serde_json::json!({
         "preprocess": PreprocessRegime::configured_live().ok().map(PreprocessRegime::label),
+        "stable_photometry_enabled": enabled_env_flag("BUTTERCUP_SAM31_STABLE_PHOTOMETRY", false),
+        "photometry_policy": if enabled_env_flag("BUTTERCUP_SAM31_STABLE_PHOTOMETRY", false) {
+            "sensor-overlap-bounded-v2"
+        } else { "legacy-per-crop" },
+        "stable_photometry_supported_regimes": ["mild-blur", "balanced-quad-rgb"],
+        "stable_photometry_maximum_source_gap_ns": 900_000_000u64,
+        "stable_photometry_maximum_log_rate_per_second": 3.0,
+        "stable_photometry_model_grid": "crop-local; sensor-anchored RAW reconstruction and statistics, not exact learned-feature equivariance",
         "legacy_outer_selection": legacy_outer_selection(),
         "minimum_outer_component_area_model_pixels": minimum_outer_component_area(),
         "semantic_pupil": enabled_env_flag("BUTTERCUP_SAM31_SEMANTIC_PUPIL", true),
@@ -105,9 +113,27 @@ pub fn live_configuration() -> serde_json::Value {
         "prefer_shared_image_features": enabled_env_flag("BUTTERCUP_SAM31_SHARED_FEATURE_PROMPT", true),
         "pupil_contour_history_window_ns": PUPIL_CONTOUR_WINDOW_NS,
         "pupil_contour_maximum_gap_ns": PUPIL_CONTOUR_MAX_GAP_NS,
+        "roi_reframe_policy": if enabled_env_flag("BUTTERCUP_SAM31_CROP_MEMORY", false) {
+            "experimental-sensor-positioned-overlap-memory-v1"
+        } else if enabled_env_flag("BUTTERCUP_SAM31_REFRAME_IDENTITY", false) {
+            "fresh-raw-recondition-with-retained-identity-v1"
+        } else { "reset-pixel-memory-and-query-anchor" },
+        "roi_reframe_identity_enabled": enabled_env_flag("BUTTERCUP_SAM31_REFRAME_IDENTITY", false),
+        "roi_crop_memory_enabled": enabled_env_flag("BUTTERCUP_SAM31_CROP_MEMORY", false),
+        "memory_arbitration_enabled": memory_arbitration_enabled(),
+        "roi_crop_memory_maximum_source_age_ns": LIVE_TRACKER_MAX_TIMESTAMP_GAP_NS,
+        "roi_crop_memory_minimum_token_fraction": LIVE_CROP_MEMORY_MIN_TOKEN_FRACTION,
+        "roi_reframe_minimum_identity_visible_fraction": LIVE_REFRAME_MIN_VISIBLE_FRACTION,
+        "roi_reframe_minimum_sensor_mask_iou": LIVE_REFRAME_MIN_MASK_IOU,
+        "roi_reframe_maximum_identity_queries": LIVE_REFRAME_MAX_IDENTITY_QUERIES,
         "prompt_bundle": std::env::var("BUTTERCUP_SAM31_PROMPT_BUNDLE").ok(),
         "pupil_diagnostics_contract": "stateless RAW component audit, not the selected semantic-pupil decision",
     })
+}
+
+/// One flag owner for production submission, worker arbitration and reports.
+pub(crate) fn memory_arbitration_enabled() -> bool {
+    enabled_env_flag("BUTTERCUP_SAM31_MEMORY_ARBITRATION", false)
 }
 
 // Reproduce the pre-corpus-tuning selector in offline A/B replays. This
@@ -857,6 +883,14 @@ const LIVE_TRACKER_MIN_PRIOR_MASK_IOU: f64 = 0.68;
 const LIVE_RECOVERY_MIN_QUERY_COSINE: f64 = 0.70;
 const LIVE_TRACKER_MAX_HOLD_MISSES: u8 = 3;
 const LIVE_TRACKER_MAX_TIMESTAMP_GAP_NS: u64 = 900_000_000;
+// Association bounds, not calibrated probabilities. A crop move may retain
+// identity only while most of its last RAW-validated foreground is in view.
+// New pixels must independently confirm that identity before encoding memory.
+const LIVE_REFRAME_MIN_VISIBLE_FRACTION: f64 = 0.80;
+const LIVE_REFRAME_MIN_MASK_IOU: f64 = 0.50;
+const LIVE_REFRAME_MAX_IDENTITY_QUERIES: usize = 4;
+const LIVE_CROP_MEMORY_GRID: usize = 72;
+const LIVE_CROP_MEMORY_MIN_TOKEN_FRACTION: f64 = 0.50;
 
 #[cfg(any(feature = "sam31", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -868,6 +902,24 @@ struct LiveTrackerInput {
     sensor_origin: (u32, u32),
     width: usize,
     height: usize,
+}
+
+#[cfg(any(feature = "sam31", test))]
+impl LiveTrackerInput {
+    fn roi_source(self) -> crate::roi_continuity::RoiSource {
+        crate::roi_continuity::RoiSource {
+            sequence: self.sequence, timestamp_ns: self.timestamp_ns,
+            sensor_x: self.sensor_origin.0, sensor_y: self.sensor_origin.1,
+            width: self.width, height: self.height,
+        }
+    }
+
+    fn sensor_rect(self) -> Option<crate::roi_visibility::SensorRect> {
+        Some(crate::roi_visibility::SensorRect {
+            x: self.sensor_origin.0, y: self.sensor_origin.1,
+            width: u32::try_from(self.width).ok()?, height: u32::try_from(self.height).ok()?,
+        })
+    }
 }
 
 #[cfg(any(feature = "sam31", test))]
@@ -896,7 +948,7 @@ fn live_tracker_requires_reset(
     previous.tracking_epoch != current.tracking_epoch
         || previous.prompt_generation != current.prompt_generation
         || current.sequence <= previous.sequence
-        || current.timestamp_ns < previous.timestamp_ns
+        || current.timestamp_ns <= previous.timestamp_ns
         || current.timestamp_ns.saturating_sub(previous.timestamp_ns)
             > LIVE_TRACKER_MAX_TIMESTAMP_GAP_NS
         || roi_changed
@@ -911,13 +963,97 @@ fn pupil_history_survives_roi_relocation(
     previous.is_some_and(|previous| {
         previous.tracking_epoch == current.tracking_epoch
             && previous.prompt_generation == current.prompt_generation
-            && current.sequence > previous.sequence
-            && current.timestamp_ns > previous.timestamp_ns
-            && current.timestamp_ns - previous.timestamp_ns <= LIVE_TRACKER_MAX_TIMESTAMP_GAP_NS
-            && previous.width == current.width
-            && previous.height == current.height
-            && live_rois_overlap(previous, current)
+            && matches!(crate::roi_continuity::classify_roi_transition(
+                Some(previous.roi_source()), current.roi_source(), LIVE_TRACKER_MAX_TIMESTAMP_GAP_NS),
+                crate::roi_continuity::RoiTransition::Continuous
+                    | crate::roi_continuity::RoiTransition::CompatibleTranslation)
     })
+}
+
+#[cfg(any(feature = "sam31", test))]
+fn live_source_is_fresh(previous: Option<LiveTrackerInput>, current: LiveTrackerInput) -> bool {
+    let previous = previous.filter(|previous| previous.tracking_epoch == current.tracking_epoch
+        && previous.prompt_generation == current.prompt_generation);
+    crate::roi_continuity::classify_roi_transition(previous.map(LiveTrackerInput::roi_source),
+        current.roi_source(), LIVE_TRACKER_MAX_TIMESTAMP_GAP_NS).accepts_source()
+}
+
+/// A historical token remains in its original feature tensor. Only its key
+/// address changes, from the original crop to the current sensor window. The
+/// fractional coordinates are shared by additive sine position and axial
+/// RoPE; integer rolling would silently change the sampling phase.
+///
+/// This does NOT reconstruct features from another RAW crop: learned features
+/// retain the historical crop's context. The path is therefore experimental,
+/// and cells outside the observed overlap (plus a one-cell border guard on a
+/// move) are excluded from attention, not filled with invented zero evidence.
+#[cfg(any(feature = "sam31", test))]
+#[derive(Debug)]
+struct CropMemoryLayout {
+    indices: Vec<i64>,
+    coordinates: Vec<(f64, f64)>,
+    translated: bool,
+}
+
+#[cfg(any(feature = "sam31", test))]
+fn crop_memory_layout(previous: LiveTrackerInput, current: LiveTrackerInput) -> Option<CropMemoryLayout> {
+    if !pupil_history_survives_roi_relocation(Some(previous), current) {
+        return None;
+    }
+    let side = LIVE_CROP_MEMORY_GRID as f64;
+    let offset_x = (f64::from(previous.sensor_origin.0) - f64::from(current.sensor_origin.0))
+        * side / previous.width as f64;
+    let offset_y = (f64::from(previous.sensor_origin.1) - f64::from(current.sensor_origin.1))
+        * side / previous.height as f64;
+    let translated = previous.sensor_origin != current.sensor_origin;
+    let guard = if translated { 1.0 } else { 0.0 };
+    let mut indices = Vec::with_capacity(LIVE_CROP_MEMORY_GRID * LIVE_CROP_MEMORY_GRID);
+    let mut coordinates = Vec::with_capacity(indices.capacity());
+    for y in 0..LIVE_CROP_MEMORY_GRID {
+        for x in 0..LIVE_CROP_MEMORY_GRID {
+            let cx = x as f64 + offset_x;
+            let cy = y as f64 + offset_y;
+            if (x as f64) < guard || (y as f64) < guard
+                || x as f64 + 1.0 > side - guard || y as f64 + 1.0 > side - guard
+                || cx < guard || cy < guard || cx + 1.0 > side - guard || cy + 1.0 > side - guard
+            {
+                continue;
+            }
+            indices.push((y * LIVE_CROP_MEMORY_GRID + x) as i64);
+            coordinates.push((cx, cy));
+        }
+    }
+    (indices.len() as f64 >= side * side * LIVE_CROP_MEMORY_MIN_TOKEN_FRACTION)
+        .then_some(CropMemoryLayout { indices, coordinates, translated })
+}
+
+/// Sensor-addressed association evidence, never a current observation or a
+/// transported SAM feature tensor. Its source clock advances only on a fresh
+/// RAW-passing selected mask, not on crop moves, held predictions or misses.
+#[cfg(any(feature = "sam31", test))]
+struct LiveIdentityFootprint {
+    input: LiveTrackerInput,
+    mask: Vec<u8>,
+    mask_width: usize,
+    mask_height: usize,
+}
+
+#[cfg(any(feature = "sam31", test))]
+impl LiveIdentityFootprint {
+    fn visibility(&self, current: LiveTrackerInput) -> Option<crate::roi_visibility::ForegroundVisibility> {
+        crate::roi_visibility::mask_foreground_visibility(&self.mask, self.mask_width, self.mask_height,
+            self.input.sensor_rect()?, current.sensor_rect()?)
+    }
+
+    fn visible_fraction(&self, current: LiveTrackerInput) -> Option<f64> {
+        self.visibility(current).map(|visibility| visibility.visible_fraction())
+    }
+
+    fn survives_reframe(&self, current: LiveTrackerInput) -> bool {
+        pupil_history_survives_roi_relocation(Some(self.input), current)
+            && self.visibility(current)
+                .is_some_and(|visibility| visibility.supports_association(LIVE_REFRAME_MIN_VISIBLE_FRACTION))
+    }
 }
 
 #[cfg(any(feature = "sam31", test))]
@@ -993,11 +1129,11 @@ fn live_propagation_is_healthy(
 
 #[cfg(any(feature = "sam31", test))]
 fn choose_live_recovery_queries(
-    history_empty: bool,
+    identity_missing: bool,
     ranked_bootstrap_queries: &[usize],
     matched_identity_query: Option<(usize, f64)>,
 ) -> Vec<usize> {
-    if history_empty {
+    if identity_missing {
         ranked_bootstrap_queries.to_vec()
     } else {
         matched_identity_query
@@ -1006,6 +1142,14 @@ fn choose_live_recovery_queries(
             .into_iter()
             .collect()
     }
+}
+
+#[cfg(any(feature = "sam31", test))]
+fn choose_reframe_recovery_queries(ranked_identity_matches: &[(usize, f64)]) -> Vec<usize> {
+    ranked_identity_matches.iter()
+        .filter(|(_, cosine)| cosine.is_finite() && *cosine >= LIVE_RECOVERY_MIN_QUERY_COSINE)
+        .take(LIVE_REFRAME_MAX_IDENTITY_QUERIES)
+        .map(|(query, _)| *query).collect()
 }
 
 #[cfg(any(feature = "sam31", test))]
@@ -1022,6 +1166,88 @@ fn choose_live_temporal_update(
     }
 }
 
+/// Immutable source-clock motion captured at submission, never completion time.
+pub(crate) struct SourceMotionSnapshot {
+    pub eye_index: usize,
+    pub tracking_epoch: u64,
+    pub clock: crate::roi_evidence::SourceClock,
+    pub timeline: crate::roi_evidence::GlobalSimilarityTimeline,
+}
+
+#[cfg(any(feature = "sam31", test))]
+#[derive(Clone, Copy)]
+struct ArbitrationReference {
+    input: LiveTrackerInput,
+    eye_index: usize,
+    clock: crate::roi_evidence::SourceClock,
+    ellipse: Ellipse,
+}
+
+#[cfg(any(feature = "sam31", test))]
+#[derive(Clone, Copy, Debug)]
+struct ArbitrationExpectation {
+    center_sensor: (f64, f64),
+    major_radius: f64,
+    area_log_allowance: f64,
+    center_allowance: f64,
+}
+
+#[cfg(any(feature = "sam31", test))]
+fn arbitration_expectation(
+    prior: ArbitrationReference, input: LiveTrackerInput, eye_index: usize,
+    snapshot: &SourceMotionSnapshot,
+) -> Option<ArbitrationExpectation> {
+    let age = input.timestamp_ns.checked_sub(prior.input.timestamp_ns)?;
+    if age == 0 || age > 500_000_000 || prior.eye_index != eye_index
+        || snapshot.eye_index != eye_index || snapshot.clock != prior.clock
+        || snapshot.tracking_epoch != input.tracking_epoch
+        || !pupil_history_survives_roi_relocation(Some(prior.input), input)
+        || snapshot.timeline.last_timestamp_ns != Some(input.timestamp_ns) {
+        return None;
+    }
+    // reliable_between composes exact adjacent source links. Also bound the
+    // accumulated residual here; its aggregate alone retains only the maximum.
+    let mut residual = 0.0f64;
+    let mut steps = 0;
+    for step in snapshot.timeline.steps.iter().filter(|step|
+        step.to_timestamp_ns > prior.input.timestamp_ns && step.from_timestamp_ns < input.timestamp_ns) {
+        let motion = step.evidence.motion;
+        let scale = f64::from(1.0 + motion.scale_delta).hypot(f64::from(motion.rotation));
+        if !step.evidence.reliable || motion.support < 8 || !motion.residual.is_finite()
+            || motion.residual < 0.0 || !(0.8..=1.25).contains(&scale) { return None; }
+        residual += f64::from(motion.residual);
+        steps += 1;
+    }
+    if steps == 0 || steps > 8 || residual > 8.0 { return None; }
+    let evidence = snapshot.timeline.reliable_between(prior.input.timestamp_ns, input.timestamp_ns)?;
+    let a = 1.0 + f64::from(evidence.motion.scale_delta);
+    let b = f64::from(evidence.motion.rotation);
+    let radius = prior.ellipse.major_radius * a.hypot(b);
+    if !radius.is_finite() || radius <= 0.0 { return None; }
+    let x = prior.ellipse.center.0 + f64::from(prior.input.sensor_origin.0);
+    let y = prior.ellipse.center.1 + f64::from(prior.input.sensor_origin.1);
+    Some(ArbitrationExpectation {
+        center_sensor: (a*x - b*y + f64::from(evidence.motion.translation[0]),
+            b*x + a*y + f64::from(evidence.motion.translation[1])),
+        major_radius: radius,
+        // Defeasible engineering supports, not anatomical constants or
+        // calibrated intervals. Independent RAW residual widens both bounds.
+        area_log_allowance: 0.10 + 2.0 * residual / radius,
+        center_allowance: 0.15 * radius + 3.0 * residual,
+    })
+}
+
+#[cfg(any(feature = "sam31", test))]
+impl ArbitrationExpectation {
+    fn conflict(self, ellipse: Ellipse, input: LiveTrackerInput) -> bool {
+        let area_log = 2.0 * (ellipse.major_radius / self.major_radius).ln();
+        let distance = (ellipse.center.0 + f64::from(input.sensor_origin.0) - self.center_sensor.0)
+            .hypot(ellipse.center.1 + f64::from(input.sensor_origin.1) - self.center_sensor.1);
+        !area_log.is_finite() || !distance.is_finite()
+            || area_log.abs() > self.area_log_allowance || distance > self.center_allowance
+    }
+}
+
 struct Batch {
     target: Target,
     semantic_prompt: usize,
@@ -1029,6 +1255,7 @@ struct Batch {
     tracking_epoch: u64,
     eye_index: usize,
     frames: Vec<Arc<RawFrame>>,
+    motion: Option<SourceMotionSnapshot>,
 }
 
 enum WorkerRequest {
@@ -1113,6 +1340,18 @@ impl Client {
         prompt_generation: u64,
         tracking_epoch: u64,
     ) -> SubmitOutcome {
+        self.submit_history_with_motion(history, target, semantic_prompt, prompt_generation, tracking_epoch, None)
+    }
+
+    pub(crate) fn submit_history_with_motion(
+        &self,
+        history: &VecDeque<Arc<RawFrame>>,
+        target: Target,
+        semantic_prompt: usize,
+        prompt_generation: u64,
+        tracking_epoch: u64,
+        motion: Option<SourceMotionSnapshot>,
+    ) -> SubmitOutcome {
         if history.is_empty() {
             return SubmitOutcome::Invalid;
         }
@@ -1158,6 +1397,7 @@ impl Client {
             tracking_epoch,
             eye_index,
             frames,
+            motion,
         })) {
             Ok(()) => {
                 if let Ok(mut status) = self.status.lock() {
@@ -2003,6 +2243,18 @@ fn reflect101(mut index: isize, length: usize) -> usize {
     index as usize
 }
 
+#[path = "sam31_photometric.rs"]
+mod photometric;
+
+/// Independent of crop-addressed SAM tensor state. A live worker owns one of
+/// these per physical eye; only actual source/identity discontinuities reset it.
+#[derive(Default, Debug)]
+struct LivePhotometricState {
+    running: photometric::State,
+    regime: Option<PreprocessRegime>,
+    eye_index: Option<usize>,
+}
+
 fn balanced_quad_rgb(frames: &[Arc<RawFrame>]) -> Vec<FloatImage> {
     let mut images = frames
         .iter()
@@ -2013,6 +2265,10 @@ fn balanced_quad_rgb(frames: &[Arc<RawFrame>]) -> Vec<FloatImage> {
 }
 
 fn demosaic_quad(frame: &RawFrame) -> FloatImage {
+    demosaic_quad_with_sampling(frame, false)
+}
+
+fn demosaic_quad_with_sampling(frame: &RawFrame, sensor_anchored: bool) -> FloatImage {
     let start_x = (2 - frame.sensor_x as usize % 2) % 2;
     let start_y = (2 - frame.sensor_y as usize % 2) % 2;
     let mosaic_width = (frame.width - start_x) / 2;
@@ -2063,7 +2319,35 @@ fn demosaic_quad(frame: &RawFrame) -> FloatImage {
             };
         }
     }
-    resize_bilinear(&half, frame.width, frame.height)
+    if !sensor_anchored {
+        return resize_bilinear(&half, frame.width, frame.height);
+    }
+    // A 2x2 same-color quad has its center at sensor (even + 0.5). The
+    // legacy resize stretches trimmed odd-origin/odd-size mosaics back to
+    // the whole crop. Keep the native sensor grid instead; boundary-clamped
+    // samples remain unobserved halo context, excluded from normalization
+    // correspondence below. Even-origin/even-size sampling is unchanged.
+    let mut output = FloatImage::new(frame.width, frame.height);
+    for y in 0..frame.height {
+        let sy = (y as f64 - start_y as f64 - 0.5) / 2.0;
+        let y0 = sy.floor() as isize;
+        let fy = (sy - y0 as f64) as f32;
+        for x in 0..frame.width {
+            let sx = (x as f64 - start_x as f64 - 0.5) / 2.0;
+            let x0 = sx.floor() as isize;
+            let fx = (sx - x0 as f64) as f32;
+            let p00 = half.sample_clamped(x0, y0);
+            let p10 = half.sample_clamped(x0 + 1, y0);
+            let p01 = half.sample_clamped(x0, y0 + 1);
+            let p11 = half.sample_clamped(x0 + 1, y0 + 1);
+            output.data[y * frame.width + x] = std::array::from_fn(|c| {
+                let top = p00[c] * (1.0 - fx) + p10[c] * fx;
+                let bottom = p01[c] * (1.0 - fx) + p11[c] * fx;
+                top * (1.0 - fy) + bottom * fy
+            });
+        }
+    }
+    output
 }
 
 fn resize_bilinear(source: &FloatImage, width: usize, height: usize) -> FloatImage {
@@ -2544,6 +2828,347 @@ fn write_preprocessed_filmstrip(
             let images = dark_floor(&balanced);
             write_quantized_filmstrip(&images, 0.30, 99.70, 0.78, destination)
         }
+    }
+}
+
+/// Opt-in live adapter. Legacy/offline filmstrip behavior is not changed.
+/// Trace-only mode computes the proposed state for diagnostics but still emits
+/// the exact legacy adapter bytes. Warmup must use the legacy writer directly.
+fn write_live_preprocessed_frame(
+    frame: &Arc<RawFrame>,
+    regime: PreprocessRegime,
+    tracking_epoch: u64,
+    prompt_generation: u64,
+    state: &mut LivePhotometricState,
+    destination: &mut [u8],
+) -> Result<serde_json::Value, String> {
+    write_live_preprocessed_frame_with_policy(
+        frame, regime, tracking_epoch, prompt_generation, state, destination,
+        enabled_env_flag("BUTTERCUP_SAM31_STABLE_PHOTOMETRY", false),
+        enabled_env_flag("BUTTERCUP_SAM31_PHOTOMETRY_TRACE", false)
+            || enabled_env_flag("BUTTERCUP_SAM31_VIDEO_TRACE", false),
+    )
+}
+
+fn write_live_preprocessed_frame_with_policy(
+    frame: &Arc<RawFrame>,
+    regime: PreprocessRegime,
+    tracking_epoch: u64,
+    prompt_generation: u64,
+    state: &mut LivePhotometricState,
+    destination: &mut [u8],
+    stable: bool,
+    trace: bool,
+) -> Result<serde_json::Value, String> {
+    if frame.width < 4 || frame.height < 4
+        || frame.width.checked_mul(frame.height) != Some(frame.pixels.len())
+        || frame.width as u64 + frame.sensor_x as u64 > u32::MAX as u64
+        || frame.height as u64 + frame.sensor_y as u64 > u32::MAX as u64
+        || destination.len() != FRAME_WIDTH * FRAME_HEIGHT * 3
+    {
+        return Err("invalid live photometric RAW/model geometry".to_string());
+    }
+    let state_reset = if state.eye_index.is_some_and(|eye| eye != frame.eye_index) {
+        Some("physical-eye-changed")
+    } else if state.regime.is_some_and(|previous| previous != regime) {
+        Some("preprocess-regime-changed")
+    } else { None };
+    if state_reset.is_some() {
+        state.running = photometric::State::default();
+    }
+    state.regime = Some(regime);
+    state.eye_index = Some(frame.eye_index);
+    let supported = matches!(regime, PreprocessRegime::MildBlur | PreprocessRegime::BalancedQuadRgb);
+    if !stable || !supported {
+        write_preprocessed_filmstrip(std::slice::from_ref(frame), regime, destination)?;
+        if !trace || !supported {
+            // An unsupported/non-instrumented interval is not a sequence of
+            // fresh photometric observations. Re-enabling starts explicitly.
+            state.running = photometric::State::default();
+            return Ok(serde_json::json!({
+                "mode": "legacy-per-crop", "sequence": frame.sequence,
+                "stable_requested": stable, "supported_regime": supported,
+                "diagnostics_collected": false,
+                "reason": state_reset.unwrap_or(if !supported { "unsupported-regime" } else { "disabled" }),
+            }));
+        }
+    }
+
+    // Current live calls contain one exposure: persistent hot-pixel detection
+    // cannot establish persistence and therefore cannot replace any RAW site.
+    let native = demosaic_quad_with_sampling(frame, stable);
+    let mut sums = [0.0f64; 3];
+    for pixel in &native.data {
+        for c in 0..3 { sums[c] += pixel[c] as f64; }
+    }
+    let means = sums.map(|sum| sum / native.data.len() as f64);
+    let candidate_gains = means.map(|mean| (means[1] / mean.max(1.0)).clamp(0.25, 4.0) as f32);
+    let filtered = |image: &FloatImage| {
+        if regime == PreprocessRegime::MildBlur { gaussian_blur(image, 1.15) }
+        else { FloatImage { width: image.width, height: image.height, data: image.data.clone() } }
+    };
+    let model_image_from = |native: &FloatImage, gains: [f32; 3]| {
+        let mut balanced = FloatImage {
+            width: native.width, height: native.height, data: native.data.clone(),
+        };
+        for pixel in &mut balanced.data {
+            for c in 0..3 { pixel[c] *= gains[c]; }
+        }
+        let image = filtered(&balanced);
+        if image.width == FRAME_WIDTH && image.height == FRAME_HEIGHT { image }
+        else { resize_bilinear(&image, FRAME_WIDTH, FRAME_HEIGHT) }
+    };
+    let model_image = |gains| model_image_from(&native, gains);
+    let candidate_image = model_image(candidate_gains);
+    let (low, high) = adapter_bounds(std::slice::from_ref(&candidate_image), 0.35, 99.65);
+    let candidate = photometric::Parameters { gains: candidate_gains, low, high };
+    // The stable path can use a different demosaic grid. Keep actual legacy
+    // gains/bounds for the matched consecutive per-crop audit as well.
+    let legacy_grid_differs = frame.sensor_x % 2 != 0 || frame.sensor_y % 2 != 0
+        || frame.width % 2 != 0 || frame.height % 2 != 0;
+    let legacy_candidate = if stable && legacy_grid_differs {
+        let legacy_native = demosaic_quad(frame);
+        let mut sums = [0.0f64; 3];
+        for pixel in &legacy_native.data {
+            for c in 0..3 { sums[c] += pixel[c] as f64; }
+        }
+        let means = sums.map(|sum| sum / legacy_native.data.len() as f64);
+        let gains = means.map(|mean| (means[1] / mean.max(1.0)).clamp(0.25, 4.0) as f32);
+        let image = model_image_from(&legacy_native, gains);
+        let (low, high) = adapter_bounds(std::slice::from_ref(&image), 0.35, 99.65);
+        photometric::Parameters { gains, low, high }
+    } else { candidate };
+    let common_image = filtered(&native);
+    let stride = photometric::sampling_stride(frame.width, frame.height);
+    // Demosaic + mild blur have a finite support. Exclude a conservative halo
+    // rather than treating reflection/clamp padding as observed shared texture.
+    const COMMON_MARGIN: usize = 12;
+    let mut samples = Vec::new();
+    if frame.width > 2 * COMMON_MARGIN && frame.height > 2 * COMMON_MARGIN {
+        for y in COMMON_MARGIN..frame.height - COMMON_MARGIN {
+            let sy = frame.sensor_y as usize + y;
+            if sy % stride != 0 { continue; }
+            for x in COMMON_MARGIN..frame.width - COMMON_MARGIN {
+                let sx = frame.sensor_x as usize + x;
+                if sx % stride == 0 {
+                    samples.push(photometric::Sample {
+                        sensor_x: sx as u32, sensor_y: sy as u32,
+                        rgb: common_image.data[y * frame.width + x],
+                    });
+                }
+            }
+        }
+    }
+    let report = state.running.update_with_legacy(photometric::Source {
+        epoch: tracking_epoch, prompt_generation, sequence: frame.sequence,
+        timestamp_ns: frame.timestamp_ns, sensor_x: frame.sensor_x,
+        sensor_y: frame.sensor_y, width: frame.width, height: frame.height,
+    }, samples, candidate, legacy_candidate)?;
+    let applied = if stable { report.parameters_after } else { candidate };
+    let applied_image = if applied.gains == candidate_gains { candidate_image }
+        else { model_image(applied.gains) };
+    let mut clipped_low = [0usize; 3];
+    let mut clipped_high = [0usize; 3];
+    for (index, pixel) in applied_image.data.iter().enumerate() {
+        for c in 0..3 {
+            clipped_low[c] += usize::from(pixel[c] < applied.low[c]);
+            clipped_high[c] += usize::from(pixel[c] > applied.high[c]);
+            if stable {
+                let normalized = ((pixel[c] - applied.low[c]) / (applied.high[c] - applied.low[c]))
+                    .clamp(0.0, 1.0);
+                destination[c * FRAME_WIDTH * FRAME_HEIGHT + index] =
+                    (normalized.powf(0.82) * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    let parameter_json = |parameters: photometric::Parameters| serde_json::json!({
+        "white_balance_gains": parameters.gains, "low": parameters.low, "high": parameters.high,
+    });
+    Ok(serde_json::json!({
+        "mode": if stable { "sensor-overlap-bounded-v2" } else { "legacy-per-crop-traced" },
+        "sequence": frame.sequence, "timestamp_ns": frame.timestamp_ns,
+        "stable_requested": stable, "supported_regime": supported,
+        "diagnostics_collected": true,
+        "reason": state_reset.unwrap_or(report.reason), "source_advanced": report.source_advanced,
+        "reference_sequence": report.reference_sequence,
+        "reference_timestamp_ns": report.reference_timestamp_ns, "source_dt_ns": report.source_dt_ns,
+        "crop_overlap_fraction": report.crop_overlap_fraction,
+        "common_samples": report.common_samples, "usable_samples": report.usable_samples,
+        "lighting_common_samples": report.lighting_common_samples,
+        "ratio_reference_sequence": report.ratio_reference_sequence,
+        "ratio_reference_timestamp_ns": report.ratio_reference_timestamp_ns,
+        "robust_log_light_ratio": report.log_ratio, "robust_log_light_ratio_mad": report.log_ratio_mad,
+        "illumination_supported": report.illumination_supported,
+        "lighting_reference_sequence": report.lighting_reference_sequence,
+        "lighting_reference_timestamp_ns": report.lighting_reference_timestamp_ns,
+        "previous_parameters": parameter_json(report.parameters_before),
+        "running_parameters": parameter_json(report.parameters_after),
+        "per_crop_parameters": parameter_json(report.per_crop_candidate),
+        "legacy_per_crop_parameters": parameter_json(legacy_candidate),
+        "applied_parameters": parameter_json(applied),
+        "common_linear_normalized_mad_running": report.common_normalized_mean_absolute_delta,
+        "common_linear_normalized_mad_per_crop": report.candidate_common_normalized_mean_absolute_delta,
+        "common_delta_contract": "consecutive observed shared sensor samples; running-to-running and actual legacy parameters-to-legacy parameters; not motion-compensated, before gamma/quantization; excludes legacy demosaic-grid differences",
+        "clipped_low_fraction": clipped_low.map(|n| n as f64 / (FRAME_WIDTH * FRAME_HEIGHT) as f64),
+        "clipped_high_fraction": clipped_high.map(|n| n as f64 / (FRAME_WIDTH * FRAME_HEIGHT) as f64),
+        "common_sensor_sample_stride": stride, "unobserved_border_margin_native": COMMON_MARGIN,
+        "demosaic_grid": if stable { "native-sensor-anchored" } else { "legacy-trimmed-mosaic-resize" },
+        "sensor_cfa_phase_mod4": [frame.sensor_x % 4, frame.sensor_y % 4],
+        "model_sampling_step_native": [frame.width as f64 / FRAME_WIDTH as f64, frame.height as f64 / FRAME_HEIGHT as f64],
+        "model_sampling_phase_pixels": [
+            (frame.sensor_x as f64 * FRAME_WIDTH as f64 / frame.width as f64).rem_euclid(1.0),
+            (frame.sensor_y as f64 * FRAME_HEIGHT as f64 / frame.height as f64).rem_euclid(1.0),
+        ],
+        "model_grid_contract": "final fixed-size tensor remains crop-local; no claim of positional-feature equivariance",
+    }))
+}
+
+#[cfg(test)]
+mod photometric_adapter_tests {
+    use super::*;
+
+    fn raw_crop(sequence: u64, origin: (u32, u32), size: (usize, usize), bright_border: bool) -> Arc<RawFrame> {
+        let (width, height) = size;
+        let mut pixels = Vec::with_capacity(width * height);
+        for y in 0..height {
+            for x in 0..width {
+                let sx = x + origin.0 as usize;
+                let sy = y + origin.1 as usize;
+                let color = match ((sy / 2) % 2, (sx / 2) % 2) {
+                    (0, 0) => 0, (1, 1) => 2, _ => 1,
+                };
+                let texture = ((sx / 4 * 13 + sy / 4 * 7) % 120) as u16;
+                pixels.push(if bright_border && (sx >= width || sy >= height) { 1023 }
+                    else { [100, 80, 60][color] + texture });
+            }
+        }
+        Arc::new(RawFrame {
+            eye_index: 0, sequence, timestamp_ns: sequence * 20_000_000,
+            sensor_x: origin.0, sensor_y: origin.1, width, height,
+            registration_anchor: None, pupil_component_seed: None, pixels: Arc::new(pixels),
+        })
+    }
+
+    #[test]
+    fn sensor_anchored_demosaic_keeps_common_pixels_across_odd_cfa_origin() {
+        let a = raw_crop(1, (0, 0), (128, 96), false);
+        let b = raw_crop(1, (3, 5), (128, 96), false);
+        let a_rgb = demosaic_quad_with_sampling(&a, true);
+        let b_rgb = demosaic_quad_with_sampling(&b, true);
+        let b_legacy = demosaic_quad(&b);
+        let mut legacy_different = 0;
+        for sy in 20..76 {
+            for sx in 20..108 {
+                let before = a_rgb.data[sy * a.width + sx];
+                let after = b_rgb.data[(sy - 5) * b.width + sx - 3];
+                let legacy = b_legacy.data[(sy - 5) * b.width + sx - 3];
+                for c in 0..3 {
+                    assert!((before[c] - after[c]).abs() < 1e-5);
+                    legacy_different += usize::from((before[c] - legacy[c]).abs() > 0.01);
+                }
+            }
+        }
+        assert!(legacy_different > 100);
+    }
+
+    #[test]
+    fn even_origin_demosaic_is_unchanged_by_sensor_anchor() {
+        for origin in [(0, 0), (2, 2), (32, 24)] {
+            let frame = raw_crop(1, origin, (128, 96), false);
+            assert_eq!(demosaic_quad(&frame).data, demosaic_quad_with_sampling(&frame, true).data);
+        }
+    }
+
+    #[test]
+    fn all_quad_cfa_phases_reconstruct_constant_sensor_colors() {
+        for y in 0..4 {
+            for x in 0..4 {
+                let mut frame = (*raw_crop(1, (x, y), (63, 47), false)).clone();
+                frame.pixels = Arc::new((0..frame.width * frame.height).map(|i| {
+                    let sx = (i % frame.width + x as usize) / 2;
+                    let sy = (i / frame.width + y as usize) / 2;
+                    match (sy % 2, sx % 2) { (0, 0) => 450, (1, 1) => 80, _ => 250 }
+                }).collect());
+                let rgb = demosaic_quad_with_sampling(&frame, true);
+                assert_eq!(rgb.data[20 * frame.width + 20], [450.0, 250.0, 80.0]);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_live_and_trace_outputs_remain_byte_exact() {
+        let frame = raw_crop(1, (3, 5), (128, 96), false);
+        for regime in [PreprocessRegime::MildBlur, PreprocessRegime::BalancedQuadRgb] {
+            let mut expected = vec![0; FRAME_WIDTH * FRAME_HEIGHT * 3];
+            write_preprocessed_filmstrip(std::slice::from_ref(&frame), regime, &mut expected).unwrap();
+            for trace in [false, true] {
+                let mut actual = vec![0; expected.len()];
+                let mut state = LivePhotometricState::default();
+                write_live_preprocessed_frame_with_policy(
+                    &frame, regime, 1, 0, &mut state, &mut actual, false, trace,
+                ).unwrap();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn common_model_pixels_survive_same_source_nudge_and_entering_highlight() {
+        let a = raw_crop(1, (0, 0), (FRAME_WIDTH, FRAME_HEIGHT), true);
+        let b = raw_crop(1, (32, 24), (FRAME_WIDTH, FRAME_HEIGHT), true);
+        let mut state = LivePhotometricState::default();
+        let mut previous = vec![0; FRAME_WIDTH * FRAME_HEIGHT * 3];
+        let initial = write_live_preprocessed_frame_with_policy(
+            &a, PreprocessRegime::MildBlur, 1, 0, &mut state, &mut previous, true, true,
+        ).unwrap();
+        let mut current = vec![0; previous.len()];
+        let report = write_live_preprocessed_frame_with_policy(
+            &b, PreprocessRegime::MildBlur, 1, 0, &mut state, &mut current, true, true,
+        ).unwrap();
+        assert_eq!(report["source_advanced"], false);
+        assert_eq!(report["applied_parameters"], initial["applied_parameters"]);
+        assert_eq!(report["common_linear_normalized_mad_running"], 0.0);
+        assert!(report["common_linear_normalized_mad_per_crop"].as_f64().unwrap() > 0.1);
+        for c in 0..3 {
+            for sy in 40..FRAME_HEIGHT - 20 {
+                for sx in 48..FRAME_WIDTH - 20 {
+                    assert_eq!(previous[c * FRAME_WIDTH * FRAME_HEIGHT + sy * FRAME_WIDTH + sx],
+                        current[c * FRAME_WIDTH * FRAME_HEIGHT + (sy - 24) * FRAME_WIDTH + sx - 32]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn true_next_exposure_crop_does_not_change_lighting_when_common_raw_is_unchanged() {
+        let a = raw_crop(1, (0, 0), (128, 96), true);
+        let b = raw_crop(2, (16, 8), (128, 96), true);
+        let mut state = LivePhotometricState::default();
+        let mut pixels = vec![0; FRAME_WIDTH * FRAME_HEIGHT * 3];
+        let initial = write_live_preprocessed_frame_with_policy(
+            &a, PreprocessRegime::MildBlur, 1, 0, &mut state, &mut pixels, true, true,
+        ).unwrap();
+        let report = write_live_preprocessed_frame_with_policy(
+            &b, PreprocessRegime::MildBlur, 1, 0, &mut state, &mut pixels, true, true,
+        ).unwrap();
+        assert_eq!(report["source_advanced"], true);
+        assert_eq!(report["illumination_supported"], true);
+        assert_eq!(report["applied_parameters"], initial["applied_parameters"]);
+        assert_eq!(report["common_linear_normalized_mad_running"], 0.0);
+    }
+
+    #[test]
+    fn unsupported_nonlinear_adapter_keeps_legacy_semantics_even_when_opted_in() {
+        let frame = raw_crop(1, (0, 0), (128, 96), false);
+        let mut expected = vec![0; FRAME_WIDTH * FRAME_HEIGHT * 3];
+        write_preprocessed_filmstrip(std::slice::from_ref(&frame), PreprocessRegime::LogChroma, &mut expected).unwrap();
+        let mut actual = vec![0; expected.len()];
+        let report = write_live_preprocessed_frame_with_policy(
+            &frame, PreprocessRegime::LogChroma, 1, 0, &mut LivePhotometricState::default(),
+            &mut actual, true, true,
+        ).unwrap();
+        assert_eq!(report["supported_regime"], false);
+        assert_eq!(actual, expected);
     }
 }
 
@@ -3502,6 +4127,10 @@ mod runtime {
     struct PriorFrameFeatures {
         frame_index: usize,
         sequence: u64,
+        /// Live history carries the immutable exposure/crop/identity lineage.
+        /// The older offline feature diagnostic has no live identity session.
+        source: Option<LiveTrackerInput>,
+        raw_admitted: bool,
         features: NativeVideoFeatures,
         tracked_query: Option<usize>,
         masks: Vec<u8>,
@@ -3512,6 +4141,22 @@ mod runtime {
         temporal_conditioned: Option<Tensor>,
         tracker_mask: Option<Vec<u8>>,
         object_pointer: Option<Tensor>,
+    }
+
+    /// Learned object descriptors are not an image grid. Live pointer memory
+    /// has a separate bank and the source clock of its RAW-admitted mask; a
+    /// crop move cannot refresh that clock or turn the descriptor into pixels.
+    struct LiveObjectPointer {
+        source: LiveTrackerInput,
+        frame_index: usize,
+        value: Tensor,
+    }
+
+    struct MemoryPositionEncoding {
+        indices: Tensor,
+        position: Tensor,
+        rope_cos: Tensor,
+        rope_sin: Tensor,
     }
 
     struct NativeMaskMemoryEncoder {
@@ -3653,16 +4298,6 @@ mod runtime {
         }
 
         fn rotate_axial(&self, input: &Tensor, repeat: usize) -> Tensor {
-            let kind = input.kind();
-            let paired = input.to_kind(Kind::Float).view([
-                input.size()[0],
-                input.size()[1],
-                input.size()[2],
-                16,
-                2,
-            ]);
-            let real = paired.select(-1, 0);
-            let imaginary = paired.select(-1, 1);
             let cosine = if repeat == 1 {
                 self.rope_cos.shallow_clone()
             } else {
@@ -3673,10 +4308,20 @@ mod runtime {
             } else {
                 self.rope_sin.repeat([1, 1, repeat as i64, 1])
             };
+            Self::rotate_axial_with_phase(input, &cosine, &sine)
+        }
+
+        fn rotate_axial_with_phase(input: &Tensor, cosine: &Tensor, sine: &Tensor) -> Tensor {
+            let kind = input.kind();
+            let paired = input.to_kind(Kind::Float).view([
+                input.size()[0], input.size()[1], input.size()[2], 16, 2,
+            ]);
+            let real = paired.select(-1, 0);
+            let imaginary = paired.select(-1, 1);
             Tensor::stack(
                 &[
-                    &real * &cosine - &imaginary * &sine,
-                    &real * &sine + &imaginary * &cosine,
+                    &real * cosine - &imaginary * sine,
+                    &real * sine + &imaginary * cosine,
                 ],
                 -1,
             )
@@ -3692,13 +4337,24 @@ mod runtime {
             repeat_key_rope: bool,
             key_tokens_without_rope: usize,
         ) -> Result<Tensor, String> {
+            self.rope_attention_with_positions(query, key, value, repeat_key_rope,
+                key_tokens_without_rope, None)
+        }
+
+        fn rope_attention_with_positions(
+            &self, query: &Tensor, key: &Tensor, value: &Tensor,
+            repeat_key_rope: bool, key_tokens_without_rope: usize,
+            key_positions: Option<(&Tensor, &Tensor)>,
+        ) -> Result<Tensor, String> {
             let batch = query.size()[0];
             let query_tokens = query.size()[1];
             let key_tokens = key.size()[1];
             let spatial_key_tokens = key_tokens - key_tokens_without_rope as i64;
-            if query_tokens != 72 * 72
-                || spatial_key_tokens % query_tokens != 0
-                || (!repeat_key_rope && spatial_key_tokens != query_tokens)
+            if query_tokens != 72 * 72 || spatial_key_tokens <= 0
+                || key_positions.is_none() && (spatial_key_tokens % query_tokens != 0
+                    || (!repeat_key_rope && spatial_key_tokens != query_tokens))
+                || key_positions.is_some_and(|(cos, sin)|
+                    cos.size() != [1, 1, spatial_key_tokens, 16] || sin.size() != cos.size())
             {
                 return Err(format!(
                     "SAM31 temporal RoPE geometry is unsupported: q={:?} k={:?}",
@@ -3711,7 +4367,11 @@ mod runtime {
             let key = key.view([batch, key_tokens, 8, 32]).transpose(1, 2);
             let value = value.view([batch, key_tokens, 8, 32]).transpose(1, 2);
             let query = self.rotate_axial(&query, 1);
-            let spatial_key = self.rotate_axial(&key.narrow(2, 0, spatial_key_tokens), key_repeat);
+            let spatial_key = if let Some((cos, sin)) = key_positions {
+                Self::rotate_axial_with_phase(&key.narrow(2, 0, spatial_key_tokens), cos, sin)
+            } else {
+                self.rotate_axial(&key.narrow(2, 0, spatial_key_tokens), key_repeat)
+            };
             let key = if key_tokens_without_rope == 0 {
                 spatial_key
             } else {
@@ -3981,11 +4641,53 @@ mod runtime {
             memories: &[(&Tensor, &Tensor, usize)],
             pointers: &[(&Tensor, usize)],
         ) -> Result<Tensor, String> {
+            self.condition_with_memory_positions(current_image, memories, pointers, None)
+        }
+
+        fn memory_position_encoding(&self, layout: &CropMemoryLayout, device: Device) -> MemoryPositionEncoding {
+            let indices = Tensor::from_slice(&layout.indices).to_device(device);
+            if !layout.translated {
+                return MemoryPositionEncoding {
+                    indices,
+                    position: self.spatial_position.flatten(2, 3).transpose(1, 2),
+                    rope_cos: self.rope_cos.shallow_clone(), rope_sin: self.rope_sin.shallow_clone(),
+                };
+            }
+            let coordinates = layout.coordinates.iter().flat_map(|&(x, y)| [x as f32, y as f32]).collect::<Vec<_>>();
+            let coordinates = Tensor::from_slice(&coordinates).view([-1, 2]).to_device(device);
+            let x = coordinates.select(1, 0).unsqueeze(1);
+            let y = coordinates.select(1, 1).unsqueeze(1);
+            let scales = (0..64).map(|dimension|
+                10000f32.powf(2.0 * dimension as f32 / 128.0)).collect::<Vec<_>>();
+            let scales = Tensor::from_slice(&scales).view([1, 64]).to_device(device);
+            let sine_position = |coordinate: &Tensor| {
+                let phase = (coordinate + 1.0) * (std::f64::consts::TAU / 72.0) / &scales;
+                Tensor::stack(&[phase.sin(), phase.cos()], -1).flatten(1, 2)
+            };
+            let position = Tensor::cat(&[sine_position(&y), sine_position(&x)], 1)
+                .unsqueeze(0).to_kind(self.spatial_position.kind());
+            let frequencies = (0..8).map(|pair|
+                10000f32.powf(-((4 * pair) as f32) / 32.0)).collect::<Vec<_>>();
+            let frequencies = Tensor::from_slice(&frequencies).view([1, 8]).to_device(device);
+            let phase = Tensor::cat(&[&x * &frequencies, &y * &frequencies], 1).unsqueeze(0).unsqueeze(0);
+            MemoryPositionEncoding { indices, position, rope_cos: phase.cos(), rope_sin: phase.sin() }
+        }
+
+        fn condition_with_memory_positions(
+            &self,
+            current_image: &Tensor,
+            memories: &[(&Tensor, &Tensor, usize)],
+            pointers: &[(&Tensor, usize)],
+            layouts: Option<&[CropMemoryLayout]>,
+        ) -> Result<Tensor, String> {
             if memories.is_empty() || memories.len() > 7 {
                 return Err(format!(
                     "SAM31 temporal attention requires 1..=7 memories, got {}",
                     memories.len()
                 ));
+            }
+            if layouts.is_some_and(|layouts| layouts.len() != memories.len()) {
+                return Err("SAM31 crop-memory layout count differs from memory count".to_string());
             }
             for (label, tensor) in
                 std::iter::once(("current image", current_image)).chain(memories.iter().flat_map(
@@ -4007,12 +4709,24 @@ mod runtime {
             let mut memory_positions = Vec::with_capacity(memories.len());
             let mut object_pointers = Vec::with_capacity(pointers.len());
             let mut object_pointer_positions = Vec::with_capacity(pointers.len());
+            let mut memory_rope_cos = Vec::with_capacity(memories.len());
+            let mut memory_rope_sin = Vec::with_capacity(memories.len());
             // Official non-conditioning order is oldest to newest. Axial RoPE
             // repeats per 72x72 block; the learned v2 temporal embedding
             // disambiguates the distance of each block.
-            for &(previous_image, previous_memory, temporal_distance) in memories.iter().rev() {
-                memory_images.push(flatten(previous_image));
-                memory_masks.push(flatten(previous_memory));
+            for (index, &(previous_image, previous_memory, temporal_distance)) in memories.iter().enumerate().rev() {
+                let position = if let Some(layouts) = layouts {
+                    let encoded = self.memory_position_encoding(&layouts[index], current_image.device());
+                    memory_images.push(flatten(previous_image).index_select(1, &encoded.indices));
+                    memory_masks.push(flatten(previous_memory).index_select(1, &encoded.indices));
+                    memory_rope_cos.push(encoded.rope_cos);
+                    memory_rope_sin.push(encoded.rope_sin);
+                    encoded.position
+                } else {
+                    memory_images.push(flatten(previous_image));
+                    memory_masks.push(flatten(previous_memory));
+                    source_position.shallow_clone()
+                };
                 let temporal_index = if (1..7).contains(&temporal_distance) {
                     temporal_distance - 1
                 } else {
@@ -4022,7 +4736,7 @@ mod runtime {
                     .weight("maskmem_tpos_enc")?
                     .get(temporal_index as i64)
                     .to_kind(source_position.kind());
-                memory_positions.push(&source_position + temporal);
+                memory_positions.push(position + temporal);
             }
             for &(pointer, temporal_distance) in pointers.iter().rev() {
                 object_pointers.push(pointer.shallow_clone());
@@ -4050,6 +4764,9 @@ mod runtime {
             let mut memory_image_position =
                 Tensor::cat(&memory_positions.iter().collect::<Vec<_>>(), 1);
             let pointer_count = object_pointers.len();
+            let memory_rope = layouts.map(|_| (
+                Tensor::cat(&memory_rope_cos, 2), Tensor::cat(&memory_rope_sin, 2),
+            ));
             if pointer_count > 0 {
                 let pointers =
                     Tensor::cat(&object_pointers.iter().collect::<Vec<_>>(), 0).unsqueeze(0);
@@ -4082,7 +4799,8 @@ mod runtime {
                     + self.linear(&memory, &format!("{prefix}.cross_attn_k_proj"))?
                     + &memory_image_position;
                 let value = self.linear(&memory, &format!("{prefix}.cross_attn_v_proj"))?;
-                let attended = self.rope_attention(&query, &key, &value, true, pointer_count)?;
+                let attended = self.rope_attention_with_positions(&query, &key, &value, true, pointer_count,
+                    memory_rope.as_ref().map(|(cos, sin)| (cos, sin)))?;
                 output += self.linear(&attended, &format!("{prefix}.cross_attn_out_proj"))?;
 
                 let normalized = self.layer_norm_last(&output, &format!("{prefix}.norm3"))?;
@@ -5001,6 +5719,8 @@ mod runtime {
                 history.push(PriorFrameFeatures {
                     frame_index,
                     sequence: frames[frame_index].sequence,
+                    source: None,
+                    raw_admitted: false,
                     features: current,
                     tracked_query: carried_query,
                     masks: output.masks,
@@ -5138,12 +5858,26 @@ mod runtime {
         anchor: &Tensor,
         second_layers: &Tensor,
     ) -> Option<(usize, f64)> {
+        let similarities = decoder_query_similarities_from_anchor(anchor, second_layers)?;
+        let (value, index) = similarities.max_dim(0, false);
+        Some((index.int64_value(&[]) as usize, value.double_value(&[])))
+    }
+
+    fn reframe_decoder_query_matches_from_anchor(anchor: &Tensor, second_layers: &Tensor) -> Vec<(usize, f64)> {
+        let Some(similarities) = decoder_query_similarities_from_anchor(anchor, second_layers) else { return Vec::new(); };
+        let count = similarities.size()[0].min(LIVE_REFRAME_MAX_IDENTITY_QUERIES as i64);
+        let (values, indices) = similarities.topk(count, 0, true, true);
+        (0..count).map(|i| (indices.int64_value(&[i]) as usize, values.double_value(&[i]))).collect()
+    }
+
+    fn decoder_query_similarities_from_anchor(anchor: &Tensor, second_layers: &Tensor) -> Option<Tensor> {
         let second_shape = second_layers.size();
         let anchor_shape = anchor.size();
         if anchor_shape.len() != 1
             || second_shape.len() != 4
             || second_shape[0] == 0
             || second_shape[1] != 1
+            || second_shape[2] == 0
             || anchor_shape[0] != second_shape[3]
         {
             return None;
@@ -5163,10 +5897,7 @@ mod runtime {
             .sum_dim_intlist([1].as_slice(), true, Kind::Float)
             .sqrt()
             .clamp_min(1e-12);
-        let similarities =
-            second.matmul(&anchor.unsqueeze(1)).squeeze_dim(1) / second_norm.squeeze_dim(1);
-        let (value, index) = similarities.max_dim(0, false);
-        Some((index.int64_value(&[]) as usize, value.double_value(&[])))
+        Some(second.matmul(&anchor.unsqueeze(1)).squeeze_dim(1) / second_norm.squeeze_dim(1))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5213,14 +5944,19 @@ mod runtime {
     ) -> Option<f64> {
         let first_plane = first_width.checked_mul(first_height)?;
         let second_plane = second_width.checked_mul(second_height)?;
+        if first_plane == 0 || second_plane == 0 || extent.0 == 0 || extent.1 == 0 {
+            return None;
+        }
         let first_start = first_query.checked_mul(first_plane)?;
         let second_start = second_query.checked_mul(second_plane)?;
-        let first = first_masks.get(first_start..first_start + first_plane)?;
-        let second = second_masks.get(second_start..second_start + second_plane)?;
+        let first = first_masks.get(first_start..first_start.checked_add(first_plane)?)?;
+        let second = second_masks.get(second_start..second_start.checked_add(second_plane)?)?;
         let min_x = first_origin.0.min(second_origin.0);
         let min_y = first_origin.1.min(second_origin.1);
-        let max_x = (first_origin.0 + extent.0 as u32).max(second_origin.0 + extent.0 as u32);
-        let max_y = (first_origin.1 + extent.1 as u32).max(second_origin.1 + extent.1 as u32);
+        let native_width = u32::try_from(extent.0).ok()?;
+        let native_height = u32::try_from(extent.1).ok()?;
+        let max_x = first_origin.0.checked_add(native_width)?.max(second_origin.0.checked_add(native_width)?);
+        let max_y = first_origin.1.checked_add(native_height)?.max(second_origin.1.checked_add(native_height)?);
         let mut intersection = 0usize;
         let mut union = 0usize;
         for sensor_y in min_y..max_y {
@@ -5250,7 +5986,12 @@ mod runtime {
 
     #[derive(Default)]
     struct LiveTrackerState {
+        arbitration_reference: Option<ArbitrationReference>,
+        /// Crop-addressed learned features retain their original source crop.
+        /// Cross-crop use requires an explicit sensor-positioned attention map.
         history: Vec<PriorFrameFeatures>,
+        pointer_history: Vec<LiveObjectPointer>,
+        /// Iris-relative size/offset history, independent of image token grids.
         pupil_history: PupilContourHistory,
         frame_index: usize,
         last_input: Option<LiveTrackerInput>,
@@ -5258,23 +5999,96 @@ mod runtime {
         /// Frozen decoder-query embedding from the last detector mask that
         /// passed the untouched-RAW ring gate. Propagation never replaces it.
         decoder_query_anchor: Option<Tensor>,
+        /// Most recent independently RAW-confirmed selected foreground. Kept
+        /// separately from crop-addressed features so a reframe need not
+        /// discard which eye we are following.
+        identity_footprint: Option<LiveIdentityFootprint>,
     }
 
     impl LiveTrackerState {
         fn prepare(&mut self, input: LiveTrackerInput) {
-            if live_tracker_requires_reset(self.last_input, input) {
+            // Opt-in experiment: the matched low-light inset corpus still
+            // loses five admitted frames with the four-query identity pool.
+            // Do not enable merely because small well-lit nudges pass.
+            self.prepare_with_policy(input,
+                enabled_env_flag("BUTTERCUP_SAM31_REFRAME_IDENTITY", false),
+                enabled_env_flag("BUTTERCUP_SAM31_CROP_MEMORY", false));
+        }
+
+        fn prepare_with_reframe_identity(&mut self, input: LiveTrackerInput, preserve_identity: bool) {
+            self.prepare_with_policy(input, preserve_identity, false);
+        }
+
+        fn prepare_with_policy(&mut self, input: LiveTrackerInput, preserve_identity: bool, crop_memory: bool) {
+            if !live_source_is_fresh(self.last_input, input) { return; }
+            let unresolved_identity_expired = (self.history.is_empty() || crop_memory)
+                && self.decoder_query_anchor.is_some()
+                && !self.identity_footprint.as_ref().is_some_and(|prior| prior.survives_reframe(input));
+            // Each bank entry expires against its own exposure, not the last
+            // nudge. This includes the first conditioning frame and compact
+            // object pointers. Cropping never buys old evidence another 900ms.
+            if crop_memory {
+                self.history.retain(|prior| prior.raw_admitted
+                    && prior.source.is_some_and(|source| crop_memory_layout(source, input).is_some()));
+                self.pointer_history.retain(|prior|
+                    pupil_history_survives_roi_relocation(Some(prior.source), input));
+            }
+            if live_tracker_requires_reset(self.last_input, input) || unresolved_identity_expired {
                 // Pixel-addressed features must reset on a crop move. Pupil
                 // size and offset are iris-relative, so an overlapping crop
                 // relocation of the same tracked eye must not erase them.
                 // Identity/prompt/size/time changes still reset everything.
-                let pupil_history = if pupil_history_survives_roi_relocation(self.last_input, input) {
+                let same_eye = pupil_history_survives_roi_relocation(self.last_input, input);
+                let retain_identity = (preserve_identity || crop_memory) && same_eye && self.decoder_query_anchor.is_some()
+                    && self.identity_footprint.as_ref().is_some_and(|prior| prior.survives_reframe(input));
+                let retain_spatial = crop_memory && retain_identity;
+                if enabled_env_flag("BUTTERCUP_SAM31_VIDEO_TRACE", false) {
+                    let overlap = self.last_input.and_then(|previous|
+                        crate::roi_visibility::SensorOverlap::between(previous.sensor_rect()?, input.sensor_rect()?));
+                    eprintln!("SAM31_REFRAME {}", serde_json::json!({
+                        "sequence": input.sequence, "timestamp_ns": input.timestamp_ns,
+                        "previous_origin": self.last_input.map(|prior| prior.sensor_origin),
+                        "origin": input.sensor_origin, "identity_retained": retain_identity,
+                        "identity_source_sequence": self.identity_footprint.as_ref().map(|prior| prior.input.sequence),
+                        "identity_source_timestamp_ns": self.identity_footprint.as_ref().map(|prior| prior.input.timestamp_ns),
+                        "identity_source_age_ns": self.identity_footprint.as_ref().and_then(|prior| input.timestamp_ns.checked_sub(prior.input.timestamp_ns)),
+                        "source_crop_overlap_fraction": overlap.map(|overlap| overlap.source_fraction),
+                        "current_crop_overlap_fraction": overlap.map(|overlap| overlap.current_fraction),
+                        "visible_fraction": self.identity_footprint.as_ref().and_then(|prior| prior.visible_fraction(input)),
+                        "visibility_class": self.identity_footprint.as_ref().and_then(|prior| prior.visibility(input))
+                            .map(|visibility| format!("{:?}", visibility.class())),
+                        "pixel_memory_cleared": !retain_spatial,
+                        "sensor_positioned_memories": if retain_spatial { self.history.len() } else { 0 },
+                        "retained_object_pointers": if retain_spatial { self.pointer_history.len() } else { 0 },
+                        "oldest_memory_timestamp_ns": if retain_spatial {
+                            self.history.iter().filter_map(|prior| prior.source.map(|source| source.timestamp_ns)).min()
+                        } else { None },
+                    }));
+                }
+                let pupil_history = if same_eye {
                     std::mem::take(&mut self.pupil_history)
                 } else {
                     PupilContourHistory::default()
                 };
+                let decoder_query_anchor = if retain_identity { self.decoder_query_anchor.take() } else { None };
+                let identity_footprint = if retain_identity { self.identity_footprint.take() } else { None };
+                // Repeated nudges cannot restart the miss budget or extend the
+                // immutable source age of an unresolved identity.
+                let consecutive_misses = if retain_identity { self.consecutive_misses } else { 0 };
+                let history = if retain_spatial { std::mem::take(&mut self.history) } else { Vec::new() };
+                let pointer_history = if retain_spatial { std::mem::take(&mut self.pointer_history) } else { Vec::new() };
+                let frame_index = if retain_spatial { self.frame_index } else { 0 };
+                let arbitration_reference = if same_eye { self.arbitration_reference } else { None };
                 *self = Self {
+                    arbitration_reference,
                     last_input: Some(input),
                     pupil_history,
+                    decoder_query_anchor,
+                    identity_footprint,
+                    consecutive_misses,
+                    history,
+                    pointer_history,
+                    frame_index,
                     ..Self::default()
                 };
             } else {
@@ -5283,10 +6097,13 @@ mod runtime {
         }
 
         fn clear_temporal_memory(&mut self) {
+            self.arbitration_reference = None;
             self.history.clear();
+            self.pointer_history.clear();
             self.frame_index = 0;
             self.consecutive_misses = 0;
             self.decoder_query_anchor = None;
+            self.identity_footprint = None;
         }
 
         fn record_processed_miss(&mut self) {
@@ -5346,8 +6163,9 @@ mod runtime {
         current_luma: &FloatImage,
         request_pupil: bool,
         shared_pupil_prompt: bool,
+        motion: Option<&SourceMotionSnapshot>,
     ) -> Result<LiveTemporalOuterProposal, String> {
-        state.prepare(LiveTrackerInput {
+        let input = LiveTrackerInput {
             tracking_epoch,
             prompt_generation,
             sequence: source.sequence,
@@ -5355,12 +6173,25 @@ mod runtime {
             sensor_origin: (source.sensor_x, source.sensor_y),
             width: source.width,
             height: source.height,
-        });
+        };
+        if !live_source_is_fresh(state.last_input, input) {
+            // A replayed/cached exposure cannot advance masks, pupil priors,
+            // source ages, temporal distance, or the processed-miss budget.
+            return Err("SAM31 video duplicate or out-of-order source ignored without changing memory".to_string());
+        }
+        state.prepare(input);
+        let crop_memory = enabled_env_flag("BUTTERCUP_SAM31_CROP_MEMORY", false);
+        let arbitrate = memory_arbitration_enabled();
+        let expectation = arbitrate.then(|| state.arbitration_reference.zip(motion)
+            .and_then(|(prior, snapshot)| arbitration_expectation(prior, input, source.eye_index, snapshot))).flatten();
         let output = infer(module, staging, device, prompts, OUTER_IRIS_PROMPT)?;
         let current = output.video_features.ok_or_else(|| {
             "SAM31 live video tracking requires the native feature graph".to_string()
         })?;
         let history_exists = !state.history.is_empty();
+        let identity_exists = state.decoder_query_anchor.is_some();
+        let reframe_recovery = identity_exists && (!history_exists || crop_memory
+            && state.identity_footprint.as_ref().is_some_and(|prior| prior.input.sensor_origin != input.sensor_origin));
         let matched_query = state.decoder_query_anchor.as_ref().and_then(|anchor| {
             best_decoder_query_match_from_anchor(anchor, &current.decoder_queries)
         });
@@ -5371,8 +6202,20 @@ mod runtime {
         let ranked_bootstrap = ranked_finite_query_indices(
             &output.scores[..output.query_count.min(output.scores.len())],
         );
-        let recovery_queries =
-            choose_live_recovery_queries(!history_exists, &ranked_bootstrap, matched_query);
+        let mut recovery_queries = if reframe_recovery {
+            let matches = state.decoder_query_anchor.as_ref()
+                .map(|anchor| reframe_decoder_query_matches_from_anchor(anchor, &current.decoder_queries))
+                .unwrap_or_default();
+            choose_reframe_recovery_queries(&matches)
+        } else {
+            choose_live_recovery_queries(!identity_exists, &ranked_bootstrap, matched_query)
+        };
+        if reframe_recovery && enabled_env_flag("BUTTERCUP_SAM31_VIDEO_TRACE", false) {
+            eprintln!("SAM31_REFRAME_RECOVERY {}", serde_json::json!({
+                "sequence":source.sequence,"queries":recovery_queries,"best_identity_match":matched_query,
+                "misses":state.consecutive_misses,
+            }));
+        }
 
         let mut selected_history = state.history.iter().rev().take(6).collect::<Vec<_>>();
         if let Some(conditioning) = state.history.first() {
@@ -5383,6 +6226,14 @@ mod runtime {
                 selected_history.push(conditioning);
             }
         }
+        selected_history.retain(|prior| prior.mask_memory.is_some()
+            && (!crop_memory || prior.source.is_some_and(|source| crop_memory_layout(source, input).is_some())));
+        let memory_layouts = crop_memory.then(|| selected_history.iter().map(|prior|
+            crop_memory_layout(prior.source.expect("live memory has source provenance"), input)
+                .expect("selected live memory has supported overlap")).collect::<Vec<_>>());
+        let selected_memory_sources = if crop_memory && enabled_env_flag("BUTTERCUP_SAM31_VIDEO_TRACE", false) {
+            selected_history.iter().filter_map(|prior| prior.source).collect::<Vec<_>>()
+        } else { Vec::new() };
         let memory_bank = selected_history
             .into_iter()
             .filter_map(|prior| {
@@ -5404,7 +6255,7 @@ mod runtime {
                 selected_pointer_history.push(conditioning);
             }
         }
-        let pointer_bank = selected_pointer_history
+        let mut pointer_bank = selected_pointer_history
             .into_iter()
             .filter_map(|prior| {
                 prior
@@ -5413,11 +6264,42 @@ mod runtime {
                     .map(|pointer| (pointer, state.frame_index - prior.frame_index))
             })
             .collect::<Vec<_>>();
+        if crop_memory {
+            pointer_bank = state.pointer_history.iter().rev().take(16)
+                .filter(|prior| pupil_history_survives_roi_relocation(Some(prior.source), input))
+                .map(|prior| (&prior.value, state.frame_index.saturating_sub(prior.frame_index)))
+                .collect();
+        }
+        if crop_memory && enabled_env_flag("BUTTERCUP_SAM31_VIDEO_TRACE", false) {
+            eprintln!("SAM31_CROP_MEMORY {}", serde_json::json!({
+                "sequence": input.sequence, "timestamp_ns": input.timestamp_ns,
+                "origin": input.sensor_origin, "identity_source_timestamp_ns": state.identity_footprint.as_ref().map(|prior| prior.input.timestamp_ns),
+                "strategy": if !memory_bank.is_empty() { "sensor-positioned-overlap-memory" }
+                    else if identity_exists { "fresh-detector-retained-identity" } else { "cold-ranked-detector" },
+                "memory_count": memory_bank.len(),
+                "memory_source_timestamps_ns": selected_memory_sources.iter().map(|source| source.timestamp_ns).collect::<Vec<_>>(),
+                "memory_source_ages_ns": selected_memory_sources.iter().map(|source| input.timestamp_ns.checked_sub(source.timestamp_ns)).collect::<Vec<_>>(),
+                "memory_source_origins": selected_memory_sources.iter().map(|source| source.sensor_origin).collect::<Vec<_>>(),
+                "memory_tokens": memory_layouts.as_ref().map(|layouts| layouts.iter().map(|layout| layout.indices.len()).collect::<Vec<_>>()),
+                "maximum_memory_tokens": LIVE_CROP_MEMORY_GRID * LIVE_CROP_MEMORY_GRID,
+                "pointer_count": pointer_bank.len(), "misses": state.consecutive_misses,
+                "fresh_raw_required": true, "feature_context_reencoded": false,
+            }));
+        }
         let temporal_conditioned = (!memory_bank.is_empty())
             .then(|| {
-                encoder.condition_with_memory_bank(&current.pyramid[2], &memory_bank, &pointer_bank)
+                encoder.condition_with_memory_positions(&current.pyramid[2], &memory_bank, &pointer_bank,
+                    memory_layouts.as_deref())
             })
-            .transpose()?;
+            .transpose();
+        let temporal_conditioned = match temporal_conditioned {
+            Ok(conditioned) => conditioned,
+            Err(error) if crop_memory => {
+                eprintln!("SAM31 crop-memory attention unavailable; checking fresh detector: {error}");
+                None
+            }
+            Err(error) => return Err(error),
+        };
         let tracker_decode = temporal_conditioned
             .as_ref()
             .map(|conditioned| {
@@ -5426,7 +6308,15 @@ mod runtime {
                     [&current.pyramid[0], &current.pyramid[1]],
                 )
             })
-            .transpose()?;
+            .transpose();
+        let tracker_decode = match tracker_decode {
+            Ok(decoded) => decoded,
+            Err(error) if crop_memory => {
+                eprintln!("SAM31 crop-memory decode unavailable; checking fresh detector: {error}");
+                None
+            }
+            Err(error) => return Err(error),
+        };
         let tracker_selection = tracker_decode.as_ref().map(|decoded| {
             let selected = decoded.iou_scores.argmax(-1, false).int64_value(&[0]) as usize;
             (
@@ -5479,16 +6369,30 @@ mod runtime {
                     )
                 })
         });
+        let tracker_raw_support = tracker_fit.as_ref().filter(|_| crop_memory).map(|fit|
+            raw_ring_support(current_luma, model_ellipse_in_source(fit.ellipse, source.width)));
+        let propagation_conflict = tracker_fit.as_ref().zip(expectation).is_some_and(|(fit, expected)|
+            expected.conflict(model_ellipse_in_source(fit.ellipse, source.width), input));
+        if propagation_conflict {
+            // A bounded competitor pool from this already inferred exposure.
+            // Keep the established embedding and foreground association gates.
+            let matches = state.decoder_query_anchor.as_ref()
+                .map(|anchor| reframe_decoder_query_matches_from_anchor(anchor, &current.decoder_queries))
+                .unwrap_or_default();
+            recovery_queries = choose_reframe_recovery_queries(&matches);
+        }
         let tracker_healthy = live_propagation_is_healthy(
             tracker_selection.is_some_and(|selection| selection.1 > 0.0),
             tracker_area,
             tracker_fit.is_some(),
             history_exists,
             tracker_prior_iou,
-        );
+        ) && (!crop_memory || tracker_raw_support.is_some_and(live_detector_raw_gate_passes))
+            && !propagation_conflict;
 
         // A bootstrap searches every finite-scored slot in descending model
-        // order. Anchored recovery deliberately supplies at most one slot.
+        // order. Normal recovery supplies one identity slot; a pixel-memory
+        // reset may compare at most four embedding AND sensor-mask matches.
         // Keep the strongest geometry-plausible RAW failure for diagnostics,
         // but only a RAW-passing detector candidate may condition memory.
         let mut diagnostic_detector = None::<LiveSelectedMask>;
@@ -5507,12 +6411,40 @@ mod runtime {
                     .unsqueeze(0)
                     .unsqueeze(0);
                 let mask = binary_mask_bytes(&logits);
+                // A crop reset has no usable SAM pixel memory. Match the new
+                // detector mask to the old foreground in SENSOR coordinates;
+                // never compare equal local addresses in different crops.
+                let reframe_iou = (reframe_recovery || propagation_conflict).then(|| {
+                    state.identity_footprint.as_ref().and_then(|prior| {
+                        sensor_aligned_query_mask_iou_with_extent(
+                            &prior.mask, prior.mask_width, prior.mask_height, 0, prior.input.sensor_origin,
+                            &mask, output.mask_width, output.mask_height, 0,
+                            (source.sensor_x, source.sensor_y), (source.width, source.height),
+                        )
+                    })
+                }).flatten();
+                let association_min = if reframe_recovery { LIVE_REFRAME_MIN_MASK_IOU } else { LIVE_TRACKER_MIN_PRIOR_MASK_IOU };
+                if (reframe_recovery || propagation_conflict) && !reframe_iou.is_some_and(|iou| iou >= association_min) {
+                    if enabled_env_flag("BUTTERCUP_SAM31_VIDEO_TRACE", false) {
+                        eprintln!("SAM31_REFRAME_QUERY {}", serde_json::json!({
+                            "sequence":source.sequence,"query":query,"sensor_iou":reframe_iou,
+                            "rejection":"sensor-foreground-disagreement",
+                        }));
+                    }
+                    continue;
+                }
                 let area = Some(
                     mask.iter().filter(|&&value| value != 0).count() as f64
                         / mask.len().max(1) as f64,
                 );
                 let fit = tracker_fit_review(&mask, output.mask_width, output.mask_height);
                 if !live_detector_candidate_is_plausible(score, area, fit.is_some()) {
+                    if reframe_recovery && enabled_env_flag("BUTTERCUP_SAM31_VIDEO_TRACE", false) {
+                        eprintln!("SAM31_REFRAME_QUERY {}", serde_json::json!({
+                            "sequence":source.sequence,"query":query,"sensor_iou":reframe_iou,
+                            "rejection":"detector-shape","area":area,"has_fit":fit.is_some(),
+                        }));
+                    }
                     continue;
                 }
                 let fit = fit.expect("a plausible detector candidate has a fit");
@@ -5528,23 +6460,28 @@ mod runtime {
                     score,
                     outer_support,
                 };
-                if audit_candidates {
+                let independent_conflict = propagation_conflict && expectation.is_some_and(|expected|
+                    expected.conflict(model_ellipse_in_source(candidate.fit.ellipse, source.width), input));
+                if audit_candidates || ((reframe_recovery || propagation_conflict) && enabled_env_flag("BUTTERCUP_SAM31_VIDEO_TRACE", false)) {
                     eprintln!("SAM31_DETECTOR_CANDIDATE {}", serde_json::json!({
                         "sequence":source.sequence,"query":query,"score":score,"area_fraction":area,
                         "center":candidate.fit.ellipse.center,"major_radius":candidate.fit.ellipse.major_radius,
                         "minor_radius":candidate.fit.ellipse.minor_radius,"angle":candidate.fit.ellipse.angle,
                         "raw_score":outer_support.score,"raw_positive_fraction":outer_support.positive_fraction,
                         "raw_strong_sectors":outer_support.strong_sectors,
+                        "reframe_identity_iou":reframe_iou,
+                        "independent_conflict":independent_conflict,
                         "raw_admitted":live_memory_commit_allowed(LiveMemorySource::Detector,outer_support)}));
                 }
+                if independent_conflict { continue; }
                 if live_memory_commit_allowed(LiveMemorySource::Detector, outer_support) {
                     raw_candidates_seen += 1;
                     let replace = raw_valid_detector.as_ref().is_none_or(|prior|
                         outer_limbus_candidate_supersedes(candidate.fit.ellipse,candidate.outer_support.score,candidate.score,
                             prior.fit.ellipse,prior.outer_support.score,prior.score));
                     if replace { raw_valid_detector = Some(candidate); }
-                    // Recovery has one identity-anchored query. Only cold
-                    // acquisition compares a bounded set of RAW-valid masks.
+                    // Reframe recovery stays within its small identity pool;
+                    // only cold acquisition can inspect the global ranking.
                     if legacy_outer_selection() || (!audit_candidates && raw_candidates_seen >= 8) { break; }
                     continue;
                 }
@@ -5557,6 +6494,22 @@ mod runtime {
             .as_ref()
             .and_then(|candidate| candidate.query);
         let update = choose_live_temporal_update(tracker_healthy, raw_valid_detector_query);
+        if arbitrate && enabled_env_flag("BUTTERCUP_SAM31_VIDEO_TRACE", false) {
+            eprintln!("SAM31_MEMORY_ARBITRATION {}", serde_json::json!({
+                "sequence":source.sequence,"timestamp_ns":source.timestamp_ns,"eye_index":source.eye_index,
+                "tracking_epoch":tracking_epoch,"source_clock":motion.map(|m| (m.clock.domain,m.clock.epoch)),
+                "reference_timestamp_ns":state.arbitration_reference.map(|r| r.input.timestamp_ns),
+                "reference_sequence":state.arbitration_reference.map(|r| r.input.sequence),
+                "reference_clock":state.arbitration_reference.map(|r| (r.clock.domain,r.clock.epoch)),
+                "independent_support":expectation.is_some(),"propagation_conflict":propagation_conflict,
+                "propagated_major_radius":tracker_fit.as_ref().map(|f| model_ellipse_in_source(f.ellipse, source.width).major_radius),
+                "expected_major_radius":expectation.map(|e| e.major_radius),
+                "area_log_allowance":expectation.map(|e| e.area_log_allowance),
+                "expected_center_sensor":expectation.map(|e| e.center_sensor),
+                "center_allowance":expectation.map(|e| e.center_allowance),
+                "detector_query":raw_valid_detector_query,"update":format!("{update:?}")
+            }));
+        }
         let object_pointer = tracker_selection
             .filter(|_| matches!(update, LiveTemporalUpdate::Propagate))
             .map(|(selected, score, _)| {
@@ -5568,7 +6521,7 @@ mod runtime {
             })
             .transpose()?;
         let recondition =
-            matches!(update, LiveTemporalUpdate::ConditionFromDetector(_)) && history_exists;
+            matches!(update, LiveTemporalUpdate::ConditionFromDetector(_)) && identity_exists;
         let (selected, commit_memory) = match update {
             LiveTemporalUpdate::Propagate => {
                 let fit = tracker_fit.expect("a healthy tracker has plausible limbus geometry");
@@ -5674,9 +6627,24 @@ mod runtime {
                 state.clear_temporal_memory();
                 state.decoder_query_anchor = refreshed_anchor;
             }
+            // The default live path need not allocate another mask copy for
+            // an experiment that is off. Explicit tracing retains it for the
+            // clipping/identity diagnostics even when testing baseline policy.
+            if live_detector_raw_gate_passes(selected.outer_support)
+                && (enabled_env_flag("BUTTERCUP_SAM31_REFRAME_IDENTITY", false)
+                    || crop_memory
+                    || arbitrate
+                    || enabled_env_flag("BUTTERCUP_SAM31_VIDEO_TRACE", false)) {
+                state.identity_footprint = Some(LiveIdentityFootprint {
+                    input: state.last_input.expect("prepare records the current source"),
+                    mask: selected.mask.clone(), mask_width, mask_height,
+                });
+            }
             state.history.push(PriorFrameFeatures {
                 frame_index: state.frame_index,
                 sequence: source.sequence,
+                source: Some(input),
+                raw_admitted: live_detector_raw_gate_passes(selected.outer_support),
                 features: current,
                 tracked_query: selected.query,
                 masks: output.masks,
@@ -5687,11 +6655,26 @@ mod runtime {
                 temporal_conditioned,
                 tracker_mask: Some(selected.mask.clone()),
                 object_pointer: if matches!(update, LiveTemporalUpdate::Propagate) {
-                    object_pointer
+                    object_pointer.as_ref().map(Tensor::shallow_clone)
                 } else {
                     None
                 },
             });
+            if arbitrate && live_detector_raw_gate_passes(selected.outer_support) {
+                state.arbitration_reference = motion.filter(|snapshot|
+                    snapshot.eye_index == source.eye_index && snapshot.tracking_epoch == tracking_epoch
+                    && snapshot.timeline.last_timestamp_ns == Some(source.timestamp_ns))
+                    .map(|snapshot| ArbitrationReference {
+                        input, eye_index: source.eye_index, clock: snapshot.clock, ellipse: outer,
+                    });
+            }
+            if crop_memory && live_detector_raw_gate_passes(selected.outer_support) {
+                if let Some(value) = object_pointer {
+                    state.pointer_history.push(LiveObjectPointer { source: input,
+                        frame_index: state.frame_index, value });
+                    if state.pointer_history.len() > 16 { state.pointer_history.remove(0); }
+                }
+            }
             if state.history.len() > 16 {
                 state.history.remove(1);
             }
@@ -5719,7 +6702,7 @@ mod runtime {
         }
         if std::env::var_os("BUTTERCUP_SAM31_VIDEO_TRACE").is_some() {
             eprintln!(
-                "SAM31_VIDEO sequence={} history={} present={:?} recondition={} committed={} misses={} area={:.4} fit={}",
+                "SAM31_VIDEO sequence={} history={} present={:?} recondition={} committed={} misses={} area={:.4} fit={} reframe_recovery={} identity_cosine={:?}",
                 source.sequence,
                 state.history.len(),
                 Some(tracker_healthy),
@@ -5728,6 +6711,8 @@ mod runtime {
                 state.consecutive_misses,
                 trace_area,
                 true,
+                reframe_recovery,
+                matched_query.map(|matched| matched.1),
             );
         }
         let semantic_pupil = if let Some(pupil_output) = pupil_inference {
@@ -5836,6 +6821,9 @@ mod runtime {
             let mut prompts: Option<RuntimePrompts> = None;
             let mut tracker_encoder: Option<NativeMaskMemoryEncoder> = None;
             let mut tracker_states = HashMap::<usize, LiveTrackerState>::new();
+            // Photometric history belongs to an eye/source session, not the
+            // crop-addressed SAM memory. A spatial reset must not erase it.
+            let mut photometric_states = HashMap::<usize, LivePhotometricState>::new();
             let device = Device::Cuda(0);
             let mut native_staging: Option<Tensor> = None;
             let mut warmed = false;
@@ -5852,6 +6840,7 @@ mod runtime {
                             Ok(loaded) => {
                                 prompts = Some(loaded);
                                 tracker_states.clear();
+                                photometric_states.clear();
                                 update_status(
                                     &status,
                                     "idle",
@@ -5958,18 +6947,20 @@ mod runtime {
                     .into_iter()
                     .next();
                 let video_outer = (|| {
-                    write_preprocessed_filmstrip(
-                        &batch.frames[batch.frames.len() - 1..],
-                        regime,
+                    let source = batch.frames.last()
+                        .ok_or_else(|| "SAM31 live batch has no target frame".to_string())?;
+                    let photometry = write_live_preprocessed_frame(source, regime,
+                        batch.tracking_epoch, batch.prompt_generation,
+                        photometric_states.entry(batch.eye_index).or_default(),
                         staging_bytes_len(
                             native_staging.as_ref().unwrap(),
                             FRAME_WIDTH * FRAME_HEIGHT * 3,
                         ),
                     )?;
-                    let source = batch
-                        .frames
-                        .last()
-                        .ok_or_else(|| "SAM31 live batch has no target frame".to_string())?;
+                    if enabled_env_flag("BUTTERCUP_SAM31_PHOTOMETRY_TRACE", false)
+                        || enabled_env_flag("BUTTERCUP_SAM31_VIDEO_TRACE", false) {
+                        eprintln!("SAM31_PHOTOMETRY {photometry}");
+                    }
                     let luma = current_luma.as_ref().ok_or_else(|| {
                         "SAM31 live batch could not construct current RAW luma".to_string()
                     })?;
@@ -5986,6 +6977,7 @@ mod runtime {
                         luma,
                         matches!(batch.target, Target::InnerPupilVoid | Target::OuterLimbusAndInnerPupilVoid),
                         shared_pupil_prompt,
+                        batch.motion.as_ref(),
                     )
                 })();
                 let video_outer = match video_outer {
@@ -6977,6 +7969,243 @@ mod runtime {
         })
     }
 
+    #[cfg(test)]
+    mod reframe_state_tests {
+        use super::*;
+
+        fn input(sequence: u64, x: u32, y: u32) -> LiveTrackerInput {
+            LiveTrackerInput { tracking_epoch: 7, prompt_generation: 11, sequence,
+                timestamp_ns: 2_000_000_000 + sequence * 100_000_000,
+                sensor_origin: (x, y), width: FRAME_WIDTH, height: FRAME_HEIGHT }
+        }
+
+        fn tracked_state() -> LiveTrackerState {
+            let source = input(40, 100, 200);
+            let mut mask = vec![0u8; 48 * 32];
+            for y in 10..22 { for x in 15..33 { mask[y * 48 + x] = 1; } }
+            let tensor = || Tensor::zeros([1], (Kind::Float, Device::Cpu));
+            let mut state = LiveTrackerState {
+                last_input: Some(source), frame_index: 1,
+                decoder_query_anchor: Some(tensor()),
+                identity_footprint: Some(LiveIdentityFootprint {
+                    input: source, mask: mask.clone(), mask_width: 48, mask_height: 32,
+                }),
+                ..LiveTrackerState::default()
+            };
+            state.history.push(PriorFrameFeatures {
+                frame_index: 0, sequence: source.sequence,
+                source: Some(source), raw_admitted: true,
+                features: NativeVideoFeatures { pyramid: std::array::from_fn(|_| tensor()), decoder_queries: tensor() },
+                tracked_query: Some(2), masks: mask.clone(), mask_width: 48, mask_height: 32,
+                sensor_origin: source.sensor_origin, mask_memory: Some(tensor()),
+                temporal_conditioned: Some(tensor()), tracker_mask: Some(mask), object_pointer: Some(tensor()),
+            });
+            state
+        }
+
+        fn position_only_encoder() -> NativeMaskMemoryEncoder {
+            NativeMaskMemoryEncoder {
+                weights: HashMap::new(),
+                spatial_position: Tensor::zeros([1, 256, 72, 72], (Kind::Float, Device::Cpu)),
+                rope_cos: Tensor::ones([1, 1, 72 * 72, 16], (Kind::Float, Device::Cpu)),
+                rope_sin: Tensor::zeros([1, 1, 72 * 72, 16], (Kind::Float, Device::Cpu)),
+                random_image_position: Tensor::zeros([1], (Kind::Float, Device::Cpu)),
+            }
+        }
+
+        #[test]
+        fn crop_memory_tensor_positions_and_rope_share_fractional_sensor_addresses() {
+            let encoder = position_only_encoder();
+            let layout = CropMemoryLayout { indices: vec![20 * 72 + 20],
+                coordinates: vec![(14.0, 13.25)], translated: true };
+            let encoded = encoder.memory_position_encoding(&layout, Device::Cpu);
+            assert_eq!(encoded.indices.int64_value(&[0]), 20 * 72 + 20);
+            assert_eq!(encoded.position.size(), [1, 1, 256]);
+            for (axis, coordinate) in [13.25f64, 14.0].into_iter().enumerate() {
+                for dimension in 0..128 {
+                    let scale = 10000f64.powf(2.0 * (dimension / 2) as f64 / 128.0);
+                    let phase = (coordinate + 1.0) * std::f64::consts::TAU / 72.0 / scale;
+                    let expected = if dimension % 2 == 0 { phase.sin() } else { phase.cos() };
+                    assert!((encoded.position.double_value(&[0, 0, (axis * 128 + dimension) as i64]) - expected).abs() < 2e-6);
+                }
+            }
+            for pair in 0..16 {
+                let coordinate = if pair < 8 { 14.0 } else { 13.25 };
+                let phase = coordinate * 10000f64.powf(-((4 * (pair % 8)) as f64) / 32.0);
+                assert!((encoded.rope_cos.double_value(&[0, 0, 0, pair]) - phase.cos()).abs() < 2e-6);
+                assert!((encoded.rope_sin.double_value(&[0, 0, 0, pair]) - phase.sin()).abs() < 2e-6);
+            }
+        }
+
+        #[test]
+        fn crop_memory_attention_handles_only_selected_keys_and_unpositioned_pointers() {
+            let encoder = position_only_encoder();
+            let layout = CropMemoryLayout { indices: vec![3, 9],
+                coordinates: vec![(2.5, 4.25), (8.5, 4.25)], translated: true };
+            let position = encoder.memory_position_encoding(&layout, Device::Cpu);
+            let query = Tensor::zeros([1, 72 * 72, 256], (Kind::Float, Device::Cpu));
+            let key = Tensor::zeros([1, 3, 256], (Kind::Float, Device::Cpu));
+            let values = Tensor::cat(&[
+                Tensor::full([1, 2, 256], 2.0, (Kind::Float, Device::Cpu)),
+                Tensor::full([1, 1, 256], 4.0, (Kind::Float, Device::Cpu)),
+            ], 1);
+            let output = encoder.rope_attention_with_positions(&query, &key, &values, true, 1,
+                Some((&position.rope_cos, &position.rope_sin))).unwrap();
+            assert_eq!(output.size(), [1, 72 * 72, 256]);
+            assert!((output - (8.0 / 3.0)).abs().max().double_value(&[]) < 1e-6,
+                "two observed keys plus one nonspatial pointer; absent cells must not enter the denominator");
+        }
+
+        #[test]
+        fn crop_memory_same_crop_position_encoding_is_the_exact_legacy_encoding() {
+            let encoder = position_only_encoder();
+            let layout = crop_memory_layout(input(40, 100, 200), input(41, 100, 200)).unwrap();
+            let encoded = encoder.memory_position_encoding(&layout, Device::Cpu);
+            assert_eq!((encoded.position - encoder.spatial_position.flatten(2, 3).transpose(1, 2)).abs().max().double_value(&[]), 0.0);
+            assert_eq!((encoded.rope_cos - encoder.rope_cos).abs().max().double_value(&[]), 0.0);
+            assert_eq!((encoded.rope_sin - encoder.rope_sin).abs().max().double_value(&[]), 0.0);
+        }
+
+        #[test]
+        fn crop_memory_preserves_sensor_provenance_and_miss_budget_across_small_nudges() {
+            let mut state = tracked_state();
+            state.consecutive_misses = 1;
+            state.pointer_history.push(LiveObjectPointer { source: input(40, 100, 200), frame_index: 0,
+                value: Tensor::zeros([1, 256], (Kind::Float, Device::Cpu)) });
+            state.prepare_with_policy(input(41, 132, 224), false, true);
+            assert_eq!(state.history.len(), 1);
+            assert_eq!(state.history[0].source, Some(input(40, 100, 200)));
+            assert_eq!(state.history[0].sensor_origin, (100, 200), "old grids must not be relabeled as current grids");
+            assert_eq!(state.pointer_history.len(), 1);
+            assert_eq!(state.pointer_history[0].source, input(40, 100, 200));
+            assert_eq!(state.frame_index, 1);
+            assert_eq!(state.consecutive_misses, 1);
+        }
+
+        #[test]
+        fn crop_memory_expires_each_source_and_never_refreshes_it_with_nudges() {
+            let mut state = tracked_state();
+            state.pointer_history.push(LiveObjectPointer { source: input(40, 100, 200), frame_index: 0,
+                value: Tensor::zeros([1, 256], (Kind::Float, Device::Cpu)) });
+            for sequence in 41..=49 {
+                state.prepare_with_policy(input(sequence, 100 + sequence as u32 - 40, 200), false, true);
+                assert_eq!(state.history[0].source.unwrap().sequence, 40);
+                assert_eq!(state.pointer_history[0].source.sequence, 40);
+            }
+            state.prepare_with_policy(input(50, 110, 200), false, true);
+            assert!(state.history.is_empty());
+            assert!(state.pointer_history.is_empty());
+            assert!(state.identity_footprint.is_none());
+            assert!(state.decoder_query_anchor.is_none());
+        }
+
+        #[test]
+        fn crop_memory_excludes_raw_invalid_memories_and_severely_clipped_identity() {
+            let mut state = tracked_state();
+            state.history[0].raw_admitted = false;
+            state.prepare_with_policy(input(41, 132, 224), false, true);
+            assert!(state.history.is_empty());
+            assert!(state.decoder_query_anchor.is_some(), "current RAW detector can still verify the bounded identity");
+            let mut state = tracked_state();
+            state.prepare_with_policy(input(41, 292, 200), false, true);
+            assert!(state.history.is_empty());
+            assert!(state.decoder_query_anchor.is_none());
+        }
+
+        #[test]
+        fn duplicate_or_delayed_crop_presentations_do_not_consume_memory_or_misses() {
+            for candidate in [input(40, 132, 224), input(39, 100, 200),
+                LiveTrackerInput { sequence: 41, ..input(40, 132, 224) }] {
+                let mut state = tracked_state();
+                state.consecutive_misses = 2;
+                state.prepare_with_policy(candidate, false, true);
+                assert_eq!(state.last_input, Some(input(40, 100, 200)));
+                assert_eq!(state.history.len(), 1);
+                assert_eq!(state.frame_index, 1);
+                assert_eq!(state.consecutive_misses, 2);
+            }
+        }
+
+        #[test]
+        fn overlapping_reframe_retains_identity_but_never_crop_addressed_tensors() {
+            let mut state = tracked_state();
+            state.prepare_with_reframe_identity(input(41, 132, 224), true);
+            assert!(state.history.is_empty());
+            assert_eq!(state.frame_index, 0);
+            assert!(state.decoder_query_anchor.is_some());
+            assert_eq!(state.identity_footprint.as_ref().unwrap().input, input(40, 100, 200));
+            assert_eq!(state.last_input, Some(input(41, 132, 224)));
+            assert_eq!(choose_live_recovery_queries(state.decoder_query_anchor.is_none(), &[8, 2], Some((2, 0.95))), vec![2]);
+        }
+
+        #[test]
+        fn repeated_reframes_cannot_reset_the_processed_miss_budget() {
+            let mut state = tracked_state();
+            for sequence in 41..=43 {
+                state.prepare_with_reframe_identity(input(sequence, 100 + sequence as u32 - 40, 200), true);
+                assert_eq!(state.consecutive_misses, (sequence - 41) as u8);
+                state.record_processed_miss();
+            }
+            assert!(state.history.is_empty());
+            assert!(state.decoder_query_anchor.is_none());
+            assert!(state.identity_footprint.is_none());
+        }
+
+        #[test]
+        fn repeated_reframes_cannot_renew_the_last_raw_observation_clock() {
+            let mut state = tracked_state();
+            for sequence in 41..=49 {
+                state.prepare_with_reframe_identity(input(sequence, 100 + sequence as u32 - 40, 200), true);
+                assert_eq!(state.identity_footprint.as_ref().unwrap().input.sequence, 40);
+            }
+            state.prepare_with_reframe_identity(input(50, 110, 200), true);
+            assert!(state.decoder_query_anchor.is_none());
+            assert!(state.identity_footprint.is_none());
+        }
+
+        #[test]
+        fn reframe_with_identity_or_visibility_discontinuity_releases_all_memory() {
+            let next = input(41, 132, 224);
+            for incompatible in [
+                LiveTrackerInput { tracking_epoch: 8, ..next },
+                LiveTrackerInput { prompt_generation: 12, ..next },
+                LiveTrackerInput { width: 420, ..next },
+                LiveTrackerInput { sensor_origin: (292, 200), ..next },
+            ] {
+                let mut state = tracked_state();
+                state.prepare_with_reframe_identity(incompatible, true);
+                assert!(state.history.is_empty());
+                assert!(state.decoder_query_anchor.is_none());
+                assert!(state.identity_footprint.is_none());
+            }
+        }
+
+        #[test]
+        fn reframe_mask_association_uses_sensor_space_and_rejects_a_local_lookalike() {
+            let state = tracked_state();
+            let prior = state.identity_footprint.as_ref().unwrap();
+            let mut moved_mask = vec![0; prior.mask.len()];
+            // Model mask cells cover 8x8 native sensor pixels. A +32,+24
+            // crop shift is -4,-3 cells locally for the same physical iris.
+            for y in 7..19 { for x in 11..29 { moved_mask[y * 48 + x] = 1; } }
+            let iou = |mask: &[u8], origin| sensor_aligned_query_mask_iou_with_extent(
+                &prior.mask, 48, 32, 0, (100, 200), mask, 48, 32, 0, origin, (FRAME_WIDTH, FRAME_HEIGHT));
+            assert_eq!(iou(&moved_mask, (132, 224)), Some(1.0));
+            assert!(iou(&prior.mask, (196, 264)).unwrap() < LIVE_REFRAME_MIN_MASK_IOU);
+            assert_eq!(sensor_aligned_query_mask_iou_with_extent(&[], 0, 0, 0, (0, 0),
+                &[], 0, 0, 0, (0, 0), (FRAME_WIDTH, FRAME_HEIGHT)), None);
+        }
+
+        #[test]
+        fn default_reframe_policy_does_not_enable_the_low_light_regression() {
+            let mut state = tracked_state();
+            state.prepare_with_reframe_identity(input(41, 132, 224), false);
+            assert!(state.history.is_empty());
+            assert!(state.decoder_query_anchor.is_none());
+            assert!(state.identity_footprint.is_none());
+        }
+    }
+
     fn debug_adapter(
         name: &str,
         extracted: &(
@@ -7016,6 +8245,57 @@ mod runtime {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn arbitration_uses_sensor_motion_and_keeps_missing_support_unknown() {
+        use crate::roi_evidence::{GlobalSimilarityTimeline, NativeGlobalSimilarityEvidence, SimilarityMotion, SourceClock};
+        let before = live_input(1, 100_000_000);
+        let after = LiveTrackerInput { sequence: 2, timestamp_ns: 200_000_000,
+            sensor_origin: (before.sensor_origin.0 + 32, before.sensor_origin.1 + 24), ..before };
+        let ellipse = Ellipse { center: (180.0, 120.0), major_radius: 80.0, minor_radius: 65.0, angle: 0.0 };
+        let clock = SourceClock { domain: 7, epoch: 2 };
+        let prior = ArbitrationReference { input: before, eye_index: 0, clock, ellipse };
+        let mut snapshot = SourceMotionSnapshot { eye_index: 0, tracking_epoch: before.tracking_epoch,
+            clock, timeline: GlobalSimilarityTimeline::default() };
+        snapshot.timeline.observe_frame(before.timestamp_ns, NativeGlobalSimilarityEvidence::default());
+        assert!(arbitration_expectation(prior, after, 0, &snapshot).is_none());
+        snapshot.timeline.observe_frame(after.timestamp_ns, NativeGlobalSimilarityEvidence {
+            reliable: true, motion: SimilarityMotion { support: 12, residual: 1.0, ..SimilarityMotion::default() },
+            ..NativeGlobalSimilarityEvidence::default()
+        });
+        let expected = arbitration_expectation(prior, after, 0, &snapshot).unwrap();
+        let shifted = Ellipse { center: (148.0, 96.0), ..ellipse };
+        assert!(!expected.conflict(shifted, after));
+        assert!(expected.conflict(Ellipse { major_radius: 92.0, ..shifted }, after));
+        assert!(expected.conflict(Ellipse { center: (178.0, 96.0), ..shifted }, after));
+        snapshot.clock.epoch += 1;
+        assert!(arbitration_expectation(prior, after, 0, &snapshot).is_none());
+        snapshot.clock = clock;
+        assert!(arbitration_expectation(prior, after, 1, &snapshot).is_none());
+        snapshot.timeline.steps.front_mut().unwrap().evidence.reliable = false;
+        assert!(arbitration_expectation(prior, after, 0, &snapshot).is_none());
+    }
+
+    #[test]
+    fn arbitration_scale_uses_affine_determinant_and_rejects_gaps() {
+        use crate::roi_evidence::{GlobalSimilarityTimeline, NativeGlobalSimilarityEvidence, SimilarityMotion, SourceClock};
+        let before = live_input(1, 100_000_000);
+        let after = LiveTrackerInput { sequence: 2, timestamp_ns: 200_000_000, ..before };
+        let ellipse = Ellipse { center: (180.0, 120.0), major_radius: 80.0, minor_radius: 65.0, angle: 0.0 };
+        let clock = SourceClock { domain: 7, epoch: 2 };
+        let prior = ArbitrationReference { input: before, eye_index: 0, clock, ellipse };
+        let mut snapshot = SourceMotionSnapshot { eye_index: 0, tracking_epoch: before.tracking_epoch,
+            clock, timeline: GlobalSimilarityTimeline::default() };
+        snapshot.timeline.observe_frame(before.timestamp_ns, NativeGlobalSimilarityEvidence::default());
+        snapshot.timeline.observe_frame(after.timestamp_ns, NativeGlobalSimilarityEvidence {
+            reliable: true, motion: SimilarityMotion { support: 12, residual: 1.0, rotation: 0.1,
+                scale_delta: 0.02, ..SimilarityMotion::default() }, ..NativeGlobalSimilarityEvidence::default()
+        });
+        let expected = arbitration_expectation(prior, after, 0, &snapshot).unwrap();
+        assert!((expected.major_radius - 80.0 * (1.02f64).hypot(0.1)).abs() < 1e-5);
+        snapshot.timeline.steps.front_mut().unwrap().from_timestamp_ns += 1;
+        assert!(arbitration_expectation(prior, after, 0, &snapshot).is_none());
+    }
+
     use super::*;
 
     #[test]
@@ -7242,6 +8522,127 @@ mod tests {
         assert_eq!(next_live_hold_miss(0), (1, false));
         assert_eq!(next_live_hold_miss(1), (2, false));
         assert_eq!(next_live_hold_miss(2), (3, true));
+    }
+
+    #[test]
+    fn crop_memory_uses_fractional_sensor_positions_and_only_observed_cells() {
+        let previous = live_input(40, 2_000_000_000);
+        let current = LiveTrackerInput { sensor_origin: (132, 224), ..live_input(41, 2_100_000_000) };
+        let layout = crop_memory_layout(previous, current).unwrap();
+        assert!(layout.translated);
+        assert!(layout.indices.len() < 72 * 72);
+        for (&index, &(x, y)) in layout.indices.iter().zip(&layout.coordinates) {
+            let source_x = (index as usize % 72) as f64;
+            let source_y = (index as usize / 72) as f64;
+            assert!((x - (source_x - 6.0)).abs() < 1e-12);
+            assert!((y - (source_y - 6.75)).abs() < 1e-12,
+                "the +24 native-y move is fractional on SAM's 72-token grid");
+            assert!(x >= 1.0 && y >= 1.0 && x + 1.0 <= 71.0 && y + 1.0 <= 71.0);
+            assert!(source_x >= 1.0 && source_y >= 1.0 && source_x + 1.0 <= 71.0 && source_y + 1.0 <= 71.0);
+        }
+        assert!(!layout.indices.contains(&0), "outgoing/boundary tokens are absent, not zero-filled");
+    }
+
+    #[test]
+    fn crop_memory_same_crop_keeps_all_tokens_and_original_positions() {
+        let previous = live_input(40, 2_000_000_000);
+        let layout = crop_memory_layout(previous, live_input(41, 2_100_000_000)).unwrap();
+        assert!(!layout.translated);
+        assert_eq!(layout.indices.len(), 72 * 72);
+        for (index, &(x, y)) in layout.coordinates.iter().enumerate() {
+            assert_eq!(layout.indices[index], index as i64);
+            assert_eq!((x, y), ((index % 72) as f64, (index / 72) as f64));
+        }
+    }
+
+    #[test]
+    fn crop_memory_rejects_thin_overlap_expired_sources_and_duplicate_exposures() {
+        let previous = live_input(40, 2_000_000_000);
+        assert!(crop_memory_layout(previous, LiveTrackerInput {
+            sensor_origin: (292, 200), ..live_input(41, 2_100_000_000) }).is_none());
+        assert!(crop_memory_layout(previous, live_input(41, 2_900_000_001)).is_none());
+        assert!(crop_memory_layout(previous, live_input(41, 2_000_000_000)).is_none());
+        assert!(crop_memory_layout(previous, LiveTrackerInput {
+            tracking_epoch: 8, ..live_input(41, 2_100_000_000) }).is_none());
+    }
+
+    fn central_identity_footprint(input: LiveTrackerInput) -> LiveIdentityFootprint {
+        let mut mask = vec![0; 48 * 32];
+        for y in 10..22 {
+            for x in 15..33 { mask[y * 48 + x] = 1; }
+        }
+        LiveIdentityFootprint { input, mask, mask_width: 48, mask_height: 32 }
+    }
+
+    #[test]
+    fn live_reframe_identity_follows_sensor_foreground_not_crop_area() {
+        let previous = live_input(40, 2_000_000_000);
+        let footprint = central_identity_footprint(previous);
+        for (dx, dy) in [(32, 24), (-32, -24), (64, 32), (-64, 32)] {
+            let moved = LiveTrackerInput {
+                sensor_origin: ((100i32 + dx) as u32, (200i32 + dy) as u32),
+                ..live_input(41, 2_100_000_000)
+            };
+            assert!(live_tracker_requires_reset(Some(previous), moved));
+            assert_eq!(footprint.visible_fraction(moved), Some(1.0));
+            assert!(footprint.survives_reframe(moved));
+        }
+        let clipped = LiveTrackerInput {
+            sensor_origin: (292, 200), ..live_input(41, 2_100_000_000)
+        };
+        assert!(live_rois_overlap(previous, clipped));
+        assert_eq!(footprint.visible_fraction(clipped), Some(0.5));
+        assert!(!footprint.survives_reframe(clipped), "overlapping rectangles alone are not identity");
+    }
+
+    #[test]
+    fn live_reframe_identity_has_an_immutable_source_clock_and_compatible_lineage() {
+        let previous = live_input(40, 2_000_000_000);
+        let footprint = central_identity_footprint(previous);
+        let moved = LiveTrackerInput { sensor_origin: (132, 224), ..live_input(41, 2_100_000_000) };
+        for incompatible in [
+            LiveTrackerInput { tracking_epoch: 8, ..moved },
+            LiveTrackerInput { prompt_generation: 12, ..moved },
+            LiveTrackerInput { width: 420, ..moved },
+            LiveTrackerInput { height: 280, ..moved },
+            LiveTrackerInput { sequence: 40, ..moved },
+            LiveTrackerInput { timestamp_ns: previous.timestamp_ns, ..moved },
+            LiveTrackerInput { timestamp_ns: previous.timestamp_ns - 1, ..moved },
+            LiveTrackerInput { timestamp_ns: previous.timestamp_ns + LIVE_TRACKER_MAX_TIMESTAMP_GAP_NS + 1, ..moved },
+            LiveTrackerInput { sensor_origin: (100 + FRAME_WIDTH as u32, 200), ..moved },
+        ] {
+            assert!(!footprint.survives_reframe(incompatible), "{incompatible:?}");
+        }
+        assert!(live_tracker_requires_reset(Some(previous), LiveTrackerInput {
+            timestamp_ns: previous.timestamp_ns, ..live_input(41, 2_100_000_000)
+        }), "a second buffer from one exposure cannot advance video memory");
+        assert_eq!(footprint.input, previous);
+    }
+
+    #[test]
+    fn live_reframe_identity_abstains_on_missing_or_invalid_masks() {
+        let previous = live_input(40, 2_000_000_000);
+        let next = live_input(41, 2_100_000_000);
+        let mut footprint = central_identity_footprint(previous);
+        footprint.mask.fill(0);
+        assert!(!footprint.survives_reframe(next));
+        footprint.mask.clear();
+        assert_eq!(footprint.visible_fraction(next), None);
+        footprint.mask_width = 0;
+        assert_eq!(footprint.visible_fraction(next), None);
+    }
+
+    #[test]
+    fn live_reframe_without_pixel_memory_still_recovers_only_its_identity() {
+        let global_rank = [8, 4, 2];
+        // Empty crop-addressed memory is NOT the same thing as no identity.
+        assert_eq!(choose_live_recovery_queries(false, &global_rank, Some((2, 0.95))), vec![2]);
+        assert!(choose_live_recovery_queries(false, &global_rank, Some((8, 0.69))).is_empty());
+        assert!(choose_live_recovery_queries(false, &global_rank, None).is_empty());
+        assert_eq!(choose_live_recovery_queries(true, &global_rank, None), global_rank);
+        assert_eq!(choose_reframe_recovery_queries(&[(2,0.96),(4,0.93),(8,0.92),(9,0.91),(12,0.90)]),
+            vec![2,4,8,9], "the reframe pool has a hard real-time work bound");
+        assert_eq!(choose_reframe_recovery_queries(&[(2,0.96),(4,0.69),(8,f64::NAN)]), vec![2]);
     }
 
     #[test]
