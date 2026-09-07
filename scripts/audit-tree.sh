@@ -72,6 +72,7 @@ mapfile -t unexpected_files < <(
       ./src/raw_sclera_vein_graph.rs \
       ./src/raw_sclera_red_canny.rs \
       ./src/sam31_outer.rs \
+      ./src/sam31_pipeline.rs \
       ./src/sam31_cuda_stream.cpp \
       ./src/sam31_photometric.rs \
       ./src/sam31_text.rs \

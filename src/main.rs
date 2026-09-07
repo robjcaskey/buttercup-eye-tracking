@@ -33316,7 +33316,8 @@ fn receive(
                     }
                 }
                 // Each enabled eye has independent source/session history.
-                // The shared worker still admits only current, nonqueued work.
+                // Each lane replaces its one waiting RAW frame under load;
+                // encoding overlaps ordered per-eye tracking, never a FIFO.
                 if let Some(target) = sam31_target {
                     if let Some(client) = sam31_client.as_ref() {
                         let motion = sam31_outer::memory_arbitration_enabled().then(||
