@@ -9,7 +9,9 @@ use crate::conic_solver::joint::{EyeScenePrior,JointScenePrior,PinholeCamera,Pos
 #[derive(Clone,Copy,Debug)]
 pub(crate) struct EyePoseInput {
     pub(crate) limbus_center_sensor_px:[f64;2],
-    /// [nominal,minimum,maximum], inherited from the coarse acquisition model.
+    /// [nominal,minimum,maximum], inherited from coarse acquisition and possibly
+    /// held since an earlier semantic update. Candidate-independent is NOT a
+    /// declaration of a fresh scale measurement or calibrated metric accuracy.
     pub(crate) pixels_per_10mm:Option<[f64;3]>,
 }
 
@@ -20,7 +22,8 @@ pub(crate) enum ScaleProvenance { CoarseAcquisition,NominalInterocularSpan,Nomin
 pub(crate) struct CoarseBinocularScene {
     pub(crate) prior:JointScenePrior,
     pub(crate) scale_provenance:[Option<ScaleProvenance>;2],
-    /// Only externally supplied coarse scale populates this diagnostic.
+    /// Only externally supplied coarse scale populates this diagnostic. Values
+    /// may be held acquisition priors; no fresh measurement time is asserted.
     pub(crate) independent_pixels_per_mm:[Option<[f64;3]>;2],
 }
 

@@ -481,6 +481,16 @@ fn useful_two_eye_evidence_is_not_replaced_by_a_free_single_eye_hypothesis() {
 }
 
 #[test]
+fn dominated_unlocalized_models_return_their_starts_to_the_joint_search() {
+    let fixture=Fixture::new([70.0,-130.0,250.0]);
+    let result=fixture.solve([true,true],16).unwrap();
+    assert!(result.robust_cost<0.01,"current evidence already supports a near-zero joint cost");
+    assert_eq!(result.hypotheses_by_association,[16,0,0],
+        "omitting either strongly supported ROI has an irreducible cost above the current fit; do not halve the useful joint search");
+    assert_eq!(result.hypotheses_evaluated,16);
+}
+
+#[test]
 fn misleading_first_conic_does_not_replace_strong_two_eye_boundary_support() {
     for eye in 0..2 {
         let mut fixture=Fixture::new([70.0,-130.0,250.0]);

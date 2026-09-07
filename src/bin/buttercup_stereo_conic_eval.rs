@@ -14,6 +14,7 @@
 use native::{conic_solver,outline_conic_segments,roi_evidence};
 use native::{binocular_coordinator,eye_scene_model};
 #[path="../gaze_target_solver/joint_tracking.rs"] mod joint_tracking;
+#[path="buttercup_stereo_conic_eval/source_order.rs"] mod source_order;
 use native::eye_scene_model::binocular_pose::{approximate_scene,EyePoseInput};
 use conic_solver::joint::*;
 use outline_conic_segments::sparse_evidence::*;
@@ -119,7 +120,7 @@ fn prepare(row:Value,partial_outlines:bool)->Result<Frame,String> {
     Ok(Frame {input,packet,pose,validation,baseline,selected_raw_admitted,partial_outline})
 }
 
-fn heldout(solution:&JointConicSolution,frames:&[Option<Frame>;2])->[Value;2] {
+fn heldout(solution:&JointConicSolution,frames:[Option<&Frame>;2])->[Value;2] {
     std::array::from_fn(|eye| {
         let Some(frame)=&frames[eye] else {return Value::Null;};
         let mut values=Vec::new();
@@ -142,7 +143,7 @@ fn heldout(solution:&JointConicSolution,frames:&[Option<Frame>;2])->[Value;2] {
     })
 }
 
-fn solution_json(result:Result<JointConicSolution,JointConicUnavailable>,frames:&[Option<Frame>;2],elapsed:f64)->Value {
+fn solution_json(result:Result<JointConicSolution,JointConicUnavailable>,frames:[Option<&Frame>;2],elapsed:f64)->Value {
     match result {
         Err(reason)=>json!({"available":false,"reason":format!("{reason:?}"),"elapsed_ms":elapsed}),
         Ok(solution)=>json!({"available":true,"target_camera_mm":solution.target_camera_mm,
@@ -153,6 +154,7 @@ fn solution_json(result:Result<JointConicSolution,JointConicUnavailable>,frames:
             "alternative_cost_margin":solution.alternative_cost_margin,
             "alternative_target_camera_mm":solution.alternative_target_camera_mm,
             "hypotheses":solution.hypotheses_evaluated,"refinement_steps":solution.refinement_steps,
+            "hypotheses_by_association":solution.hypotheses_by_association,
             "outer_ellipses":solution.ellipses_roi_px.map(|e|ellipse_json(e[0])),
             "support":solution.arcs.iter().map(|a|json!({"roi":a.exposure.roi.0,"kind":format!("{:?}",a.kind),
                 "group":a.evidence_group,"arc":a.arc_index,"rms_px":a.rms_px,"sigma_px":a.sigma_px,"used":a.used,
@@ -199,7 +201,7 @@ fn evaluate(frames:[Option<Frame>;2],export_sparse:bool)->Value {
             maximum_hypotheses:16,maximum_refinements:12,maximum_source_skew_ns:0,
             exposure_uncertainty_ns:2_000_000,motion_bound_px_per_second:150.0,
         });
-        row[name]=solution_json(result,&frames,started.elapsed().as_secs_f64()*1000.0);
+        row[name]=solution_json(result,frames.each_ref().map(Option::as_ref),started.elapsed().as_secs_f64()*1000.0);
     }
     row
 }
@@ -211,18 +213,30 @@ fn run()->Result<(),String> {
     let mut maximum_frames_per_cache=usize::MAX;
     let mut partial_outlines=false;
     let mut export_sparse=false;
+    let mut source_order_replay=false;
+    let mut arrival_delay_ns=[0u64;2];
     while let Some(arg)=args.next() {
         if arg=="--max-frames-per-cache" {
             maximum_frames_per_cache=args.next().ok_or("missing frame limit")?.parse::<usize>().map_err(|e|e.to_string())?;
             if maximum_frames_per_cache==0 {return Err("frame limit must be positive".into());}
         } else if arg=="--partial-outlines" {partial_outlines=true;}
         else if arg=="--export-sparse-evidence" {export_sparse=true;}
+        else if arg=="--source-order-replay" {source_order_replay=true;}
+        else if arg=="--arrival-delay-ns" {
+            let eye=args.next().ok_or("missing delayed ROI id (1 or 2)")?.parse::<usize>().map_err(|e|e.to_string())?;
+            if !(1..=2).contains(&eye) {return Err("delayed ROI id must be 1 or 2".into());}
+            arrival_delay_ns[eye-1]=args.next().ok_or("missing arrival delay")?.parse::<u64>().map_err(|e|e.to_string())?;
+        }
         else {files.push(arg);}
     }
     if files.is_empty() {return Err("at least one SAM evidence cache is required".into());}
     let allowed=std::fs::canonicalize("outputs").map_err(|e|e.to_string())?;
     if !std::fs::canonicalize(output.parent().ok_or("missing output directory")?).map_err(|e|e.to_string())?.starts_with(allowed) {return Err("output must be under outputs".into());}
     let mut writer=BufWriter::new(OpenOptions::new().create_new(true).write(true).open(output).map_err(|e|e.to_string())?);
+    if source_order_replay {
+        return source_order::run(&files,maximum_frames_per_cache,partial_outlines,arrival_delay_ns,&mut writer);
+    }
+    if arrival_delay_ns!=[0;2] {return Err("arrival-delay-ns requires source-order-replay".into());}
     let mut pending:HashMap<(String,u64),[Option<Frame>;2]>=HashMap::new();
     let mut count=0usize;
     let mut write=|frames|->Result<(),String> {

@@ -237,6 +237,9 @@ pub(crate) struct JointConicSolution {
     pub(crate) alternative_cost_margin: Option<f64>,
     pub(crate) alternative_target_camera_mm: Option<[f64; 3]>,
     pub(crate) hypotheses_evaluated: usize,
+    /// Refined starts for [both ROIs, right only, left only]. Includes failed
+    /// starts; these counts share the single caller-supplied work budget.
+    pub(crate) hypotheses_by_association: [usize;3],
     pub(crate) refinement_steps: usize,
 }
 
@@ -868,7 +871,7 @@ impl<'a> Problem<'a> {
             ellipses_roi_px: [[None;3];2], arcs: Vec::new(), contributing_eyes: [false;2],
             modeled_eyes:self.present,unlocalized_eye_cost:[0.0;2],
             robust_cost: cost, alternative_cost_margin: None, alternative_target_camera_mm: None,
-            hypotheses_evaluated: 0, refinement_steps: 0 };
+            hypotheses_evaluated: 0, hypotheses_by_association:[0;3], refinement_steps: 0 };
         for (g,selection) in self.groups.iter().zip(self.select(&conics)) {
             let a = &g.alternatives[selection];
             let c = conics[a.eye][a.boundary]?;
@@ -950,23 +953,45 @@ pub(crate) fn solve_joint_conics(request: JointConicRequest<'_>) -> Result<Joint
     let problem = Problem::new(request)?;
     let budget=request.maximum_hypotheses.min(MAX_HYPOTHESES);
     let reserve=if problem.present==[true,true]&&budget>=8 {(budget/4).min(4)} else {0};
-    let mut models=vec![(problem.present,budget-2*reserve)];
-    if reserve>0 {models.extend([([true,false],reserve),([false,true],reserve)]);}
     let mut fits=Vec::<([f64;2],JointConicSolution)>::new();
     let mut hypotheses=0;let mut steps=0;let mut feasible=false;
-    for (modeled,limit) in models {
-        let subrequest=JointConicRequest {eyes:std::array::from_fn(|i|if modeled[i] {request.eyes[i]} else {None}),
-            maximum_hypotheses:limit,..request};
-        let model=Problem::new(subrequest)?;
-        let omitted=problem.unlocalized_costs(modeled);
-        for seed in model.seeds() {
+    let mut associations=[0;3];
+    let mut optimize=|model:&Problem<'_>,seeds:&[Parameters],omitted:[f64;2]| {
+        let mut best=f64::INFINITY;
+        for &seed in seeds {
             hypotheses+=1;
+            associations[if model.present==[true,true] {0} else if model.present[0] {1} else {2}]+=1;
             let Some((p,cost,refinements))=model.refine(seed) else {continue;};
             feasible=true;steps+=refinements;
             let Some(mut solution)=model.solution(&p,cost+omitted.iter().sum::<f64>()) else {continue;};
             solution.unlocalized_eye_cost=omitted;
+            best=best.min(solution.robust_cost);
             fits.push(([p[0],p[1]],solution));
         }
+        best
+    };
+    let seeds=problem.seeds();
+    let prefix=(budget-2*reserve).min(seeds.len());
+    let mut used=prefix;
+    let mut best=optimize(&problem,&seeds[..prefix],[0.0;2]);
+    if reserve>0 {for modeled in [[true,false],[false,true]] {
+        let omitted=problem.unlocalized_costs(modeled);
+        // Every remaining residual is nonnegative. This is a LOWER bound on
+        // the identical objective, not a confidence threshold: an association
+        // that already costs more with perfect residuals cannot beat `best`.
+        // Return its reserved starts to the joint search. In particular, good
+        // stereo evidence must not lose half its search to impossible winners.
+        if omitted.iter().sum::<f64>()>best {continue;}
+        let subrequest=JointConicRequest {eyes:std::array::from_fn(|i|if modeled[i] {request.eyes[i]} else {None}),
+            maximum_hypotheses:reserve,..request};
+        let model=Problem::new(subrequest)?;
+        let candidates=model.seeds();
+        used+=candidates.len();
+        best=best.min(optimize(&model,&candidates,omitted));
+    }}
+    let end=(prefix+budget-used).min(seeds.len());
+    if end>prefix {
+        optimize(&problem,&seeds[prefix..end],[0.0;2]);
     }
     // These are alternative ASSOCIATIONS in one robust boundary objective.
     // A one-ROI hypothesis pays the complete other ROI's capped evidence cost;
@@ -976,6 +1001,7 @@ pub(crate) fn solve_joint_conics(request: JointConicRequest<'_>) -> Result<Joint
         else {JointConicUnavailable::NoFeasibleInitialization});}
     let (slope,mut solution)=fits.remove(0);
     solution.hypotheses_evaluated=hypotheses;solution.refinement_steps=steps;
+    solution.hypotheses_by_association=associations;
     if let Some((_,alternate))=fits.iter().find(|(q,_)|(q[0]-slope[0]).hypot(q[1]-slope[1])>0.035) {
         solution.alternative_cost_margin=Some((alternate.robust_cost-solution.robust_cost).max(0.0));
         solution.alternative_target_camera_mm=Some(alternate.target_camera_mm);

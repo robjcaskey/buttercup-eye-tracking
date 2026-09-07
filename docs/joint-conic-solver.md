@@ -68,6 +68,28 @@ the initial geometry is moved toward the nominal scene until feasible; the
 constraint itself is never widened. No-feasible-initialization and
 all-evidence-rejected outcomes have separate diagnostics.
 
+Each alternative outer conic now initializes its **own** circle center/range
+and metric radius, not just a new target direction around the first conic's
+geometry. Starts interleave ROIs before advancing to their next conic hints.
+The regression test for secondary-conic geometry failed before this change.
+
+An explicitly unlocalized-ROI association can compete in the **same objective**.
+It pays every omitted correlation group's full capped cost, exports no center,
+normal or ellipse for that ROI, and removes its fitted pair-position constraint.
+This is not an unpenalized choice between two independent gaze estimates.
+`modeled_eyes` distinguishes an unlocalized ROI from a modeled ROI whose arcs
+all became outliers; `unlocalized_eye_cost` retains the omission penalty.
+The full request's clocks, timing and scene are validated before any omission.
+The frozen coarse scene support remains conditional on its acquisition priors.
+
+Initially reserving four starts for each unlocalized association needlessly
+halved a 16-start joint search. The corrected scheduler first tries a joint
+prefix, then prunes an association if its omitted-evidence cost **alone** exceeds
+the best current total cost. All other residual costs are nonnegative, making
+this a genuine objective lower bound rather than a confidence gate. Unused
+starts return to the joint search; the total cap does not increase. Diagnostics
+count starts by `[both, right-only, left-only]`, including infeasible starts.
+
 ## Source time and live routing
 
 `binocular_coordinator/source_pairing.rs` retains at most 32 sparse packets per
@@ -81,6 +103,15 @@ A previous shared target can initialize a later optimization; it is not a
 residual, smoothing operation, or fresh sample. Host completion/redraw time is
 not used as exposure time. The 2 ms row-time allowance is an explicit engineering
 assumption, not an attested bound on the sensor's rolling exposure.
+
+Rejections retain a per-ROI **newest-observation timestamp** independently of
+the optional latest successful fit. Otherwise clearing a new empty observation
+could let an old, uniquely arriving second-eye result resurrect old geometry.
+Recorded source 1766 reproduced that failure under a synthetic 100 ms left-eye
+arrival delay. Both that case and invalid coarse-scene support now clear/retain
+state according to the observation timestamp, not whether a fit pointer exists.
+An old pair may still be returned as historical output without replacing a
+newer ROI's live state. A source/provider generation change resets these floors.
 
 With the existing `3` hotkey enabling the second ROI, SAM frames now use this
 joint path. The second ROI remains off by default. Provider changes advance
@@ -157,8 +188,8 @@ assistant, backup and unreviewed documents; ten match available stereo RAW
 bytes and geometry exactly. None falls in this first 20,000-exposure subset.
 All ten are now evaluated, using 76 fresh native SAM exposures around their
 source positions (49 reads). Labels entered scoring only after fitting.
-Eight targets have a fit and two still have no boundary evidence. The latest
-candidate is frozen as `eval-pair-init`; the comparison baseline is
+At this pre-partial-outline checkpoint, eight targets have a fit and two have
+no boundary evidence. That candidate is frozen as `eval-pair-init`; the baseline is
 `eval-projected` (before conic depth initialization and geometric arc weights).
 Visible and guessed landmarks are separate; limbus localization is not gaze
 ground truth.
@@ -225,15 +256,118 @@ anatomical constancy or ROI-reframe performance. The emitted scale-only bounds
 omit conic uncertainty and are not confidence intervals. Unnormalized area
 tails on the larger subset still regress and cannot be relabeled SN-FEIDA.
 
-The full viewer suite currently has 957 passing tests, the same 41 failures as
+The full viewer suite currently has 964 passing tests, the same 41 failures as
 the pre-change baseline, and 24 ignored tests. Live-adapter tests additionally
 check source deduplication, different ROI sequences on one clock, crop transport,
 missing-eye behavior, provider changes, radius units and shared gaze mapping.
 No live user calibration or desktop-pointer trial has been performed for this
 new path.
-The standalone solver has 62 passing tests. The independent report tests also
+The standalone evaluator has 72 passing tests, including its source-replay
+index and shared live-tracker tests. All 13 independent report tests pass and
 exercise source matching, probe changes, missing-read accounting, chronological
 area transitions, rejected geometry and determinant-based scale normalization.
+
+### Current bounded-search comparison
+
+The frozen `eval-search-bound-v3` comparison uses the same 50,000 exposures and
+unchanged training/withheld points. Against `eval-partial-control` with the
+ordinary extractor, there are 19,780 right / 12,244 left matched withheld-error
+comparisons and 107,874 verified coordinate fingerprints. Right p95 changes
+6.382→6.356 px; left 6.940→6.879 px. Right/left improvements over one pixel are
+48/35, versus 52/30 regressions. Admission gains are 2/6 and losses 8/11. This
+is a modest conditional optimizer change, not a uniformly better localization.
+
+The separate comparison against `eval-unlocalized-pose-v2` isolates the
+cost-bound search scheduler: 19,782/12,246 matched right/left results, with
+94/96 improvements and 37/49 regressions over one pixel. The earlier scheduler's
+halved joint search is therefore not retained merely because its tests passed.
+There are 10,338 available requests using all 16 starts on the paired model;
+the total observed hypothesis maximum remains 16. Shared-CPU joint request
+median/p95/max is 2.46/10.45/18.10 ms, not an end-to-end or exclusive benchmark.
+
+With the still-experimental partial extractor, the same solver improves
+829/635 right/left withheld errors by over one pixel and regresses 554/442,
+relative to `eval-partial-v1`; admissions gain 159/92 and lose 158/192. The
+right/left p95 remains very large at 74.15/72.79 px, including rejected probes.
+The reviewed target 105933 regresses 3.33→3.49 px. Targets 106191/106217 still
+have roughly 26.65/45.23 px visible-label RMS. These are not successful fits.
+Native inspection of remaining large-error sources 2799, 5332, 15368 and
+19322 shows skin/lid or heavily clipped off-target regions, not established
+ground-truth limbuses. Boundary identity remains a separate unsolved problem.
+
+The corresponding byte-matched independent-motion audit has 14 SN-FEIDA links,
+zero reframes, median absolute log change 0.03976 in both arms and mean
+0.16176→0.16235. The 1.66914 maximum remains. This comparison uses the former
+partial candidate as its baseline: the extra 106213→106215 link was already
+admitted there and is **not** a new solver recovery. Neither this admission
+intersection change nor the small area differences demonstrate better anatomy.
+No independent absolute scale exists on the 50k optimizer subset.
+
+The expanded 100,000-exposure control/candidate evaluation has completed on
+cache prefixes 100–50099 and 193759–243758: 58,253 reads, 41,747 RAW pairs,
+26,598 both-evidence reads and 124 capture entries. There are 46,733 available
+candidate solutions, including 26,487 with both eyes contributing. The
+independent output auditor verifies shared-target rays and the 16-start cap.
+There are still **287,519 available exposures not evaluated in this comparison**.
+
+The separately inspected new half (25100–50099 and 218759–243758) contains
+27,280 reads and 151,752 matched coordinate fingerprints. Its 22,771 right /
+18,036 left matched withheld-error comparisons have p95 7.310→7.312 and
+7.380→7.312 px, respectively; 61/53 improve over one pixel and 71/42 regress.
+Admissions gain 3/7 and lose 15/11. Common accepted-arc comparisons are retained
+separately. Native source 31883 contains a real eye, but the upstream contour
+extends beyond the limbus: its higher contour residual does not by itself prove
+worse anatomical localization. Source 40991 is a clipped skin/lid region. No
+human label or gaze ground truth is available for either inspection.
+
+Unlike the first 50k subset, this expansion has 1,391 right / 859 left
+exposure-attached **coarse acquisition scale priors**. Source-code provenance
+is `coarse_centimeter_scales`: MediaPipe apparent radius with an assumed 12 mm
+limbus, updated at semantic reacquisition and held between updates. They are
+independent of the tested SAM/joint candidate radius, but are **not 2,250 fresh
+scale measurements**. Their measurement timestamps are not recovered, and
+their wide bounds are heuristic. Normalizing with these priors yields 1,261/753
+matched right/left log-area steps: unchanged medians 0.014742/0.013958 and
+maxima 1.97919/1.41501. This is conditional coarse-prior-normalized SN-FEIDA,
+not independently measured frame-to-frame physical-area constancy. Keep it
+separate from the 14 exact-RAW motion links above, and do not treat held scale
+values or stable wrong ellipses as fresh corroborating evidence.
+
+### Recorded-source live-tracker replay
+
+`buttercup_stereo_conic_eval --source-order-replay` disk-indexes the immutable
+caches and passes the actual sparse native packets through `JointTracker`.
+It retains only the live 32-packet/ROI, 1.5-second evidence window; the offline
+disk-offset index is separate. Optional `--arrival-delay-ns ROI NS` changes
+arrival scheduling, never source time, RAW bytes, origin or sample coordinates.
+It is not a replay of SAM video memory or measured GPU completion times.
+
+The pre-fix tracker failed the native replay at source 1766 after a newer empty
+right-eye observation. Two unit tests independently reproduced stale revival
+and failure to clear an invalid scene. After the timestamp-floor correction,
+all three frozen `eval-source-watermark-v4` replays completed and passed the
+independent Python source/geometry audit:
+
+| Arrival scenario | Unique RAW exposures | Same-read RAW pairs | Native crop moves | Duplicate checks | Shared publications using both eyes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Source order | 50,000 | 19,027 | 879 | 50,000 | 10,438 |
+| Right ROI delayed 100 ms | 50,000 | 19,027 | 879 | 50,000 | 10,438 |
+| Left ROI delayed 100 ms | 50,000 | 19,027 | 879 | 50,000 | 10,438 |
+
+Each scenario covers the same 30,973 reads, 61 capture entries and 108 source
+lineages. The auditor checks exact publication-source identity, co-clocked
+pairing, the single shared target/rays, source age rather than arrival age,
+per-eye rejection floors and duplicate suppression. It counts unique arriving
+RAW exposures, not repeated same-read publications. Right-first and left-first
+monocular interim availability differs; that is not an extra stereo dropout.
+Sorted paired source identities plus contribution flags have the same SHA256
+in all three scenarios (`81bf877c7698a7d2c57d8a38fc902fc8247b460be463f5366c6dda17c955f0c4`),
+so this comparison is not relying merely on equal aggregate admission counts.
+There are 757/756/757 fresh fitted crop-move arrivals in the displayed order.
+These checks establish source-state correctness, **not** geometric accuracy or
+SN-FEIDA stability across those 879 moves. Their independent scale/label support
+still needs evaluation. No viewer restart or live user calibration was performed;
+the updated viewer builds successfully.
 
 ## Known failures and remaining work
 
@@ -267,12 +401,10 @@ fit. Native inspection of 212419/212420 and 15631 shows off-target or heavily
 clipped ROIs, not established ground-truth irises; those large mask-residual
 regressions must not be described as measured gaze/localization errors.
 Thus widening localization bands is not a complete treatment of uncertain
-boundary identity or a genuinely unlocalized second eye. The next solver
-change must address that failure without averaging independent gaze points.
-In particular, test a penalized unlocalized-eye hypothesis within the shared
-objective, and ensure alternative conic starts carry their own center/range
-geometry rather than only rotating a target around the first candidate's
-geometry. Both need matched corpus checks, not just added initialization code.
+boundary identity or a genuinely unlocalized second eye. The subsequent
+penalized unlocalized-eye model, per-conic geometry starts and search-budget
+correction are described and evaluated above. They do not yet repair the
+remaining boundary-identity and partial-outline localization failures.
 No independent absolute scale exists on this 50k subset, so the area summaries
 cannot establish an SN-FEIDA improvement.
 
@@ -322,6 +454,8 @@ buttercup_stereo_conic_eval output.jsonl cache.jsonl...
 report-stereo-conics.py output.jsonl report.json --expected-manifest manifest.json
 score-stereo-labels.py inventory.json frames.jsonl labels.json output.jsonl...
 python3 scripts/report-stereo-motion.py baseline.jsonl candidate.jsonl motion.json SCALE_REPORT.json...
+buttercup_stereo_conic_eval source.jsonl cache.jsonl... --source-order-replay --arrival-delay-ns 2 100000000
+report-stereo-conics.py source.jsonl source-report.json --source-order-replay --expected-manifest manifest.json
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-stereo-conics-report.py
 buttercup_raw10_preview --source-index frames.jsonl INDEX comparison.png output.jsonl
 ```

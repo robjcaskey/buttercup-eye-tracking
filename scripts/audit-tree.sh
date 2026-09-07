@@ -67,6 +67,7 @@ mapfile -t unexpected_files < <(
       ./src/outline_conic_segments/recent_exclusion.rs \
       ./src/outline_conic_segments/sparse_evidence.rs \
       ./src/outline_conic_segments/partial_outline.rs \
+      ./src/bin/buttercup_stereo_conic_eval/source_order.rs \
       ./src/roi_evidence.rs \
       ./src/roi_evidence/timing.rs \
       ./src/roi_continuity.rs \

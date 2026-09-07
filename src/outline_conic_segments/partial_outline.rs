@@ -178,4 +178,21 @@ mod tests {
         assert!((a.arcs.iter().map(|a|length(&a.points_roi_px)).sum::<f64>()-
             b.arcs.iter().map(|a|length(&a.points_roi_px)).sum::<f64>()).abs()<2.0);
     }
+
+    #[test]
+    fn an_inward_curving_bright_occluder_is_not_part_of_the_outer_limbus() {
+        let e=ellipse();
+        let mut raw=vec![550;256*192];let mut component=Vec::new();
+        for y in 0..192 {for x in 0..256 {
+            let inside=((x as f64-e.center.0)/e.major_radius).hypot((y as f64-e.center.1)/e.minor_radius)<=1.0;
+            let reflection=(x as f64-165.0).hypot(y as f64-96.0)<32.0;
+            if inside&&!reflection {raw[y*256+x]=150;component.push(y*256+x);}
+        }}
+        let outline=super::super::native_component_contour(&component,256,192);
+        let p=extract(&raw,&[outline]);
+        assert!(p.arcs.len()>=3,"the remaining actual limbus must survive");
+        let worst=p.arcs.iter().flat_map(|a|&a.points_roi_px)
+            .map(|&point|crate::conic_solver::ellipse_residual(point,e)).fold(0.0,f64::max);
+        assert!(worst<5.0,"bright inward occlusion leaked into limbus evidence: {worst}px");
+    }
 }

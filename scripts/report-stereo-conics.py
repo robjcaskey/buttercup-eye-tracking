@@ -47,6 +47,11 @@ def check_shared_target_contract(result):
     """
     if not result.get("available") or "modeled_eyes" not in result:
         return
+    if "hypotheses_by_association" in result:
+        work=result["hypotheses_by_association"]
+        if len(work)!=3 or any(type(v) is not int or v<0 for v in work) \
+                or sum(work)!=result["hypotheses"] or sum(work)>24:
+            raise ValueError("association searches did not share the declared bounded work budget")
     modeled=result["modeled_eyes"]
     penalties=result["unlocalized_eye_cost"]
     if len(modeled)!=2 or any(type(v) is not bool for v in modeled) or len(penalties)!=2 \
@@ -70,6 +75,108 @@ def check_shared_target_contract(result):
         if not math.isfinite(distance) or distance<=0 or not all(math.isfinite(v) for v in ray) \
                 or max(abs(v/distance-r) for v,r in zip(delta,ray))>1e-7:
             raise ValueError("exported gaze ray does not point to the single shared target")
+
+
+def source_clock_epoch(lineage):
+    value=14695981039346656037
+    for byte in lineage.encode():
+        value=((value^byte)*1099511628211)&((1<<64)-1)
+    return value
+
+
+def summarize_source_replay(evaluation,expected=None):
+    """Arrival-order validation. Publications are NOT additional exposures."""
+    counts=collections.Counter()
+    identities={}
+    reads=collections.defaultdict(set)
+    latest_observed={}
+    previous_geometry={}
+    completed_clocks=set()
+    captures=set()
+    current_clock=None
+    previous_arrival=0
+    delays=None
+    elapsed=[]
+    def identity(source):
+        frame=source["frame"]
+        return (source["clock_lineage"],source.get("raw_sha256"),
+            *(int(frame[k]) for k in ("timestamp_ns","eye_id","sequence","sensor_x","sensor_y","width","height","stride")))
+    with evaluation.open() as stream:
+        for event,line in enumerate(stream):
+            row=json.loads(line)
+            if row.get("schema")!="buttercup-joint-source-replay-v1" or row["event"]!=event:
+                raise ValueError("invalid source-replay event order/schema")
+            source=row["input"];frame=source["frame"]
+            index=source["index"];clock=source["clock_lineage"]
+            eye=int(frame["eye_id"])-1;time=int(frame["timestamp_ns"])
+            if eye not in (0,1) or index in identities or eye in reads[clock,time]:
+                raise ValueError("duplicate or invalid source exposure in replay coverage")
+            identities[index]=identity(source);reads[clock,time].add(eye)
+            captures.add(source.get("capture_entry"))
+            if clock!=current_clock:
+                if clock in completed_clocks:raise ValueError("unrelated clock lineages interleaved")
+                if current_clock is not None:completed_clocks.add(current_clock)
+                current_clock=clock;previous_arrival=0
+            current_delays=[int(v) for v in row["arrival_delay_ns"]]
+            if delays is None:delays=current_delays
+            if current_delays!=delays:raise ValueError("arrival scenario changed mid-replay")
+            arrival=int(row["logical_arrival_timestamp_ns"])
+            if arrival!=time+delays[eye] or arrival<previous_arrival:
+                raise ValueError("arrival scheduling changed source time or went backwards")
+            previous_arrival=arrival
+            key=(clock,eye)
+            old=latest_observed.get(key)
+            if old is None or time>old[0]:latest_observed[key]=(time,int(frame["sequence"]))
+            geometry=(time,frame["sensor_x"],frame["sensor_y"],frame["width"],frame["height"])
+            prior=previous_geometry.get(key)
+            reframe=bool(prior and 0<time-prior[0]<=500_000_000 and geometry[3:]==prior[3:]
+                and geometry[1:3]!=prior[1:3])
+            if reframe!=row["native_roi_reframe"]:raise ValueError("incorrect native ROI-reframe declaration")
+            previous_geometry[key]=geometry
+            counts["native_roi_reframes"]+=reframe
+            fit=row["joint"];elapsed.append(fit["elapsed_ms"])
+            counts["available_publications"]+=fit.get("available",False)
+            if fit.get("available"):
+                check_shared_target_contract(fit)
+                inputs=row["publication_inputs"]
+                for p in inputs:
+                    if p is not None and (identities.get(p["index"])!=identity(p)
+                            or p["clock_lineage"]!=clock or int(p["frame"]["timestamp_ns"])!=time):
+                        raise ValueError("publication used altered, future, or cross-read evidence")
+                counts["paired_publications"]+=all(inputs)
+                counts["both_eyes_contributing_publications"]+=all(fit["contributing_eyes"])
+                counts["fresh_reframe_fits"]+=reframe and fit["contributing_eyes"][eye]
+            else:
+                counts["unavailable:"+fit["reason"]]+=1
+            duplicate=row["duplicate_suppressed"]
+            if not duplicate and "OutsideSourceWindow" not in fit.get("reason",""):
+                raise ValueError("a retained duplicate re-entered the solver")
+            counts["duplicate_suppression_checks"]+=duplicate
+            now=int(row["source_now_ns"])
+            if now!=max(t for (c,_),(t,_) in latest_observed.items() if c==clock):
+                raise ValueError("latest-state age used arrival time instead of native source time")
+            for slot,latest in enumerate(row["latest"]):
+                if latest is None:continue
+                s=latest["source"]
+                if int(s["clock_domain"])!=1 or int(s["clock_epoch"])!=source_clock_epoch(clock) \
+                        or int(s["roi_id"])!=slot+1 \
+                        or (int(s["timestamp_ns"]),int(s["sequence"]))!=latest_observed.get((clock,slot)) \
+                        or not 0<=now-int(s["timestamp_ns"])<=500_000_000:
+                    raise ValueError("late completion restored invalidated, foreign, future, or expired live geometry")
+                counts["latest_current_source_checks"]+=1
+    unexpected=[i for i in identities if expected is not None and not 0<=i<expected]
+    missing=expected-len(identities)+len(unexpected) if expected is not None else None
+    return {"schema":"buttercup-joint-source-replay-report-v1","evaluation":str(evaluation),
+        "scope":{"unique_input_indices":len(identities),"reads":len(reads),
+            "both_raw_reads":sum(len(eyes)==2 for eyes in reads.values()),"capture_entries":len(captures),
+            "clock_lineages":len(completed_clocks)+(current_clock is not None),
+            "expected_input_indices":expected,"missing_input_count":missing,"unexpected_indices":unexpected,
+            "complete_corpus":expected is not None and missing==0 and not unexpected},
+        "arrival_delay_ns":delays,"counts":counts,"tracker_elapsed_ms":distribution(elapsed),
+        "limitations":["Synthetic arrival delays only; no measured detector latency or SAM video-memory reproduction.",
+            "Repeated same-exposure publications are not new observations; coverage counts unique arriving RAW sources.",
+            "Source freshness, pairing and duplicate checks do not establish limbus localization, sign or gaze accuracy.",
+            "Native ROI reframes are counted, not certified accurate by source-continuity checks."]}
 
 
 def matched_algorithm_report(baseline, candidate, index_ranges):
@@ -152,6 +259,7 @@ def matched_algorithm_report(baseline, candidate, index_ranges):
             "candidate":distribution([b for a,b in p])} for p in normalized_steps],
         "largest_regressions":sorted(regressions,key=lambda r:-r["delta_rms_px"])[:30],
         "limitations":["Optimizer-only comparison: unchanged extraction/withheld coordinates must be verified separately for old exports lacking probe hashes.",
+            "Acquisition scale is candidate-independent but held between MediaPipe updates under an assumed 12mm limbus; normalized steps are conditional on that prior, not fresh physical-scale measurements.",
             "Pixel-area steps are unnormalized, include genuine motion, and do not establish physical area stability.",
             "Short adjacent same-clock intervals only; no bridging absent fits or treating held source exposures as new.",
             "Limbus localization and gaze/pose ground truth remain separate post-fit validations."]}
@@ -163,13 +271,22 @@ def main():
     parser.add_argument("output", type=Path)
     parser.add_argument("--expected-manifest", type=Path)
     parser.add_argument("--baseline-evaluation", type=Path)
+    parser.add_argument("--source-order-replay", action="store_true")
     parser.add_argument("--index-range", type=int, nargs=2, action="append", default=[], metavar=("START", "END"),
         help="optional source-index intervals for the separate optimizer A/B report; END is exclusive")
     args = parser.parse_args()
+    if args.source_order_replay:
+        if args.baseline_evaluation or args.index_range:
+            parser.error("source-order reports do not use stateless row-zipped comparisons")
+        expected=json.loads(args.expected_manifest.read_text())["summary"]["unique_raw_frames"] if args.expected_manifest else None
+        report=summarize_source_replay(args.evaluation,expected)
+        args.output.write_text(json.dumps(report,indent=2)+"\n")
+        return
     methods = ("joint", "monocular_right", "monocular_left")
     summary = {m: {"available": 0, "unavailable": collections.Counter(),
                    "contributing_eyes": collections.Counter(), "costs": [],
                    "modeled_eyes": collections.Counter(), "unlocalized_eye_costs": [], "hypotheses": [],
+                   "association_work": collections.Counter(),
                    "elapsed_ms": [], "alternative_margins": []} for m in methods}
     heldout = [[], []]
     matched_supported = [[], []]
@@ -208,6 +325,7 @@ def main():
                 aggregate["modeled_eyes"][str(result.get("modeled_eyes","legacy-unspecified"))] += 1
                 aggregate["unlocalized_eye_costs"].append(sum(result["unlocalized_eye_cost"]) if "unlocalized_eye_cost" in result else None)
                 aggregate["hypotheses"].append(result.get("hypotheses"))
+                aggregate["association_work"][str(result.get("hypotheses_by_association","legacy-unspecified"))] += 1
                 aggregate["costs"].append(result["cost"])
                 aggregate["alternative_margins"].append(result["alternative_cost_margin"])
             joint = row.get("joint", {})

@@ -32,6 +32,16 @@ def row(index=1):
     return {"inputs":[source,None],"joint":fit}
 
 
+def replay_row(index=1):
+    source=row(index)["inputs"][0]
+    source["frame"].update(eye_id=1,sensor_x=100,sensor_y=200)
+    time=source["frame"]["timestamp_ns"]
+    return {"schema":"buttercup-joint-source-replay-v1","event":index-1,"input":source,
+        "arrival_delay_ns":["0","0"],"logical_arrival_timestamp_ns":str(time),"source_now_ns":str(time),
+        "native_roi_reframe":False,"duplicate_suppressed":True,"latest":[None,None],
+        "joint":{"available":False,"reason":"Conic(NoBoundaryEvidence)","elapsed_ms":0.1}}
+
+
 class MatchingTests(unittest.TestCase):
     def test_unlocalized_roi_exports_no_geometry_but_keeps_its_rejection_cost(self):
         result={"available":True,"modeled_eyes":[True,False],"unlocalized_eye_cost":[0.0,3.0],
@@ -49,9 +59,40 @@ class MatchingTests(unittest.TestCase):
             "target_camera_mm":[0.0,0.0,100.0],"eye_centers_camera_mm":[[-3.0,0.0,96.0],[3.0,0.0,96.0]],
             "eye_gaze_directions":[[0.6,0.0,0.8],[-0.6,0.0,0.8]],"outer_ellipses":[{},{}],
             "contributing_eyes":[True,True]}
+        result.update(hypotheses=16,hypotheses_by_association=[8,4,4])
+        report.check_shared_target_contract(result)
+        result["hypotheses_by_association"]=[16,4,4]
+        with self.assertRaises(ValueError):report.check_shared_target_contract(result)
+        result["hypotheses_by_association"]=[8,4,4]
         report.check_shared_target_contract(result)
         result["eye_gaze_directions"][1]=[0.6,0.0,0.8]
         with self.assertRaises(ValueError):report.check_shared_target_contract(result)
+
+    def test_source_replay_counts_raw_exposures_and_native_reframes_not_redraws(self):
+        a,b=replay_row(1),replay_row(2)
+        b["input"]["frame"]["sensor_x"]+=8;b["native_roi_reframe"]=True
+        result=report.summarize_source_replay(Rows([a,b]),10)
+        self.assertEqual(result["scope"]["unique_input_indices"],2)
+        self.assertEqual(result["scope"]["missing_input_count"],8)
+        self.assertFalse(result["scope"]["complete_corpus"])
+        self.assertEqual(result["counts"]["native_roi_reframes"],1)
+        self.assertEqual(result["counts"]["duplicate_suppression_checks"],2)
+        self.assertEqual(result["counts"]["fresh_reframe_fits"],0)
+
+    def test_source_replay_rejects_stale_geometry_after_new_empty_evidence(self):
+        a,b=replay_row(1),replay_row(2)
+        source=a["input"]
+        b["latest"][0]={"source":{"roi_id":1,"clock_domain":"1",
+            "clock_epoch":str(report.source_clock_epoch(source["clock_lineage"])),
+            "timestamp_ns":str(source["frame"]["timestamp_ns"]),"sequence":"1"},
+            "contributing":True,"target_camera_mm":[0,0,100]}
+        with self.assertRaises(ValueError):report.summarize_source_replay(Rows([a,b]))
+
+    def test_source_replay_rejects_changed_native_time_and_fabricated_reframes(self):
+        for field,value in [("source_now_ns","1"),("logical_arrival_timestamp_ns","2"),
+                            ("native_roi_reframe",True),("duplicate_suppressed",False)]:
+            invalid=replay_row();invalid[field]=value
+            with self.assertRaises(ValueError):report.summarize_source_replay(Rows([invalid]))
 
     def test_scale_uses_determinant_and_never_the_candidate_radius(self):
         a={"width":420,"height":280,"timestamp_ns":10,"sequence":1}
