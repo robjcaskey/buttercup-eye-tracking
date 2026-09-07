@@ -44979,6 +44979,9 @@ fn main() {
         Some("--offline-sam-outline-export") => {
             offline_segmentation_replay::sam_outline_export(env::args().skip(2))
         }
+        Some("--offline-stereo-sam-export") => {
+            offline_segmentation_replay::stereo_sam_export(env::args().skip(2))
+        }
         Some("--offline-sam-pupil-refit") => {
             offline_segmentation_replay::sam_pupil_refit(env::args().skip(2))
         }

@@ -32,6 +32,9 @@ mapfile -t unexpected_files < <(
       ./scripts/audit-tree.sh \
       ./scripts/run-viewer.sh \
       ./scripts/audit-readmission-corpus.py \
+      ./scripts/inventory-stereo-corpus.py \
+      ./scripts/prepare-stereo-replay.py \
+      ./scripts/report-stereo-conics.py \
       ./scripts/validate-recording.py \
       ./scripts/toggle-mouse-output.py \
       ./scripts/test-mouse-output.py \
@@ -52,16 +55,20 @@ mapfile -t unexpected_files < <(
       ./src/gaze_focus/tests.rs \
       ./src/gaze_accuracy.rs \
       ./src/conic_solver.rs \
+      ./src/conic_solver/joint.rs \
+      ./src/conic_solver/joint/tests.rs \
       ./src/conic_solver/fidelity.rs \
       ./src/conic_solver/constraint_tests.rs \
       ./src/outline_conic_segments.rs \
       ./src/outline_conic_segments/recent_exclusion.rs \
+      ./src/outline_conic_segments/sparse_evidence.rs \
       ./src/roi_evidence.rs \
       ./src/roi_evidence/timing.rs \
       ./src/roi_continuity.rs \
       ./src/roi_visibility.rs \
       ./src/eye_scene_model.rs \
       ./src/eye_scene_model/limbus_scale.rs \
+      ./src/eye_scene_model/binocular_pose.rs \
       ./src/eye_scene_model/pupil_center.rs \
       ./src/eye_scene_model/pupil_projection.rs \
       ./src/eye_scene_model/pupil_size.rs \
@@ -72,6 +79,7 @@ mapfile -t unexpected_files < <(
       ./src/bin/buttercup_screen_reflection_raw_decode.rs \
       ./src/bin/buttercup_sam31_arc_trial.rs \
       ./src/bin/buttercup_flat_tire_eval.rs \
+      ./src/bin/buttercup_stereo_conic_eval.rs \
       ./src/bin/buttercup_sam31_prompt_bundle.rs \
       ./src/bin/buttercup_sam31_video_graph.rs \
       ./src/bin/buttercup_sam31_tracker_bundle.rs \
@@ -85,6 +93,7 @@ mapfile -t unexpected_files < <(
       ./src/offline_segmentation_replay/showcase.rs \
       ./src/offline_segmentation_replay/contact_sign.rs \
       ./src/offline_segmentation_replay/sign_acquisition.rs \
+      ./src/offline_segmentation_replay/stereo.rs \
       ./src/pupil_clock_supervision.rs \
       ./src/pivot_region_scheduler.rs \
       ./src/raw10.rs \

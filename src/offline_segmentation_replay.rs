@@ -14,6 +14,8 @@ mod contact_sign;
 pub(super) use contact_sign::run as contact_sign_eval;
 mod sign_acquisition;
 pub(super) use sign_acquisition::run as sign_acquisition_trial;
+mod stereo;
+pub(super) use stereo::export as stereo_sam_export;
 
 #[derive(Default)]
 struct ModelAggregate {

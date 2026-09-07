@@ -1,7 +1,7 @@
 //! Gaze-to-target geometry, separate from binocular timing/vergence coordination.
 //!
 //! Currently owns the existing monocular ray/physical-display and affine
-//! calibration math. The joint mixed-conic target solve is not implemented.
+//! calibration math and a joint mixed-conic target solve.
 //! UI admission, authority/epoch binding, held cursors, and target animation
 //! stay in the viewer. Screen coordinates are fractions, not sensor pixels.
 
@@ -9,6 +9,7 @@ use crate::binocular_coordinator::BinocularFactors;
 use crate::eye_scene_model::RelativeGazeVector;
 use crate::geometry::{add3, cross3, dot3, norm3, normalized3, scale3, solve_3x3, sub3};
 use crate::roi_evidence::RoiConicEvidence;
+use crate::conic_solver::joint::{JointConicRequest, JointConicSolution, JointConicUnavailable, JointScenePrior};
 
 /// Joint target solving is intentionally distinct from the migrated
 /// monocular display mapping below. Do not choose a winning eye before this
@@ -17,30 +18,57 @@ use crate::roi_evidence::RoiConicEvidence;
 pub(crate) struct JointGazeRequest<'a> {
     pub(crate) eyes: [Option<RoiConicEvidence<'a>>; 2],
     pub(crate) binocular: Option<BinocularFactors>,
+    pub(crate) scene: &'a JointScenePrior,
+    pub(crate) maximum_hypotheses: usize,
+    pub(crate) maximum_refinements: usize,
+    pub(crate) exposure_uncertainty_ns: u64,
+    pub(crate) motion_bound_px_per_second: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JointGazeUnavailable {
-    NotImplemented,
+    Conic(JointConicUnavailable),
 }
 
 /// Unlike a display cursor, the joint target may have metric depth. Unknown
 /// metric origin/scale must leave the target absent even when a direction is
 /// observable. Camera-frame axes follow RelativeGazeVector (+Z toward camera).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct JointGazeSolution {
     pub(crate) eye_directions: [Option<RelativeGazeVector>; 2],
     pub(crate) target_camera_frame_mm: Option<[f64; 3]>,
     /// Only a calibrated uncertainty model may populate this covariance.
     pub(crate) target_covariance_mm2: Option<[[f64; 3]; 3]>,
+    pub(crate) conic_solution: JointConicSolution,
 }
 
 pub(crate) fn solve_joint_gaze_target(
-    _request: JointGazeRequest<'_>,
+    request: JointGazeRequest<'_>,
 ) -> Result<JointGazeSolution, JointGazeUnavailable> {
-    // Stub only. In particular, missing/defocused second-eye input must not
-    // silently fall back to an unrelated native pupil or a nominal target.
-    Err(JointGazeUnavailable::NotImplemented)
+    // Coordination only grants a bounded source-time compatibility window.
+    // The shared target is fitted to image evidence INSIDE the conic solve;
+    // these two directions are outputs of that one solve, not its inputs.
+    let maximum_source_skew_ns = request.binocular.map(|b| b.maximum_joint_skew_ns).unwrap_or(0);
+    let conic_solution = crate::conic_solver::solve_joint_conics(JointConicRequest {
+        eyes: request.eyes, scene: request.scene,
+        maximum_hypotheses: request.maximum_hypotheses,
+        maximum_refinements: request.maximum_refinements,
+        maximum_source_skew_ns,
+        exposure_uncertainty_ns: request.exposure_uncertainty_ns,
+        motion_bound_px_per_second: request.motion_bound_px_per_second,
+    }).map_err(JointGazeUnavailable::Conic)?;
+    let eye_directions = std::array::from_fn(|eye| {
+        if !conic_solution.contributing_eyes[eye] { return None; }
+        let normal = conic_solution.eye_gaze_directions[eye]?;
+        RelativeGazeVector::from_projected(normal[0],normal[1])
+    });
+    Ok(JointGazeSolution {
+        eye_directions,
+        target_camera_frame_mm: Some(conic_solution.target_camera_mm),
+        // The present scene supports are defeasible, not calibrated noise.
+        target_covariance_mm2: None,
+        conic_solution,
+    })
 }
 
 // Allow a coarse initial calibration from the central 20% target field.

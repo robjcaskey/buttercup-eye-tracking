@@ -1,6 +1,6 @@
 //! Cross-ROI timing/settling and user-specific vergence factors.
 //!
-//! Interface scaffold only; not called by live publication yet. The existing
+//! Source-time compatibility; unmeasured settling remains unknown. The existing
 //! coupled_eye_kinematics module couples pupil and surrounding tissue within
 //! ONE eye, and must not be presented as binocular coordination.
 //! This module supplies constraints; gaze_target_solver owns the final target.
@@ -23,11 +23,13 @@ pub(crate) struct BinocularFactors {
     pub(crate) vergence_angle_radians: Option<f64>,
     pub(crate) vergence_uncertainty_radians: Option<f64>,
     pub(crate) ipd_mm: Option<f64>,
+    pub(crate) maximum_joint_skew_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CoordinationUnavailable {
-    NotImplemented,
+    NoEyes,
+    IncompatibleClocks,
 }
 
 #[derive(Default)]
@@ -36,10 +38,21 @@ pub(crate) struct BinocularCoordinator;
 impl BinocularCoordinator {
     pub(crate) fn coordinate(
         &mut self,
-        _request: BinocularRequest<'_>,
+        request: BinocularRequest<'_>,
     ) -> Result<BinocularFactors, CoordinationUnavailable> {
-        // No fake "settled" result and no equal-weight average of the eyes.
-        Err(CoordinationUnavailable::NotImplemented)
+        match request.eyes {
+            [None,None] => Err(CoordinationUnavailable::NoEyes),
+            [Some(a),Some(b)] => {
+                let skew = a.exposure.separation_ns(b.exposure)
+                    .ok_or(CoordinationUnavailable::IncompatibleClocks)?;
+                // No motion history is available at this boundary yet. Only
+                // same-stamped reads are granted simultaneous fixation. The
+                // optical row-time allowance remains explicit in the solver.
+                Ok(BinocularFactors { source_skew_ns: Some(skew),
+                    maximum_joint_skew_ns: 0, ..Default::default() })
+            }
+            _ => Ok(BinocularFactors::default()),
+        }
     }
 }
 
@@ -48,17 +61,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scaffold_never_manufactures_binocular_factors() {
+    fn missing_evidence_never_manufactures_settling_or_ipd() {
         assert_eq!(
             BinocularCoordinator.coordinate(BinocularRequest { eyes: [None, None] }),
-            Err(CoordinationUnavailable::NotImplemented),
+            Err(CoordinationUnavailable::NoEyes),
         );
         assert_eq!(BinocularFactors::default().settled, [None, None]);
         assert_eq!(BinocularFactors::default().ipd_mm, None);
     }
 
     #[test]
-    fn joint_solver_scaffolds_abstain_with_a_missing_or_soft_second_eye() {
+    fn clock_policy_keeps_weak_or_missing_eyes_optional_without_inventing_gaze() {
         use crate::roi_evidence::{ExposureKey, RoiId, SourceClock};
         let eye = RoiConicEvidence {
             exposure: ExposureKey {
@@ -89,27 +102,10 @@ mod tests {
             [None, Some(soft_second_eye)],
             [Some(eye), Some(soft_second_eye)],
         ] {
-            assert!(matches!(
-                BinocularCoordinator.coordinate(BinocularRequest { eyes }),
-                Err(CoordinationUnavailable::NotImplemented),
-            ));
-            assert!(matches!(
-                crate::gaze_target_solver::solve_joint_gaze_target(
-                    crate::gaze_target_solver::JointGazeRequest {
-                        eyes,
-                        binocular: None
-                    }
-                ),
-                Err(crate::gaze_target_solver::JointGazeUnavailable::NotImplemented),
-            ));
-            assert!(matches!(
-                crate::conic_solver::solve_joint_conics(crate::conic_solver::JointConicRequest {
-                    eyes,
-                    maximum_hypotheses: 16,
-                    maximum_refinements: 4,
-                }),
-                Err(crate::conic_solver::JointConicUnavailable::NotImplemented),
-            ));
+            let factors = BinocularCoordinator.coordinate(BinocularRequest { eyes }).unwrap();
+            assert_eq!(factors.maximum_joint_skew_ns,0);
+            assert_eq!(factors.settled,[None,None]);
+            assert_eq!(factors.vergence_angle_radians,None);
         }
     }
 }

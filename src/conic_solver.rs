@@ -1,53 +1,18 @@
 //! Sparse conic fitting and geometric support/culling.
 //!
 //! This is the existing deterministic single-ellipse fitter, extracted intact.
-//! Mixed-boundary/multi-ROI posterior solving is not implemented here yet.
+//! The joint layer fits one shared fixation to boundary samples across ROIs.
 //! Conditioning scores and scale intervals are heuristics, not calibrated probabilities.
 
 use crate::geometry::{ellipse_axis_point, ellipse_coordinate, Ellipse};
-use crate::roi_evidence::{BoundaryKind, ExposureKey, RoiConicEvidence};
 use std::cmp::Ordering as CmpOrdering;
 use std::f64::consts::PI;
 
 pub(crate) mod fidelity;
+pub(crate) mod joint;
+pub(crate) use joint::{solve_joint_conics, JointConicRequest, JointConicUnavailable};
 #[cfg(test)]
 mod constraint_tests;
-
-/// Future joint constraint solve. Budgets must bound hypothesis expansion
-/// and refinement, not just how many candidates happen to be returned.
-/// The completed contract must condition nested limbus/pupil arcs on an
-/// uncertain eye-scene state AND return source-keyed residual factors that
-/// refine that state (including its effective pivot). This is a bounded joint
-/// optimization, not a one-way fixed-pivot gate or repeated independent votes
-/// for the same pixels. Pupil center/axis and rotation pivot are distinct.
-/// The legacy single-ellipse path below is unchanged and does not consume
-/// these settings.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct JointConicRequest<'a> {
-    pub(crate) eyes: [Option<RoiConicEvidence<'a>>; 2],
-    pub(crate) maximum_hypotheses: usize,
-    pub(crate) maximum_refinements: usize,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct SupportedConicSolution {
-    pub(crate) exposure: ExposureKey,
-    pub(crate) kind: BoundaryKind,
-    pub(crate) ellipse_roi_px: Ellipse,
-    pub(crate) supporting_arc_indices: Vec<usize>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum JointConicUnavailable {
-    NotImplemented,
-}
-
-pub(crate) fn solve_joint_conics(
-    _request: JointConicRequest<'_>,
-) -> Result<Vec<SupportedConicSolution>, JointConicUnavailable> {
-    // Do not disguise independent ellipse fits as a joint posterior.
-    Err(JointConicUnavailable::NotImplemented)
-}
 
 /// Conservative camera-and-anatomy envelope for treating an image conic as
 /// the projection of the physical limbus.

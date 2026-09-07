@@ -14,6 +14,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 pub(crate) mod limbus_scale;
+pub(crate) mod binocular_pose;
 pub(crate) mod pupil_center;
 pub(crate) mod pupil_projection;
 pub(crate) mod pupil_size;

@@ -654,6 +654,17 @@ pub fn export_native_outline_sequence(
     Err("SAM31 support is not compiled in; rebuild with --features sam31".to_string())
 }
 
+/// Bounded-memory corpus traversal. The caller retains its source-clock tag;
+/// the detector never substitutes host completion time or a prior prediction.
+pub(crate) fn visit_native_outline_frames<T,I,F>(model:&Path,frames:I,visitor:F) -> Result<usize,String>
+where I:Iterator<Item=Result<(T,Arc<RawFrame>),String>>,
+      F:FnMut(T,&Arc<RawFrame>,serde_json::Value)->Result<(),String> {
+    #[cfg(feature="sam31")]
+    { runtime::visit_native_outline_frames(model,frames,true,visitor) }
+    #[cfg(not(feature="sam31"))]
+    { let _=(model,frames,visitor); Err("SAM31 support is not compiled in; rebuild with --features sam31".into()) }
+}
+
 /// Run an arbitrary-size prompt bundle synchronously for an offline trial.
 /// The live viewer deliberately retains its bounded asynchronous API; only the
 /// temporary corpus experiment uses this entry point.
@@ -5179,11 +5190,22 @@ mod runtime {
         model_path: &Path,
         frames: &[Arc<RawFrame>],
     ) -> Result<serde_json::Value, String> {
-        if frames.is_empty() || frames.iter().any(|f| f.width == 0 || f.height == 0
-            || f.width.checked_mul(f.height) != Some(f.pixels.len())
-            || f.width * FRAME_HEIGHT != f.height * FRAME_WIDTH) {
-            return Err("outline export needs nonempty, same-aspect native RAW frames".into());
-        }
+        if frames.is_empty() {return Err("outline export needs nonempty native RAW frames".into());}
+        let mut cases=Vec::new();
+        visit_native_outline_frames(model_path,frames.iter().cloned().map(|f|Ok(((),f))),false,
+            |(),_,case| {cases.push(case);Ok(())})?;
+        Ok(serde_json::json!({
+            "schema": "buttercup-native-sam-outlines-v1", "model": model_path,
+            "configuration": live_configuration(),
+            "contract": "Current-frame detector masks before contour rejection, using live native-ROI preprocessing and canonical outer prompt. No video-memory propagation, prediction seeds, human labels, or live state changes. Baseline is the production stateless mask fitter, not end-to-end live acceptance. Coordinates are native ROI pixels.",
+            "cases": cases,
+        }))
+    }
+
+    pub(super) fn visit_native_outline_frames<T,I,F>(model_path:&Path,frames:I,include_pupil:bool,mut visitor:F)
+        -> Result<usize,String>
+    where I:Iterator<Item=Result<(T,Arc<RawFrame>),String>>,
+          F:FnMut(T,&Arc<RawFrame>,serde_json::Value)->Result<(),String> {
         load_cuda_dispatch_library()?;
         configure_cuda_bfloat16_autocast();
         let _no_grad = tch::no_grad_guard();
@@ -5205,15 +5227,21 @@ mod runtime {
                 "center": e.center, "major_radius": e.major_radius,
                 "minor_radius": e.minor_radius, "angle": e.angle,
             });
-            let mut cases = Vec::new();
-            for (index, frame) in frames.iter().enumerate() {
+            let mut count_frames=0;
+            for tagged in frames {
+                let (tag,frame)=tagged?;
+                if frame.width==0 || frame.height==0 || frame.width.checked_mul(frame.height)!=Some(frame.pixels.len())
+                    || frame.width*FRAME_HEIGHT!=frame.height*FRAME_WIDTH {
+                    return Err("outline export needs valid same-aspect native RAW frames".into());
+                }
                 let started = Instant::now();
-                write_preprocessed_filmstrip(std::slice::from_ref(frame), regime,
+                write_preprocessed_filmstrip(std::slice::from_ref(&frame), regime,
                     staging_bytes_len(&staging, FRAME_WIDTH * FRAME_HEIGHT * 3))?;
                 let output = infer(&module, &staging, device, &prompts, OUTER_IRIS_PROMPT)?;
-                let luma = raw_luma(std::slice::from_ref(frame)).into_iter().next()
+                let luma = raw_luma(std::slice::from_ref(&frame)).into_iter().next()
                     .ok_or("outline export could not decode RAW luma")?;
                 let mut candidates = Vec::new();
+                let mut selected=None;
                 for query in ranked_finite_query_indices(&output.scores).into_iter().take(12) {
                     let count = output.mask_width * output.mask_height;
                     let mask = &output.masks[query*count..(query+1)*count];
@@ -5224,30 +5252,37 @@ mod runtime {
                     let old = diagnostic_fit_single_frame_mask(mask, output.mask_width, output.mask_height)
                         .map(|r| model_review_in_source(r, frame.width));
                     let support = old.as_ref().map(|r| raw_ring_support(&luma, r.ellipse));
+                    if selected.is_none() && support.is_some_and(live_detector_raw_gate_passes) {
+                        selected=old.as_ref().map(|r|(query,r.ellipse));
+                    }
                     candidates.push(serde_json::json!({
                         "query": query, "semantic_score": output.scores[query],
                         "mask_area_fraction": area_fraction, "outline": outline,
                         "baseline_ellipse": old.as_ref().map(|r| ellipse_json(r.ellipse)),
                         "baseline_retained": old.as_ref().map(|r| r.retained_points.as_ref()),
+                        "baseline_retained_segments": old.as_ref().map(|r| r.conic_segments.as_ref()),
                         "baseline_censored": old.as_ref().map(|r| r.flat_tire_points.as_ref()),
                         "baseline_raw_admitted": support.is_some_and(live_detector_raw_gate_passes),
                         "baseline_raw_score": support.map(|s| s.score),
                     }));
                 }
-                cases.push(serde_json::json!({
+                let pupil=if include_pupil {selected.and_then(|(_,ellipse)|fit_inner_pupil_void(&luma,ellipse,None))} else {None};
+                let case=serde_json::json!({
                     "sequence": frame.sequence, "timestamp_ns": frame.timestamp_ns,
                     "sensor_origin": [frame.sensor_x, frame.sensor_y],
                     "width": frame.width, "height": frame.height, "candidates": candidates,
+                    "selected_query":selected.map(|(query,_)|query),
+                    "pupil_void":pupil.map(|(ellipse,support)|serde_json::json!({
+                        "ellipse":ellipse_json(ellipse),"raw_support_score":support.score,
+                        "raw_support_points":support.points,"raw_positive_fraction":support.positive_fraction,
+                        "raw_strong_sectors":support.strong_sectors})),
                     "elapsed_ms": started.elapsed().as_millis() as u64,
-                }));
-                eprintln!("SAM outline export {}/{} sequence={}", index+1, frames.len(), frame.sequence);
+                });
+                visitor(tag,&frame,case)?;
+                count_frames+=1;
+                if count_frames%100==0 {eprintln!("SAM outline stream frames={count_frames} sequence={}",frame.sequence);}
             }
-            Ok(serde_json::json!({
-                "schema": "buttercup-native-sam-outlines-v1", "model": model_path,
-                "configuration": live_configuration(),
-                "contract": "Current-frame detector masks before contour rejection, using live native-ROI preprocessing and canonical outer prompt. No video-memory propagation, prediction seeds, human labels, or live state changes. Baseline is the production stateless mask fitter, not end-to-end live acceptance. Coordinates are native ROI pixels.",
-                "cases": cases,
-            }))
+            Ok(count_frames)
         })
     }
 

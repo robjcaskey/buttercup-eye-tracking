@@ -15,6 +15,7 @@ use std::sync::Arc;
 /// Offline-only temporal exclusion experiment; the stateless live fitter below
 /// deliberately does not call this module.
 pub(crate) mod recent_exclusion;
+pub(crate) mod sparse_evidence;
 
 /// Geometric evidence extracted from an ordered semantic-mask contour.
 /// Points and ellipse share the caller's pixel frame (model space during
