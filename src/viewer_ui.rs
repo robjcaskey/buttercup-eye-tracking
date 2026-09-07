@@ -267,6 +267,8 @@ pub(super) enum Action {
     NextView,
     Search,
     FocusReference,
+    SaveMonitor,
+    AccuracyCheck,
 }
 pub(super) fn apply(app: &mut App, action: Action) {
     app.ui.rois[app.ui.selected] = RoiView {
@@ -274,6 +276,12 @@ pub(super) fn apply(app: &mut App, action: Action) {
         overlay: app.roi_overlay_mode,
     };
     match action {
+        Action::SaveMonitor => {
+            if let Ok(mut s)=app.shared.lock() {
+                if let Err(e)=s.monitor_location.save(){s.monitor_location.status=format!("MONITOR SAVE FAILED: {e}");}
+            }
+        }
+        Action::AccuracyCheck => app.toggle_accuracy_check(),
         Action::Scope(scope) => app.ui.scope = scope,
         Action::Select(i) => {
             app.ui.selected = i.min(1);
@@ -625,6 +633,10 @@ fn split_pair(r: Rect) -> [Rect; 2] {
 
 #[derive(Clone)]
 struct Snapshot {
+    monitor_status:String,
+    mouse_output_status: String,
+    gaze_focus_status: String,
+    monitor_unsaved:bool,
     method: SegmentationMode,
     second: bool,
     object_running: bool,
@@ -664,6 +676,10 @@ pub(super) fn render(
             (&s.sam31_prompt_text, &s.sam31_prompt_status)
         };
         Snapshot {
+            monitor_status:s.monitor_location.status.clone(),
+            mouse_output_status: s.mouse_output.label(),
+            gaze_focus_status: s.gaze_focus.label(),
+            monitor_unsaved:s.monitor_location.unsaved_candidate(),
             method: s.segmentation_mode,
             second: s.second_roi_enabled,
             object_running: s.sam31_object_inspection,
@@ -701,6 +717,9 @@ pub(super) fn render(
             "iris_prompt_generation":s.sam31_prompt_bundle_generation,"object_prompt_generation":s.sam31_scene_prompt_generation,
             "object_prompt_status":s.sam31_scene_prompt_status,"recovery_status":s.reacquire_status,
             "roi_views":app.ui.rois.map(|r|r.overlay.label()),"roi_pixels":app.ui.rois.map(|r|annotated_view_mode_name(r.pixels)),
+            "monitor":s.monitor_location.snapshot(),
+            "mouse_output":s.mouse_output.snapshot(),
+            "gaze_focus":s.gaze_focus.snapshot(),
         });
     }
 }
@@ -755,6 +774,10 @@ fn render_snapshot(
     snapshot: &Snapshot,
 ) {
     let Snapshot {
+        monitor_status,
+        mouse_output_status,
+        gaze_focus_status,
+        monitor_unsaved,
         method,
         second,
         object_running,
@@ -1076,6 +1099,18 @@ fn render_snapshot(
         text_area.h = text_area.h.saturating_sub(32);
     }
     let mut rows = vec![];
+    if ui.panel==Panel::Selection && !ui.object_view() {
+        for (label,action,active) in [
+            ("SAVE MONITOR LOCATION",Action::SaveMonitor,monitor_unsaved),
+            ("\\ ACCURACY CHECK - 20 TARGETS",Action::AccuracyCheck,false),
+        ] {
+            button(&mut c,ui,Rect {h:28.min(text_area.h),..text_area},label,active,action);
+            text_area.y+=32.min(text_area.h);text_area.h=text_area.h.saturating_sub(32);
+        }
+        rows.push(monitor_status);
+        rows.push(mouse_output_status);
+        rows.push(gaze_focus_status);
+    }
     if object_running {
         rows.push("OBJECT SEARCH ACTIVE / SPACE STOP".into());
         rows.push("FINE EYE ANALYSIS PAUSED".into());
@@ -1354,6 +1389,8 @@ mod tests {
         left.sensor_x += 1200;
         Snapshot {
             method: SegmentationMode::Sam31,
+            mouse_output_status: "MOUSE OFF / Super+Shift+M".into(),
+            gaze_focus_status: "GAZE FOCUS OFF / Super+Shift+F".into(),
             second: true,
             object_running: false,
             prompt: "iris".into(),
@@ -1379,6 +1416,8 @@ mod tests {
             camera_telemetry: None,
             checkerboard: checkerboard_calibration::StatusSnapshot::default(),
             analysis_detail: "SYNTHETIC FIXTURE".into(),
+            monitor_status:"MONITOR POSE SESSION ONLY".into(),
+            monitor_unsaved:true,
         }
     }
     #[test]

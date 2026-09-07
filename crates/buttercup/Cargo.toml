@@ -1,0 +1,10 @@
+[package]
+name = "buttercup"
+version = "0.1.0"
+edition = "2021"
+description = "Portable Buttercup RAW10 decoding shared by native and browser viewers"
+
+[lib]
+path = "../../src/portable.rs"
+
+[workspace]

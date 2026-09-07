@@ -5,6 +5,11 @@ mod binocular_coordinator;
 mod checkerboard_calibration;
 mod conic_solver;
 mod display_pose_wireframe;
+mod monitor_location;
+mod mouse_output;
+mod desktop_gaze;
+mod gaze_focus;
+mod gaze_accuracy;
 mod eye_scene_model;
 mod gaze_target_solver;
 mod geometry;
@@ -15,7 +20,10 @@ mod outline_conic_segments;
 mod pivot_region_scheduler;
 mod pupil_clock_supervision;
 mod raw10;
+mod raw_preview;
+use raw_preview::{percentile_range, quad_luma_preview, raw10_luma_preview, raw10_color_preview, color_preview, DisplayColorBalance};
 mod raw_eye_model_protocol;
+mod recording_trace;
 mod raw_iris_focus;
 mod raw_motion_octrees;
 mod raw_sclera_red_canny;
@@ -70,11 +78,11 @@ use eye_scene_model::{
 };
 #[cfg(test)]
 use eye_scene_model::{
-    GAZE_SURFACE_AREA_BUCKET_RATIO, GAZE_SURFACE_RESET_AFTER, GAZE_SURFACE_SCALE_SWITCH_FRAMES,
-    GAZE_SURFACE_SIGN_SWITCH_FRAMES, GazeKinematicFrame, ProjectedVisionPose,
-    ROTATION_POSE_FIRM_START_FRAMES, RingPoseObservation, bucket_surface_area,
+    FRONTAL_DISK_AREA_BIN_RATIO, GAZE_SURFACE_RESET_AFTER, FRONTAL_DISK_SCALE_RELOCK_UPDATES,
+    CONTACT_SIGN_CONFIRMATION_UPDATES, GazeKinematicFrame, ProjectedVisionPose,
+    ROTATION_POSE_FIRM_START_FRAMES, RingPoseObservation, quantize_frontal_disk_area,
     centimeter_scale_half_width, infer_projected_rotation_center, kinematic_gaze_sign_correction,
-    projected_pose_temporal_penalty, rectified_ellipse_area_px2,
+    projected_pose_temporal_penalty, frontal_equivalent_iris_disk_area_px2,
 };
 use gaze_target_solver::{
     GazeAffine, NOMINAL_DISPLAY_ASPECT_HEIGHT, NOMINAL_DISPLAY_ASPECT_WIDTH,
@@ -97,6 +105,7 @@ use geometry::{add3, dot3, norm3, normalized3, scale3};
 
 use raw10::unpack_raw10;
 use raw_eye_model_protocol::{
+    CameraThumbnailFrame, ModelStreamFrame, ThumbnailKind,
     RawModelFrame, FLAG_ANATOMY_VALID, FLAG_EYE_BASIN_VALID, FLAG_FOCUS_SETTLED,
     FLAG_IDENTITY_PRESENT, FLAG_MOTION_COMPARABLE, FLAG_VERIFIED_RAW10_1X1,
 };
@@ -4742,6 +4751,8 @@ struct EyeFrame {
     eye_id: u32,
     sequence: u64,
     timestamp_ns: u64,
+    recording_clock: serde_json::Value,
+    recording_ready: serde_json::Value,
     segmentation_mode: SegmentationMode,
     /// Monotonic receiver-owned lineage for every input which can alter the
     /// physical gaze surface. It also advances across camera reconnects, so a
@@ -4935,10 +4946,10 @@ fn json_surface_gaze(sample: Option<SurfaceGazeSample>) -> serde_json::Value {
         .map(|sample| {
             serde_json::json!({
                 "source_timestamp_ns": sample.source_timestamp_ns,
-                "rectified_area_px2": json_finite_number(sample.rectified_area_px2),
+                "rectified_area_px2": json_finite_number(sample.frontal_equivalent_disk_area_px2),
                 "area_bucket": sample.area_bucket,
-                "bucketed_face_radius_px": json_finite_number(sample.bucketed_face_radius_px),
-                "camera_near_point_sensor": json_point(sample.camera_near_point_sensor),
+                "bucketed_face_radius_px": json_finite_number(sample.quantized_frontal_disk_radius_px),
+                "camera_near_point_sensor": json_point(sample.near_surface_point_sensor_px),
                 // `feature` remains as the calibration-compatible 2D
                 // projection. New consumers should use the explicit 3D
                 // camera-relative unit vector.
@@ -5010,8 +5021,8 @@ fn roi_prediction_record(frame: &EyeFrame) -> serde_json::Value {
                 "stable_frames": layer.stable_frames,
                 "similarity": {
                     "translation": json_point((f64::from(motion.translation[0]), f64::from(motion.translation[1]))),
-                    "rotation_rad": json_finite_number(f64::from(motion.rotation)),
-                    "scale_delta": json_finite_number(f64::from(motion.scale_delta)),
+                    "rotation_rad": json_finite_number(f64::from(motion.rotation_coefficient)),
+                    "scale_delta": json_finite_number(f64::from(motion.diagonal_coefficient_delta)),
                     "residual_px": json_finite_number(f64::from(motion.residual)),
                     "support": motion.support,
                 },
@@ -5132,6 +5143,8 @@ fn roi_prediction_record(frame: &EyeFrame) -> serde_json::Value {
 
     serde_json::json!({
         "schema": "buttercup-roi-prediction-frame-v1",
+        "source_clock": frame.recording_clock,
+        "prediction_ready": frame.recording_ready,
         "roi_frame_key": {
             "roi_id": frame.eye_id,
             "sequence": frame.sequence,
@@ -5427,6 +5440,9 @@ fn eye_presence_stack_text_rows(
 
 #[derive(Default)]
 struct SharedState {
+    recording_trace: recording_trace::Hub,
+    mouse_output: mouse_output::Controller,
+    gaze_focus: gaze_focus::Controller,
     ui_action: Option<viewer_ui::Action>,
     ui_prompt_request: Option<String>,
     ui_snapshot: serde_json::Value,
@@ -5520,6 +5536,7 @@ struct SharedState {
     /// clients so an off-screen nominal ray cannot masquerade as a calibrated
     /// cursor stuck at the display edge.
     display_cursor_status: DisplayCursorStatus,
+    monitor_location: monitor_location::MonitorLocation,
     /// Presentation-only SAM question selected by the F-key overlay. The
     /// receiver passes at most one extra semantic prompt through each accepted
     /// batch, so inspecting masks cannot create a six-query hidden backlog.
@@ -6660,8 +6677,8 @@ fn control_status_json(state: &SharedState) -> String {
                     motion.support,
                     motion.translation[0],
                     motion.translation[1],
-                    motion.rotation,
-                    motion.scale_delta,
+                    motion.rotation_coefficient,
+                    motion.diagonal_coefficient_delta,
                     motion.residual,
                     layer.centroid[0],
                     layer.centroid[1],
@@ -7030,13 +7047,13 @@ fn control_status_json(state: &SharedState) -> String {
             coupled.reference_generation,
             derivatives_json(coupled.cyan),
             derivatives_json(coupled.green),
-            derivatives_json(coupled.green_relative_to_cyan),
+            derivatives_json(coupled.pupil_relative_to_general),
             center_json(coupled.relative_motion_fixed_point),
             center_json(coupled.green_rotation_center),
             projected_globe_json(coupled.projected_globe),
             center_json(coupled.cyan_rotation_center),
-            coupled.saccade_likelihood,
-            coupled.micro_motion_likelihood,
+            coupled.saccade_score,
+            coupled.micro_motion_score,
         );
         format!(
             "{{\"sequence\":{},\"timestamp_ns\":{},\"sensor_x\":{},\"sensor_y\":{},\"width\":{},\"height\":{},\"focus_score\":{:.6},\"focus_points\":{},\"focus_center\":{},\"eye_basin_valid\":{},\"anatomy_valid\":{},\"virtual_contact\":{},\"motion_octrees\":{{\"generation\":{},\"active_objects\":{},\"feature_trails\":{},\"nodes\":{},\"objects\":[{}],\"subpixel\":{},\"nautilus_fingerprint_tree\":{},\"horizontal_light_field\":{},\"radial_limbus\":{},\"lid_occlusions\":{},\"relation_graph\":{},\"coupled_motion\":{},\"focus_sfm\":{}}}}}",
@@ -7482,6 +7499,33 @@ fn handle_control_command(command: &str, shared: &Arc<Mutex<SharedState>>) -> St
     match fields {
         [ping] if ping.eq_ignore_ascii_case("PING") => "{\"ok\":true,\"reply\":\"PONG\"}".to_string(),
         [status] if status.eq_ignore_ascii_case("STATUS") => control_status_json(&state),
+        [mouse, output, action]
+            if mouse.eq_ignore_ascii_case("MOUSE") && output.eq_ignore_ascii_case("OUTPUT") =>
+        {
+            // Desktop mouse OFF must work independently of camera leases and
+            // whether the window is focused, hidden or collecting targets.
+            let reply = state.mouse_output.command(action);
+            if !action.eq_ignore_ascii_case("STATUS") && reply["ok"] == true
+                && reply["mouse_output"]["enabled"] == true { state.gaze_focus.disable(); }
+            reply.to_string()
+        }
+        [gaze, focus, action]
+            if gaze.eq_ignore_ascii_case("GAZE") && focus.eq_ignore_ascii_case("FOCUS") =>
+        {
+            let reply = state.gaze_focus.command(action);
+            if !action.eq_ignore_ascii_case("STATUS") && reply["ok"] == true
+                && reply["gaze_focus"]["enabled"] == true { state.mouse_output.command("OFF"); }
+            reply.to_string()
+        }
+        [monitor, status] if monitor.eq_ignore_ascii_case("MONITOR") && status.eq_ignore_ascii_case("STATUS") => {
+            serde_json::json!({"ok":true,"monitor":state.monitor_location.snapshot()}).to_string()
+        }
+        [monitor, save] if monitor.eq_ignore_ascii_case("MONITOR") && save.eq_ignore_ascii_case("SAVE") => {
+            match state.monitor_location.save() {
+                Ok(())=>serde_json::json!({"ok":true,"monitor":state.monitor_location.snapshot()}).to_string(),
+                Err(e)=>control_error(e),
+            }
+        }
         [view, status] if view.eq_ignore_ascii_case("VIEW") && status.eq_ignore_ascii_case("STATUS") => {
             serde_json::json!({"ok":true,"ui":state.ui_snapshot}).to_string()
         }
@@ -7499,10 +7543,11 @@ fn handle_control_command(command: &str, shared: &Arc<Mutex<SharedState>>) -> St
                 "LEFT"=>Some(viewer_ui::Action::Select(1)),
                 "RIGHT"=>Some(viewer_ui::Action::Select(0)),
                 "SEARCH"=>Some(viewer_ui::Action::Search),
+                "ACCURACY"=>Some(viewer_ui::Action::AccuracyCheck),
                 _=>None,
             };
             if let Some(action)=action { state.ui_action=Some(action); "{\"ok\":true,\"queued\":\"view\"}".into() }
-            else {"{\"ok\":false,\"error\":\"VIEW STATUS|ROI|LINKED|GLOBAL|NEXT|LEFT|RIGHT|SEARCH|PROMPT text\"}".into()}
+            else {"{\"ok\":false,\"error\":\"VIEW STATUS|ROI|LINKED|GLOBAL|NEXT|LEFT|RIGHT|SEARCH|ACCURACY|PROMPT text\"}".into()}
         }
         [checkerboard, status]
             if (checkerboard.eq_ignore_ascii_case("CHECKERBOARD")
@@ -8493,10 +8538,10 @@ fn dominant_specular_motion(
                 && motion.translation[0].is_finite()
                 && motion.translation[1].is_finite()
                 && motion.translation[0].hypot(motion.translation[1]) <= 32.0
-                && motion.rotation.is_finite()
-                && motion.rotation.abs() <= 0.35
-                && motion.scale_delta.is_finite()
-                && motion.scale_delta.abs() <= 0.35
+                && motion.rotation_coefficient.is_finite()
+                && motion.rotation_coefficient.abs() <= 0.35
+                && motion.diagonal_coefficient_delta.is_finite()
+                && motion.diagonal_coefficient_delta.abs() <= 0.35
         })
         .max_by(|left, right| {
             let quality = |motion: &raw_motion_octrees::SimilarityMotion| {
@@ -8506,8 +8551,8 @@ fn dominant_specular_motion(
         })
         .map(|motion| specular_map::SimilarityMotion {
             translation: motion.translation,
-            rotation: motion.rotation,
-            scale_delta: motion.scale_delta,
+            rotation_coefficient: motion.rotation_coefficient,
+            diagonal_coefficient_delta: motion.diagonal_coefficient_delta,
         })
 }
 
@@ -8582,10 +8627,10 @@ impl TemporalFeatureLimbusCenterGate {
                 && motion.translation[0].is_finite()
                 && motion.translation[1].is_finite()
                 && motion.translation[0].hypot(motion.translation[1]) <= 48.0
-                && motion.rotation.is_finite()
-                && motion.rotation.abs() <= 0.20
-                && motion.scale_delta.is_finite()
-                && motion.scale_delta.abs() <= 0.15
+                && motion.rotation_coefficient.is_finite()
+                && motion.rotation_coefficient.abs() <= 0.20
+                && motion.diagonal_coefficient_delta.is_finite()
+                && motion.diagonal_coefficient_delta.abs() <= 0.15
         });
         let prediction_base = self.carried_prediction.or(self.last_admitted);
         let predicted = prediction_base
@@ -8612,15 +8657,15 @@ impl TemporalFeatureLimbusCenterGate {
                     center_sensor: (
                         previous.center_sensor.0
                             + f64::from(motion.translation[0])
-                            + f64::from(motion.scale_delta) * x
-                            - f64::from(motion.rotation) * y,
+                            + f64::from(motion.diagonal_coefficient_delta) * x
+                            - f64::from(motion.rotation_coefficient) * y,
                         previous.center_sensor.1
                             + f64::from(motion.translation[1])
-                            + f64::from(motion.rotation) * x
-                            + f64::from(motion.scale_delta) * y,
+                            + f64::from(motion.rotation_coefficient) * x
+                            + f64::from(motion.diagonal_coefficient_delta) * y,
                     ),
                     frontal_parallel_radius_px: previous.frontal_parallel_radius_px
-                        * (1.0 + f64::from(motion.scale_delta)).clamp(0.85, 1.15),
+                        * (1.0 + f64::from(motion.diagonal_coefficient_delta)).clamp(0.85, 1.15),
                 }
             });
         if let Some(predicted) = predicted {
@@ -8692,12 +8737,12 @@ fn shared_global_limbus_scale_prediction(
         || motion.support < 9
         || !motion.residual.is_finite()
         || motion.residual > 2.0
-        || !motion.scale_delta.is_finite()
-        || !(0.002..=0.04).contains(&motion.scale_delta.abs())
+        || !motion.diagonal_coefficient_delta.is_finite()
+        || !(0.002..=0.04).contains(&motion.diagonal_coefficient_delta.abs())
     {
         return None;
     }
-    let scale_ratio = 1.0 + f64::from(motion.scale_delta);
+    let scale_ratio = 1.0 + f64::from(motion.diagonal_coefficient_delta);
     let support_precision = 1.0 / (motion.support as f64).sqrt().max(1.0);
     let uncertainty =
         (0.012 + f64::from(motion.residual.max(0.0)) / 180.0 + 0.025 * support_precision)
@@ -8723,8 +8768,8 @@ fn fine_visual_odometry_limbus_scale_prediction(
         && iris_layer.coherence >= 0.45
         && iris_motion.residual.is_finite()
         && iris_motion.residual <= 2.0
-        && iris_motion.scale_delta.is_finite()
-        && (0.002..=0.04).contains(&iris_motion.scale_delta.abs());
+        && iris_motion.diagonal_coefficient_delta.is_finite()
+        && (0.002..=0.04).contains(&iris_motion.diagonal_coefficient_delta.abs());
     // A rigid move toward/away from the camera must also be visible outside
     // the proposed iris. Requiring the general full-ROI layer keeps a
     // cohesive glasses-rim or limbus reflection from granting itself scale
@@ -8737,13 +8782,13 @@ fn fine_visual_odometry_limbus_scale_prediction(
         && broad_layer.coherence >= 0.55
         && broad_motion.residual.is_finite()
         && broad_motion.residual <= 2.0
-        && broad_motion.scale_delta.is_finite()
-        && (0.002..=0.04).contains(&broad_motion.scale_delta.abs());
+        && broad_motion.diagonal_coefficient_delta.is_finite()
+        && (0.002..=0.04).contains(&broad_motion.diagonal_coefficient_delta.abs());
     if !iris_valid || !broad_valid {
         return None;
     }
-    let iris_delta = f64::from(iris_motion.scale_delta);
-    let broad_delta = f64::from(broad_motion.scale_delta);
+    let iris_delta = f64::from(iris_motion.diagonal_coefficient_delta);
+    let broad_delta = f64::from(broad_motion.diagonal_coefficient_delta);
     let disagreement = (iris_delta - broad_delta).abs();
     let maximum_delta = iris_delta.abs().max(broad_delta.abs());
     if iris_delta * broad_delta <= 0.0 || disagreement > 0.006 + 0.35 * maximum_delta {
@@ -8772,6 +8817,9 @@ enum DisplayCursorMapping {
     UncalibratedNominal,
     Calibrated,
     InvalidatedNominalFallback,
+    SavedMonitorPreset,
+    InvalidatedSavedMonitorFallback,
+    SessionMonitorPreset,
 }
 
 impl DisplayCursorMapping {
@@ -8780,6 +8828,9 @@ impl DisplayCursorMapping {
             Self::UncalibratedNominal => "uncalibrated-nominal",
             Self::Calibrated => "calibrated-affine-3d-gate",
             Self::InvalidatedNominalFallback => "invalidated-nominal-fallback",
+            Self::SavedMonitorPreset => "saved-monitor-pose-uncalibrated-gaze",
+            Self::InvalidatedSavedMonitorFallback => "invalidated-gaze-saved-monitor-fallback",
+            Self::SessionMonitorPreset => "session-monitor-pose-uncalibrated-gaze",
         }
     }
 
@@ -8788,6 +8839,9 @@ impl DisplayCursorMapping {
             Self::UncalibratedNominal => "DEV MONITOR PRESET - UNCALIBRATED",
             Self::Calibrated => "CALIBRATED AFFINE+3D",
             Self::InvalidatedNominalFallback => "CAL INVALID - DEV PRESET",
+            Self::SavedMonitorPreset => "SAVED MONITOR POSE - GAZE UNCALIBRATED",
+            Self::InvalidatedSavedMonitorFallback => "GAZE CAL INVALID - SAVED MONITOR POSE",
+            Self::SessionMonitorPreset => "SESSION MONITOR POSE - GAZE UNCALIBRATED",
         }
     }
 }
@@ -9145,6 +9199,8 @@ struct VirtualMouseMode {
     display_dimensions: Option<(f64, f64)>,
     gaze_affine: Option<GazeAffine>,
     reticle: Option<(f64, f64)>,
+    /// Evidence key for a displayed reticle that can survive a redraw.
+    reticle_source_timestamp_ns: Option<u64>,
     last_timestamp_ns: Option<u64>,
     gaze_available: bool,
     frame_state: CalibrationFrameState,
@@ -9179,6 +9235,7 @@ impl VirtualMouseMode {
             display_dimensions: None,
             gaze_affine: None,
             reticle: None,
+            reticle_source_timestamp_ns: None,
             last_timestamp_ns: None,
             gaze_available: false,
             frame_state: CalibrationFrameState::MissingFrame,
@@ -9460,6 +9517,7 @@ impl VirtualMouseMode {
                     // Absolute placement: a fresh gaze target must not ease
                     // toward its destination over subsequent observations.
                     self.reticle = Some(mapped);
+                    self.reticle_source_timestamp_ns = self.last_timestamp_ns;
                 }
             }
             return;
@@ -9592,6 +9650,8 @@ impl VirtualMouseMode {
 }
 
 struct App {
+    recording_metadata: recording_trace::scene::HostMetadata,
+    desktop_gaze_next_tick: Instant,
     ui: viewer_ui::Workspace,
     context: Context<DisplayHandle<'static>>,
     window_state: Option<ScreenWindow>,
@@ -9619,6 +9679,8 @@ struct App {
     stop: Arc<AtomicBool>,
     backdrop: Option<Backdrop>,
     virtual_mouse: Option<VirtualMouseMode>,
+    accuracy_requested: bool,
+    accuracy_check: Option<AccuracyCheck>,
     main_lightbox: MouseCalibrationLightbox,
     calibrated_display: Option<CalibratedDisplay>,
     calibration_capture: Option<CalibrationRawCapture>,
@@ -9651,7 +9713,42 @@ struct CalibratedDisplay {
     gaze_affine: GazeAffine,
 }
 
+struct AccuracyCheck {
+    session: gaze_accuracy::Session,
+    plane: VirtualDisplayPlane,
+    calibration: Option<CalibratedDisplay>,
+    basis: Option<(CalibrationGazeAuthority,u64)>,
+}
+
+fn accuracy_basis(frame:Option<&EyeFrame>,surface:Option<SurfaceGazeSample>)
+    ->Option<(CalibrationGazeAuthority,u64)> {
+    let frame=frame?;let surface=surface.filter(|s|s.sign_resolved)?;
+    Some((CalibrationGazeAuthority {eye:frame.eye_id.saturating_sub(1) as usize,segmentation_mode:frame.segmentation_mode,
+        sam_prompt_generation:frame.gaze_authority_sam_prompt_generation,generation:frame.gaze_authority_generation},surface.sign_epoch))
+}
+
+fn save_accuracy_report(check:&mut AccuracyCheck) {
+    if check.session.finished.is_none() || check.session.report_path.is_some() || check.session.report_error.is_some(){return;}
+    let stamp=SystemTime::now().duration_since(UNIX_EPOCH).map(|d|d.as_nanos()).unwrap_or(0);
+    let path=PathBuf::from(format!("outputs/gaze-accuracy/accuracy-{stamp}.json"));
+    match monitor_location::write_json_atomic(&path,&check.session.report()) {
+        Ok(())=> {eprintln!("GAZE_ACCURACY_REPORT {}",path.display());check.session.report_path=Some(path.display().to_string());}
+        Err(e)=>{eprintln!("GAZE_ACCURACY_REPORT_FAILED {e}");check.session.report_error=Some(e);}
+    }
+}
+
 impl CalibratedDisplay {
+    fn for_frame(self, eye: usize, frame: Option<&EyeFrame>) -> Option<Self> {
+        let frame = frame?;
+        let surface = mouse_gaze_surface(frame)?;
+        (self.eye == eye && frame.segmentation_mode == self.segmentation_mode
+            && frame.gaze_authority_generation == self.gaze_authority_generation
+            && surface.sign_resolved && surface.sign_epoch == self.sign_epoch
+            && (self.segmentation_mode != SegmentationMode::Sam31
+                || frame.gaze_authority_sam_prompt_generation == self.sam_prompt_generation))
+            .then_some(self)
+    }
+
     fn target(self, gaze: RelativeGazeVector) -> Option<(f64, f64)> {
         // The affine supplies the user-calibrated pointer coordinates, while
         // the fixed-diagonal metric plane remains the physical intersection
@@ -9836,6 +9933,27 @@ fn compile_live_sam31_outer_prompt(shared: Arc<Mutex<SharedState>>, prompt: Stri
 }
 
 impl App {
+    fn toggle_accuracy_check(&mut self) {
+        if self.accuracy_check.is_some() || self.accuracy_requested {
+            if let Some(check)=self.accuracy_check.as_mut(){check.session.abort("CANCELLED");save_accuracy_report(check);}
+            self.accuracy_check=None;self.accuracy_requested=false;
+            if let Some(state)=&self.window_state {state.window.set_fullscreen(None);}
+        } else if self.virtual_mouse.is_none() && self.sam31_prompt_editor.is_none()
+            && !self.shared.lock().is_ok_and(|s|s.sam31_object_inspection) {
+            self.accuracy_requested=true;
+            if let Some(state)=&self.window_state {state.window.set_fullscreen(Some(Fullscreen::Borderless(None)));}
+        }
+    }
+    fn toggle_raw_recording(&mut self) {
+        if let Ok(mut shared) = self.shared.lock() {
+            if local_camera_control_allowed(&mut shared, "RAW RECORD") {
+                match queue_hotkey_raw_record_toggle(&mut shared) {
+                    Ok((action, path)) => eprintln!("queued S/H RAW recording {action}: {}", path.display()),
+                    Err(error) => eprintln!("S/H RAW recording toggle refused: {error}"),
+                }
+            }
+        }
+    }
     fn request_shutdown(&mut self, event_loop: &ActiveEventLoop, source: &str) {
         let now = Instant::now();
         if self.quit_armed_until.is_some_and(|until| now <= until) {
@@ -10564,9 +10682,9 @@ fn native_meridian_strong_limbus_measurement(
             boundary.major_radius,
             boundary.minor_radius,
         )
-        && diagnostics.analog_force_samples >= 24
+        && diagnostics.analog_edge_samples >= 24
         && diagnostics.analog_mean_certainty >= 0.18
-        && diagnostics.analog_mean_power >= 0.18
+        && diagnostics.analog_mean_edge_amplitude >= 0.18
         && diagnostics.analog_mean_signed_offset_px.abs() <= 8.0
         && diagnostics.opposing_supported >= 12
         && diagnostics.selected_left >= 6
@@ -12177,7 +12295,7 @@ fn driving_multibank_analog_edge_step(
         // not a precise localization constraint.  Texture/edge power sets
         // certainty continuously instead of turning either into a binary
         // threshold.
-        let power = (gradient_sum / 0.16).clamp(0.0, 1.0);
+        let normalized_edge_amplitude = (gradient_sum / 0.16).clamp(0.0, 1.0);
         let localization = (-0.5 * (spread / 5.0).powi(2)).exp();
         // Lateral lanes remain authoritative.  Near-vertical lanes contribute
         // a smaller 2D-center constraint only when the same signed transition
@@ -12216,16 +12334,16 @@ fn driving_multibank_analog_edge_step(
         } else {
             let persistence = parallel_edge(-7.0).zip(parallel_edge(7.0)).map_or(
                 0.0,
-                |((left_power, left_centroid), (right_power, right_centroid))| {
-                    let parallel_power = (left_power.min(right_power) / 0.14).clamp(0.0, 1.0);
+                |((left_gradient_sum, left_centroid), (right_gradient_sum, right_centroid))| {
+                    let parallel_edge_amplitude = (left_gradient_sum.min(right_gradient_sum) / 0.14).clamp(0.0, 1.0);
                     let centroid_agreement =
                         (-0.5 * ((left_centroid - right_centroid) / 3.0).powi(2)).exp();
-                    parallel_power * centroid_agreement
+                    parallel_edge_amplitude * centroid_agreement
                 },
             );
             (0.16 + 0.34 * normal.0.abs()) * persistence
         };
-        let weight = power * localization * directional_reliability;
+        let weight = normalized_edge_amplitude * localization * directional_reliability;
         if weight < 0.08 || !centroid.is_finite() {
             continue;
         }
@@ -25402,6 +25520,7 @@ struct PacketHeader {
 }
 
 struct ReceivedPacket {
+    camera_header: [u8; HEADER_BYTES],
     header: PacketHeader,
     payload: Vec<u8>,
     arrived: Instant,
@@ -25411,7 +25530,7 @@ struct ReceivedPacket {
 
 struct RawModelPublisher {
     path: PathBuf,
-    sender: Option<SyncSender<Arc<RawModelFrame>>>,
+    sender: Option<SyncSender<ModelStreamFrame>>,
     queued: Arc<AtomicU64>,
     sent: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
@@ -25420,7 +25539,7 @@ struct RawModelPublisher {
 
 impl RawModelPublisher {
     fn start(path: PathBuf) -> Result<Self, String> {
-        let (sender, receiver) = sync_channel::<Arc<RawModelFrame>>(MODEL_STREAM_QUEUE_FRAMES);
+        let (sender, receiver) = sync_channel::<ModelStreamFrame>(MODEL_STREAM_QUEUE_FRAMES);
         let queued = Arc::new(AtomicU64::new(0));
         let sent = Arc::new(AtomicU64::new(0));
         let dropped = Arc::new(AtomicU64::new(0));
@@ -25475,6 +25594,14 @@ impl RawModelPublisher {
     }
 
     fn submit(&self, frame: Arc<RawModelFrame>) {
+        self.submit_packet(ModelStreamFrame::Eye(frame));
+    }
+
+    fn submit_thumbnail(&self, frame: Arc<CameraThumbnailFrame>) {
+        self.submit_packet(ModelStreamFrame::Thumbnail(frame));
+    }
+
+    fn submit_packet(&self, frame: ModelStreamFrame) {
         let Some(sender) = self.sender.as_ref() else {
             return;
         };
@@ -25717,6 +25844,7 @@ impl RawPacketReader {
                         return;
                     }
                     let packet = ReceivedPacket {
+                        camera_header: header_bytes,
                         header,
                         payload,
                         arrived,
@@ -26250,6 +26378,7 @@ struct Recorder {
     jsonl: File,
     predictions: File,
     recovery: File,
+    trace: recording_trace::BundleTrace,
     raw: [File; 2],
     offsets: [u64; 2],
     pending_predictions: BTreeMap<(u32, u64, u64), RecordedRoiFrame>,
@@ -26273,7 +26402,7 @@ struct HotkeyRecording {
 }
 
 impl Recorder {
-    fn new(output: &Path, config: &Config) -> Result<Self, String> {
+    fn new(output: &Path, config: &Config, trace: &recording_trace::Hub) -> Result<Self, String> {
         if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
@@ -26282,7 +26411,7 @@ impl Recorder {
             .unwrap_or_default()
             .as_nanos();
         let temp = PathBuf::from(format!(
-            "/tmp/buttercup-raw-eye-bundle-{}-{stamp}",
+            "outputs/recording-staging/buttercup-raw-eye-bundle-{}-{stamp}",
             std::process::id()
         ));
         fs::create_dir_all(&temp).map_err(|error| error.to_string())?;
@@ -26298,6 +26427,20 @@ impl Recorder {
         let mut manifest: serde_json::Value = serde_json::from_str(&manifest).map_err(|error|error.to_string())?;
         manifest["recovery_index"] = serde_json::json!("recovery.jsonl");
         manifest["recovery_schema"] = serde_json::json!("buttercup-roi-recovery-frame-v1");
+        manifest["viewer_events_index"] = serde_json::json!(recording_trace::METADATA_FILE);
+        manifest["viewer_events_schema"] = serde_json::json!(recording_trace::SCHEMA);
+        manifest["scene_index"] = serde_json::json!(recording_trace::METADATA_FILE);
+        manifest["scene_schema"] = serde_json::json!(recording_trace::SCENE_SCHEMA);
+        manifest["metadata_encoding"] = serde_json::json!("OIM1: same 24-byte envelope as OIC1; bounded JSON section only; no JSONL or compression");
+        manifest["viewer_coordinates"] = serde_json::json!({
+            "normalized": "top-left [0,0], bottom-right [1,1]; predictions may be outside",
+            "pixels": "viewer physical framebuffer pixels, not desktop coordinates",
+            "timing": "host submit-call bounds, not scan-out; camera clock remains separate",
+            "source_freshness": "source_advanced_for_basis is not proof of a correct/fresh fit",
+        });
+        manifest["thumbnail_index"] = serde_json::json!("thumbnails.jsonl");
+        manifest["thumbnail_stream"] = serde_json::json!("thumbnails.oic1");
+        manifest["thumbnail_encoding"] = serde_json::json!("OIC1 native camera packet envelopes; no re-encoding");
         fs::write(temp.join("manifest.json"), serde_json::to_vec_pretty(&manifest).map_err(|error|error.to_string())?).map_err(|error| error.to_string())?;
         let jsonl = File::create(temp.join("frames.jsonl")).map_err(|error| error.to_string())?;
         let predictions =
@@ -26307,12 +26450,14 @@ impl Recorder {
             File::create(temp.join("subject-right.raw10")).map_err(|error| error.to_string())?;
         let left =
             File::create(temp.join("subject-left.raw10")).map_err(|error| error.to_string())?;
+        let trace = recording_trace::BundleTrace::new(&temp, trace)?;
         Ok(Self {
             output: output.to_path_buf(),
             temp,
             jsonl,
             predictions,
             recovery,
+            trace,
             raw: [right, left],
             offsets: [0, 0],
             pending_predictions: BTreeMap::new(),
@@ -26345,7 +26490,7 @@ impl Recorder {
         self.recovery.write_all(b"\n").map_err(|e|e.to_string())
     }
 
-    fn record(&mut self, header: &PacketHeader, payload: &[u8]) -> Result<(), String> {
+    fn record(&mut self, header: &PacketHeader, payload: &[u8], clock: Option<&serde_json::Value>) -> Result<(), String> {
         let PacketKind::Eye(eye_id) = header.kind else {
             return Err("raw eye recorder received a non-eye packet".to_string());
         };
@@ -26357,10 +26502,10 @@ impl Recorder {
         self.flush_unavailable_predictions()?;
         // Capture this at recorder ingress, before filesystem work can add a
         // variable page-cache or writeback delay to the coarse screen join.
-        let host_arrival_unix_ns = SystemTime::now()
+        let host_arrival_unix_ns = clock.and_then(|c| c["host_arrival_unix_ns"].as_str()).and_then(|s| s.parse::<u128>().ok()).unwrap_or_else(|| SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_nanos();
+            .as_nanos());
         let index = if eye_id == 1 { 0 } else { 1 };
         let label = subject_eye_label(index);
         let stream = if index == 0 {
@@ -26386,9 +26531,10 @@ impl Recorder {
                 "width": SENSOR_WIDTH, "height": FINE_SENSOR_WINDOW_HEIGHT },
             "source_sequence": header.sequence,
         })).unwrap_or(serde_json::Value::Null);
+        let source_clock = clock.unwrap_or(&serde_json::Value::Null);
         writeln!(
             self.jsonl,
-            "{{\"sequence\":{},\"timestamp_ns\":{},\"host_arrival_unix_ns\":{},\"eye_id\":{},\"label\":\"{}\",\"sensor_x\":{},\"sensor_y\":{},\"width\":{},\"height\":{},\"stride\":{},\"pixel_format\":\"RAW10_LE40_1X1\",\"stream\":\"{}\",\"offset\":{},\"length\":{},\"region\":{region}}}",
+            "{{\"sequence\":{},\"timestamp_ns\":{},\"host_arrival_unix_ns\":{},\"eye_id\":{},\"label\":\"{}\",\"sensor_x\":{},\"sensor_y\":{},\"width\":{},\"height\":{},\"stride\":{},\"pixel_format\":\"RAW10_LE40_1X1\",\"stream\":\"{}\",\"offset\":{},\"length\":{},\"region\":{region},\"source_clock\":{source_clock}}}",
             header.sequence,
             header.timestamp_ns,
             host_arrival_unix_ns,
@@ -26414,10 +26560,11 @@ impl Recorder {
             height: header.height,
         };
         self.pending_predictions.insert(recorded.key(), recorded);
-        Ok(())
+        self.trace.drain(false)
     }
 
     fn record_prediction(&mut self, frame: &EyeFrame) -> Result<(), String> {
+        self.trace.drain(false)?;
         let key = (frame.eye_id, frame.sequence, frame.timestamp_ns);
         if !self.pending_predictions.contains_key(&key) {
             return Ok(());
@@ -26452,10 +26599,16 @@ impl Recorder {
     }
 
     fn finalize(&mut self) -> Result<(), String> {
+        self.finalize_with_reason("requested-stop")
+    }
+
+    fn finalize_with_reason(&mut self, reason: &str) -> Result<(), String> {
         if self.finalized {
             return Ok(());
         }
         self.finalized = true;
+        // A sidecar failure must not prevent recovering the native RAW files.
+        let trace_error = self.trace.drain_with_reason(Some(reason)).err();
         self.flush_unavailable_predictions()?;
         self.jsonl.flush().map_err(|error| error.to_string())?;
         self.recovery.flush().map_err(|error|error.to_string())?;
@@ -26475,6 +26628,9 @@ impl Recorder {
                 "frames.jsonl",
                 "predictions.jsonl",
                 "recovery.jsonl",
+                recording_trace::METADATA_FILE,
+                "thumbnails.jsonl",
+                "thumbnails.oic1",
                 "subject-left.raw10",
                 "subject-right.raw10",
             ])
@@ -26485,13 +26641,13 @@ impl Recorder {
         }
         fs::remove_dir_all(&self.temp).map_err(|error| error.to_string())?;
         eprintln!("saved raw eye bundle {}", self.output.display());
-        Ok(())
+        trace_error.map_or(Ok(()), |error| Err(format!("RAW bundle saved with incomplete viewer trace: {error}")))
     }
 }
 
 impl Drop for Recorder {
     fn drop(&mut self) {
-        if let Err(error) = self.finalize() {
+        if let Err(error) = self.finalize_with_reason("recorder-dropped-before-requested-stop") {
             eprintln!("finalize raw eye bundle: {error}");
         }
     }
@@ -26792,86 +26948,6 @@ fn unpack_gray16(payload: &[u8]) -> Vec<u16> {
     payload
         .chunks_exact(2)
         .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
-        .collect()
-}
-
-fn percentile_range(values: &[u16]) -> (u16, u16) {
-    let mut histogram = [0u32; 1024];
-    for &value in values {
-        histogram[value.min(1023) as usize] += 1;
-    }
-    let count = values.len() as u32;
-    let low_target = count / 100;
-    let high_target = count * 99 / 100;
-    let mut cumulative = 0u32;
-    let mut low = 0u16;
-    let mut high = 1023u16;
-    for (index, &hits) in histogram.iter().enumerate() {
-        cumulative += hits;
-        if cumulative >= low_target {
-            low = index as u16;
-            break;
-        }
-    }
-    cumulative = 0;
-    for (index, &hits) in histogram.iter().enumerate() {
-        cumulative += hits;
-        if cumulative >= high_target {
-            high = index as u16;
-            break;
-        }
-    }
-    (low, high.max(low + 1))
-}
-
-fn quad_luma_preview(
-    values: &[u16],
-    width: usize,
-    height: usize,
-    contrast_percent: u16,
-) -> Vec<u32> {
-    let luma = (0..values.len())
-        .map(|index| {
-            let x = index % width;
-            let y = index / width;
-            let quad_x = x & !3;
-            let quad_y = y & !3;
-            let mut sum = 0u32;
-            let mut count = 0u32;
-            for yy in quad_y..(quad_y + 4).min(height) {
-                for xx in quad_x..(quad_x + 4).min(width) {
-                    sum += values[yy * width + xx] as u32;
-                    count += 1;
-                }
-            }
-            (sum / count.max(1)) as u16
-        })
-        .collect::<Vec<_>>();
-    let (low, high) = percentile_range(&luma);
-    luma.into_iter()
-        .map(|value| {
-            let baseline =
-                value.saturating_sub(low) as f64 * 255.0 / high.saturating_sub(low).max(1) as f64;
-            let gray = (128.0 + (baseline - 128.0) * contrast_percent as f64 / 100.0)
-                .round()
-                .clamp(0.0, 255.0) as u32;
-            (gray << 16) | (gray << 8) | gray
-        })
-        .collect()
-}
-
-fn raw10_luma_preview(values: &[u16], contrast_percent: u16) -> Vec<u32> {
-    let (low, high) = percentile_range(values);
-    values
-        .iter()
-        .map(|&value| {
-            let baseline =
-                value.saturating_sub(low) as f64 * 255.0 / high.saturating_sub(low).max(1) as f64;
-            let gray = (128.0 + (baseline - 128.0) * contrast_percent as f64 / 100.0)
-                .round()
-                .clamp(0.0, 255.0) as u32;
-            (gray << 16) | (gray << 8) | gray
-        })
         .collect()
 }
 
@@ -27311,254 +27387,6 @@ fn learning_canny_mask_preview(
     };
     mask.iter()
         .map(|accepted| if *accepted != 0 { edge_color } else { 0 })
-        .collect()
-}
-
-fn raw10_color_preview(
-    values: &[u16],
-    width: usize,
-    sensor_x: u32,
-    sensor_y: u32,
-    contrast_percent: u16,
-) -> Vec<u32> {
-    let (low, high) = percentile_range(values);
-    values
-        .iter()
-        .enumerate()
-        .map(|(index, &value)| {
-            let x = index % width;
-            let y = index / width;
-            let baseline =
-                value.saturating_sub(low) as f64 * 255.0 / high.saturating_sub(low).max(1) as f64;
-            let level = (128.0 + (baseline - 128.0) * contrast_percent as f64 / 100.0)
-                .round()
-                .clamp(0.0, 255.0) as u32;
-            let quad_x_even = (((x as u32 + sensor_x) / 2) & 1) == 0;
-            let quad_y_even = (((y as u32 + sensor_y) / 2) & 1) == 0;
-            match (quad_y_even, quad_x_even) {
-                (true, true) => level << 16,
-                (false, false) => level,
-                _ => level << 8,
-            }
-        })
-        .collect()
-}
-
-#[derive(Default)]
-struct DisplayColorBalance {
-    white_balance: Option<[f64; 3]>,
-    luma_range: Option<[f64; 2]>,
-}
-
-impl DisplayColorBalance {
-    fn smooth_white_balance(&mut self, candidate: [f64; 3]) -> [f64; 3] {
-        // CFA channel means are noisy in a small eye ROI. A per-frame white
-        // balance makes that noise look like an illuminant toggling on and off,
-        // so retain a display-only estimate across frames and reconnects.
-        const ALPHA: f64 = 0.02;
-        let mut balance = self.white_balance.unwrap_or(candidate);
-        for channel in 0..3 {
-            balance[channel] += (candidate[channel] - balance[channel]) * ALPHA;
-        }
-        self.white_balance = Some(balance);
-        balance
-    }
-
-    fn smooth_luma_range(&mut self, low: u16, high: u16) -> (f64, f64) {
-        // Percentile endpoints also move as the eyelid and pupil cross the ROI.
-        // Follow real illumination/exposure changes over several frames instead
-        // of renormalizing the entire preview for every image.
-        const ALPHA: f64 = 0.05;
-        let candidate = [low as f64, high as f64];
-        let mut range = self.luma_range.unwrap_or(candidate);
-        for endpoint in 0..2 {
-            range[endpoint] += (candidate[endpoint] - range[endpoint]) * ALPHA;
-        }
-        if range[1] < range[0] + 1.0 {
-            range[1] = range[0] + 1.0;
-        }
-        self.luma_range = Some(range);
-        (range[0], range[1])
-    }
-}
-
-fn color_preview(
-    values: &[u16],
-    width: usize,
-    height: usize,
-    sensor_x: u32,
-    sensor_y: u32,
-    contrast_percent: u16,
-    mut display_balance: Option<&mut DisplayColorBalance>,
-) -> Vec<u32> {
-    if width < 4 || height < 4 || width & 1 != 0 || height & 1 != 0 {
-        return quad_luma_preview(values, width, height, contrast_percent);
-    }
-
-    // IMX582 full-resolution 1x1 readout is Quad Bayer: each conventional
-    // RGGB sample is a physical 2x2 same-color group. Treating adjacent sensor
-    // pixels as ordinary RGGB creates the visible every-other-pixel lattice.
-    // Average each native color group, demosaic the resulting half-resolution
-    // RGGB plane, then bilinearly enlarge only this display copy. Tracking,
-    // autofocus, recording, and transport continue to use untouched RAW10.
-    let quad_width = width / 2;
-    let quad_height = height / 2;
-    let mut quad = vec![0.0; quad_width * quad_height];
-    for quad_y in 0..quad_height {
-        for quad_x in 0..quad_width {
-            let x = quad_x * 2;
-            let y = quad_y * 2;
-            quad[quad_y * quad_width + quad_x] = (values[y * width + x] as f64
-                + values[y * width + x + 1] as f64
-                + values[(y + 1) * width + x] as f64
-                + values[(y + 1) * width + x + 1] as f64)
-                * 0.25;
-        }
-    }
-
-    let at = |x: isize, y: isize| -> f64 {
-        let x = x.clamp(0, quad_width.saturating_sub(1) as isize) as usize;
-        let y = y.clamp(0, quad_height.saturating_sub(1) as isize) as usize;
-        quad[y * quad_width + x]
-    };
-    let mut quad_rgb = Vec::with_capacity(quad.len());
-    for y in 0..quad_height {
-        for x in 0..quad_width {
-            let xe = ((x as u32 + sensor_x / 2) & 1) == 0;
-            let ye = ((y as u32 + sensor_y / 2) & 1) == 0;
-            let c = at(x as isize, y as isize);
-            let horizontal =
-                (at(x as isize - 1, y as isize) + at(x as isize + 1, y as isize)) * 0.5;
-            let vertical = (at(x as isize, y as isize - 1) + at(x as isize, y as isize + 1)) * 0.5;
-            let diagonal = (at(x as isize - 1, y as isize - 1)
-                + at(x as isize + 1, y as isize - 1)
-                + at(x as isize - 1, y as isize + 1)
-                + at(x as isize + 1, y as isize + 1))
-                * 0.25;
-            quad_rgb.push(match (ye, xe) {
-                (true, true) => [c, (horizontal + vertical) * 0.5, diagonal],
-                (true, false) => [horizontal, c, vertical],
-                (false, true) => [vertical, c, horizontal],
-                (false, false) => [diagonal, (horizontal + vertical) * 0.5, c],
-            });
-        }
-    }
-
-    let mut channel_means = [0.0; 3];
-    for pixel in &quad_rgb {
-        for channel in 0..3 {
-            channel_means[channel] += pixel[channel];
-        }
-    }
-    for mean in &mut channel_means {
-        *mean /= quad_rgb.len().max(1) as f64;
-    }
-    let white_balance_candidate = [
-        (channel_means[1] / channel_means[0].max(1.0)).clamp(0.25, 4.0),
-        1.0,
-        (channel_means[1] / channel_means[2].max(1.0)).clamp(0.25, 4.0),
-    ];
-    let white_balance = display_balance
-        .as_deref_mut()
-        .map(|balance| balance.smooth_white_balance(white_balance_candidate))
-        .unwrap_or(white_balance_candidate);
-
-    // Keep chroma deliberately lower-bandwidth than luma. Raw sensor noise in
-    // each same-color group otherwise survives as a larger Quad Bayer lattice
-    // even after the CFA phase itself is decoded correctly.
-    let mut quad_chroma = vec![[0.0; 3]; quad_rgb.len()];
-    const CHROMA_RADIUS: isize = 2;
-    for y in 0..quad_height {
-        for x in 0..quad_width {
-            let mut sum = [0.0; 3];
-            let mut samples = 0.0;
-            for dy in -CHROMA_RADIUS..=CHROMA_RADIUS {
-                let yy = (y as isize + dy).clamp(0, quad_height as isize - 1) as usize;
-                for dx in -CHROMA_RADIUS..=CHROMA_RADIUS {
-                    let xx = (x as isize + dx).clamp(0, quad_width as isize - 1) as usize;
-                    let pixel = quad_rgb[yy * quad_width + xx];
-                    for channel in 0..3 {
-                        sum[channel] += pixel[channel] * white_balance[channel];
-                    }
-                    samples += 1.0;
-                }
-            }
-            let local_luma = ((sum[0] + sum[1] * 2.0 + sum[2]) * 0.25 / samples).max(1.0);
-            quad_chroma[y * quad_width + x] = [
-                sum[0] / samples / local_luma,
-                sum[1] / samples / local_luma,
-                sum[2] / samples / local_luma,
-            ];
-        }
-    }
-
-    let quad_pixel = |x: isize, y: isize| -> [f64; 3] {
-        let x = x.clamp(0, quad_width.saturating_sub(1) as isize) as usize;
-        let y = y.clamp(0, quad_height.saturating_sub(1) as isize) as usize;
-        quad_chroma[y * quad_width + x]
-    };
-
-    let integral_stride = width + 1;
-    let mut integral = vec![0u32; integral_stride * (height + 1)];
-    for y in 0..height {
-        let mut row_sum = 0u32;
-        for x in 0..width {
-            row_sum += values[y * width + x] as u32;
-            integral[(y + 1) * integral_stride + x + 1] =
-                integral[y * integral_stride + x + 1] + row_sum;
-        }
-    }
-    let neutral_luma = |x: usize, y: usize| -> f64 {
-        let x0 = x.saturating_sub(1).min(width - 4);
-        let y0 = y.saturating_sub(1).min(height - 4);
-        let x1 = x0 + 4;
-        let y1 = y0 + 4;
-        let sum = integral[y1 * integral_stride + x1] + integral[y0 * integral_stride + x0]
-            - integral[y0 * integral_stride + x1]
-            - integral[y1 * integral_stride + x0];
-        sum as f64 / 16.0
-    };
-    let mut rgb = Vec::with_capacity(values.len());
-    let mut luma = Vec::with_capacity(values.len());
-    for y in 0..height {
-        let source_y = (y as f64 + 0.5) * 0.5 - 0.5;
-        let y0 = source_y.floor() as isize;
-        let fy = source_y - y0 as f64;
-        for x in 0..width {
-            let source_x = (x as f64 + 0.5) * 0.5 - 0.5;
-            let x0 = source_x.floor() as isize;
-            let fx = source_x - x0 as f64;
-            let p00 = quad_pixel(x0, y0);
-            let p10 = quad_pixel(x0 + 1, y0);
-            let p01 = quad_pixel(x0, y0 + 1);
-            let p11 = quad_pixel(x0 + 1, y0 + 1);
-            let mut pixel = [0.0; 3];
-            let local_luma = neutral_luma(x, y);
-            for channel in 0..3 {
-                pixel[channel] = ((p00[channel] * (1.0 - fx) + p10[channel] * fx) * (1.0 - fy)
-                    + (p01[channel] * (1.0 - fx) + p11[channel] * fx) * fy)
-                    * local_luma;
-            }
-            luma.push(local_luma as u16);
-            rgb.push(pixel);
-        }
-    }
-    let (candidate_low, candidate_high) = percentile_range(&luma);
-    let (low, high) = display_balance
-        .as_deref_mut()
-        .map(|balance| balance.smooth_luma_range(candidate_low, candidate_high))
-        .unwrap_or((candidate_low as f64, candidate_high as f64));
-    let span = (high - low).max(1.0);
-    rgb.into_iter()
-        .map(|pixel| {
-            let channel = |value: f64| {
-                let baseline = (value - low) * 255.0 / span;
-                (128.0 + (baseline - 128.0) * contrast_percent as f64 / 100.0)
-                    .round()
-                    .clamp(0.0, 255.0) as u32
-            };
-            (channel(pixel[0]) << 16) | (channel(pixel[1]) << 8) | channel(pixel[2])
-        })
         .collect()
 }
 
@@ -28618,7 +28446,7 @@ impl RawRoiTracker {
         index: usize,
         source_timestamp_ns: u64,
         current_timestamp_ns: u64,
-        pivot_sensor: (f64, f64),
+        effective_pivot_sensor_px: (f64, f64),
         support_offset_px: [f64; 2],
         velocity_sensor_px_s: [f64; 2],
         cap_radius_px: f64,
@@ -28629,7 +28457,7 @@ impl RawRoiTracker {
         if !self.live_region_transactions || self.region_follow_paused || index >= 2 { return; }
         let velocity_sensor_px_s = if velocity_sensor_px_s == [0.0; 2] {
             coherent_projected_pivot_velocity(
-                &self.pivot_motion_history[index], source_timestamp_ns, pivot_sensor,
+                &self.pivot_motion_history[index], source_timestamp_ns, effective_pivot_sensor_px,
             )
         } else { velocity_sensor_px_s };
         let Some(scheduler) = self.pivot_scheduler.as_mut() else { return; };
@@ -28641,7 +28469,7 @@ impl RawRoiTracker {
             identity: index as u64,
             source_lineage: 1, // reset_pivot_source_clock runs on every reconnect
             source_timestamp_ns,
-            pivot_sensor: [pivot_sensor.0, pivot_sensor.1],
+            effective_pivot_sensor_px: [effective_pivot_sensor_px.0, effective_pivot_sensor_px.1],
             support_offset_px,
             velocity_sensor_px_s,
             uncertainty_px: [uncertainty_px; 2],
@@ -28649,12 +28477,12 @@ impl RawRoiTracker {
             quality,
             priority: if index == focus_eye { 1.0 } else { 0.0 },
         }) { return; }
-        self.pivot_motion_history[index].push_back((source_timestamp_ns, pivot_sensor));
+        self.pivot_motion_history[index].push_back((source_timestamp_ns, effective_pivot_sensor_px));
         while self.pivot_motion_history[index].len() > 3 {
             self.pivot_motion_history[index].pop_front();
         }
         self.readmission_pivots[index] = Some((source_timestamp_ns,
-            [pivot_sensor.0, pivot_sensor.1], support_offset_px));
+            [effective_pivot_sensor_px.0, effective_pivot_sensor_px.1], support_offset_px));
         self.readmission_refinable[index] = quality >= 0.6 && velocity_sensor_px_s.iter().all(|v| v.abs() < 10.0);
         if let [Some(a),Some(b)] = self.readmission_pivots {
             let clocks=[a.0,b.0];
@@ -30671,7 +30499,8 @@ struct GlobalPresentationCapture {
     timestamp_ns: u64,
 }
 
-fn capture_global_presentation(config: &Config) -> Result<GlobalPresentationCapture, String> {
+fn capture_global_presentation(config: &Config, publishers: &[RawModelPublisher], trace: &recording_trace::Hub) -> Result<GlobalPresentationCapture, String> {
+    let capture_scope = trace.capture_scope();
     let format = config.global_capture_format;
     let (width, height) = format.dimensions();
     let sequence = SystemTime::now()
@@ -30706,6 +30535,23 @@ fn capture_global_presentation(config: &Config) -> Result<GlobalPresentationCapt
     stream
         .read_exact(&mut payload)
         .map_err(|error| format!("read global {} payload: {error}", format.protocol_name()))?;
+
+    drop(capture_scope);
+    let payload = Arc::new(payload);
+    {
+        let native = Arc::new(CameraThumbnailFrame {
+            kind: ThumbnailKind::GlobalSensor,
+            sensor_size_px: [SENSOR_WIDTH, SENSOR_HEIGHT],
+            sensor_rect_px: [0, 0, SENSOR_WIDTH, SENSOR_HEIGHT],
+            host_received_unix_ns: SystemTime::now().duration_since(UNIX_EPOCH)
+                .unwrap_or_default().as_nanos().min(u64::MAX as u128) as u64,
+            region_session: None, region_generation: None,
+            camera_header: header, payload: Arc::clone(&payload),
+        });
+        native.validate()?;
+        trace.thumbnail(Arc::clone(&native));
+        for publisher in publishers { publisher.submit_thumbnail(Arc::clone(&native)); }
+    }
 
     let (presentation, gray, gray_width, gray_height) = match format {
         GlobalCaptureFormat::Gray16 => {
@@ -30891,14 +30737,15 @@ fn scene_crop_bounds(bounds: [f64;4], width: usize, height: usize) -> (usize,usi
 }
 
 fn inspect_prompt_scene(config: &Config, shared: &Mutex<SharedState>, client: Option<&sam31_outer::Client>,
-    stop: &AtomicBool) -> Result<(), String> {
+    stop: &AtomicBool, publishers: &[RawModelPublisher]) -> Result<(), String> {
     let client = client.ok_or("SAM worker unavailable")?;
     let (generation, bundle) = {
         let mut state = shared.lock().map_err(|_| "viewer lock poisoned")?;
         state.reacquire_status = Some("OBJECT GLOBAL SEARCH: CAPTURING FULL SENSOR".into());
         (state.sam31_scene_prompt_generation, state.sam31_scene_prompt_bundle.clone())
     };
-    let capture = capture_global_presentation(config)?;
+    let trace = shared.lock().map_err(|_| "viewer lock poisoned")?.recording_trace.clone();
+    let capture = capture_global_presentation(config, publishers, &trace)?;
     let backdrop = load_ppm(&capture.path)?;
     let current = || !stop.load(Ordering::Relaxed) && shared.lock().is_ok_and(|state|
         state.sam31_object_inspection && state.sam31_scene_prompt_generation == generation);
@@ -30943,10 +30790,12 @@ fn reacquire_with_mediapipe(
     _context_snapshot: Option<&Path>,
     task_kind: MediaPipeTaskKind,
     shared: &Mutex<SharedState>,
+    publishers: &[RawModelPublisher],
 ) -> Result<Config, String> {
     let phase_started = Instant::now();
     eprintln!("REACQUIRE_PHASE task={task_kind:?} phase=spawn_acquisition elapsed_ms=0");
-    let capture = capture_global_presentation(current)?;
+    let trace = shared.lock().map_err(|_| "viewer lock poisoned")?.recording_trace.clone();
+    let capture = capture_global_presentation(current, publishers, &trace)?;
     // Podbay restores the prior fine sensor mode before it writes the
     // completed capture packet. Release the eye receiver immediately; native
     // inference runs in parallel with the newly resumed fine stream.
@@ -31001,10 +30850,11 @@ fn receive(
             "TEMPORARY DIAGNOSTIC: fine-context ROI steering disabled; MediaPipe semantic reseeds remain enabled"
         );
     }
+    let recording_trace = shared.lock().map_err(|_| "viewer lock poisoned")?.recording_trace.clone();
     let mut recorder = config
         .record
         .as_deref()
-        .map(|path| Recorder::new(path, &config))
+        .map(|path| Recorder::new(path, &config, &recording_trace))
         .transpose()
         .unwrap_or_else(|error| {
             eprintln!("open raw recorder: {error}");
@@ -31012,12 +30862,13 @@ fn receive(
         });
     let mut timed_recording: Option<TimedRecording> = None;
     let mut hotkey_recording: Option<HotkeyRecording> = None;
-    let model_publishers = config
+    let model_publishers = Arc::new(config
         .model_streams
         .iter()
         .cloned()
         .map(RawModelPublisher::start)
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?);
+    recording_trace.attach_publishers(Arc::clone(&model_publishers));
     let screen_clock_analyzer = screen_reflection_live::LiveScreenClockAnalyzer::start()?;
     let checkerboard_output = env::var_os("BUTTERCUP_CHECKERBOARD_CALIBRATION_OUTPUT")
         .map(PathBuf::from)
@@ -31333,7 +31184,7 @@ fn receive(
                 state.eye_identity_present = [false; 2];
                 state.sam31_scene_candidate = None;
             }
-            let result = inspect_prompt_scene(&config, &shared, sam31_client.as_ref(), &stop);
+            let result = inspect_prompt_scene(&config, &shared, sam31_client.as_ref(), &stop, &model_publishers);
             if let Err(error) = result {
                 if let Ok(mut state) = shared.lock() {
                     state.reacquire_status = Some(format!("OBJECT GLOBAL SEARCH: {error}"));
@@ -31489,6 +31340,7 @@ fn receive(
                 stream,
                 Arc::clone(&cadence_frame_length),
             )?;
+            let recording_stream_epoch = recording_trace.start_stream();
             let started = Instant::now();
             let mut counts = [0u64; 2];
             let mut bytes = 0u64;
@@ -31816,12 +31668,20 @@ fn receive(
                     continue;
                 };
                 let ReceivedPacket {
+                    camera_header,
                     header,
                     payload,
                     arrived: packet_arrived,
                     host_arrival_unix_ns,
                     read_elapsed,
                 } = packet;
+                let recording_clock = if let PacketKind::Eye(roi_id) = header.kind {
+                    recording_trace.raw_arrived(serde_json::json!({"roi_id":roi_id,
+                        "sequence":header.sequence.to_string(),"sensor_timestamp_ns":header.timestamp_ns.to_string(),
+                        "stream_epoch":recording_stream_epoch,
+                        "region_session":header.region.map(|r|r.session.to_string()),
+                        "region_generation":header.region.map(|r|r.generation.to_string())}), packet_arrived, host_arrival_unix_ns)
+                } else { serde_json::Value::Null };
                 if header.kind == PacketKind::Regions {
                     let metadata = header.region.ok_or("region packet missing parsed metadata")?;
                     if !roi_tracker.live_region_transactions || metadata.session != region_session {
@@ -31858,6 +31718,9 @@ fn receive(
                     }
                     let residency_changed = applied_region_mask ^ metadata.active_mask;
                     applied_region_mask = metadata.active_mask;
+                    recording_trace.region(serde_json::json!({"session":metadata.session.to_string(),
+                        "generation":metadata.generation.to_string(),"active_mask":metadata.active_mask,
+                        "band_y":metadata.band_y,"eyes":metadata.eyes,"eye_size":metadata.eye_size}));
                     roi_tracker.acknowledge_pivot_regions(header.timestamp_ns, header.sensor_y, metadata);
                     for index in 0..2 {
                         if applied_region_mask & (1 << index) == 0 || residency_changed & (1 << index) != 0 {
@@ -31900,11 +31763,15 @@ fn receive(
                         }
                     }
                     TrackingQueueAction::DropWarmup | TrackingQueueAction::DropBacklog => {
+                        recording_trace.dropped_source(recording_clock.clone(), "tracking-warmup-or-backlog");
                         stale_queue_drops = stale_queue_drops.saturating_add(1);
                         stale_queue_peak_age = stale_queue_peak_age.max(queue_age);
                         continue;
                     }
                     TrackingQueueAction::Fatal => {
+                        if !recording_clock.is_null() {
+                            recording_trace.dropped_source(recording_clock.clone(), "tracking-queue-hard-limit");
+                        }
                         if std::env::var_os("BUTTERCUP_CALIBRATION_CAPTURE")
                             .is_some_and(|value| value != "0")
                         {
@@ -31938,6 +31805,20 @@ fn receive(
                     continue;
                 }
                 if header.kind == PacketKind::Context {
+                    {
+                        let native = Arc::new(CameraThumbnailFrame {
+                            kind: ThumbnailKind::SensorBand,
+                            sensor_size_px: [SENSOR_WIDTH, SENSOR_HEIGHT],
+                            sensor_rect_px: [header.sensor_x, header.sensor_y, config.window_size.0, config.window_size.1],
+                            host_received_unix_ns: host_arrival_unix_ns,
+                            region_session: header.region.map(|r| r.session),
+                            region_generation: header.region.map(|r| r.generation),
+                            camera_header, payload: Arc::clone(&payload),
+                        });
+                        native.validate()?;
+                        recording_trace.thumbnail(Arc::clone(&native));
+                        for publisher in model_publishers.iter() { publisher.submit_thumbnail(Arc::clone(&native)); }
+                    }
                     // The bilateral context matcher assumes both configured eyes occupy this band.
                     // A scheduled eviction must not become loss-of-lock/global reacquisition evidence.
                     if applied_region_mask != 3 { continue; }
@@ -32142,7 +32023,7 @@ fn receive(
                     last_raw_set_arrival = Some(raw_packet_arrived);
                 }
                 if let Some(recorder) = recorder.as_mut() {
-                    recorder.record(&header, &payload)?;
+                    recorder.record(&header, &payload, Some(&recording_clock))?;
                     recorder.record_recovery(&header, &roi_tracker)?;
                 }
                 if first_in_set {
@@ -32168,7 +32049,7 @@ fn receive(
                                         });
                                     }
                                 } else {
-                                    match Recorder::new(&path, &config) {
+                                    match Recorder::new(&path, &config, &recording_trace) {
                                         Ok(dynamic_recorder) => {
                                             eprintln!(
                                                 "S/H started two-ROI RAW recording with frame predictions {}",
@@ -32265,7 +32146,7 @@ fn receive(
                                 });
                             }
                         } else {
-                            match Recorder::new(&request.path, &config) {
+                            match Recorder::new(&request.path, &config, &recording_trace) {
                                 Ok(dynamic_recorder) => {
                                     if let Ok(mut state) = shared.lock() {
                                         if let Some(result) = state.timed_record_result.as_mut() {
@@ -32305,7 +32186,7 @@ fn receive(
                 }
                 let mut timed_completion = None;
                 if let Some(active) = timed_recording.as_mut() {
-                    match active.recorder.record(&header, &payload).and_then(|()|active.recorder.record_recovery(&header,&roi_tracker)) {
+                    match active.recorder.record(&header, &payload, Some(&recording_clock)).and_then(|()|active.recorder.record_recovery(&header,&roi_tracker)) {
                         Ok(()) => {
                             active.frames = active.frames.saturating_add(1);
                             if last_in_set {
@@ -32352,7 +32233,7 @@ fn receive(
                 }
                 let mut hotkey_error = None;
                 if let Some(active) = hotkey_recording.as_mut() {
-                    match active.recorder.record(&header, &payload).and_then(|()|active.recorder.record_recovery(&header,&roi_tracker)) {
+                    match active.recorder.record(&header, &payload, Some(&recording_clock)).and_then(|()|active.recorder.record_recovery(&header,&roi_tracker)) {
                         Ok(()) => {
                             active.frames = active.frames.saturating_add(1);
                             if last_in_set {
@@ -34755,14 +34636,14 @@ fn receive(
                                         native_diagnostics.selected_right,
                                         native_diagnostics.selected_lower,
                                         native_diagnostics.analog_mean_signed_offset_px,
-                                        native_diagnostics.analog_mean_power,
+                                        native_diagnostics.analog_mean_edge_amplitude,
                                         native_diagnostics.analog_mean_certainty,
                                         if native_diagnostics.analog_fit_applied {
                                             ""
                                         } else {
                                             " HOLD"
                                         },
-                                        native_diagnostics.analog_force_samples,
+                                        native_diagnostics.analog_edge_samples,
                                         native_diagnostics.elapsed_us,
                                         native_diagnostics.work_stride,
                                         native_diagnostics.sample_stride,
@@ -35485,7 +35366,7 @@ fn receive(
                             pupil_center_track_diagnostics.regime.label().to_ascii_uppercase(),
                             pupil_center_track_diagnostics.transport_source.short_label(),
                             pupil_center_track_diagnostics.innovation_px,
-                            pupil_center_track_diagnostics.saccade_likelihood,
+                            pupil_center_track_diagnostics.saccade_score,
                             pupil_center_track_diagnostics.relative_jerk_px_s3,
                             pupil_center_pending,
                             if inner_iris.points.is_empty() {
@@ -35586,7 +35467,7 @@ fn receive(
                         {
                             if let Some(pivot) = virtual_contact_surface_trackers[index].kinematic_history.back()
                                 .filter(|frame| frame.source_timestamp_ns == Some(result.source_timestamp_ns))
-                                .map(|frame| frame.implied_globe_center_sensor)
+                                .map(|frame| frame.implied_pivot_sensor_px)
                             {
                                 roi_tracker.observe_projected_pivot(
                                     index, result.source_timestamp_ns, header.timestamp_ns, pivot,
@@ -36582,10 +36463,12 @@ fn receive(
                         Err(error) => eprintln!("{label} eye export failed: {error}"),
                     }
                 }
-                let frame = EyeFrame {
+                let mut frame = EyeFrame {
                     eye_id,
                     sequence: header.sequence,
                     timestamp_ns: header.timestamp_ns,
+                    recording_clock,
+                    recording_ready: serde_json::Value::Null,
                     segmentation_mode,
                     gaze_authority_generation: gaze_authority_generations[index],
                     gaze_authority_sam_prompt_generation: (segmentation_mode
@@ -36875,6 +36758,7 @@ fn receive(
                         None
                     },
                 };
+                frame.recording_ready = recording_trace.stamp_json();
                 if !model_publishers.is_empty() {
                     let (
                         focus_target,
@@ -36936,7 +36820,7 @@ fn receive(
                         point_count: border_focus.points.len().min(u32::MAX as usize) as u32,
                         payload: Arc::clone(&payload),
                     });
-                    for publisher in &model_publishers {
+                    for publisher in model_publishers.iter() {
                         publisher.submit(Arc::clone(&model_frame));
                     }
                 }
@@ -37938,6 +37822,7 @@ fn receive(
                 }
                 let task_config = config.clone();
                 let task_shared = Arc::clone(&shared);
+                let task_publishers = Arc::clone(&model_publishers);
                 fine_sets_since_mediapipe = 0;
                 let (sender, receiver) = sync_channel(1);
                 let (restore_sender, restore_receiver) = sync_channel(1);
@@ -37958,6 +37843,7 @@ fn receive(
                             context_snapshot.as_deref(),
                             task_kind,
                             &task_shared,
+                            &task_publishers,
                         );
                         // A capture failure must still release the receiver so
                         // it can inspect the result and restore explicitly.
@@ -38293,7 +38179,7 @@ fn draw_sensor_overview_eye_laser(
         .or_else(|| {
             frame
                 .virtual_contact_surface_gaze
-                .map(|surface| surface.bucketed_face_radius_px * 1.83)
+                .map(|surface| surface.quantized_frontal_disk_radius_px * 1.83)
         })
         .or_else(|| {
             let points = frame.outer_iris_points.as_slice();
@@ -39514,6 +39400,19 @@ fn draw_sam31_deflattened_virtual_contact(
     pixel_scale: usize,
     frame: &EyeFrame,
 ) -> usize {
+    draw_sam31_virtual_contact_source(pixels, width, height, origin_x, origin_y,
+        pixel_scale, frame.sequence, frame.sam31_proposal_masks.as_deref(),
+        frame.virtual_contact_surface_gaze)
+}
+
+/// Shared renderer for live presentation and offline source-aligned exports.
+#[allow(clippy::too_many_arguments)]
+fn draw_sam31_virtual_contact_source(
+    pixels: &mut [u32], width: usize, height: usize,
+    origin_x: i32, origin_y: i32, pixel_scale: usize, sequence: u64,
+    proposals: Option<&sam31_outer::ProposalMasks>,
+    surface_gaze: Option<SurfaceGazeSample>,
+) -> usize {
     let count = draw_sam31_outer_iris_fit(
         pixels,
         width,
@@ -39521,17 +39420,17 @@ fn draw_sam31_deflattened_virtual_contact(
         origin_x,
         origin_y,
         pixel_scale,
-        frame.sequence,
-        frame.sam31_proposal_masks.as_deref(),
+        sequence,
+        proposals,
     );
-    let Some(proposals) = frame.sam31_proposal_masks.as_deref() else {
+    let Some(proposals) = proposals else {
         return count;
     };
     let Some(review) = proposals.outer_fit.as_ref() else {
         return count;
     };
     let boundary = review.ellipse.dense_points(240);
-    let Some(pose) = provisional_surface_pose(frame.virtual_contact_surface_gaze, &boundary) else {
+    let Some(pose) = provisional_surface_pose(surface_gaze, &boundary) else {
         draw_text(
             pixels,
             width,
@@ -39554,7 +39453,7 @@ fn draw_sam31_deflattened_virtual_contact(
         None,
         Some(pose.relative_gaze),
         Some(pose.sphere_radius),
-        Some((frame.sequence % 180) as f64 * std::f64::consts::PI / 180.0),
+        Some((sequence % 180) as f64 * std::f64::consts::PI / 180.0),
         true,
         None,
         &[],
@@ -41396,9 +41295,9 @@ fn draw_motion_octree_overlay_with_spatial_debug(
         coupled.cyan.angular_velocity_rad_s,
         coupled.green.speed_px_s,
         coupled.green.angular_velocity_rad_s,
-        coupled.green_relative_to_cyan.speed_px_s,
-        coupled.green_relative_to_cyan.angular_velocity_rad_s,
-        coupled.saccade_likelihood,
+        coupled.pupil_relative_to_general.speed_px_s,
+        coupled.pupil_relative_to_general.angular_velocity_rad_s,
+        coupled.saccade_score,
     );
     draw_text(
         pixels,
@@ -41603,7 +41502,7 @@ fn draw_rotation_meridians(
         boundary_center,
         boundary_radius,
         sphere_radius,
-        slice_depth,
+        limbus_plane_offset_px,
         rotation_center,
     } = geometry;
 
@@ -41613,7 +41512,7 @@ fn draw_rotation_meridians(
     // but the 3D surface is still perfectly well-defined; choose a canonical
     // presentation tangent rather than suppressing the valid contact.
     let relative_gaze = relative_gaze.or_else(|| {
-        resolve_projected_surface_normal(None, boundary_center, rotation_center, slice_depth).map(
+        resolve_projected_surface_normal(None, boundary_center, rotation_center, limbus_plane_offset_px).map(
             |normal| RelativeGazeVector {
                 right: normal[0],
                 down: normal[1],
@@ -42137,7 +42036,7 @@ impl PresentationLaserLease {
             .map(|point| (point.0 - center.0).hypot(point.1 - center.1))
             .sum::<f64>()
             / boundary.len() as f64;
-        let slice_depth = (self.sphere_radius * self.sphere_radius
+        let limbus_plane_offset_px = (self.sphere_radius * self.sphere_radius
             - boundary_radius * boundary_radius)
             .max(0.0)
             .sqrt();
@@ -42147,8 +42046,8 @@ impl PresentationLaserLease {
         ));
         frame.projected_rotation_center_z = self.rotation_center_z;
         frame.projected_gaze_pole = Some((
-            slice_depth * self.relative_gaze.right,
-            slice_depth * self.relative_gaze.down,
+            limbus_plane_offset_px * self.relative_gaze.right,
+            limbus_plane_offset_px * self.relative_gaze.down,
         ));
         frame.projected_sphere_radius = Some(self.sphere_radius);
         frame.presentation_contact_boundary = boundary;
@@ -42198,7 +42097,7 @@ fn ray_origin_lock_from_frame(eye: usize, frame: &EyeFrame) -> Option<LockedRayO
         frame.projected_gaze_pole,
         geometry.boundary_center,
         geometry.rotation_center,
-        geometry.slice_depth,
+        geometry.limbus_plane_offset_px,
     )?;
     let relative_gaze = RelativeGazeVector::from_projected(normal[0], normal[1])?;
     let convex = camera_facing_convex_contact(geometry, relative_gaze, None)?;
@@ -42310,7 +42209,7 @@ fn presentation_pivot_contact_from_frame(
         pole,
         geometry.boundary_center,
         geometry.rotation_center,
-        geometry.slice_depth,
+        geometry.limbus_plane_offset_px,
     )?;
     let relative_gaze = RelativeGazeVector::from_projected(normal[0], normal[1])?;
     let convex = camera_facing_convex_contact(geometry, relative_gaze, None)?;
@@ -42328,8 +42227,8 @@ fn presentation_pivot_contact_from_frame(
         ),
         boundary_radius: geometry.boundary_radius,
         projected_gaze_pole: (
-            geometry.slice_depth * normal[0],
-            geometry.slice_depth * normal[1],
+            geometry.limbus_plane_offset_px * normal[0],
+            geometry.limbus_plane_offset_px * normal[1],
         ),
         sphere_radius: geometry.sphere_radius,
         source_timestamp_ns: frame.timestamp_ns,
@@ -42477,14 +42376,42 @@ fn surface_gaze_status(sample: Option<SurfaceGazeSample>) -> String {
             };
             format!(
                 "FACE AREA {:.0}PX2  BUCKET {}  R {:.1}  NEAR {:.1},{:.1}  SIGN {sign}",
-                sample.rectified_area_px2,
+                sample.frontal_equivalent_disk_area_px2,
                 sample.area_bucket,
-                sample.bucketed_face_radius_px,
-                sample.camera_near_point_sensor.0,
-                sample.camera_near_point_sensor.1,
+                sample.quantized_frontal_disk_radius_px,
+                sample.near_surface_point_sensor_px.0,
+                sample.near_surface_point_sensor_px.1,
             )
         },
     )
+}
+
+fn draw_accuracy_check(session:&gaze_accuracy::Session,pixels:&mut[u32],width:usize,height:usize,now:Instant) {
+    pixels.fill(VIRTUAL_MOUSE_BACKGROUND);
+    if let Some(outcome)=session.finished.as_deref() {
+        let report=session.report();
+        let number=|key:&str|report[key].as_f64().map_or("N/A".into(),|v|format!("{v:.1}"));
+        let rows=[
+            format!("GAZE ACCURACY: {outcome}"),
+            format!("MEAN TARGET ERROR {} PX / {} PCT SCREEN DIAGONAL",number("mean_target_error_px"),number("mean_target_error_percent_diagonal")),
+            format!("MEDIAN {} PX / P95 {} PX",number("median_sample_error_px"),number("p95_sample_error_px")),
+            format!("TARGETS WITH DATA {}/20 / FRESH SAMPLES {}",report["targets_with_samples"],report["fresh_samples"]),
+            "MISSING TARGETS ARE NOT ZERO ERROR".into(),
+            "NO RECALIBRATION / MONITOR DEFAULTS UNCHANGED".into(),
+            if session.report_error.is_some(){"REPORT SAVE FAILED - CHECK LOG".into()}
+                else {"REPORT SAVED IN OUTPUTS/GAZE-ACCURACY".into()},
+            "BACKSLASH OR ESC RETURNS TO VIEWER".into(),
+        ];
+        for (i,row) in rows.iter().enumerate(){draw_centered_text(pixels,width,height,40+i as i32*30,row,VIRTUAL_MOUSE_INK);}
+    } else {
+        let (u,v)=gaze_accuracy::TARGETS[session.index];
+        let center=((u*width.saturating_sub(1) as f64).round() as i32,(v*height.saturating_sub(1) as f64).round() as i32);
+        let elapsed=session.elapsed(now);
+        let spinner=Duration::from_secs_f64(elapsed.as_secs_f64()/gaze_accuracy::HOLD.as_secs_f64()*VIRTUAL_MOUSE_TARGET_HOLD.as_secs_f64());
+        draw_virtual_mouse_calibration_target(pixels,width,height,center,spinner,VIRTUAL_MOUSE_MIN_SAMPLES);
+        fill_rect(pixels,width,height,center.0-2,center.1-2,5,5,VIRTUAL_MOUSE_INK);
+        draw_centered_text(pixels,width,height,16,&format!("LOOK AT THE DOT  {}/20",session.index+1),VIRTUAL_MOUSE_INK);
+    }
 }
 
 fn draw_virtual_mouse_calibration_target(
@@ -42819,6 +42746,7 @@ fn draw_completed_display_wireframe(mode: &VirtualMouseMode, pixels: &mut [u32],
     ] { draw_centered_text(pixels,width,height,y,&text,color); }
 }
 
+#[cfg(test)]
 fn draw_virtual_mouse(
     mode: &VirtualMouseMode,
     focused_frame: Option<&EyeFrame>,
@@ -42826,7 +42754,11 @@ fn draw_virtual_mouse(
     width: usize,
     height: usize,
 ) {
-    let now = Instant::now();
+    draw_virtual_mouse_at(mode, focused_frame, pixels, width, height, Instant::now());
+}
+
+fn draw_virtual_mouse_at(mode: &VirtualMouseMode, focused_frame: Option<&EyeFrame>,
+    pixels: &mut [u32], width: usize, height: usize, now: Instant) {
     if mode.lightbox.enabled {
         let band = ((width.min(height) as f64 * mode.lightbox.width_fraction).round() as i32)
             .clamp(1, width.min(height).max(1) as i32 / 2);
@@ -43164,7 +43096,89 @@ fn fulfill_pending_presentation_export(
     }
 }
 
-fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
+fn recording_gaze(
+    frame: Option<&EyeFrame>,
+    surface: Option<SurfaceGazeSample>,
+    predicted: Option<(f64, f64)>,
+    drawn: Option<(f64, f64)>,
+    mapping: serde_json::Value,
+    held_geometry: bool,
+) -> recording_trace::Gaze {
+    let source_timestamp_ns = surface.and_then(|s| s.source_timestamp_ns);
+    recording_trace::Gaze {
+        predicted, drawn,
+        drawn_source_timestamp_ns: drawn.and(source_timestamp_ns),
+        source_timestamp_ns,
+        source_basis: serde_json::json!({
+            "roi_id": frame.map(|f| f.eye_id),
+            "segmentation": frame.map(|f| f.segmentation_mode.label()),
+            "gaze_authority_generation": frame.map(|f| f.gaze_authority_generation.to_string()),
+            "sam_prompt_generation": frame.and_then(|f| f.gaze_authority_sam_prompt_generation).map(|n| n.to_string()),
+            "sign_epoch": surface.map(|s| s.sign_epoch.to_string()),
+            "sign_resolved": surface.map(|s| s.sign_resolved),
+        }),
+        roi_frame: frame.map(|f| if !f.recording_clock.is_null() { f.recording_clock["source_key"].clone() } else { serde_json::json!({
+            "roi_id": f.eye_id, "sequence": f.sequence.to_string(),
+            "sensor_timestamp_ns": f.timestamp_ns.to_string(),
+            "sensor_rect_px": [f.sensor_x, f.sensor_y, f.width as u32, f.height as u32],
+        }) }).unwrap_or(serde_json::Value::Null),
+        mapping,
+        held_geometry,
+        status: if predicted.is_some() { "predicted" }
+            else if frame.is_none() { "no-frame" }
+            else if surface.is_none() { "no-surface" }
+            else if surface.is_some_and(|s| !s.sign_resolved) { "unresolved-sign" }
+            else { "no-admissible-monitor-target" },
+    }
+}
+
+fn recording_mapping(kind: &str, plane: VirtualDisplayPlane, affine: Option<GazeAffine>) -> serde_json::Value {
+    serde_json::json!({"kind": kind, "monitor_plane": monitor_location::plane_json(plane),
+        "affine": affine.map(|a| serde_json::json!({"x": a.x, "y": a.y}))})
+}
+
+#[cfg(test)]
+fn calibration_recording_targets(mode: &VirtualMouseMode) -> Vec<recording_trace::Target> {
+    calibration_recording_targets_at(mode, Instant::now())
+}
+
+fn calibration_recording_targets_at(mode: &VirtualMouseMode, now: Instant) -> Vec<recording_trace::Target> {
+    if !mode.sequence_started || mode.display_plane.is_some() || mode.calibration_failure.is_some() {
+        return vec![];
+    }
+    let index = mode.target_index.min(VIRTUAL_MOUSE_CALIBRATION_TARGETS.len() - 1);
+    vec![recording_trace::Target { id: format!("calibration-{index}"), role: "calibration",
+        normalized: VIRTUAL_MOUSE_CALIBRATION_TARGETS[index],
+        appearance: recording_target_appearance("spinner-crosshair", now.saturating_duration_since(mode.target_started), mode.samples[index].len()) }]
+}
+
+#[cfg(test)]
+fn accuracy_recording_targets(session: &gaze_accuracy::Session) -> Vec<recording_trace::Target> {
+    accuracy_recording_targets_at(session, Instant::now())
+}
+
+fn accuracy_recording_targets_at(session: &gaze_accuracy::Session, now: Instant) -> Vec<recording_trace::Target> {
+    if session.finished.is_some() { return vec![]; }
+    vec![recording_trace::Target { id: format!("accuracy-{}", session.index), role: "accuracy",
+        normalized: gaze_accuracy::TARGETS[session.index], appearance: recording_target_appearance("spinner-dot",
+            Duration::from_secs_f64(session.elapsed(now).as_secs_f64()/gaze_accuracy::HOLD.as_secs_f64()*VIRTUAL_MOUSE_TARGET_HOLD.as_secs_f64()),
+            VIRTUAL_MOUSE_MIN_SAMPLES) }]
+}
+
+fn recording_target_appearance(style: &str, elapsed: Duration, samples: usize) -> serde_json::Value {
+    let progress = (elapsed.as_secs_f64()/VIRTUAL_MOUSE_TARGET_HOLD.as_secs_f64())
+        .min(samples as f64 / VIRTUAL_MOUSE_MIN_SAMPLES as f64).clamp(0.0,1.0);
+    serde_json::json!({"style":style,"foreground_rgb":[255,255,255],"background_rgb":[0,0,0],
+        "ring_radius_px":29.0/VIRTUAL_MOUSE_THUMBNAIL_DIVISOR as f64,"segments":32,
+        "completed_segments":(progress*32.0).ceil(),"progress":progress,
+        "phase_rad":elapsed.as_secs_f64()*std::f64::consts::TAU*0.65,
+        "ring_track_rgb":[88,88,88],"head_size_px":3,"angle_offset_rad":-std::f64::consts::FRAC_PI_2,
+        "crosshair_size_px":if style=="spinner-crosshair" {15} else {0},"crosshair_width_px":3,
+        "center_cutout_size_px":if style=="spinner-crosshair" {5} else {0},
+        "center_dot_size_px":if style=="spinner-crosshair" {3} else {5}})
+}
+
+fn refresh_viewer_frames(app: &mut App) -> Result<(), String> {
     let action=app.shared.lock().ok().and_then(|mut shared|shared.ui_action.take());
     if let Some(action)=action {viewer_ui::apply(app,action);}
     let prompt=app.shared.lock().ok().and_then(|mut shared|shared.ui_prompt_request.take());
@@ -43227,6 +43241,33 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
             frame,
         );
     }
+    Ok(())
+}
+
+/// Shared preparation for the visible contact and desktop pointer. Holding a
+/// laser between observations remains a later, strictly presentation-only step.
+fn prepare_current_contact_frame(app: &App, eye: usize, frame: &mut EyeFrame, prompt_generation: u64) {
+    if frame.sam31_proposal_masks.as_ref()
+        .is_some_and(|proposal| proposal.prompt_generation != prompt_generation)
+    {
+        frame.sam31_proposal_masks = None;
+    }
+    if let Some(lock) = app.ray_origin_lock {
+        if lock.eye == eye { apply_ray_origin_lock(eye, frame, lock); }
+    } else if let Some(contact) = app.presentation_pivot_contact {
+        if contact.eye == eye { apply_presentation_pivot_contact(eye, frame, contact); }
+    }
+}
+
+fn display_gaze_target(pose: VirtualContactPose, calibration: Option<CalibratedDisplay>, plane: VirtualDisplayPlane)
+    -> Option<(f64, f64)>
+{
+    calibration.map_or_else(|| plane.target(pose.relative_gaze), |c| c.target(pose.relative_gaze))
+}
+
+fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
+    refresh_viewer_frames(app)?;
+    let recording_trace = app.shared.lock().map_err(|_| "viewer lock poisoned")?.recording_trace.clone();
     let size = state.window.inner_size();
     if size.width == 0 || size.height == 0 {
         return Ok(());
@@ -43234,6 +43275,7 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
     resize_surface(&mut state.surface, size);
     let width = size.width as usize;
     let height = size.height as usize;
+    let (display_metadata, camera_metadata) = app.recording_metadata.observe(&state.window, &app.checkerboard_status);
     let mut buffer = state
         .surface
         .buffer_mut()
@@ -43330,21 +43372,55 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
                 plane,
                 gaze_affine,
             });
-        }
-        if calibration_finished {
-            app.stop_calibration_capture(calibration_sequence_completed);
+            if let Ok(mut shared)=app.shared.lock() {shared.monitor_location.offer(plane);}
         }
         pixels.fill(VIRTUAL_MOUSE_BACKGROUND);
-        draw_virtual_mouse(
+        let calibration_rendered_at = Instant::now();
+        draw_virtual_mouse_at(
             app.virtual_mouse.as_ref().expect("virtual mouse mode"),
             focused_frame.as_ref(),
             pixels,
             width,
             height,
+            calibration_rendered_at,
         );
+        let mode = app.virtual_mouse.as_ref().expect("virtual mouse mode");
+        let plane = mode.display_plane.unwrap_or_else(|| app.shared.lock()
+            .map(|s| s.monitor_location.effective_plane())
+            .unwrap_or_else(|_| VirtualDisplayPlane::development_default()));
+        let predicted = observation.filter(|_| mode.completed_basis_pause.is_none()).and_then(|(_, feature, _)| {
+            mode.gaze_affine.map(|a| a.map(feature)).or_else(|| {
+                RelativeGazeVector::from_projected(feature.0, feature.1).and_then(|ray| plane.target(ray))
+            })
+        });
+        let drawn = mode.display_plane.and(mode.reticle);
+        let mut gaze = recording_gaze(focused_frame.as_ref(), surface_gaze, predicted, drawn,
+            recording_mapping(if mode.gaze_affine.is_some() { "calibration-affine-reticle" }
+                else { "calibrating-monitor-preset" }, plane, mode.gaze_affine), false);
+        gaze.drawn_source_timestamp_ns = drawn.and(mode.reticle_source_timestamp_ns);
+        if mode.completed_basis_pause.is_some() { gaze.status = "calibrated-basis-paused"; }
+        let scene = recording_trace::scene::snapshot(&app.eyes, recording_trace::scene::Input {
+            reference_eye:app.focus_eye, plane, selected_prediction:predicted,
+            selected_ray:observation.filter(|_|mode.completed_basis_pause.is_none()).and_then(|(_,p,_)|RelativeGazeVector::from_projected(p.0,p.1)),
+            calibration:serde_json::json!({"phase":if !mode.sequence_started {"arming"} else if mode.calibration_failure.is_some() {"failed"}
+                else if mode.display_plane.is_some() {"complete"} else {"collecting"},
+                "sign_restarts":mode.calibration_sign_restarts,"authority_restarts":mode.calibration_authority_restarts,
+                "failure":mode.calibration_failure,"basis_pause":mode.completed_basis_pause}),
+            camera:camera_metadata,
+        }, &app.shared, &recording_trace);
+        let presentation = recording_trace::Presentation { mode: "mouse-calibration", size: [width, height],
+            targets: calibration_recording_targets_at(mode, calibration_rendered_at), gaze, display:display_metadata, scene };
         fulfill_pending_presentation_export(&app.shared, pixels, width, height);
         state.window.pre_present_notify();
-        return buffer.present().map_err(|error| error.to_string());
+        let before_submit = recording_trace.stamp();
+        buffer.present().map_err(|error| error.to_string())?;
+        recording_trace.presented(presentation, before_submit);
+        // Record the final target removal before asking the receiver to close
+        // the automatically armed calibration bundle.
+        if calibration_finished {
+            app.stop_calibration_capture(calibration_sequence_completed);
+        }
+        return Ok(());
     }
     let mut presented_eyes = app.eyes.clone();
     // Prompt compilation and CUDA inference are asynchronous. Clear any
@@ -43356,22 +43432,9 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
         .lock()
         .map(|state| state.sam31_prompt_bundle_generation)
         .unwrap_or(0);
-    for frame in presented_eyes.iter_mut().flatten() {
-        if frame
-            .sam31_proposal_masks
-            .as_ref()
-            .is_some_and(|proposal| proposal.prompt_generation != requested_prompt_generation)
-        {
-            frame.sam31_proposal_masks = None;
-        }
-    }
-    if let Some(lock) = app.ray_origin_lock {
-        if let Some(frame) = presented_eyes[lock.eye].as_mut() {
-            apply_ray_origin_lock(lock.eye, frame, lock);
-        }
-    } else if let Some(contact) = app.presentation_pivot_contact {
-        if let Some(frame) = presented_eyes[contact.eye].as_mut() {
-            apply_presentation_pivot_contact(contact.eye, frame, contact);
+    for (eye, frame) in presented_eyes.iter_mut().enumerate() {
+        if let Some(frame) = frame {
+            prepare_current_contact_frame(app, eye, frame, requested_prompt_generation);
         }
     }
     let eye_laser_enabled_now = app
@@ -43418,45 +43481,96 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
         virtual_contact_authority.and_then(VirtualContactAuthority::eye_laser_style);
     let active_frame = presented_eyes[app.focus_eye].as_ref();
     let active_surface = active_frame.and_then(mouse_gaze_surface);
-    let active_prompt_generation =
-        active_frame.and_then(|frame| frame.gaze_authority_sam_prompt_generation);
     let stored_calibration = app
         .calibrated_display
         .filter(|calibration| calibration.eye == app.focus_eye);
-    let calibrated_display = stored_calibration.filter(|calibration| {
-        active_frame.is_some_and(|frame| frame.segmentation_mode == calibration.segmentation_mode)
-            && active_frame.is_some_and(|frame| {
-                frame.gaze_authority_generation == calibration.gaze_authority_generation
-            })
-            && active_surface.is_some_and(|surface| {
-                surface.sign_resolved && surface.sign_epoch == calibration.sign_epoch
-            })
-            && (calibration.segmentation_mode != SegmentationMode::Sam31
-                || active_prompt_generation == calibration.sam_prompt_generation)
-    });
+    let calibrated_display = stored_calibration.and_then(|c| c.for_frame(app.focus_eye, active_frame));
+    let (default_monitor_plane,saved_monitor_pose,session_monitor_pose)=app.shared.lock().map(|s|(
+        s.monitor_location.effective_plane(),s.monitor_location.saved,
+        s.monitor_location.unsaved_candidate()))
+        .unwrap_or_else(|_|(VirtualDisplayPlane::development_default(),false,false));
     let cursor_mapping = if calibrated_display.is_some() {
         DisplayCursorMapping::Calibrated
+    } else if session_monitor_pose {
+        DisplayCursorMapping::SessionMonitorPreset
+    } else if saved_monitor_pose {
+        if stored_calibration.is_some(){DisplayCursorMapping::InvalidatedSavedMonitorFallback}
+        else {DisplayCursorMapping::SavedMonitorPreset}
     } else if stored_calibration.is_some() {
         DisplayCursorMapping::InvalidatedNominalFallback
     } else {
         DisplayCursorMapping::UncalibratedNominal
     };
-    let raw_display_target = eye_laser_enabled
-        .then(|| {
-            selected_virtual_contact.and_then(|pose| {
-                calibrated_display.map_or_else(
-                    || VirtualDisplayPlane::development_default().target(pose.relative_gaze),
-                    |calibration| calibration.target(pose.relative_gaze),
-                )
-            })
-        })
-        .flatten();
+    if app.accuracy_requested {
+        let plane=calibrated_display.map_or(default_monitor_plane,|cal|cal.plane);
+        let basis=accuracy_basis(active_frame,active_surface);
+        app.accuracy_check=Some(AccuracyCheck {
+            session:gaze_accuracy::Session::new((width,height),serde_json::json!({
+                "mode":cursor_mapping.status_label(),"monitor_pose":monitor_location::plane_json(plane),
+                "affine":calibrated_display.map(|cal|serde_json::json!({"x":cal.gaze_affine.x,"y":cal.gaze_affine.y})),
+                "eye":app.focus_eye,"basis":basis.map(|(authority,epoch)|format!("{authority:?}; sign epoch {epoch}")),
+                "frozen_for_accuracy_check":true})),
+            plane,calibration:calibrated_display,basis,
+        });
+        app.accuracy_requested=false;
+    }
+    if let Some(check)=app.accuracy_check.as_mut() {
+        if check.session.size!=(width,height) {
+            if check.session.index==0 && check.session.elapsed(now)<gaze_accuracy::SETTLE {
+                check.session=gaze_accuracy::Session::new((width,height),check.session.mapping.clone());
+            } else {check.session.abort("DISPLAY RESIZED");}
+        }
+        let basis=accuracy_basis(active_frame,active_surface);
+        if let Some(current)=basis {
+            if check.basis.is_some_and(|previous|previous!=current){check.session.abort("GAZE BASIS CHANGED - RERUN CHECK");}
+            else if check.basis.is_none(){
+                check.basis=Some(current);
+                check.session.mapping["basis"]=serde_json::json!(format!("{:?}; sign epoch {}",current.0,current.1));
+            }
+        }
+        let observation=active_surface.filter(|s|s.sign_resolved).and_then(|surface| {
+            let source=surface.source_timestamp_ns?;
+            let pose=selected_virtual_contact?;
+            let target=check.calibration.map_or_else(||check.plane.target(pose.relative_gaze),|cal|cal.target(pose.relative_gaze))?;
+            Some((source,target))
+        });
+        let reason=if active_frame.is_none(){"NO RAW FRAME"}
+            else if active_surface.is_none(){"NO SURFACE"}
+            else if active_surface.is_some_and(|s|!s.sign_resolved){"UNRESOLVED SIGN"}
+            else {"NO FORWARD MONITOR HIT"};
+        check.session.observe(now,active_frame.map(|f|f.timestamp_ns),observation,reason);
+        save_accuracy_report(check);
+        draw_accuracy_check(&check.session,pixels,width,height,now);
+        let presentation = recording_trace::Presentation { mode: "gaze-accuracy", size: [width, height],
+            targets: accuracy_recording_targets_at(&check.session, now),
+            gaze: recording_gaze(active_frame, active_surface, observation.map(|(_, p)| p), None,
+                check.session.mapping.clone(), selected_virtual_contact.is_some_and(|pose|
+                    pose.authority == VirtualContactAuthority::MotionHeld)),
+            display:display_metadata,
+            scene:recording_trace::scene::snapshot(&presented_eyes, recording_trace::scene::Input {
+                reference_eye:app.focus_eye,plane:check.plane,selected_ray:selected_virtual_contact.map(|p|p.relative_gaze),
+                selected_prediction:observation.map(|(_,p)|p),camera:camera_metadata,
+                calibration:serde_json::json!({"phase":"accuracy-check-frozen-mapping","outcome":check.session.finished}),
+            }, &app.shared, &recording_trace),
+        };
+        fulfill_pending_presentation_export(&app.shared,pixels,width,height);
+        state.window.pre_present_notify();
+        let before_submit = recording_trace.stamp();
+        buffer.present().map_err(|e|e.to_string())?;
+        recording_trace.presented(presentation, before_submit);
+        return Ok(());
+    }
+    // Compute the same mapping while J is off too: hiding a cursor must not
+    // discard the gaze prediction from an S recording.
+    let predicted_display_target = selected_virtual_contact
+        .and_then(|pose| display_gaze_target(pose, calibrated_display, default_monitor_plane));
+    let raw_display_target = eye_laser_enabled.then_some(predicted_display_target).flatten();
     // Present the absolute target immediately, with no redraw-rate easing.
     app.nominal_display_cursor = raw_display_target;
     let display_cursor_status = DisplayCursorStatus {
         mapping: cursor_mapping,
         display_distance_inches: calibrated_display
-            .map_or(VirtualDisplayPlane::development_default().distance_inches(), |calibration| {
+            .map_or(default_monitor_plane.distance_inches(), |calibration| {
                 calibration.plane.distance_inches()
             }),
         raw_target: raw_display_target,
@@ -43465,6 +43579,20 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
     if let Ok(mut shared) = app.shared.lock() {
         shared.display_cursor_status = display_cursor_status;
     }
+    let presentation = recording_trace::Presentation { mode: "viewer", size: [width, height], targets: vec![],
+        gaze: recording_gaze(active_frame, active_surface, predicted_display_target, raw_display_target,
+            recording_mapping(cursor_mapping.status_label(),
+                calibrated_display.map_or(default_monitor_plane, |c| c.plane),
+                calibrated_display.map(|c| c.gaze_affine)),
+            selected_virtual_contact.is_some_and(|pose| pose.authority == VirtualContactAuthority::MotionHeld)),
+        display:display_metadata,
+        scene:recording_trace::scene::snapshot(&presented_eyes, recording_trace::scene::Input {
+            reference_eye:app.focus_eye,plane:calibrated_display.map_or(default_monitor_plane,|c|c.plane),
+            selected_ray:selected_virtual_contact.map(|p|p.relative_gaze),selected_prediction:predicted_display_target,
+            camera:camera_metadata,calibration:serde_json::json!({"phase":cursor_mapping.status_label(),
+                "stored_calibration":stored_calibration.is_some(),"active_calibration":calibrated_display.is_some()}),
+        }, &app.shared, &recording_trace),
+    };
     viewer_ui::render(app, pixels, width, height, &presented_eyes);
     if app.main_lightbox.enabled && width > 2 && height > 2 {
         let scene = pixels.to_vec();
@@ -43493,7 +43621,10 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
     }
     fulfill_pending_presentation_export(&app.shared, pixels, width, height);
     state.window.pre_present_notify();
-    buffer.present().map_err(|error| error.to_string())
+    let before_submit = recording_trace.stamp();
+    buffer.present().map_err(|error| error.to_string())?;
+    recording_trace.presented(presentation, before_submit);
+    Ok(())
 }
 
 impl ApplicationHandler for App {
@@ -43518,7 +43649,7 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CursorMoved { position, .. } => { self.ui.pointer=(position.x,position.y); }
             WindowEvent::MouseInput { state:ElementState::Pressed, button:winit::event::MouseButton::Left, .. }
-                if self.virtual_mouse.is_none() && self.sam31_prompt_editor.is_none() => { viewer_ui::click(self); }
+                if self.virtual_mouse.is_none() && self.accuracy_check.is_none() && !self.accuracy_requested && self.sam31_prompt_editor.is_none() => { viewer_ui::click(self); }
             WindowEvent::MouseWheel { delta, .. } if self.virtual_mouse.is_none() => {
                 let y=match delta {winit::event::MouseScrollDelta::LineDelta(_,y)=>y as f64,
                     winit::event::MouseScrollDelta::PixelDelta(p)=>p.y};
@@ -43534,8 +43665,18 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Focused(focused) => {
                 self.window_focused = focused;
+                if !focused {if let Some(check)=self.accuracy_check.as_mut(){check.session.abort("VIEWER LOST FOCUS");}}
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if self.accuracy_check.is_some() || self.accuracy_requested {
+                    if !event.repeat && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyS | KeyCode::KeyH)) {
+                        self.toggle_raw_recording();
+                    }
+                    if !event.repeat && matches!(event.physical_key,PhysicalKey::Code(KeyCode::Backslash | KeyCode::Escape | KeyCode::KeyQ)) {
+                        self.toggle_accuracy_check();
+                    }
+                    return;
+                }
                 // Treat Escape as an editor cancel before normal hotkeys. Use
                 // both logical and physical identity because some Wayland
                 // keyboard layouts do not expose a stable physical code.
@@ -43589,6 +43730,7 @@ impl ApplicationHandler for App {
                     return;
                 }
                 match event.physical_key {
+                    PhysicalKey::Code(KeyCode::Backslash) if !event.repeat => self.toggle_accuracy_check(),
                     PhysicalKey::Code(KeyCode::Escape) | PhysicalKey::Code(KeyCode::KeyQ) => {
                         if !event.repeat {
                             self.request_shutdown(event_loop, "keyboard");
@@ -44104,19 +44246,7 @@ impl ApplicationHandler for App {
                     }
                     PhysicalKey::Code(KeyCode::KeyS) | PhysicalKey::Code(KeyCode::KeyH) => {
                         if !event.repeat {
-                            if let Ok(mut shared) = self.shared.lock() {
-                                if local_camera_control_allowed(&mut shared, "RAW RECORD") {
-                                    match queue_hotkey_raw_record_toggle(&mut shared) {
-                                        Ok((action, path)) => eprintln!(
-                                            "queued S/H RAW recording {action}: {}",
-                                            path.display(),
-                                        ),
-                                        Err(error) => {
-                                            eprintln!("S/H RAW recording toggle refused: {error}")
-                                        }
-                                    }
-                                }
-                            }
+                            self.toggle_raw_recording();
                         }
                     }
                     PhysicalKey::Code(KeyCode::Digit0) => {
@@ -44307,6 +44437,7 @@ impl ApplicationHandler for App {
             event_loop.exit();
             return;
         }
+        desktop_gaze::tick(self);
         if let Some(state) = self.window_state.as_ref() {
             state.window.request_redraw();
         }
@@ -44321,6 +44452,14 @@ impl ApplicationHandler for App {
             if let Some(map)=hotkeys.as_mut() {
                 viewer_ui::configure_hotkeys(map,&self.ui,self.sam31_prompt_editor.is_some(),
                     self.shared.lock().is_ok_and(|s|s.sam31_object_inspection));
+            }
+        }
+        if self.accuracy_check.is_some() || self.accuracy_requested {
+            if let Some(map)=hotkeys.as_mut() {
+                for binding in &mut map.bindings {
+                    binding.enabled=matches!(binding.key,"Esc"|"Q"|"\\");
+                    if binding.enabled {binding.label="Return from accuracy check";}
+                }
             }
         }
         self.keyboard_peeper.replace_if_changed(hotkeys);
@@ -44576,6 +44715,7 @@ fn run() -> Result<(), String> {
         Err(error) => eprintln!("native Rust MediaPipe reacquisition unavailable: {error}"),
     }
     let shared = Arc::new(Mutex::new(SharedState {
+        monitor_location: monitor_location::MonitorLocation::load(monitor_location::DEFAULT_PATH),
         ui_action: None,
         ui_prompt_request: None,
         ui_snapshot: serde_json::Value::Null,
@@ -44656,6 +44796,8 @@ fn run() -> Result<(), String> {
     })
     .map_err(|error| error.to_string())?;
     let mut app = App {
+        recording_metadata: recording_trace::scene::HostMetadata::default(),
+        desktop_gaze_next_tick: Instant::now(),
         ui: viewer_ui::Workspace::default(),
         context,
         window_state: None,
@@ -44683,6 +44825,8 @@ fn run() -> Result<(), String> {
         stop: Arc::clone(&stop),
         backdrop,
         virtual_mouse: None,
+        accuracy_requested:false,
+        accuracy_check:None,
         main_lightbox: MouseCalibrationLightbox::new(Instant::now()),
         calibrated_display: None,
         calibration_capture: None,
@@ -44701,6 +44845,10 @@ fn run() -> Result<(), String> {
     let event_result = event_loop
         .run_app(&mut app)
         .map_err(|error| error.to_string());
+    if let Ok(mut shared) = app.shared.lock() {
+        shared.mouse_output.command("OFF");
+        shared.gaze_focus.disable();
+    }
     stop.store(true, Ordering::Relaxed);
     control
         .join()
@@ -44729,6 +44877,9 @@ fn main() {
         }
         Some("--offline-sam-sequence-eval") => {
             offline_segmentation_replay::sam_sequence_eval(env::args().skip(2))
+        }
+        Some("--offline-contact-sign-eval") => {
+            offline_segmentation_replay::contact_sign_eval(env::args().skip(2))
         }
         Some("--offline-sam-outline-export") => {
             offline_segmentation_replay::sam_outline_export(env::args().skip(2))
@@ -50306,8 +50457,8 @@ mod tests {
         let surface = SurfaceGazeSample {
             source_timestamp_ns: Some(proposals.source_timestamp_ns), sign_resolved: true,
             relative_gaze: RelativeGazeVector::from_projected(0.0, 0.2).unwrap(),
-            rectified_area_px2: 1000.0, area_bucket: 0, bucketed_face_radius_px: 18.0,
-            camera_near_point_sensor: (3040.0, 2430.0), sign_epoch: 7, kinematic_sign_correction: [false; 2],
+            frontal_equivalent_disk_area_px2: 1000.0, area_bucket: 0, quantized_frontal_disk_radius_px: 18.0,
+            near_surface_point_sensor_px: (3040.0, 2430.0), sign_epoch: 7, kinematic_sign_correction: [false; 2],
         };
         let mut frame = control_eye_frame(100);
         frame.segmentation_mode = SegmentationMode::Sam31;
@@ -50349,11 +50500,11 @@ mod tests {
             last_keyed_source_timestamp_ns: Some(1_000_000_000),
             last_keyed_attempted_source_timestamp_ns: Some(1_000_000_000),
             contact_sign_hypotheses: Some([eye_scene_model::ContactSignHypothesis {
-                pivot_sensor: (3040.0, 2430.0), near_sensor: (3041.0, 2433.0), residual_ema: 0.1, observations: 9,
+                effective_pivot_sensor_px: (3040.0, 2430.0), near_surface_sensor_px: (3041.0, 2433.0), residual_ema: 0.1, observations: 9,
             }; 2]),
             kinematic_history: VecDeque::from([GazeKinematicFrame {
                 observed_at: Instant::now(), source_timestamp_ns: Some(1_000_000_000),
-                ellipse_center_sensor: (3040.0, 2430.0), projected_gaze: (0.0, 0.2), implied_globe_center_sensor: (3040.0, 2426.0),
+                ellipse_center_sensor: (3040.0, 2430.0), projected_gaze: (0.0, 0.2), implied_pivot_sensor_px: (3040.0, 2426.0),
             }]),
             ..Default::default()
         });
@@ -50484,7 +50635,7 @@ mod tests {
         let started = Instant::now();
         let mut tracker = SurfaceGazeTracker::default();
         let mut sample = None;
-        for frame in 0..GAZE_SURFACE_SIGN_SWITCH_FRAMES {
+        for frame in 0..CONTACT_SIGN_CONFIRMATION_UPDATES {
             sample = tracker.observe_keyed_with_global_similarity(
                 proposals.source_timestamp_ns + u64::from(frame),
                 started + Duration::from_millis(u64::from(frame) * 100),
@@ -50493,7 +50644,7 @@ mod tests {
                 &boundary,
                 None,
             );
-            if frame + 1 < GAZE_SURFACE_SIGN_SWITCH_FRAMES {
+            if frame + 1 < CONTACT_SIGN_CONFIRMATION_UPDATES {
                 assert!(!sample.expect("provisional SAM contact").sign_resolved);
             }
         }
@@ -50532,10 +50683,10 @@ mod tests {
         {
             let major_radius = 30.0;
             let minor_radius = major_radius * tilt.cos();
-            let rectified = rectified_ellipse_area_px2(major_radius, minor_radius).unwrap();
-            let (_, bucketed_area) = bucket_surface_area(rectified).unwrap();
+            let rectified = frontal_equivalent_iris_disk_area_px2(major_radius, minor_radius).unwrap();
+            let (_, bucketed_area) = quantize_frontal_disk_area(rectified).unwrap();
             let face_radius = (bucketed_area / std::f64::consts::PI).sqrt();
-            let slice_depth = ((face_radius * 1.83).powi(2) - face_radius.powi(2)).sqrt();
+            let limbus_plane_offset_px = ((face_radius * 1.83).powi(2) - face_radius.powi(2)).sqrt();
             let projected_normal = tilt.sin();
             // With a zero major-axis angle the deterministic first-frame
             // choice is +Y. Generate a real -Y surface whose inferred globe
@@ -50543,7 +50694,7 @@ mod tests {
             // must overturn that initial mirror choice.
             let center = (
                 globe_center.0,
-                globe_center.1 - slice_depth * projected_normal,
+                globe_center.1 - limbus_plane_offset_px * projected_normal,
             );
             let ellipse = sam31_outer::Ellipse {
                 center,
@@ -50754,6 +50905,8 @@ mod tests {
             eye_id: 1,
             sequence,
             timestamp_ns: 123_000,
+            recording_clock: serde_json::Value::Null,
+            recording_ready: serde_json::Value::Null,
             segmentation_mode: SegmentationMode::Native,
             gaze_authority_generation: 1,
             gaze_authority_sam_prompt_generation: None,
@@ -51696,7 +51849,7 @@ mod tests {
         outer: &raw_iris_focus::OuterIrisBoundary,
     ) -> SurfaceGazeSample {
         let mut latest = None;
-        for frame in 0..GAZE_SURFACE_SIGN_SWITCH_FRAMES {
+        for frame in 0..CONTACT_SIGN_CONFIRMATION_UPDATES {
             latest = tracker.observe(
                 started + Duration::from_millis(u64::from(frame) * 100),
                 sensor_origin,
@@ -51718,7 +51871,7 @@ mod tests {
         outer: &raw_iris_focus::OuterIrisBoundary,
     ) -> SurfaceGazeSample {
         let mut latest = None;
-        for frame in 0..GAZE_SURFACE_SIGN_SWITCH_FRAMES {
+        for frame in 0..CONTACT_SIGN_CONFIRMATION_UPDATES {
             latest = tracker.observe_keyed_with_global_similarity(
                 first_source_timestamp_ns + u64::from(frame) * 100_000_000,
                 started + Duration::from_millis(u64::from(frame) * 100),
@@ -51872,14 +52025,14 @@ mod tests {
 
     #[test]
     fn rectified_ellipse_area_is_invariant_to_disk_foreshortening() {
-        let front_facing = rectified_ellipse_area_px2(50.0, 50.0).unwrap();
-        let tilted = rectified_ellipse_area_px2(50.0, 35.0).unwrap();
+        let front_facing = frontal_equivalent_iris_disk_area_px2(50.0, 50.0).unwrap();
+        let tilted = frontal_equivalent_iris_disk_area_px2(50.0, 35.0).unwrap();
 
         assert!((front_facing - std::f64::consts::PI * 2_500.0).abs() < 1.0e-9);
         assert!((tilted - front_facing).abs() < 1.0e-9);
-        let (_, representative) = bucket_surface_area(tilted).unwrap();
-        assert!((representative / tilted).ln().abs() <= GAZE_SURFACE_AREA_BUCKET_RATIO.ln());
-        assert!(rectified_ellipse_area_px2(50.0, 15.0).is_none());
+        let (_, representative) = quantize_frontal_disk_area(tilted).unwrap();
+        assert!((representative / tilted).ln().abs() <= FRONTAL_DISK_AREA_BIN_RATIO.ln());
+        assert!(frontal_equivalent_iris_disk_area_px2(50.0, 15.0).is_none());
     }
 
     #[test]
@@ -51901,7 +52054,7 @@ mod tests {
             let actual = sample.relative_gaze.projected();
             assert!((actual.0-current.0).hypot(actual.1-current.1) < 1e-12);
             assert!((actual.1.abs() - (1.0_f64-(minor/50.0).powi(2)).sqrt()).abs()<1e-12);
-            assert!((sample.rectified_area_px2-std::f64::consts::PI*2500.0).abs()<1e-8);
+            assert!((sample.frontal_equivalent_disk_area_px2-std::f64::consts::PI*2500.0).abs()<1e-8);
             assert!(sample.relative_gaze.is_camera_facing());
             let history_len = tracker.kinematic_history.len();
             let repeat = tracker.observe_keyed_with_global_similarity(
@@ -51950,7 +52103,7 @@ mod tests {
         assert_eq!(first.area_bucket, second.area_bucket);
         assert!(first.relative_gaze.down > 0.55);
         assert!(second.relative_gaze.down > 0.55);
-        assert!(second.camera_near_point_sensor.1 > 1_600.0);
+        assert!(second.near_surface_point_sensor_px.1 > 1_600.0);
     }
 
     #[test]
@@ -51982,8 +52135,8 @@ mod tests {
 
         let hypothesis = tracker.contact_sign_hypotheses.unwrap()[persistent_identity];
         let direction = (
-            hypothesis.near_sensor.0 - hypothesis.pivot_sensor.0,
-            hypothesis.near_sensor.1 - hypothesis.pivot_sensor.1,
+            hypothesis.near_surface_sensor_px.0 - hypothesis.effective_pivot_sensor_px.0,
+            hypothesis.near_surface_sensor_px.1 - hypothesis.effective_pivot_sensor_px.1,
         );
         let length = direction.0.hypot(direction.1);
         let expected = (-0.5, 30.0_f64.to_radians().cos());
@@ -52003,7 +52156,7 @@ mod tests {
             establish_test_surface_sign(&mut tracker, now, (3_000, 1_500), (0.0, 0.08), &outer);
         let contradicted = tracker
             .observe(
-                now + Duration::from_millis(u64::from(GAZE_SURFACE_SIGN_SWITCH_FRAMES) * 100),
+                now + Duration::from_millis(u64::from(CONTACT_SIGN_CONFIRMATION_UPDATES) * 100),
                 (3_000, 1_500),
                 Some((0.0, -0.08)),
                 &outer,
@@ -52052,8 +52205,8 @@ mod tests {
             .unwrap();
         let hypothesis = tracker.contact_sign_hypotheses.unwrap()[selected];
         let axis = (
-            hypothesis.near_sensor.0 - hypothesis.pivot_sensor.0,
-            hypothesis.near_sensor.1 - hypothesis.pivot_sensor.1,
+            hypothesis.near_surface_sensor_px.0 - hypothesis.effective_pivot_sensor_px.0,
+            hypothesis.near_surface_sensor_px.1 - hypothesis.effective_pivot_sensor_px.1,
         );
         assert!(axis.1 > 0.0, "identity was silently inverted: {axis:?}");
         assert_eq!(sample.sign_epoch, established.sign_epoch);
@@ -52063,7 +52216,7 @@ mod tests {
     #[test]
     fn surface_gaze_sign_switch_requires_sustained_evidence() {
         let mut tracker = SurfaceGazeTracker::default();
-        for frames in 1..GAZE_SURFACE_SIGN_SWITCH_FRAMES {
+        for frames in 1..CONTACT_SIGN_CONFIRMATION_UPDATES {
             tracker.consider_sign_hypothesis(0);
             assert!(
                 !tracker.sign_resolved,
@@ -52074,7 +52227,7 @@ mod tests {
         tracker.consider_sign_hypothesis(0);
         assert!(tracker.sign_resolved);
 
-        for frames in 1..GAZE_SURFACE_SIGN_SWITCH_FRAMES {
+        for frames in 1..CONTACT_SIGN_CONFIRMATION_UPDATES {
             tracker.consider_sign_hypothesis(1);
             assert_eq!(
                 tracker.selected_sign_hypothesis, 0,
@@ -52107,7 +52260,7 @@ mod tests {
         assert!(!wrong.sign_resolved);
 
         let mut corrected = wrong;
-        for frame in 0..GAZE_SURFACE_SIGN_SWITCH_FRAMES {
+        for frame in 0..CONTACT_SIGN_CONFIRMATION_UPDATES {
             corrected = tracker
                 .observe_keyed_with_global_similarity(
                     2 + u64::from(frame),
@@ -52118,7 +52271,7 @@ mod tests {
                     None,
                 )
                 .unwrap();
-            if frame + 1 < GAZE_SURFACE_SIGN_SWITCH_FRAMES {
+            if frame + 1 < CONTACT_SIGN_CONFIRMATION_UPDATES {
                 assert!(!corrected.sign_resolved);
             }
         }
@@ -52153,7 +52306,7 @@ mod tests {
         let started = Instant::now();
         let boundary_for_bucket = |bucket: i32| {
             let radius =
-                (GAZE_SURFACE_AREA_BUCKET_RATIO.powi(bucket) / std::f64::consts::PI).sqrt();
+                (FRONTAL_DISK_AREA_BIN_RATIO.powi(bucket) / std::f64::consts::PI).sqrt();
             let mut boundary = test_outer_boundary((100.0, 100.0), radius, radius * 0.80);
             boundary.points = vec![raw_iris_focus::OuterIrisPoint::default(); 8];
             boundary
@@ -52178,7 +52331,7 @@ mod tests {
             let _ = tracker.observe(
                 started
                     + Duration::from_millis(
-                        (frame as u64 + u64::from(GAZE_SURFACE_SIGN_SWITCH_FRAMES)) * 100,
+                        (frame as u64 + u64::from(CONTACT_SIGN_CONFIRMATION_UPDATES)) * 100,
                     ),
                 (3_000, 1_500),
                 None,
@@ -52216,13 +52369,13 @@ mod tests {
             (0.0, 0.10),
             &initial_boundary,
         );
-        for frame in 1..GAZE_SURFACE_SCALE_SWITCH_FRAMES {
+        for frame in 1..FRONTAL_DISK_SCALE_RELOCK_UPDATES {
             assert!(
                 tracker
                     .observe(
                         started
                             + Duration::from_millis(
-                                (u64::from(GAZE_SURFACE_SIGN_SWITCH_FRAMES) + u64::from(frame))
+                                (u64::from(CONTACT_SIGN_CONFIRMATION_UPDATES) + u64::from(frame))
                                     * 100,
                             ),
                         (3_000, 1_500),
@@ -52237,8 +52390,8 @@ mod tests {
             .observe(
                 started
                     + Duration::from_millis(
-                        (u64::from(GAZE_SURFACE_SIGN_SWITCH_FRAMES)
-                            + u64::from(GAZE_SURFACE_SCALE_SWITCH_FRAMES))
+                        (u64::from(CONTACT_SIGN_CONFIRMATION_UPDATES)
+                            + u64::from(FRONTAL_DISK_SCALE_RELOCK_UPDATES))
                             * 100,
                     ),
                 (3_000, 1_500),
@@ -52249,13 +52402,13 @@ mod tests {
         assert_eq!(changed.sign_epoch, initial.sign_epoch.wrapping_add(1));
         assert!(!changed.sign_resolved);
         let mut resolved = changed;
-        for frame in 1..GAZE_SURFACE_SIGN_SWITCH_FRAMES {
+        for frame in 1..CONTACT_SIGN_CONFIRMATION_UPDATES {
             resolved = tracker
                 .observe(
                     started
                         + Duration::from_millis(
-                            (u64::from(GAZE_SURFACE_SIGN_SWITCH_FRAMES)
-                                + u64::from(GAZE_SURFACE_SCALE_SWITCH_FRAMES)
+                            (u64::from(CONTACT_SIGN_CONFIRMATION_UPDATES)
+                                + u64::from(FRONTAL_DISK_SCALE_RELOCK_UPDATES)
                                 + u64::from(frame))
                                 * 100,
                         ),
@@ -52297,7 +52450,7 @@ mod tests {
             source_timestamp_ns: Some(1),
             ellipse_center_sensor: (100.0, 100.0),
             projected_gaze: (0.0, 0.4),
-            implied_globe_center_sensor: (100.0, 70.0),
+            implied_pivot_sensor_px: (100.0, 70.0),
         });
 
         assert!(!tracker.consider_kinematic_sign_hypothesis(1));
@@ -52306,7 +52459,7 @@ mod tests {
         assert!(!tracker.consider_kinematic_sign_hypothesis(0));
         assert_eq!(tracker.pending_kinematic_sign_frames, 0);
 
-        for _ in 1..GAZE_SURFACE_SIGN_SWITCH_FRAMES {
+        for _ in 1..CONTACT_SIGN_CONFIRMATION_UPDATES {
             assert!(!tracker.consider_kinematic_sign_hypothesis(1));
         }
         assert!(tracker.consider_kinematic_sign_hypothesis(1));
@@ -52319,15 +52472,15 @@ mod tests {
     #[test]
     fn gaze_kinematics_corrects_only_the_measured_ellipse_antipode() {
         let started = Instant::now();
-        let slice_depth = 80.0;
+        let limbus_plane_offset_px = 80.0;
         let frame = |millis: u64, center: (f64, f64), gaze: (f64, f64)| GazeKinematicFrame {
             observed_at: started + Duration::from_millis(millis),
             source_timestamp_ns: None,
             ellipse_center_sensor: center,
             projected_gaze: gaze,
-            implied_globe_center_sensor: (
-                center.0 - slice_depth * gaze.0,
-                center.1 - slice_depth * gaze.1,
+            implied_pivot_sensor_px: (
+                center.0 - limbus_plane_offset_px * gaze.0,
+                center.1 - limbus_plane_offset_px * gaze.1,
             ),
         };
         let history = VecDeque::from([
@@ -52340,7 +52493,7 @@ mod tests {
             started + Duration::from_millis(200),
             None,
             (104.0, 202.0),
-            slice_depth,
+            limbus_plane_offset_px,
             (-0.30, 0.20),
             None,
         );
@@ -52355,7 +52508,7 @@ mod tests {
             started + Duration::from_millis(200),
             None,
             (104.0, 202.0),
-            slice_depth,
+            limbus_plane_offset_px,
             (-0.30, -0.20),
             None,
         );
@@ -52367,13 +52520,13 @@ mod tests {
     #[test]
     fn horizontal_ellipse_translation_immediately_resolves_the_antipodal_sign() {
         let started = Instant::now();
-        let slice_depth = 80.0;
+        let limbus_plane_offset_px = 80.0;
         let history = VecDeque::from([GazeKinematicFrame {
             observed_at: started,
             source_timestamp_ns: None,
             ellipse_center_sensor: (100.0, 200.0),
             projected_gaze: (0.0, 0.0),
-            implied_globe_center_sensor: (100.0, 200.0),
+            implied_pivot_sensor_px: (100.0, 200.0),
         }]);
 
         // A 16 px rightward limbus-center translation at this slice depth is
@@ -52383,7 +52536,7 @@ mod tests {
             started + Duration::from_millis(100),
             None,
             (116.0, 200.0),
-            slice_depth,
+            limbus_plane_offset_px,
             (-0.20, 0.0),
             None,
         );
@@ -52395,15 +52548,15 @@ mod tests {
     #[test]
     fn gaze_kinematics_preserves_a_smooth_real_axis_crossing() {
         let started = Instant::now();
-        let slice_depth = 80.0;
+        let limbus_plane_offset_px = 80.0;
         let make_frame = |millis: u64, center_x: f64, gaze_x: f64| GazeKinematicFrame {
             observed_at: started + Duration::from_millis(millis),
             source_timestamp_ns: None,
             ellipse_center_sensor: (center_x, 200.0),
             projected_gaze: (gaze_x, 0.20),
-            implied_globe_center_sensor: (
-                center_x - slice_depth * gaze_x,
-                200.0 - slice_depth * 0.20,
+            implied_pivot_sensor_px: (
+                center_x - limbus_plane_offset_px * gaze_x,
+                200.0 - limbus_plane_offset_px * 0.20,
             ),
         };
         let history = VecDeque::from([make_frame(0, 100.0, 0.05), make_frame(100, 102.0, 0.0)]);
@@ -52413,7 +52566,7 @@ mod tests {
             started + Duration::from_millis(200),
             None,
             (104.0, 200.0),
-            slice_depth,
+            limbus_plane_offset_px,
             (-0.05, 0.20),
             None,
         );
@@ -52443,8 +52596,8 @@ mod tests {
         let first = reliable_test_global_similarity(
             raw_motion_octrees::SimilarityMotion {
                 translation: [3.0, -2.0],
-                rotation: 0.015,
-                scale_delta: 0.010,
+                rotation_coefficient: 0.015,
+                diagonal_coefficient_delta: 0.010,
                 residual: 0.4,
                 support: 14,
             },
@@ -52453,8 +52606,8 @@ mod tests {
         let second = reliable_test_global_similarity(
             raw_motion_octrees::SimilarityMotion {
                 translation: [-1.0, 4.0],
-                rotation: -0.008,
-                scale_delta: -0.004,
+                rotation_coefficient: -0.008,
+                diagonal_coefficient_delta: -0.004,
                 residual: 0.6,
                 support: 12,
             },
@@ -52476,12 +52629,12 @@ mod tests {
             (
                 point.0
                     + f64::from(evidence.motion.translation[0])
-                    + f64::from(evidence.motion.scale_delta) * x
-                    - f64::from(evidence.motion.rotation) * y,
+                    + f64::from(evidence.motion.diagonal_coefficient_delta) * x
+                    - f64::from(evidence.motion.rotation_coefficient) * y,
                 point.1
                     + f64::from(evidence.motion.translation[1])
-                    + f64::from(evidence.motion.rotation) * x
-                    + f64::from(evidence.motion.scale_delta) * y,
+                    + f64::from(evidence.motion.rotation_coefficient) * x
+                    + f64::from(evidence.motion.diagonal_coefficient_delta) * y,
             )
         };
         let source = (4_032.0, 2_251.0);
@@ -52584,15 +52737,15 @@ mod tests {
         // This deliberately gives the other persistent identity a much lower
         // historical residual for longer than the old four-vote switch. It is
         // not new physical evidence and must not reverse resolved gaze.
-        for frame in 0..GAZE_SURFACE_SIGN_SWITCH_FRAMES {
+        for frame in 0..CONTACT_SIGN_CONFIRMATION_UPDATES {
             let sample = tracker
                 .observe_keyed_with_global_similarity(
                     1_000_000_000
-                        + (u64::from(GAZE_SURFACE_SIGN_SWITCH_FRAMES) + u64::from(frame))
+                        + (u64::from(CONTACT_SIGN_CONFIRMATION_UPDATES) + u64::from(frame))
                             * 100_000_000,
                     started
                         + Duration::from_millis(
-                            (u64::from(GAZE_SURFACE_SIGN_SWITCH_FRAMES) + u64::from(frame)) * 100,
+                            (u64::from(CONTACT_SIGN_CONFIRMATION_UPDATES) + u64::from(frame)) * 100,
                         ),
                     (3_000, 1_500),
                     None,
@@ -52632,7 +52785,7 @@ mod tests {
             .observe_keyed_with_global_similarity(
                 3_000_000_000,
                 started
-                    + Duration::from_millis(u64::from(GAZE_SURFACE_SIGN_SWITCH_FRAMES - 1) * 100)
+                    + Duration::from_millis(u64::from(CONTACT_SIGN_CONFIRMATION_UPDATES - 1) * 100)
                     + GAZE_SURFACE_RESET_AFTER
                     + Duration::from_millis(100),
                 (3_000, 1_500),
@@ -52784,7 +52937,10 @@ mod tests {
     #[test]
     fn development_display_preset_projects_center_and_edges() {
         let plane = VirtualDisplayPlane::development_default();
-        assert!((plane.width_inches.hypot(plane.height_inches) - 27.0).abs() < 1e-10);
+        // The selected accepted session used EDID's 590 x 333 mm rectangle,
+        // not the separate nominal 27-inch solver prior.
+        assert!((plane.width_inches - 590.0/25.4).abs() < 1e-10);
+        assert!((plane.height_inches - 333.0/25.4).abs() < 1e-10);
         assert!((norm3(plane.right_axis) - 1.0).abs() < 1e-10);
         assert!((norm3(plane.down_axis) - 1.0).abs() < 1e-10);
         assert!(dot3(plane.right_axis, plane.down_axis).abs() < 1e-10);
@@ -52800,6 +52956,22 @@ mod tests {
             }).unwrap();
             assert!((actual.0 - target.0).hypot(actual.1 - target.1) < 1e-10);
         }
+    }
+
+    #[test]
+    fn accuracy_screen_has_target_and_reports_missing_data_without_calibrating() {
+        let now=Instant::now();
+        let mut session=gaze_accuracy::Session::new((640,480),serde_json::json!({"test":true}));
+        session.observe(now,Some(100),None,"NO SURFACE");
+        let mut pixels=vec![0;640*480];
+        draw_accuracy_check(&session,&mut pixels,640,480,now);
+        let (u,v)=gaze_accuracy::TARGETS[0];
+        let (x,y)=((u*639.0).round() as usize,(v*479.0).round() as usize);
+        assert_eq!(pixels[y*640+x],VIRTUAL_MOUSE_INK);
+        session.abort("CANCELLED");
+        draw_accuracy_check(&session,&mut pixels,640,480,now);
+        assert!(pixels.iter().any(|p|*p!=VIRTUAL_MOUSE_BACKGROUND));
+        assert!(session.report()["mean_target_error_px"].is_null());
     }
 
     #[test]
@@ -52890,10 +53062,10 @@ mod tests {
     fn sam_mouse_gaze_uses_only_the_sam_virtual_contact_surface() {
         let native = SurfaceGazeSample {
             source_timestamp_ns: None,
-            rectified_area_px2: 1_000.0,
+            frontal_equivalent_disk_area_px2: 1_000.0,
             area_bucket: 0,
-            bucketed_face_radius_px: 30.0,
-            camera_near_point_sensor: (100.0, 100.0),
+            quantized_frontal_disk_radius_px: 30.0,
+            near_surface_point_sensor_px: (100.0, 100.0),
             relative_gaze: RelativeGazeVector::from_projected(-0.60, 0.10).unwrap(),
             sign_resolved: true,
             sign_epoch: 0,
@@ -53326,7 +53498,7 @@ mod tests {
 
         let mut overlay = raw_motion_octrees::MotionOctreeOverlay::default();
         overlay.motions[raw_motion_octrees::PUPIL_LAYER] = raw_motion_octrees::SimilarityMotion {
-            scale_delta: 0.03,
+            diagonal_coefficient_delta: 0.03,
             residual: 0.8,
             support: 9,
             ..raw_motion_octrees::SimilarityMotion::default()
@@ -53342,7 +53514,7 @@ mod tests {
             "an iris/glasses edge cannot authorize apparent scale by itself"
         );
         overlay.motions[raw_motion_octrees::GENERAL_LAYER] = raw_motion_octrees::SimilarityMotion {
-            scale_delta: 0.028,
+            diagonal_coefficient_delta: 0.028,
             residual: 0.7,
             support: 12,
             ..raw_motion_octrees::SimilarityMotion::default()
@@ -53362,18 +53534,18 @@ mod tests {
         assert!((fine.scale_ratio - 1.0289).abs() < 1.0e-7);
         assert_eq!(fine.source.short_label(), "FINE");
 
-        overlay.motions[raw_motion_octrees::GENERAL_LAYER].scale_delta = -0.028;
+        overlay.motions[raw_motion_octrees::GENERAL_LAYER].diagonal_coefficient_delta = -0.028;
         assert!(
             fine_visual_odometry_limbus_scale_prediction(&overlay).is_none(),
             "opposing local and broad scale motion is not a rigid depth move"
         );
-        overlay.motions[raw_motion_octrees::GENERAL_LAYER].scale_delta = 0.028;
+        overlay.motions[raw_motion_octrees::GENERAL_LAYER].diagonal_coefficient_delta = 0.028;
         overlay.layers[raw_motion_octrees::PUPIL_LAYER].stable_frames = 1;
         assert!(fine_visual_odometry_limbus_scale_prediction(&overlay).is_none());
 
         let global = raw_motion_octrees::NativeGlobalSimilarityEvidence {
             motion: raw_motion_octrees::SimilarityMotion {
-                scale_delta: 0.021,
+                diagonal_coefficient_delta: 0.021,
                 residual: 0.65,
                 support: 14,
                 ..raw_motion_octrees::SimilarityMotion::default()
@@ -53410,7 +53582,7 @@ mod tests {
         assert!(shared_global_limbus_scale_prediction(
             raw_motion_octrees::NativeGlobalSimilarityEvidence {
                 motion: raw_motion_octrees::SimilarityMotion {
-                    scale_delta: 0.09,
+                    diagonal_coefficient_delta: 0.09,
                     ..global.motion
                 },
                 ..global
@@ -54459,10 +54631,10 @@ mod tests {
             coherence: 0.76,
             ..raw_motion_octrees::MotionLayerStatus::default()
         };
-        motion.coupled_motion.saccade_likelihood = 0.84;
-        motion.coupled_motion.green_relative_to_cyan.samples = 6;
-        motion.coupled_motion.green_relative_to_cyan.confidence = 0.28;
-        motion.coupled_motion.green_relative_to_cyan.jerk_px_s3 = [1_200.0, -800.0];
+        motion.coupled_motion.saccade_score = 0.84;
+        motion.coupled_motion.pupil_relative_to_general.samples = 6;
+        motion.coupled_motion.pupil_relative_to_general.confidence = 0.28;
+        motion.coupled_motion.pupil_relative_to_general.jerk_px_s3 = [1_200.0, -800.0];
         let later = now + Duration::from_millis(100);
         let prediction = tracker
             .begin_frame(
@@ -58277,8 +58449,8 @@ mod tests {
                 && global_motion.candidate_motion.translation[0]
                     .hypot(global_motion.candidate_motion.translation[1])
                     <= 28.0
-                && global_motion.candidate_motion.rotation.abs() <= 0.14
-                && global_motion.candidate_motion.scale_delta.abs() <= 0.10;
+                && global_motion.candidate_motion.rotation_coefficient.abs() <= 0.14
+                && global_motion.candidate_motion.diagonal_coefficient_delta.abs() <= 0.10;
             global_motion_relaxed_frames += usize::from(relaxed_global_motion);
             let focus = raw_iris_focus::score_stream_eye(&raw, 384, 256);
             let native =
@@ -61262,8 +61434,8 @@ mod tests {
         plane.down_axis = [-roll.sin()*tilt.cos(),roll.cos()*tilt.cos(),tilt.sin()];
         mode.gaze_available = true;
         mode.surface_gaze = Some(SurfaceGazeSample {
-            source_timestamp_ns: Some(1), rectified_area_px2: 100.0, area_bucket: 1,
-            bucketed_face_radius_px: 10.0, camera_near_point_sensor: (0.0,0.0),
+            source_timestamp_ns: Some(1), frontal_equivalent_disk_area_px2: 100.0, area_bucket: 1,
+            quantized_frontal_disk_radius_px: 10.0, near_surface_point_sensor_px: (0.0,0.0),
             relative_gaze: RelativeGazeVector::from_projected(0.1,0.05).unwrap(),
             sign_resolved: true, sign_epoch: 0, kinematic_sign_correction: [false;2],
         });
@@ -63092,8 +63264,8 @@ mod tests {
         let mut motion = raw_motion_octrees::MotionOctreeOverlay::default();
         motion.motions[raw_motion_octrees::GENERAL_LAYER] = raw_motion_octrees::SimilarityMotion {
             translation: [3.0, -2.0],
-            rotation: 0.0,
-            scale_delta: 0.0,
+            rotation_coefficient: 0.0,
+            diagonal_coefficient_delta: 0.0,
             residual: 1.0,
             support: 4,
         };
@@ -63375,10 +63547,10 @@ mod tests {
         ];
         let surface = SurfaceGazeSample {
             source_timestamp_ns: None,
-            rectified_area_px2: std::f64::consts::PI * 20.0 * 20.0,
+            frontal_equivalent_disk_area_px2: std::f64::consts::PI * 20.0 * 20.0,
             area_bucket: 0,
-            bucketed_face_radius_px: 20.0,
-            camera_near_point_sensor: (40.0, 40.0),
+            quantized_frontal_disk_radius_px: 20.0,
+            near_surface_point_sensor_px: (40.0, 40.0),
             relative_gaze: RelativeGazeVector::from_projected(0.0, 0.0).unwrap(),
             sign_resolved: true,
             sign_epoch: 0,
@@ -63445,10 +63617,10 @@ mod tests {
         frame.outer_iris_points = Arc::new(outer_prediction);
         let surface = SurfaceGazeSample {
             source_timestamp_ns: None,
-            rectified_area_px2: std::f64::consts::PI * 20.0 * 20.0,
+            frontal_equivalent_disk_area_px2: std::f64::consts::PI * 20.0 * 20.0,
             area_bucket: 0,
-            bucketed_face_radius_px: 20.0,
-            camera_near_point_sensor: (48.0, 40.0),
+            quantized_frontal_disk_radius_px: 20.0,
+            near_surface_point_sensor_px: (48.0, 40.0),
             relative_gaze: RelativeGazeVector::from_projected(0.40, 0.0).unwrap(),
             sign_resolved: true,
             sign_epoch: 0,
@@ -63488,10 +63660,10 @@ mod tests {
         frame.outer_iris_points = Arc::new(outer_prediction);
         frame.virtual_contact_surface_gaze = Some(SurfaceGazeSample {
             source_timestamp_ns: None,
-            rectified_area_px2: std::f64::consts::PI * 20.0 * 20.0,
+            frontal_equivalent_disk_area_px2: std::f64::consts::PI * 20.0 * 20.0,
             area_bucket: 0,
-            bucketed_face_radius_px: 20.0,
-            camera_near_point_sensor: (48.0, 40.0),
+            quantized_frontal_disk_radius_px: 20.0,
+            near_surface_point_sensor_px: (48.0, 40.0),
             relative_gaze: RelativeGazeVector::from_projected(0.40, 0.0).unwrap(),
             sign_resolved: true,
             sign_epoch: 0,
@@ -63531,10 +63703,10 @@ mod tests {
         frame.driving_limbus_edge_source_timestamp_ns = Some(frame.timestamp_ns);
         frame.virtual_contact_surface_gaze = Some(SurfaceGazeSample {
             source_timestamp_ns: None,
-            rectified_area_px2: std::f64::consts::PI * 20.0 * 20.0,
+            frontal_equivalent_disk_area_px2: std::f64::consts::PI * 20.0 * 20.0,
             area_bucket: 0,
-            bucketed_face_radius_px: 20.0,
-            camera_near_point_sensor: (48.0, 40.0),
+            quantized_frontal_disk_radius_px: 20.0,
+            near_surface_point_sensor_px: (48.0, 40.0),
             relative_gaze: RelativeGazeVector::from_projected(0.40, 0.0).unwrap(),
             sign_resolved: true,
             sign_epoch: 0,
@@ -63603,10 +63775,10 @@ mod tests {
         ]);
         frame.virtual_contact_surface_gaze = Some(SurfaceGazeSample {
             source_timestamp_ns: None,
-            rectified_area_px2: std::f64::consts::PI * 20.0 * 20.0,
+            frontal_equivalent_disk_area_px2: std::f64::consts::PI * 20.0 * 20.0,
             area_bucket: 0,
-            bucketed_face_radius_px: 20.0,
-            camera_near_point_sensor: (48.0, 40.0),
+            quantized_frontal_disk_radius_px: 20.0,
+            near_surface_point_sensor_px: (48.0, 40.0),
             relative_gaze: RelativeGazeVector::from_projected(0.40, 0.0).unwrap(),
             sign_resolved: true,
             sign_epoch: 0,
@@ -63731,10 +63903,10 @@ mod tests {
         ];
         let surface = SurfaceGazeSample {
             source_timestamp_ns: None,
-            rectified_area_px2: std::f64::consts::PI * 20.0 * 20.0,
+            frontal_equivalent_disk_area_px2: std::f64::consts::PI * 20.0 * 20.0,
             area_bucket: 0,
-            bucketed_face_radius_px: 20.0,
-            camera_near_point_sensor: (48.0, 40.0),
+            quantized_frontal_disk_radius_px: 20.0,
+            near_surface_point_sensor_px: (48.0, 40.0),
             relative_gaze: RelativeGazeVector::from_projected(0.40, 0.0).unwrap(),
             sign_resolved: true,
             sign_epoch: 0,
@@ -63798,10 +63970,10 @@ mod tests {
         ]);
         frame.virtual_contact_surface_gaze = Some(SurfaceGazeSample {
             source_timestamp_ns: None,
-            rectified_area_px2: std::f64::consts::PI * 20.0 * 20.0,
+            frontal_equivalent_disk_area_px2: std::f64::consts::PI * 20.0 * 20.0,
             area_bucket: 0,
-            bucketed_face_radius_px: 20.0,
-            camera_near_point_sensor: (48.0, 40.0),
+            quantized_frontal_disk_radius_px: 20.0,
+            near_surface_point_sensor_px: (48.0, 40.0),
             relative_gaze: RelativeGazeVector::from_projected(0.40, 0.0).unwrap(),
             sign_resolved: true,
             sign_epoch: 0,
@@ -66567,13 +66739,80 @@ mod tests {
     }
 
     #[test]
+    fn recording_scene_never_duplicates_a_cursor_or_invents_other_eye_geometry() {
+        let shared=Mutex::new(SharedState::default());
+        let hub=recording_trace::Hub::default();
+        let scene=recording_trace::scene::snapshot(&[Some(control_eye_frame(97)),None],
+            recording_trace::scene::Input { plane:VirtualDisplayPlane::nominal(), reference_eye:0,
+                selected_ray:None,selected_prediction:Some((0.4,1.2)),calibration:serde_json::Value::Null,
+                camera:serde_json::Value::Null}, &shared, &hub);
+        let eyes=&scene["eyes"];
+        assert_eq!(eyes[0]["predicted_screen_uv"],serde_json::json!([0.4,1.2]));
+        assert!(eyes[1]["predicted_screen_uv"].is_null());
+        assert_eq!(eyes[0]["origin_provenance"],"assumed-fixed-reference");
+        assert!(eyes[1]["ray_origin"].is_null());
+        assert!(eyes[1]["eye_to_scene"].is_null());
+        assert_eq!(eyes[1]["monitor_intersection"]["status"],"origin-unavailable");
+        for index in 0..2 {
+            assert!(eyes[index]["visual_axis"].is_null());
+            assert!(eyes[index]["metric_radius"].is_null());
+        }
+    }
+
+    #[test]
+    fn recording_targets_match_calibration_and_accuracy_visibility() {
+        let now = Instant::now();
+        let mut mode = VirtualMouseMode::new(now);
+        for index in 0..VIRTUAL_MOUSE_CALIBRATION_TARGETS.len() {
+            mode.target_index = index;
+            let targets = calibration_recording_targets(&mode);
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].normalized, VIRTUAL_MOUSE_CALIBRATION_TARGETS[index]);
+        }
+        mode.sequence_started = false;
+        assert!(calibration_recording_targets(&mode).is_empty());
+        mode.sequence_started = true;
+        mode.calibration_failure = Some("FAILED");
+        assert!(calibration_recording_targets(&mode).is_empty());
+        mode.calibration_failure = None;
+        mode.display_plane = Some(VirtualDisplayPlane::development_default());
+        assert!(calibration_recording_targets(&mode).is_empty());
+        let mut session = gaze_accuracy::Session::new((1001, 501), serde_json::json!({}));
+        for index in 0..gaze_accuracy::TARGETS.len() {
+            session.index = index;
+            let targets = accuracy_recording_targets(&session);
+            assert_eq!(targets[0].normalized, gaze_accuracy::TARGETS[index]);
+        }
+        session.abort("CANCELLED");
+        assert!(accuracy_recording_targets(&session).is_empty());
+    }
+
+    #[test]
+    fn recording_gaze_uses_surface_source_not_latest_raw_frame_clock() {
+        let frame = control_eye_frame(97);
+        let surface = SurfaceGazeSample {
+            source_timestamp_ns: Some(123), frontal_equivalent_disk_area_px2: 100.0,
+            area_bucket: 1, quantized_frontal_disk_radius_px: 5.0,
+            near_surface_point_sensor_px: (10.0, 20.0),
+            relative_gaze: RelativeGazeVector::from_projected(0.1, 0.2).unwrap(),
+            sign_resolved: true, sign_epoch: 7, kinematic_sign_correction: [false, false],
+        };
+        let gaze = recording_gaze(Some(&frame), Some(surface), Some((0.25, 1.5)), None,
+            recording_mapping("test", VirtualDisplayPlane::development_default(), None), false);
+        assert_eq!(gaze.source_timestamp_ns, Some(123));
+        assert_eq!(gaze.roi_frame["sensor_timestamp_ns"], frame.timestamp_ns.to_string());
+        assert_eq!(gaze.predicted, Some((0.25, 1.5)));
+        assert_eq!(gaze.drawn, None);
+    }
+
+    #[test]
     fn raw_bundle_index_preserves_sensor_and_host_clock_domains() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let output = PathBuf::from(format!(
-            "/tmp/buttercup-raw-host-clock-test-{}-{stamp}.tar",
+            "outputs/recording-trace-tests/raw-host-clock-{}-{stamp}.tar",
             std::process::id()
         ));
         let config = Config {
@@ -66613,14 +66852,54 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        let mut recorder = Recorder::new(&output, &config).unwrap();
-        recorder.record(&header, &[1, 2, 3, 4, 5]).unwrap();
+        let trace = recording_trace::Hub::default();
+        let mut native_header = [0u8; 64];
+        native_header[..4].copy_from_slice(b"OTH1");
+        native_header[4..6].copy_from_slice(&1u16.to_le_bytes());
+        native_header[6..8].copy_from_slice(&64u16.to_le_bytes());
+        for (offset, value) in [(12, 3u32), (40, 4), (44, 1), (48, 8), (52, 8), (56, 16)] {
+            native_header[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let native = Arc::new(CameraThumbnailFrame {
+            kind: ThumbnailKind::GlobalSensor, sensor_size_px: [8000, 6000], sensor_rect_px: [0, 0, 8000, 6000],
+            host_received_unix_ns: before, region_session: None, region_generation: None,
+            camera_header: native_header, payload: Arc::new(vec![0, 1, 2, 3, 4, 5, 6, 7]),
+        });
+        trace.thumbnail(Arc::clone(&native));
+        let mut recorder = Recorder::new(&output, &config, &trace).unwrap();
+        trace.presented(recording_trace::Presentation {
+            mode: "test", size: [1001, 501],
+            display:serde_json::json!({"id":"test"}), scene:serde_json::Value::Null,
+            targets: calibration_recording_targets(&VirtualMouseMode::new(Instant::now())),
+            gaze: recording_gaze(None, None, Some((0.2, 0.3)), Some((0.2, 0.3)),
+                serde_json::json!({"kind": "test"}), false),
+        }, trace.stamp());
+        recorder.record(&header, &[1, 2, 3, 4, 5], None).unwrap();
         recorder.record_recovery(&header, &synthetic_tracker()).unwrap();
         let after = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
         recorder.finalize().unwrap();
+        let member = |name: &str| {
+            let result = Command::new("tar").args(["-xOf"]).arg(&output).arg(name).output().unwrap();
+            assert!(result.status.success()); result.stdout
+        };
+        let manifest: serde_json::Value = serde_json::from_slice(&member("manifest.json")).unwrap();
+        assert_eq!(manifest["viewer_events_index"], recording_trace::METADATA_FILE);
+        assert_eq!(manifest["scene_index"], recording_trace::METADATA_FILE);
+        let bytes = member(recording_trace::METADATA_FILE);
+        let events = recording_trace::decode_metadata(&bytes);
+        assert_eq!(events.iter().filter(|row| row["event"] == "target_added").count(), 1);
+        let presentation = events.iter().find(|row| row["event"] == "presentation").unwrap();
+        assert_eq!(presentation["gaze"]["predicted_normalized"], serde_json::json!([0.2, 0.3]));
+        assert_eq!(events.last().unwrap()["event"], "recording_stopped");
+        let thumbnail_bytes = member("thumbnails.oic1");
+        let ModelStreamFrame::Thumbnail(decoded) = ModelStreamFrame::read_from(&mut thumbnail_bytes.as_slice()).unwrap() else { panic!(); };
+        assert_eq!(decoded.camera_header, native.camera_header);
+        assert_eq!(decoded.payload, native.payload);
+        let thumbnail_index: serde_json::Value = serde_json::from_slice(&member("thumbnails.jsonl")).unwrap();
+        assert_eq!(thumbnail_index["recording_start_snapshot"], true);
         let recovery = Command::new("tar").args(["-xOf"]).arg(&output).arg("recovery.jsonl").output().unwrap();
         assert!(recovery.status.success());
         let trace: serde_json::Value = serde_json::from_slice(&recovery.stdout).unwrap();

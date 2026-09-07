@@ -16,6 +16,7 @@ mapfile -t unexpected_files < <(
       ./AGENTS.md \
       ./Cargo.lock \
       ./Cargo.toml \
+      ./crates/buttercup/Cargo.toml \
       ./build.rs \
       ./README.md \
       ./docs/viewer-overview.png \
@@ -24,9 +25,14 @@ mapfile -t unexpected_files < <(
       ./docs/roi-reframe-continuity.md \
       ./docs/viewer-workspaces.md \
       ./docs/sam-concurrency-and-gaze-latency.md \
+      ./docs/raw-recording-evidence.md \
+      ./docs/physics-naming-audit.md \
       ./scripts/audit-tree.sh \
       ./scripts/run-viewer.sh \
       ./scripts/audit-readmission-corpus.py \
+      ./scripts/validate-recording.py \
+      ./scripts/toggle-mouse-output.py \
+      ./scripts/test-mouse-output.py \
       ./scripts/run-sam31-arc-trial.sh \
       ./scripts/run-sam31-prompt-lab.sh \
       ./scripts/prompt-lab-troublesome-3.txt \
@@ -34,6 +40,14 @@ mapfile -t unexpected_files < <(
       ./src/checkerboard_calibration.rs \
       ./src/geometry.rs \
       ./src/display_pose_wireframe.rs \
+      ./src/monitor_location.rs \
+      ./src/mouse_output.rs \
+      ./src/mouse_output/linux.rs \
+      ./src/desktop_gaze.rs \
+      ./src/gaze_focus.rs \
+      ./src/gaze_focus/sway.rs \
+      ./src/gaze_focus/tests.rs \
+      ./src/gaze_accuracy.rs \
       ./src/conic_solver.rs \
       ./src/conic_solver/fidelity.rs \
       ./src/conic_solver/constraint_tests.rs \
@@ -48,6 +62,7 @@ mapfile -t unexpected_files < <(
       ./src/eye_scene_model/pupil_center.rs \
       ./src/eye_scene_model/pupil_projection.rs \
       ./src/eye_scene_model/pupil_size.rs \
+      ./src/eye_scene_model/sign_motion.rs \
       ./src/gaze_target_solver.rs \
       ./src/binocular_coordinator.rs \
       ./src/bin/buttercup_screen_reflection_raw_decode.rs \
@@ -63,10 +78,17 @@ mapfile -t unexpected_files < <(
       ./src/viewer_ui.rs \
       ./src/native_mediapipe.rs \
       ./src/offline_segmentation_replay.rs \
+      ./src/offline_segmentation_replay/showcase.rs \
+      ./src/offline_segmentation_replay/contact_sign.rs \
       ./src/pupil_clock_supervision.rs \
       ./src/pivot_region_scheduler.rs \
       ./src/raw10.rs \
+      ./src/raw_preview.rs \
+      ./src/portable.rs \
       ./src/raw_eye_model_protocol.rs \
+      ./src/raw_eye_model_protocol/thumbnail.rs \
+      ./src/recording_trace.rs \
+      ./src/recording_trace/scene.rs \
       ./src/raw_iris_focus.rs \
       ./src/raw_motion_octrees.rs \
       ./src/raw_sclera_vein_graph.rs \

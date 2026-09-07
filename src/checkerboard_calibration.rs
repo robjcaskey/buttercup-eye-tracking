@@ -701,10 +701,10 @@ impl WorkerSession {
             let centroid_delta = ((candidate.centroid[0] - prior.centroid[0])
                 .hypot(candidate.centroid[1] - prior.centroid[1]))
                 / f64::from(self.sensor_size.0.max(self.sensor_size.1));
-            let scale_delta = (candidate.scale / prior.scale.max(1.0)).ln().abs();
+            let absolute_log_scale_ratio = (candidate.scale / prior.scale.max(1.0)).ln().abs();
             let angle_delta =
                 angle_delta_degrees(candidate.orientation_degrees, prior.orientation_degrees);
-            centroid_delta >= 0.035 || scale_delta >= 0.08 || angle_delta >= 4.0
+            centroid_delta >= 0.035 || absolute_log_scale_ratio >= 0.08 || angle_delta >= 4.0
         })
     }
 
@@ -1292,9 +1292,9 @@ fn fit_intrinsics(
         .map_err(cv_error)?
         .to_mat()
         .map_err(cv_error)?;
-    let initial_focal = f64::from(sensor_size.0) * 0.60;
-    *camera.at_2d_mut::<f64>(0, 0).map_err(cv_error)? = initial_focal;
-    *camera.at_2d_mut::<f64>(1, 1).map_err(cv_error)? = initial_focal;
+    let initial_focal_length_px = f64::from(sensor_size.0) * 0.60;
+    *camera.at_2d_mut::<f64>(0, 0).map_err(cv_error)? = initial_focal_length_px;
+    *camera.at_2d_mut::<f64>(1, 1).map_err(cv_error)? = initial_focal_length_px;
     *camera.at_2d_mut::<f64>(0, 2).map_err(cv_error)? = f64::from(sensor_size.0) * 0.5;
     *camera.at_2d_mut::<f64>(1, 2).map_err(cv_error)? = f64::from(sensor_size.1) * 0.5;
     let mut distortion = Mat::zeros(5, 1, CV_64F)

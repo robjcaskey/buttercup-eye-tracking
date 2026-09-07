@@ -132,6 +132,7 @@ version = "0.1.0"
 dependencies = [
  "cc",
  "flate2",
+ "libc",
  "libloading",
  "opencv",
  "regex",

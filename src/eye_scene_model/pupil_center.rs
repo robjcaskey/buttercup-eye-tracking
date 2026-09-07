@@ -146,7 +146,7 @@ pub(crate) struct PupilCenterTrackDiagnostics {
     pub(crate) measurement_admissible: bool,
     pub(crate) transported_hold: bool,
     pub(crate) pending_relocation_frames: u8,
-    pub(crate) saccade_likelihood: f32,
+    pub(crate) saccade_score: f32,
     pub(crate) relative_motion_confidence: f32,
     pub(crate) relative_speed_px_s: f32,
     pub(crate) relative_acceleration_px_s2: f32,
@@ -201,11 +201,11 @@ pub(crate) fn pupil_center_saccade_motion_supported<'a>(
 ) -> bool {
     let overlay = overlay.into();
     let coupled = overlay.coupled_motion;
-    let relative = coupled.green_relative_to_cyan;
+    let relative = coupled.pupil_relative_to_general;
     let pupil_layer = overlay.pupil_layer;
     let jerk = relative.jerk_px_s3[0].hypot(relative.jerk_px_s3[1]);
-    let classified_saccade = coupled.saccade_likelihood >= 0.68;
-    let high_jerk_transition = coupled.saccade_likelihood >= 0.34 && jerk >= 650.0;
+    let classified_saccade = coupled.saccade_score >= 0.68;
+    let high_jerk_transition = coupled.saccade_score >= 0.34 && jerk >= 650.0;
     relative.samples >= 4
         && relative.confidence >= 0.12
         && pupil_layer.persistent_tracks >= 3
@@ -223,7 +223,7 @@ pub(crate) fn pupil_center_saccade_search_warranted<'a>(
     overlay: impl Into<PupilCenterMotionEvidence<'a>>,
 ) -> bool {
     let overlay = overlay.into();
-    let relative = overlay.coupled_motion.green_relative_to_cyan;
+    let relative = overlay.coupled_motion.pupil_relative_to_general;
     let pupil_layer = overlay.pupil_layer;
     let acceleration = relative.acceleration_px_s2[0].hypot(relative.acceleration_px_s2[1]);
     let jerk = relative.jerk_px_s3[0].hypot(relative.jerk_px_s3[1]);
@@ -232,7 +232,7 @@ pub(crate) fn pupil_center_saccade_search_warranted<'a>(
         && pupil_layer.persistent_tracks >= 3
         && pupil_layer.stable_frames >= 2
         && pupil_layer.coherence >= 0.18
-        && (overlay.coupled_motion.saccade_likelihood >= 0.22
+        && (overlay.coupled_motion.saccade_score >= 0.22
             || acceleration >= 420.0
             || jerk >= 1_100.0)
 }
@@ -434,13 +434,13 @@ impl PupilCenterStateTracker {
                 (
                     sensor.0
                         + f64::from(global_motion.translation[0])
-                        + f64::from(global_motion.scale_delta) * x
-                        - f64::from(global_motion.rotation) * y
+                        + f64::from(global_motion.diagonal_coefficient_delta) * x
+                        - f64::from(global_motion.rotation_coefficient) * y
                         - f64::from(sensor_origin.0),
                     sensor.1
                         + f64::from(global_motion.translation[1])
-                        + f64::from(global_motion.rotation) * x
-                        + f64::from(global_motion.scale_delta) * y
+                        + f64::from(global_motion.rotation_coefficient) * x
+                        + f64::from(global_motion.diagonal_coefficient_delta) * y
                         - f64::from(sensor_origin.1),
                 )
             });
@@ -558,12 +558,12 @@ impl PupilCenterStateTracker {
             projection.fronto_parallel_limbus_radius_px.value()
         });
         let fixation_gate = (limbus_radius * 0.014).clamp(1.25, 2.40);
-        let micro_gate = if overlay.coupled_motion.micro_motion_likelihood >= 0.65 {
+        let micro_gate = if overlay.coupled_motion.micro_motion_score >= 0.65 {
             fixation_gate * 1.35
         } else {
             fixation_gate
         };
-        let relative = overlay.coupled_motion.green_relative_to_cyan;
+        let relative = overlay.coupled_motion.pupil_relative_to_general;
         let relative_acceleration =
             relative.acceleration_px_s2[0].hypot(relative.acceleration_px_s2[1]);
         let relative_jerk = relative.jerk_px_s3[0].hypot(relative.jerk_px_s3[1]);
@@ -829,7 +829,7 @@ impl PupilCenterStateTracker {
             pending_relocation_frames: self
                 .pending_relocation
                 .map_or(0, |pending| pending.agreeing_frames),
-            saccade_likelihood: overlay.coupled_motion.saccade_likelihood,
+            saccade_score: overlay.coupled_motion.saccade_score,
             relative_motion_confidence: relative.confidence,
             relative_speed_px_s: relative.speed_px_s,
             relative_acceleration_px_s2: relative_acceleration,

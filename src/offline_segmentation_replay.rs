@@ -9,6 +9,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::io::{Read as IoRead, Seek as IoSeek, SeekFrom};
 
+mod showcase;
+mod contact_sign;
+pub(super) use contact_sign::run as contact_sign_eval;
+
 #[derive(Default)]
 struct ModelAggregate {
     candidates: usize,
@@ -148,7 +152,7 @@ struct PupilAffineTemporalTransition {
     third_log_area_derivative_per_second3: Option<f64>,
     gross_reliable: bool,
     gross_translation_px: f64,
-    gross_rotation_degrees: f64,
+    gross_small_angle_rotation_degrees: f64,
     gross_scale_delta: f64,
     gross_support: usize,
     gross_residual_px: f64,
@@ -179,7 +183,7 @@ fn pupil_affine_temporal_subset_json(transitions: Vec<&PupilAffineTemporalTransi
         .collect::<Vec<_>>();
     let gross_rotation = transitions
         .iter()
-        .map(|transition| transition.gross_rotation_degrees.abs())
+        .map(|transition| transition.gross_small_angle_rotation_degrees.abs())
         .collect::<Vec<_>>();
     let gross_scale = transitions
         .iter()
@@ -257,7 +261,7 @@ impl PupilAffineTemporalAggregate {
 
                 let gross_translation =
                     f64::from(gross.motion.translation[0].hypot(gross.motion.translation[1]));
-                let gross_scale = 1.0 + f64::from(gross.motion.scale_delta);
+                let gross_scale = 1.0 + f64::from(gross.motion.diagonal_coefficient_delta);
                 let gross_compensated_pupil_radius_log_residual =
                     (gross.reliable && gross_scale > 0.0).then(|| {
                         (current.pupil_projected_area_radius_px
@@ -271,12 +275,12 @@ impl PupilAffineTemporalAggregate {
                     let predicted = (
                         previous.pupil_center_sensor.0
                             + f64::from(gross.motion.translation[0])
-                            + f64::from(gross.motion.scale_delta) * x
-                            - f64::from(gross.motion.rotation) * y,
+                            + f64::from(gross.motion.diagonal_coefficient_delta) * x
+                            - f64::from(gross.motion.rotation_coefficient) * y,
                         previous.pupil_center_sensor.1
                             + f64::from(gross.motion.translation[1])
-                            + f64::from(gross.motion.rotation) * x
-                            + f64::from(gross.motion.scale_delta) * y,
+                            + f64::from(gross.motion.rotation_coefficient) * x
+                            + f64::from(gross.motion.diagonal_coefficient_delta) * y,
                     );
                     (predicted.0 - current.pupil_center_sensor.0)
                         .hypot(predicted.1 - current.pupil_center_sensor.1)
@@ -303,8 +307,8 @@ impl PupilAffineTemporalAggregate {
                     third_log_area_derivative_per_second3: third_derivative,
                     gross_reliable: gross.reliable,
                     gross_translation_px: gross_translation,
-                    gross_rotation_degrees: f64::from(gross.motion.rotation).to_degrees(),
-                    gross_scale_delta: f64::from(gross.motion.scale_delta),
+                    gross_small_angle_rotation_degrees: f64::from(gross.motion.rotation_coefficient).to_degrees(),
+                    gross_scale_delta: f64::from(gross.motion.diagonal_coefficient_delta),
                     gross_support: gross.motion.support,
                     gross_residual_px: f64::from(gross.motion.residual),
                     gross_compensated_pupil_radius_log_residual,
@@ -322,7 +326,7 @@ impl PupilAffineTemporalAggregate {
                     "gross_anatomy": {
                         "reliable": transition.gross_reliable,
                         "translation_px": transition.gross_translation_px,
-                        "rotation_degrees": transition.gross_rotation_degrees,
+                        "rotation_degrees": transition.gross_small_angle_rotation_degrees,
                         "scale_delta": transition.gross_scale_delta,
                         "support": transition.gross_support,
                         "residual_px": transition.gross_residual_px,
@@ -392,7 +396,7 @@ impl PupilAffineTemporalAggregate {
             .filter(|transition| {
                 transition.gross_reliable
                     && transition.gross_translation_px <= 1.0
-                    && transition.gross_rotation_degrees.abs() <= 0.25
+                    && transition.gross_small_angle_rotation_degrees.abs() <= 0.25
                     && transition.gross_scale_delta.abs() <= 0.005
             })
             .collect::<Vec<_>>();
@@ -402,7 +406,7 @@ impl PupilAffineTemporalAggregate {
             .filter(|transition| {
                 transition.gross_reliable
                     && (transition.gross_translation_px > 1.0
-                        || transition.gross_rotation_degrees.abs() > 0.25
+                        || transition.gross_small_angle_rotation_degrees.abs() > 0.25
                         || transition.gross_scale_delta.abs() > 0.005)
             })
             .collect::<Vec<_>>();
@@ -429,7 +433,7 @@ impl PupilAffineTemporalAggregate {
             .transitions
             .iter()
             .filter(|transition| {
-                transition.gross_reliable && transition.gross_rotation_degrees.abs() < 0.25
+                transition.gross_reliable && transition.gross_small_angle_rotation_degrees.abs() < 0.25
             })
             .collect::<Vec<_>>();
         let rotation_quarter_to_one = self
@@ -437,14 +441,14 @@ impl PupilAffineTemporalAggregate {
             .iter()
             .filter(|transition| {
                 transition.gross_reliable
-                    && (0.25..1.0).contains(&transition.gross_rotation_degrees.abs())
+                    && (0.25..1.0).contains(&transition.gross_small_angle_rotation_degrees.abs())
             })
             .collect::<Vec<_>>();
         let rotation_one_or_more = self
             .transitions
             .iter()
             .filter(|transition| {
-                transition.gross_reliable && transition.gross_rotation_degrees.abs() >= 1.0
+                transition.gross_reliable && transition.gross_small_angle_rotation_degrees.abs() >= 1.0
             })
             .collect::<Vec<_>>();
         let scale_below_half_percent = self
@@ -553,8 +557,8 @@ mod pupil_affine_temporal_metric_tests {
 
         let motion = raw_motion_octrees::SimilarityMotion {
             translation: [3.0, -2.0],
-            rotation: 0.01,
-            scale_delta: 0.021,
+            rotation_coefficient: 0.01,
+            diagonal_coefficient_delta: 0.021,
             residual: 0.25,
             support: 24,
         };
@@ -563,12 +567,12 @@ mod pupil_affine_temporal_metric_tests {
         let transported = (
             previous.pupil_center_sensor.0
                 + f64::from(motion.translation[0])
-                + f64::from(motion.scale_delta) * x
-                - f64::from(motion.rotation) * y,
+                + f64::from(motion.diagonal_coefficient_delta) * x
+                - f64::from(motion.rotation_coefficient) * y,
             previous.pupil_center_sensor.1
                 + f64::from(motion.translation[1])
-                + f64::from(motion.rotation) * x
-                + f64::from(motion.scale_delta) * y,
+                + f64::from(motion.rotation_coefficient) * x
+                + f64::from(motion.diagonal_coefficient_delta) * y,
         );
         let current = observation(
             1_100_000_000,
@@ -2636,11 +2640,11 @@ fn diagnostics_json(diagnostics: raw_iris_focus::OuterIrisDiagnostics) -> Value 
         "outward_topology_detail": outward_topology_detail,
         "flat_rejected": diagnostics.flat_rejected,
         "occlusion_recovered": diagnostics.occlusion_recovered,
-        "analog_force_samples": diagnostics.analog_force_samples,
-        "analog_force_outward": diagnostics.analog_force_outward,
-        "analog_force_inward": diagnostics.analog_force_inward,
+        "analog_force_samples": diagnostics.analog_edge_samples,
+        "analog_force_outward": diagnostics.analog_edge_outward_samples,
+        "analog_force_inward": diagnostics.analog_edge_inward_samples,
         "analog_mean_signed_offset_px": diagnostics.analog_mean_signed_offset_px,
-        "analog_mean_power": diagnostics.analog_mean_power,
+        "analog_mean_power": diagnostics.analog_mean_edge_amplitude,
         "analog_mean_certainty": diagnostics.analog_mean_certainty,
         "analog_refinement_elapsed_us": diagnostics.analog_refinement_elapsed_us,
         "analog_fit_applied": diagnostics.analog_fit_applied,
@@ -2725,8 +2729,8 @@ fn motion_layers_json(overlay: &raw_motion_octrees::MotionOctreeOverlay) -> Valu
                     "motion_support": motion.support,
                     "motion_residual": motion.residual,
                     "translation": motion.translation,
-                    "rotation": motion.rotation,
-                    "scale_delta": motion.scale_delta,
+                    "rotation": motion.rotation_coefficient,
+                    "scale_delta": motion.diagonal_coefficient_delta,
                 })
             })
             .collect(),
@@ -2735,7 +2739,7 @@ fn motion_layers_json(overlay: &raw_motion_octrees::MotionOctreeOverlay) -> Valu
 
 fn pupil_center_motion_gate_json(overlay: &raw_motion_octrees::MotionOctreeOverlay) -> Value {
     let coupled = overlay.coupled_motion;
-    let relative = coupled.green_relative_to_cyan;
+    let relative = coupled.pupil_relative_to_general;
     let acceleration = relative.acceleration_px_s2[0].hypot(relative.acceleration_px_s2[1]);
     let jerk = relative.jerk_px_s3[0].hypot(relative.jerk_px_s3[1]);
     let pupil_layer = overlay.layers[raw_motion_octrees::PUPIL_LAYER];
@@ -2747,8 +2751,8 @@ fn pupil_center_motion_gate_json(overlay: &raw_motion_octrees::MotionOctreeOverl
         "broad_search_warranted": pupil_center_saccade_search_warranted(overlay),
         "timestamp_ns": coupled.timestamp_ns,
         "dt_ms": coupled.dt_ms,
-        "saccade_likelihood": coupled.saccade_likelihood,
-        "micro_motion_likelihood": coupled.micro_motion_likelihood,
+        "saccade_likelihood": coupled.saccade_score,
+        "micro_motion_likelihood": coupled.micro_motion_score,
         "cyan": {
             "samples": coupled.cyan.samples,
             "confidence": coupled.cyan.confidence,
@@ -3147,7 +3151,7 @@ fn pupil_center_track_json(diagnostics: PupilCenterTrackDiagnostics) -> Value {
         "measurement_admissible": diagnostics.measurement_admissible,
         "transported_hold": diagnostics.transported_hold,
         "pending_relocation_frames": diagnostics.pending_relocation_frames,
-        "saccade_likelihood": diagnostics.saccade_likelihood,
+        "saccade_likelihood": diagnostics.saccade_score,
         "relative_motion_confidence": diagnostics.relative_motion_confidence,
         "relative_speed_px_s": diagnostics.relative_speed_px_s,
         "relative_acceleration_px_s2": diagnostics.relative_acceleration_px_s2,
@@ -4116,8 +4120,8 @@ fn labeled_light_candidate_features(
             "tangential_step_coherence",
             candidate.tangential_step_coherence,
         ),
-        ("inside_texture_energy", candidate.inside_texture_energy),
-        ("outside_texture_energy", candidate.outside_texture_energy),
+        ("inside_texture_energy", candidate.inside_texture_difference_rms),
+        ("outside_texture_energy", candidate.outside_texture_difference_rms),
         ("texture_drop", candidate.texture_drop),
     ]
 }
@@ -4150,8 +4154,8 @@ fn labeled_light_candidate_json(
         "achromatic_edge_fraction": candidate.achromatic_edge_fraction,
         "normal_edge_concentration": candidate.normal_edge_concentration,
         "tangential_step_coherence": candidate.tangential_step_coherence,
-        "inside_texture_energy": candidate.inside_texture_energy,
-        "outside_texture_energy": candidate.outside_texture_energy,
+        "inside_texture_energy": candidate.inside_texture_difference_rms,
+        "outside_texture_energy": candidate.outside_texture_difference_rms,
         "texture_drop": candidate.texture_drop,
     })
 }
@@ -5154,6 +5158,12 @@ where I: Iterator<Item = String> {
     if records.is_empty() { return Err("empty SAM sequence".into()); }
     let model = env::var_os("BUTTERCUP_SAM31_MODEL").map(PathBuf::from)
         .unwrap_or_else(sam31_outer::default_model_path);
+    let render_directory = env::var_os("BUTTERCUP_REPLAY_RENDER_DIR").map(PathBuf::from);
+    if let Some(directory) = render_directory.as_ref() {
+        if crop_mode != "native" { return Err("showcase export requires native ROI coordinates".into()); }
+        if directory.exists() { return Err(format!("render directory already exists: {}", directory.display())); }
+        fs::create_dir_all(directory).map_err(|e|e.to_string())?;
+    }
     let client = sam31_outer::Client::start(&model)?;
     let mut history = VecDeque::new();
     let mut cases = Vec::new();
@@ -5287,6 +5297,10 @@ where I: Iterator<Item = String> {
             contact_tracker.observe_keyed_with_global_similarity(proposals.source_timestamp_ns,now,origin,
                 sam31_proposal_pupil_limbus_anchor(proposals),&boundary,source_motion)
         });
+        let rendered_views = render_directory.as_ref().map(|directory|
+            showcase::render(directory,index,&frame,proposal.as_deref(),
+                contact.filter(|sample|sample.source_timestamp_ns==Some(timestamp))))
+            .transpose()?;
         let ratio = outer.zip(pupil).map(|(o,p)| (p.ellipse.major_radius * p.ellipse.minor_radius / (o.major_radius * o.minor_radius)).sqrt());
         if let Some(ratio) = ratio {
             ratios.push(ratio);
@@ -5303,11 +5317,41 @@ where I: Iterator<Item = String> {
             "center":(e.center.0+crop_offset.0 as f64,e.center.1+crop_offset.1 as f64),
             "major_radius":e.major_radius,"minor_radius":e.minor_radius,"angle":e.angle});
         let scale_ratio = independent_motion.reliable.then(||
-            (1.0f64 + f64::from(independent_motion.motion.scale_delta)).hypot(f64::from(independent_motion.motion.rotation)));
+            (1.0f64 + f64::from(independent_motion.motion.diagonal_coefficient_delta)).hypot(f64::from(independent_motion.motion.rotation_coefficient)));
         let admitted_radius = result.as_ref().and(outer).map(|e|e.major_radius);
         let sn_feida_log_step = previous_radius.zip(admitted_radius).zip(scale_ratio)
             .map(|((previous,current),scale)|2.0*((current/previous).ln()-scale.ln()));
         previous_radius = admitted_radius;
+        // Export existing production review geometry for browser playback. This
+        // is serialization only: never refit, advance trackers, or use held
+        // answers as observations. All coordinates refer to the recorded ROI.
+        let point_stream = proposal.as_ref().and_then(|p| {
+            let review = p.outer_fit.as_ref()?;
+            let shift = |points: &[(f64, f64)]| points.iter().map(|p|
+                (p.0 + crop_offset.0 as f64, p.1 + crop_offset.1 as f64)).collect::<Vec<_>>();
+            let boundary = review.ellipse.dense_points(240);
+            let fresh_contact = contact.filter(|sample|sample.source_timestamp_ns==Some(p.source_timestamp_ns));
+            let pose = provisional_surface_pose(fresh_contact, &boundary);
+            Some(json!({
+                "schema":"buttercup-precomputed-points-v1",
+                "source_sequence":p.source_sequence,
+                "source_timestamp_ns":p.source_timestamp_ns.to_string(),
+                "coordinate_space":"recorded-roi-pixels",
+                "retained_points":shift(review.retained_points.as_slice()),
+                "flat_tire_points":shift(review.flat_tire_points.as_slice()),
+                "ellipse_points":shift(&boundary),
+                "upper_flat_tire":review.upper_flat_tire,
+                "lower_flat_tire":review.lower_flat_tire,
+                "raw_admitted":result.is_some(),
+                "contact":pose.map(|pose|json!({
+                    "rotation_center":[pose.rotation_center.0+crop_offset.0 as f64,pose.rotation_center.1+crop_offset.1 as f64],
+                    "sphere_radius":pose.sphere_radius,
+                    "relative_gaze":[pose.relative_gaze.right,pose.relative_gaze.down,pose.relative_gaze.toward_camera],
+                    "sign_resolved":fresh_contact.is_some_and(|s|s.sign_resolved),
+                    "presentation_only":true
+                }))
+            }))
+        });
         cases.push(json!({"frame":record,"epoch":epoch,"source_transition":format!("{transition:?}"),
             "legacy_caller_crop_reset":legacy_reset,
             "gaze_authority_generation":gaze_authority_generation,
@@ -5318,12 +5362,13 @@ where I: Iterator<Item = String> {
                 "source_timestamp_ns":timestamp,"reframed":reframed},
             "independent_motion":{"reliable":independent_motion.reliable,"scale_ratio":scale_ratio,
                 "center_sensor":independent_motion.motion_center_sensor,"translation":independent_motion.motion.translation,
-                "rotation_coefficient":independent_motion.motion.rotation,"support":independent_motion.motion.support,
+                "rotation_coefficient":independent_motion.motion.rotation_coefficient,"support":independent_motion.motion.support,
                 "residual_px":independent_motion.motion.residual},
             "sn_feida_log_step":sn_feida_log_step,
             "raw_admitted":result.is_some(),"pupil":pupil.map(|p|ellipse_json(p.ellipse)),
             "pupil_support":pupil.map(|p|json!({"score":p.raw_support.score,"positive_fraction":p.raw_support.positive_fraction,"strong_sectors":p.raw_support.strong_sectors})),
             "pupil_radius_ratio":ratio,"post_sam":post,"virtual_contact":json_surface_gaze(contact),
+            "point_stream":point_stream,"rendered_views":rendered_views,
             "contact_fresh_source":contact.is_some_and(|sample|sample.source_timestamp_ns==Some(timestamp)),
             "pupil_diagnostics":outer.map(|o|sam31_outer::inspect_pupil_fit(frame,o)),
             "status":client.status().detail,"elapsed_ms":elapsed}));
@@ -8763,14 +8808,14 @@ where
                 "motion_support": global_similarity.motion.support,
                 "motion_residual": global_similarity.motion.residual,
                 "translation": global_similarity.motion.translation,
-                "rotation": global_similarity.motion.rotation,
-                "scale_delta": global_similarity.motion.scale_delta,
+                "rotation": global_similarity.motion.rotation_coefficient,
+                "scale_delta": global_similarity.motion.diagonal_coefficient_delta,
                 "candidate_motion_support": global_similarity.candidate_motion.support,
                 "candidate_matches": global_similarity.candidate_matches,
                 "candidate_motion_residual": global_similarity.candidate_motion.residual,
                 "candidate_translation": global_similarity.candidate_motion.translation,
-                "candidate_rotation": global_similarity.candidate_motion.rotation,
-                "candidate_scale_delta": global_similarity.candidate_motion.scale_delta,
+                "candidate_rotation": global_similarity.candidate_motion.rotation_coefficient,
+                "candidate_scale_delta": global_similarity.candidate_motion.diagonal_coefficient_delta,
                 "prediction": scale_prediction.map(|prediction| json!({
                     "scale_ratio": prediction.scale_ratio,
                     "fractional_uncertainty": prediction.fractional_uncertainty,

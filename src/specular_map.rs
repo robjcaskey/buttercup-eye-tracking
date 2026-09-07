@@ -9,8 +9,10 @@
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SimilarityMotion {
     pub translation: [f32; 2],
-    pub rotation: f32,
-    pub scale_delta: f32,
+    /// b in [[1+d, -b], [b, 1+d]]; atan2(b, 1+d) is the rotation angle.
+    pub rotation_coefficient: f32,
+    /// d in the similarity matrix, not hypot(1+d, b)-1 (the scale change).
+    pub diagonal_coefficient_delta: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -136,8 +138,8 @@ fn inverse_motion_point(
     current_center: [f32; 2],
     motion: SimilarityMotion,
 ) -> Option<[f32; 2]> {
-    let a = 1.0 + motion.scale_delta;
-    let b = motion.rotation;
+    let a = 1.0 + motion.diagonal_coefficient_delta;
+    let b = motion.rotation_coefficient;
     let determinant = a * a + b * b;
     if !determinant.is_finite() || determinant < 0.25 {
         return None;

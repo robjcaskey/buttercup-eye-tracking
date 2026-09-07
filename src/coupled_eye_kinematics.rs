@@ -17,7 +17,7 @@ const MIN_LAYER_SUPPORT: usize = 3;
 const MAX_CONTIGUOUS_DT_NS: u64 = 750_000_000;
 const MIN_CONTIGUOUS_DT_NS: u64 = 2_000_000;
 const CENTER_INFORMATION_DECAY: f64 = 0.997;
-const CYAN_CENTER_INFORMATION_DECAY: f64 = 0.86;
+const GENERAL_FRAME_CENTER_INFORMATION_DECAY: f64 = 0.86;
 const MIN_CENTER_EXCITATION: f64 = 2.5e-5;
 const CENTER_LOCK_MIN_SAMPLES: u32 = 10;
 const GLOBE_TRANSLATION_LIMIT_RADII: f64 = 0.12;
@@ -176,7 +176,7 @@ pub struct CoupledMotionStatus {
     pub reference_generation: u64,
     pub cyan: KinematicDerivatives,
     pub green: KinematicDerivatives,
-    pub green_relative_to_cyan: KinematicDerivatives,
+    pub pupil_relative_to_general: KinematicDerivatives,
     /// Algebraic fixed point of the green-after-cyan 2-D similarity. This is
     /// useful corroboration, but is not an anatomical assertion.
     pub relative_motion_fixed_point: RotationCenterStatus,
@@ -187,8 +187,8 @@ pub struct CoupledMotionStatus {
     /// A short-horizon image-space center of the cyan transform.  Translation
     /// makes this correctly unobservable (a center at infinity).
     pub cyan_rotation_center: RotationCenterStatus,
-    pub saccade_likelihood: f32,
-    pub micro_motion_likelihood: f32,
+    pub saccade_score: f32,
+    pub micro_motion_score: f32,
 }
 
 impl CoupledMotionStatus {
@@ -244,9 +244,9 @@ impl Affine2 {
     }
 
     fn from_motion(motion: SimilarityMotion, center: [f32; 2]) -> Self {
-        let scale = 1.0 + motion.scale_delta as f64;
-        let rotation = motion.rotation as f64;
-        let linear = [[scale, -rotation], [rotation, scale]];
+        let scale = 1.0 + motion.diagonal_coefficient_delta as f64;
+        let rotation_coefficient = motion.rotation_coefficient as f64;
+        let linear = [[scale, -rotation_coefficient], [rotation_coefficient, scale]];
         let center = [center[0] as f64, center[1] as f64];
         let transformed_center = matrix_vector(linear, center);
         Self {
@@ -1330,9 +1330,9 @@ impl CoupledEyeKinematics {
     fn clear_current_dynamics(&mut self) {
         self.status.cyan = KinematicDerivatives::default();
         self.status.green = KinematicDerivatives::default();
-        self.status.green_relative_to_cyan = KinematicDerivatives::default();
-        self.status.saccade_likelihood = 0.0;
-        self.status.micro_motion_likelihood = 0.0;
+        self.status.pupil_relative_to_general = KinematicDerivatives::default();
+        self.status.saccade_score = 0.0;
+        self.status.micro_motion_score = 0.0;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1458,7 +1458,7 @@ impl CoupledEyeKinematics {
             cyan_equation,
             cyan_rhs,
             cyan_quality,
-            CYAN_CENTER_INFORMATION_DECAY,
+            GENERAL_FRAME_CENTER_INFORMATION_DECAY,
             5.0,
             18.0,
         ) {
@@ -1617,9 +1617,9 @@ impl CoupledEyeKinematics {
         let cyan_speed = cyan_kinematics.speed_px_s as f64;
         // Likelihood describes the measured dynamics. Its independently
         // exported confidence says how strongly to trust the classification.
-        let saccade_likelihood = sigmoid((relative_speed - 52.0 - cyan_speed * 0.10) / 13.0)
+        let saccade_score = sigmoid((relative_speed - 52.0 - cyan_speed * 0.10) / 13.0)
             .max(sigmoid((relative_angular_speed - 0.30) / 0.09));
-        let micro_motion_likelihood = if relative_speed < 24.0 && relative_angular_speed < 0.18 {
+        let micro_motion_score = if relative_speed < 24.0 && relative_angular_speed < 0.18 {
             let reliability =
                 ((relative_kinematics.confidence as f64 - 0.06) / 0.12).clamp(0.0, 1.0);
             sigmoid((relative_speed - 6.0 - cyan_speed * 0.05) / 3.0) * reliability
@@ -1658,7 +1658,7 @@ impl CoupledEyeKinematics {
             reference_generation: self.reference_generation,
             cyan: cyan_kinematics,
             green: green_kinematics,
-            green_relative_to_cyan: relative_kinematics,
+            pupil_relative_to_general: relative_kinematics,
             relative_motion_fixed_point,
             green_rotation_center: relative_motion_fixed_point,
             projected_globe,
@@ -1677,8 +1677,8 @@ impl CoupledEyeKinematics {
                     && cyan_sigma <= frame_extent_px * 8.0,
                 ..RotationCenterStatus::default()
             },
-            saccade_likelihood: saccade_likelihood.clamp(0.0, 1.0) as f32,
-            micro_motion_likelihood: micro_motion_likelihood.clamp(0.0, 1.0) as f32,
+            saccade_score: saccade_score.clamp(0.0, 1.0) as f32,
+            micro_motion_score: micro_motion_score.clamp(0.0, 1.0) as f32,
         };
         self.status
     }
@@ -2162,8 +2162,8 @@ mod tests {
         );
         assert_eq!(invalid.cyan.samples, 0);
         assert_eq!(invalid.green.samples, 0);
-        assert_eq!(invalid.green_relative_to_cyan.samples, 0);
-        assert_eq!(invalid.saccade_likelihood, 0.0);
-        assert_eq!(invalid.micro_motion_likelihood, 0.0);
+        assert_eq!(invalid.pupil_relative_to_general.samples, 0);
+        assert_eq!(invalid.saccade_score, 0.0);
+        assert_eq!(invalid.micro_motion_score, 0.0);
     }
 }

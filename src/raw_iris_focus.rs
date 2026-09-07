@@ -56,7 +56,7 @@ const OUTER_IRIS_ANALOG_PROFILE_OFFSETS: [f64; 9] =
 const OUTER_IRIS_ANALOG_APERTURES: [f64; 3] = [0.85, 1.70, 3.10];
 // A profile below either floor may still be useful telemetry, but a whole
 // conic must not move on a collection of weak or poorly localized edges.
-const OUTER_IRIS_ANALOG_MIN_MEAN_POWER: f64 = 0.60;
+const OUTER_IRIS_ANALOG_MIN_MEAN_EDGE_AMPLITUDE: f64 = 0.60;
 const OUTER_IRIS_ANALOG_MIN_MEAN_CERTAINTY: f64 = 0.28;
 const OUTER_IRIS_REFLECTANCE_FUSED_STRENGTH: f64 = 0.35;
 const OUTER_IRIS_REFLECTANCE_LIGHT_STRENGTH: f64 = 0.50;
@@ -361,14 +361,14 @@ pub struct OuterIrisDiagnostics {
     pub flat_rejected: usize,
     pub occlusion_recovered: bool,
     /// Accepted meridian contacts with a completed continuous edge profile.
-    pub analog_force_samples: usize,
-    pub analog_force_outward: usize,
-    pub analog_force_inward: usize,
+    pub analog_edge_samples: usize,
+    pub analog_edge_outward_samples: usize,
+    pub analog_edge_inward_samples: usize,
     /// Mean signed measurement from the provisional conic to the local edge;
     /// positive is outward (toward sclera), negative is inward (toward iris).
     pub analog_mean_signed_offset_px: f64,
     /// Mean normalized edge amplitude after low-frequency light removal.
-    pub analog_mean_power: f64,
+    pub analog_mean_edge_amplitude: f64,
     /// Mean confidence in polarity, scale agreement, and peak localization.
     pub analog_mean_certainty: f64,
     pub analog_refinement_elapsed_us: u64,
@@ -2846,10 +2846,10 @@ fn grain_great_circle_objective(luma: &BoxLuma5, center: (f64, f64), radius: f64
     // A gnomonic lift gives every image radius a true angular distance from
     // the candidate iris pole. Grain following then compares like distances
     // even when perspective spreads the outer samples more than inner ones.
-    let focal = radius * 2.5;
-    let boundary_angle = (radius / focal).atan();
-    let sample_radius = |fraction: f64| focal * (boundary_angle * fraction).tan();
-    let grain_energy = |angle: f64, fraction: f64| -> Option<f64> {
+    let gnomonic_projection_scale_px = radius * 2.5;
+    let boundary_angle = (radius / gnomonic_projection_scale_px).atan();
+    let sample_radius = |fraction: f64| gnomonic_projection_scale_px * (boundary_angle * fraction).tan();
+    let grain_alignment_score = |angle: f64, fraction: f64| -> Option<f64> {
         let (direction_y, direction_x) = angle.sin_cos();
         let distance = sample_radius(fraction);
         let x = center.0 + direction_x * distance;
@@ -2886,11 +2886,11 @@ fn grain_great_circle_objective(luma: &BoxLuma5, center: (f64, f64), radius: f64
         let angle = PI * ray as f64 / 32.0;
         let inner = [0.52, 0.66, 0.78, 0.88, 0.96]
             .into_iter()
-            .filter_map(|fraction| grain_energy(angle, fraction))
+            .filter_map(|fraction| grain_alignment_score(angle, fraction))
             .collect::<Vec<_>>();
         let outer = [1.06, 1.15, 1.24]
             .into_iter()
-            .filter_map(|fraction| grain_energy(angle, fraction))
+            .filter_map(|fraction| grain_alignment_score(angle, fraction))
             .collect::<Vec<_>>();
         if inner.len() < 4 || outer.len() < 2 {
             continue;
@@ -4985,9 +4985,9 @@ pub struct OuterIrisCandidateDebug {
     /// samples. This distinguishes a coherent light boundary from a speck.
     pub tangential_step_coherence: f64,
     /// Native log-luma texture energy on the iris-facing side.
-    pub inside_texture_energy: f64,
+    pub inside_texture_difference_rms: f64,
     /// Native log-luma texture energy on the sclera-facing side.
-    pub outside_texture_energy: f64,
+    pub outside_texture_difference_rms: f64,
     /// Positive when the inside is more textured than the outside, as is
     /// common at an iris-to-sclera transition; close to zero for one material
     /// crossed by a gain-only shadow.
@@ -5001,8 +5001,8 @@ struct OuterLightStructureDebug {
     achromatic_edge_fraction: f64,
     normal_edge_concentration: f64,
     tangential_step_coherence: f64,
-    inside_texture_energy: f64,
-    outside_texture_energy: f64,
+    inside_texture_difference_rms: f64,
+    outside_texture_difference_rms: f64,
     texture_drop: f64,
 }
 
@@ -5111,10 +5111,10 @@ fn debug_outer_light_structure(
             native.sample_log_intensity(sample.0, sample.1)
         })
         .to_vec();
-    let inside_texture_energy = rms_first_difference(&inside_texture);
-    let outside_texture_energy = rms_first_difference(&outside_texture);
-    let texture_drop = (inside_texture_energy - outside_texture_energy)
-        / (inside_texture_energy + outside_texture_energy + 0.02);
+    let inside_texture_difference_rms = rms_first_difference(&inside_texture);
+    let outside_texture_difference_rms = rms_first_difference(&outside_texture);
+    let texture_drop = (inside_texture_difference_rms - outside_texture_difference_rms)
+        / (inside_texture_difference_rms + outside_texture_difference_rms + 0.02);
 
     OuterLightStructureDebug {
         common_mode_step,
@@ -5122,8 +5122,8 @@ fn debug_outer_light_structure(
         achromatic_edge_fraction,
         normal_edge_concentration,
         tangential_step_coherence,
-        inside_texture_energy,
-        outside_texture_energy,
+        inside_texture_difference_rms,
+        outside_texture_difference_rms,
         texture_drop,
     }
 }
@@ -5225,8 +5225,8 @@ pub fn debug_outer_iris_candidate_lattice(
                     achromatic_edge_fraction: light.achromatic_edge_fraction,
                     normal_edge_concentration: light.normal_edge_concentration,
                     tangential_step_coherence: light.tangential_step_coherence,
-                    inside_texture_energy: light.inside_texture_energy,
-                    outside_texture_energy: light.outside_texture_energy,
+                    inside_texture_difference_rms: light.inside_texture_difference_rms,
+                    outside_texture_difference_rms: light.outside_texture_difference_rms,
                     texture_drop: light.texture_drop,
                 }
             })
@@ -6639,13 +6639,13 @@ fn opposing_meridian_support(
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct AnalogOuterEdgeForce {
+struct OuterEdgeLocalizationEstimate {
     /// Sub-pixel location of the positive iris-to-sclera derivative relative
     /// to the accepted discrete contact. Positive is outward.
     edge_offset_px: f64,
     /// Absolute transition amplitude after log-light correction, normalized
     /// to `[0, 1]` independently of the force direction.
-    power: f64,
+    normalized_edge_amplitude: f64,
     /// Agreement of polarity, derivative scale, peak localization, material
     /// ordering, and the illumination reconstruction.
     certainty: f64,
@@ -6664,11 +6664,11 @@ fn corrected_outer_profile_log_luma(context: &OuterRayContext, x: f64, y: f64) -
 /// whether the same iris-to-sclera polarity survives scale. All samples stay
 /// in native ROI coordinates and reuse the existing RAW integral/material
 /// planes—there is no resized image or learned inference path here.
-fn sample_analog_outer_edge_force(
+fn sample_outer_edge_localization(
     context: &OuterRayContext,
     anchor: (f64, f64),
     outward_normal: (f64, f64),
-) -> Option<AnalogOuterEdgeForce> {
+) -> Option<OuterEdgeLocalizationEstimate> {
     let normal_length = outward_normal.0.hypot(outward_normal.1);
     if !anchor.0.is_finite()
         || !anchor.1.is_finite()
@@ -6806,15 +6806,15 @@ fn sample_analog_outer_edge_force(
     let lighting_certainty = context
         .material_illumination
         .map_or(0.58, material_illumination_confidence);
-    let power = (peak / 0.62).tanh().clamp(0.0, 1.0);
+    let normalized_edge_amplitude = (peak / 0.62).tanh().clamp(0.0, 1.0);
     let certainty = lighting_certainty
         * (0.22 + 0.78 * scale_coherence.clamp(0.0, 1.0))
         * (0.34 + 0.66 * concentration.clamp(0.0, 1.0))
         * (0.24 + 0.76 * prominence)
         * (0.28 + 0.72 * side_order.clamp(0.0, 1.0));
-    Some(AnalogOuterEdgeForce {
+    Some(OuterEdgeLocalizationEstimate {
         edge_offset_px: centroid.clamp(-4.0, 4.0),
-        power,
+        normalized_edge_amplitude,
         certainty: certainty.clamp(0.0, 1.0),
     })
 }
@@ -6828,7 +6828,7 @@ struct OuterAnalogRefinement {
     outward: usize,
     inward: usize,
     mean_signed_offset_px: f64,
-    mean_power: f64,
+    mean_edge_amplitude: f64,
     mean_certainty: f64,
     fit_applied: bool,
 }
@@ -6857,7 +6857,7 @@ fn fitted_outer_phase_for_contact(search: OuterSearchEllipse, point: OuterIrisPo
     fitted_coordinates.1.atan2(fitted_coordinates.0)
 }
 
-fn refine_outer_analog_edge_forces(
+fn refine_outer_edge_localizations(
     context: &OuterRayContext,
     candidates: &[Vec<OuterRayCandidate>; OUTER_IRIS_DENSE_EVIDENCE_SAMPLES],
     rays: &[Option<OuterIrisPoint>; OUTER_IRIS_DENSE_EVIDENCE_SAMPLES],
@@ -6894,7 +6894,7 @@ fn refine_outer_analog_edge_forces(
     let mut inward = 0usize;
     let mut signed_sum = 0.0;
     let mut signed_weight = 0.0;
-    let mut power_sum = 0.0;
+    let mut edge_amplitude_sum = 0.0;
     let mut certainty_sum = 0.0;
     let mut left = 0usize;
     let mut right = 0usize;
@@ -6915,7 +6915,7 @@ fn refine_outer_analog_edge_forces(
         let fitted_phase = fitted_outer_phase_for_contact(fitted_search, accepted);
         let (model_point, model_normal) = fitted_search.point_and_normal(fitted_phase, 1.0);
         let Some(profile) =
-            sample_analog_outer_edge_force(context, (accepted.x, accepted.y), model_normal)
+            sample_outer_edge_localization(context, (accepted.x, accepted.y), model_normal)
         else {
             continue;
         };
@@ -6932,8 +6932,8 @@ fn refine_outer_analog_edge_forces(
         let reliability = outer_meridian_reliability(angle);
         let certainty =
             (profile.certainty * (0.58 + 0.42 * discrete_certainty) * reliability).clamp(0.0, 1.0);
-        let power = (profile.power * (0.64 + 0.36 * candidate.margin_clarity)).clamp(0.0, 1.0);
-        let authority = (power * (0.34 + 0.66 * certainty)).clamp(0.0, 1.0);
+        let normalized_edge_amplitude = (profile.normalized_edge_amplitude * (0.64 + 0.36 * candidate.margin_clarity)).clamp(0.0, 1.0);
+        let authority = (normalized_edge_amplitude * (0.34 + 0.66 * certainty)).clamp(0.0, 1.0);
         let applied_offset = signed_offset.clamp(-maximum_pull, maximum_pull) * authority;
         adjusted[index] = Some(OuterIrisPoint {
             x: model_point.0 + model_normal.0 * applied_offset,
@@ -6941,11 +6941,11 @@ fn refine_outer_analog_edge_forces(
             contrast: accepted.contrast,
         });
         measurements[index] = Some(measured);
-        fit_weights[index] = (0.14 + 0.86 * power * certainty).clamp(0.14, 1.0);
-        let evidence_weight = (power * certainty).max(0.02);
+        fit_weights[index] = (0.14 + 0.86 * normalized_edge_amplitude * certainty).clamp(0.14, 1.0);
+        let evidence_weight = (normalized_edge_amplitude * certainty).max(0.02);
         signed_sum += signed_offset * evidence_weight;
         signed_weight += evidence_weight;
-        power_sum += power;
+        edge_amplitude_sum += normalized_edge_amplitude;
         certainty_sum += certainty;
         samples += 1;
         outward += usize::from(signed_offset > 0.15);
@@ -6979,10 +6979,10 @@ fn refine_outer_analog_edge_forces(
         .abs()
         .max((proposed[3] - initial_ellipse[3]).abs());
     let area_ratio = proposed[2] * proposed[3] / (initial_ellipse[2] * initial_ellipse[3]).max(1.0);
-    let mean_power = power_sum / samples as f64;
+    let mean_edge_amplitude = edge_amplitude_sum / samples as f64;
     let mean_certainty = certainty_sum / samples as f64;
     let fit_applied = proposed.iter().all(|value| value.is_finite())
-        && mean_power >= OUTER_IRIS_ANALOG_MIN_MEAN_POWER
+        && mean_edge_amplitude >= OUTER_IRIS_ANALOG_MIN_MEAN_EDGE_AMPLITUDE
         && mean_certainty >= OUTER_IRIS_ANALOG_MIN_MEAN_CERTAINTY
         && center_shift <= (seed[2] * 0.075).clamp(2.5, 7.0)
         && axis_shift <= (seed[2] * 0.090).clamp(3.0, 8.0)
@@ -7000,7 +7000,7 @@ fn refine_outer_analog_edge_forces(
         outward,
         inward,
         mean_signed_offset_px: signed_sum / signed_weight.max(1.0e-9),
-        mean_power,
+        mean_edge_amplitude,
         mean_certainty,
         fit_applied,
     })
@@ -8072,7 +8072,7 @@ fn run_outer_iris_branch(
     if !bilateral && !diagnostics.occlusion_recovered {
         return None;
     }
-    let analog = refine_outer_analog_edge_forces(
+    let analog = refine_outer_edge_localizations(
         context.as_ref(),
         &candidates,
         &rays,
@@ -8082,11 +8082,11 @@ fn run_outer_iris_branch(
     );
     let mut analog_weights = None;
     if let Some(analog) = analog {
-        diagnostics.analog_force_samples += analog.samples;
-        diagnostics.analog_force_outward += analog.outward;
-        diagnostics.analog_force_inward += analog.inward;
+        diagnostics.analog_edge_samples += analog.samples;
+        diagnostics.analog_edge_outward_samples += analog.outward;
+        diagnostics.analog_edge_inward_samples += analog.inward;
         diagnostics.analog_mean_signed_offset_px = analog.mean_signed_offset_px;
-        diagnostics.analog_mean_power = analog.mean_power;
+        diagnostics.analog_mean_edge_amplitude = analog.mean_edge_amplitude;
         diagnostics.analog_mean_certainty = analog.mean_certainty;
         diagnostics.analog_refinement_elapsed_us +=
             analog.elapsed.as_micros().min(u64::MAX as u128) as u64;
@@ -15973,9 +15973,9 @@ mod stream_eye_tests {
     #[test]
     fn analog_edge_force_reports_direction_power_and_certainty_after_light_correction() {
         let (_raw, context) = analog_step_context(91.25, false);
-        let from_inside = sample_analog_outer_edge_force(&context, (88.0, 48.0), (1.0, 0.0))
+        let from_inside = sample_outer_edge_localization(&context, (88.0, 48.0), (1.0, 0.0))
             .expect("positive iris-to-sclera edge");
-        let from_outside = sample_analog_outer_edge_force(&context, (94.0, 48.0), (1.0, 0.0))
+        let from_outside = sample_outer_edge_localization(&context, (94.0, 48.0), (1.0, 0.0))
             .expect("same edge viewed from its outer side");
         assert!(
             from_inside.edge_offset_px > 1.0 && from_inside.edge_offset_px <= 4.0,
@@ -15985,13 +15985,13 @@ mod stream_eye_tests {
             from_outside.edge_offset_px < -0.8 && from_outside.edge_offset_px >= -4.0,
             "force={from_outside:?}"
         );
-        assert!(from_inside.power > 0.60, "force={from_inside:?}");
+        assert!(from_inside.normalized_edge_amplitude > 0.60, "force={from_inside:?}");
         assert!(from_inside.certainty > 0.35, "force={from_inside:?}");
 
         let (_raw, reversed) = analog_step_context(91.25, true);
-        let reverse = sample_analog_outer_edge_force(&reversed, (91.0, 48.0), (1.0, 0.0));
+        let reverse = sample_outer_edge_localization(&reversed, (91.0, 48.0), (1.0, 0.0));
         assert!(
-            reverse.is_none_or(|force| force.power < 0.35 || force.certainty < 0.20),
+            reverse.is_none_or(|force| force.normalized_edge_amplitude < 0.35 || force.certainty < 0.20),
             "reverse-polarity edge gained outward authority: {reverse:?}"
         );
     }

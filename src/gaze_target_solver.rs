@@ -104,22 +104,17 @@ pub(crate) struct VirtualDisplayPlane {
 }
 
 impl VirtualDisplayPlane {
-    /// Approximate eye-relative pose from the first accepted nine-target SAM
-    /// session (1788564758-560066510). This is a development convenience, not
+    /// Eye-relative pose explicitly selected as the default from accepted SAM
+    /// session 1788765280-345175455. This is a development convenience, not
     /// a calibration for the current eye/sign epoch or a physical measurement.
     /// Keep the centered nominal model separate for solver priors and tests.
     pub(crate) fn development_default() -> Self {
-        let (width_inches, height_inches) = nominal_display_dimensions_inches();
         Self {
-            center_inches: [-4.955731610639324, -17.47697340246995, 22.960904076603143],
-            right_axis: [
-                -0.978837250471977,
-                -0.18523052168150536,
-                -0.08699017718143479,
-            ],
-            down_axis: [-0.1458492733533812, 0.33327729220511837, 0.931479595032932],
-            width_inches,
-            height_inches,
+            center_inches: [-4.242625177491027, -16.718478032593996, 22.343548660299646],
+            right_axis: [-0.9983132233961985, 0.01620869432679404, -0.05574931587483707],
+            down_axis: [-0.053388187992544585, 0.12100934046335098, 0.9912146290806535],
+            width_inches: 23.228346456692915,
+            height_inches: 13.110236220472443,
         }
     }
 
@@ -228,30 +223,30 @@ pub(crate) fn nominal_display_dimensions_inches() -> (f64, f64) {
     )
 }
 
-pub(crate) fn display_depth_residuals(
-    depths: [f64; 3],
+pub(crate) fn display_ray_range_residuals(
+    ray_ranges_inches: [f64; 3],
     directions: [[f64; 3]; 3],
-    squared_distances: [f64; 3],
+    squared_target_distances_in2: [f64; 3],
 ) -> ([f64; 3], [[f64; 3]; 3]) {
     let pairs = [(0usize, 1usize), (0, 2), (1, 2)];
     let mut residuals = [0.0; 3];
     let mut jacobian = [[0.0; 3]; 3];
     for (row, (left, right)) in pairs.into_iter().enumerate() {
         let cosine = dot3(directions[left], directions[right]);
-        let scale = squared_distances[row].max(1.0);
-        residuals[row] = (depths[left] * depths[left] + depths[right] * depths[right]
-            - 2.0 * cosine * depths[left] * depths[right]
-            - squared_distances[row])
+        let scale = squared_target_distances_in2[row].max(1.0);
+        residuals[row] = (ray_ranges_inches[left] * ray_ranges_inches[left] + ray_ranges_inches[right] * ray_ranges_inches[right]
+            - 2.0 * cosine * ray_ranges_inches[left] * ray_ranges_inches[right]
+            - squared_target_distances_in2[row])
             / scale;
-        jacobian[row][left] = (2.0 * depths[left] - 2.0 * cosine * depths[right]) / scale;
-        jacobian[row][right] = (2.0 * depths[right] - 2.0 * cosine * depths[left]) / scale;
+        jacobian[row][left] = (2.0 * ray_ranges_inches[left] - 2.0 * cosine * ray_ranges_inches[right]) / scale;
+        jacobian[row][right] = (2.0 * ray_ranges_inches[right] - 2.0 * cosine * ray_ranges_inches[left]) / scale;
     }
     (residuals, jacobian)
 }
 
-pub(crate) fn solve_display_ray_depths(
+pub(crate) fn solve_display_ray_ranges(
     directions: [[f64; 3]; 3],
-    squared_distances: [f64; 3],
+    squared_target_distances_in2: [f64; 3],
 ) -> Vec<[f64; 3]> {
     const SEEDS: [f64; 8] = [8.0, 12.0, 18.0, 24.0, 32.0, 44.0, 64.0, 92.0];
     const PERTURBATIONS: [[f64; 3]; 7] = [
@@ -266,14 +261,14 @@ pub(crate) fn solve_display_ray_depths(
     let mut solutions = Vec::<[f64; 3]>::new();
     for seed in SEEDS {
         for perturbation in PERTURBATIONS {
-            let mut depths = [
+            let mut ray_ranges_inches = [
                 seed * perturbation[0],
                 seed * perturbation[1],
                 seed * perturbation[2],
             ];
             for _ in 0..64 {
                 let (residuals, jacobian) =
-                    display_depth_residuals(depths, directions, squared_distances);
+                    display_ray_range_residuals(ray_ranges_inches, directions, squared_target_distances_in2);
                 let error = dot3(residuals, residuals);
                 if error < 1.0e-18 {
                     break;
@@ -304,15 +299,15 @@ pub(crate) fn solve_display_ray_depths(
                 let mut step = 1.0;
                 while step >= 1.0 / 128.0 {
                     let candidate = [
-                        depths[0] + step * delta[0],
-                        depths[1] + step * delta[1],
-                        depths[2] + step * delta[2],
+                        ray_ranges_inches[0] + step * delta[0],
+                        ray_ranges_inches[1] + step * delta[1],
+                        ray_ranges_inches[2] + step * delta[2],
                     ];
-                    if candidate.iter().all(|depth| (4.0..=144.0).contains(depth)) {
+                    if candidate.iter().all(|ray_range_inches| (4.0..=144.0).contains(ray_range_inches)) {
                         let candidate_residuals =
-                            display_depth_residuals(candidate, directions, squared_distances).0;
+                            display_ray_range_residuals(candidate, directions, squared_target_distances_in2).0;
                         if dot3(candidate_residuals, candidate_residuals) < error {
-                            depths = candidate;
+                            ray_ranges_inches = candidate;
                             accepted = true;
                             break;
                         }
@@ -323,17 +318,17 @@ pub(crate) fn solve_display_ray_depths(
                     break;
                 }
             }
-            let residuals = display_depth_residuals(depths, directions, squared_distances).0;
+            let residuals = display_ray_range_residuals(ray_ranges_inches, directions, squared_target_distances_in2).0;
             let error = dot3(residuals, residuals);
             if error < 1.0e-10
                 && !solutions.iter().any(|existing| {
                     existing
                         .iter()
-                        .zip(depths)
+                        .zip(ray_ranges_inches)
                         .all(|(left, right)| (left - right).abs() < 1.0e-4)
                 })
             {
-                solutions.push(depths);
+                solutions.push(ray_ranges_inches);
             }
         }
     }
@@ -354,7 +349,7 @@ pub(crate) fn display_object_coordinates(
 pub(crate) fn display_plane_from_three_rays(
     directions: [[f64; 3]; 3],
     targets: [(f64, f64); 3],
-    depths: [f64; 3],
+    ray_ranges_inches: [f64; 3],
     width_inches: f64,
     height_inches: f64,
 ) -> Option<VirtualDisplayPlane> {
@@ -369,9 +364,9 @@ pub(crate) fn display_plane_from_three_rays(
         return None;
     }
     let points = [
-        scale3(directions[0], depths[0]),
-        scale3(directions[1], depths[1]),
-        scale3(directions[2], depths[2]),
+        scale3(directions[0], ray_ranges_inches[0]),
+        scale3(directions[1], ray_ranges_inches[1]),
+        scale3(directions[2], ray_ranges_inches[2]),
     ];
     let p10 = sub3(points[1], points[0]);
     let p20 = sub3(points[2], points[0]);
@@ -499,9 +494,9 @@ pub(crate) fn apply_display_plane_delta(
     scale: f64,
 ) -> Option<VirtualDisplayPlane> {
     let translation = [delta[0] * scale, delta[1] * scale, delta[2] * scale];
-    let rotation = [delta[3] * scale, delta[4] * scale, delta[5] * scale];
-    let right_axis = normalized3(add3(plane.right_axis, cross3(rotation, plane.right_axis)))?;
-    let down_rotated = add3(plane.down_axis, cross3(rotation, plane.down_axis));
+    let rotation_increment_rad = [delta[3] * scale, delta[4] * scale, delta[5] * scale];
+    let right_axis = normalized3(add3(plane.right_axis, cross3(rotation_increment_rad, plane.right_axis)))?;
+    let down_rotated = add3(plane.down_axis, cross3(rotation_increment_rad, plane.down_axis));
     let down_axis = normalized3(sub3(
         down_rotated,
         scale3(right_axis, dot3(down_rotated, right_axis)),
@@ -755,16 +750,16 @@ pub(crate) fn fit_virtual_display_plane_with_dimensions(
                     (object[left].0 - object[right].0).powi(2)
                         + (object[left].1 - object[right].1).powi(2)
                 };
-                let squared_distances = [
+                let squared_target_distances_in2 = [
                     squared_distance(0, 1),
                     squared_distance(0, 2),
                     squared_distance(1, 2),
                 ];
-                for depths in solve_display_ray_depths(directions, squared_distances) {
+                for ray_ranges_inches in solve_display_ray_ranges(directions, squared_target_distances_in2) {
                     let Some(seed) = display_plane_from_three_rays(
                         directions,
                         targets,
-                        depths,
+                        ray_ranges_inches,
                         width_inches,
                         height_inches,
                     ) else {

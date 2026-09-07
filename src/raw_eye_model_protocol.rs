@@ -1,10 +1,89 @@
 use std::io::{Read, Write};
 use std::sync::Arc;
 
+mod thumbnail;
+pub use thumbnail::{CameraThumbnailFrame, ThumbnailKind};
+
+/// Multiplexed camera data. ROI records retain their byte-for-byte OIR1 v1
+/// layout; OIC1 records carry unmodified camera thumbnail headers/payloads;
+/// OIM1 records carry bounded, length-delimited metadata objects (not JSONL).
+#[derive(Clone, Debug)]
+pub enum ModelStreamFrame {
+    Eye(Arc<RawModelFrame>),
+    Thumbnail(Arc<CameraThumbnailFrame>),
+    /// OIM1 uses the same 24-byte envelope layout as OIC1, with only its
+    /// length-delimited JSON metadata section populated. This is not JSONL.
+    Metadata(Arc<serde_json::Value>),
+}
+
+impl ModelStreamFrame {
+    pub fn write_to<W: Write>(&self, output: &mut W) -> Result<(), String> {
+        match self {
+            Self::Eye(frame) => frame.write_to(output),
+            Self::Thumbnail(frame) => frame.write_to(output),
+            Self::Metadata(value) => {
+                let bytes = serde_json::to_vec(value.as_ref()).map_err(|e| e.to_string())?;
+                if !value.is_object() || bytes.len() > MODEL_METADATA_MAX_BYTES {
+                    return Err("invalid model metadata".into());
+                }
+                let mut header = [0u8; 24];
+                header[..4].copy_from_slice(b"OIM1");
+                header[4..6].copy_from_slice(&1u16.to_le_bytes());
+                header[6..8].copy_from_slice(&24u16.to_le_bytes());
+                header[8..12].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+                output
+                    .write_all(&header)
+                    .and_then(|()| output.write_all(&bytes))
+                    .map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    pub fn read_from<R: Read>(input: &mut R) -> Result<Self, String> {
+        let mut magic = [0u8; 4];
+        input
+            .read_exact(&mut magic)
+            .map_err(|e| format!("read model frame magic: {e}"))?;
+        match &magic {
+            b"OIR1" => {
+                RawModelFrame::read_after_magic(input, magic).map(|f| Self::Eye(Arc::new(f)))
+            }
+            b"OIC1" => {
+                CameraThumbnailFrame::read_after_magic(input).map(|f| Self::Thumbnail(Arc::new(f)))
+            }
+            b"OIM1" => {
+                let mut header = [0u8; 24];
+                input
+                    .read_exact(&mut header[4..])
+                    .map_err(|e| e.to_string())?;
+                let length = read_u32(&header, 8) as usize;
+                if read_u16(&header, 4) != 1
+                    || read_u16(&header, 6) != 24
+                    || length == 0
+                    || length > MODEL_METADATA_MAX_BYTES
+                    || header[12..].iter().any(|b| *b != 0)
+                {
+                    return Err("invalid model metadata envelope".into());
+                }
+                let mut bytes = vec![0; length];
+                input.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+                let value: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+                if !value.is_object() {
+                    return Err("model metadata must be an object".into());
+                }
+                Ok(Self::Metadata(Arc::new(value)))
+            }
+            _ => Err("unsupported model stream record type".into()),
+        }
+    }
+}
+
 pub const MODEL_STREAM_HEADER_BYTES: usize = 96;
 pub const MODEL_STREAM_MAGIC: &[u8; 4] = b"OIR1";
 pub const MODEL_STREAM_VERSION: u16 = 1;
 pub const MODEL_STREAM_MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+pub const MODEL_METADATA_MAX_BYTES: usize = 1024 * 1024;
 
 pub const FLAG_VERIFIED_RAW10_1X1: u32 = 1 << 0;
 pub const FLAG_ANATOMY_VALID: u32 = 1 << 1;
@@ -84,9 +163,20 @@ impl RawModelFrame {
     }
 
     pub fn read_from<R: Read>(input: &mut R) -> Result<Self, String> {
+        // Source-compatible eye-only reader. New consumers should use the
+        // typed reader above; eye-only consumers safely skip other records.
+        loop {
+            if let ModelStreamFrame::Eye(frame) = ModelStreamFrame::read_from(input)? {
+                return Ok(Arc::try_unwrap(frame).unwrap_or_else(|frame| (*frame).clone()));
+            }
+        }
+    }
+
+    fn read_after_magic<R: Read>(input: &mut R, magic: [u8; 4]) -> Result<Self, String> {
         let mut header = [0u8; MODEL_STREAM_HEADER_BYTES];
+        header[..4].copy_from_slice(&magic);
         input
-            .read_exact(&mut header)
+            .read_exact(&mut header[4..])
             .map_err(|error| format!("read RAW model header: {error}"))?;
         if &header[0..4] != MODEL_STREAM_MAGIC
             || read_u16(&header, 4) != MODEL_STREAM_VERSION
@@ -206,6 +296,68 @@ mod tests {
             point_count: 12,
             payload: Arc::new(vec![1, 2, 3, 4, 5]),
         }
+    }
+
+    #[test]
+    fn metadata_is_bounded_length_delimited_and_preserves_decimal_clocks() {
+        let expected = serde_json::json!({"schema":"test", "timestamp_ns":u64::MAX.to_string(),
+            "point":[-0.5,1.5], "missing":null});
+        let mut bytes = vec![];
+        ModelStreamFrame::Metadata(Arc::new(expected.clone()))
+            .write_to(&mut bytes)
+            .unwrap();
+        let metadata_len = bytes.len();
+        let mut eye_bytes = vec![];
+        sample().write_to(&mut eye_bytes).unwrap();
+        bytes.extend_from_slice(&eye_bytes);
+        struct Fragmented<'a>(&'a [u8]);
+        impl Read for Fragmented<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let count = out.len().min(3);
+                self.0.read(&mut out[..count])
+            }
+        }
+        let mut fragmented = Fragmented(&bytes);
+        let ModelStreamFrame::Metadata(value) =
+            ModelStreamFrame::read_from(&mut fragmented).unwrap()
+        else {
+            panic!();
+        };
+        assert_eq!(*value, expected);
+        assert_eq!(
+            RawModelFrame::read_from(&mut fragmented).unwrap().sequence,
+            42
+        );
+        assert_eq!(
+            RawModelFrame::read_from(&mut bytes.as_slice())
+                .unwrap()
+                .sequence,
+            42
+        );
+        assert_eq!(&bytes[metadata_len..], eye_bytes.as_slice());
+        for length in 0..metadata_len {
+            assert!(ModelStreamFrame::read_from(&mut &bytes[..length]).is_err());
+        }
+        for (offset, value) in [
+            (8, 0u32),
+            (8, MODEL_METADATA_MAX_BYTES as u32 + 1),
+            (12, 1),
+            (16, 1),
+            (20, 1),
+        ] {
+            let mut bad = bytes[..metadata_len].to_vec();
+            bad[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(ModelStreamFrame::read_from(&mut bad.as_slice()).is_err());
+        }
+        assert!(
+            ModelStreamFrame::Metadata(Arc::new(serde_json::json!([])))
+                .write_to(&mut vec![])
+                .is_err()
+        );
+        let mut nonobject = bytes[..24].to_vec();
+        nonobject[8..12].copy_from_slice(&2u32.to_le_bytes());
+        nonobject.extend_from_slice(b"[]");
+        assert!(ModelStreamFrame::read_from(&mut nonobject.as_slice()).is_err());
     }
 
     #[test]

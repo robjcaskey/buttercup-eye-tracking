@@ -17,6 +17,7 @@ pub(crate) mod limbus_scale;
 pub(crate) mod pupil_center;
 pub(crate) mod pupil_projection;
 pub(crate) mod pupil_size;
+pub(crate) mod sign_motion;
 
 /// Unit-safe radius coordinates for the physical pupil-size posterior.
 ///
@@ -107,18 +108,18 @@ pub use coupled_eye_kinematics::{
     ProjectedGlobePoseStatus, ProjectedIrisGeometry, RotationCenterStatus,
 };
 
-pub(crate) const GAZE_SURFACE_AREA_BUCKET_RATIO: f64 = 1.04;
+pub(crate) const FRONTAL_DISK_AREA_BIN_RATIO: f64 = 1.04;
 // Continuity evidence only; never apply this averaging to published gaze.
 pub(crate) const GAZE_SURFACE_AVERAGE_ALPHA: f64 = 0.35;
 pub(crate) const GAZE_SURFACE_RESET_AFTER: Duration = Duration::from_millis(1_250);
-pub(crate) const GAZE_SURFACE_MAX_BUCKET_JUMP: i32 = 8;
+pub(crate) const FRONTAL_DISK_AREA_MAX_BIN_JUMP: i32 = 8;
 /// A physical limbus cannot change scale discontinuously in one asynchronous
 /// SAM answer. Require several mutually consistent out-of-family fits before
 /// replacing the established scale/sign lineage; isolated whole-eye or lid
 /// masks are withheld without resetting the physical normal.
-pub(crate) const GAZE_SURFACE_SCALE_SWITCH_FRAMES: u8 = 3;
-pub(crate) const GAZE_SURFACE_SCALE_SWITCH_BUCKET_TOLERANCE: i32 = 2;
-pub(crate) const GAZE_SURFACE_SIGN_SWITCH_FRAMES: u8 = 4;
+pub(crate) const FRONTAL_DISK_SCALE_RELOCK_UPDATES: u8 = 3;
+pub(crate) const FRONTAL_DISK_AREA_RELOCK_BIN_TOLERANCE: i32 = 2;
+pub(crate) const CONTACT_SIGN_CONFIRMATION_UPDATES: u8 = 4;
 // A pupil/limbus displacement which is effectively camera-normal, or nearly
 // perpendicular to the fitted ellipse normal, contains no trustworthy
 // information about which antipodal normal is physical.
@@ -129,7 +130,7 @@ pub(crate) const GAZE_SURFACE_MIN_SIGN_PROJECTION: f64 = 0.025;
 // Keep this as a hard half-space boundary rather than a score: a zero or
 // negative Z surface normal describes an edge-on/away-facing (concave from
 // the camera) solution which the head would occlude.
-pub(crate) const CAMERA_FACING_CONTACT_EPSILON: f64 = 1.0e-6;
+pub(crate) const CAMERA_FACING_NORMAL_MIN_Z: f64 = 1.0e-6;
 pub(crate) const RELATIVE_GAZE_UNIT_TOLERANCE: f64 = 1.0e-6;
 pub(crate) const GAZE_KINEMATIC_HISTORY_FRAMES: usize = 6;
 pub(crate) const ROTATION_CENTER_HISTORY: Duration = Duration::from_secs(3);
@@ -185,7 +186,7 @@ impl RelativeGazeVector {
         self.right.is_finite()
             && self.down.is_finite()
             && self.toward_camera.is_finite()
-            && self.toward_camera > CAMERA_FACING_CONTACT_EPSILON
+            && self.toward_camera > CAMERA_FACING_NORMAL_MIN_Z
             && norm_squared.is_finite()
             && (norm_squared - 1.0).abs() <= RELATIVE_GAZE_UNIT_TOLERANCE
     }
@@ -198,10 +199,10 @@ pub(crate) struct SurfaceGazeSample {
     /// retaining this key prevents those repeats from masquerading as fresh
     /// temporal or calibration evidence.
     pub(crate) source_timestamp_ns: Option<u64>,
-    pub(crate) rectified_area_px2: f64,
+    pub(crate) frontal_equivalent_disk_area_px2: f64,
     pub(crate) area_bucket: i32,
-    pub(crate) bucketed_face_radius_px: f64,
-    pub(crate) camera_near_point_sensor: (f64, f64),
+    pub(crate) quantized_frontal_disk_radius_px: f64,
+    pub(crate) near_surface_point_sensor_px: (f64, f64),
     pub(crate) relative_gaze: RelativeGazeVector,
     /// False while an anchorless ellipse still has two equally plausible
     /// projected normal branches. Such a sample may be rendered provisionally,
@@ -230,6 +231,7 @@ pub(crate) struct SurfaceGazeTracker {
     pub(crate) sign_resolved: bool,
     pub(crate) sign_epoch: u64,
     pub(crate) kinematic_history: VecDeque<GazeKinematicFrame>,
+    pub(crate) motion_sign_window: sign_motion::MotionSignWindow,
     /// Most recent source which actually produced an admitted surface. The
     /// caller composes whole-ROI motion from this exposure to the next SAM
     /// result, so a rejected intermediate proposal must not advance it.
@@ -242,8 +244,8 @@ pub(crate) struct SurfaceGazeTracker {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ContactSignHypothesis {
-    pub(crate) pivot_sensor: (f64, f64),
-    pub(crate) near_sensor: (f64, f64),
+    pub(crate) effective_pivot_sensor_px: (f64, f64),
+    pub(crate) near_surface_sensor_px: (f64, f64),
     pub(crate) residual_ema: f64,
     pub(crate) observations: u16,
 }
@@ -254,7 +256,7 @@ pub(crate) struct GazeKinematicFrame {
     pub(crate) source_timestamp_ns: Option<u64>,
     pub(crate) ellipse_center_sensor: (f64, f64),
     pub(crate) projected_gaze: (f64, f64),
-    pub(crate) implied_globe_center_sensor: (f64, f64),
+    pub(crate) implied_pivot_sensor_px: (f64, f64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -289,7 +291,7 @@ pub(crate) fn kinematic_gaze_sign_correction(
     observed_at: Instant,
     source_timestamp_ns: Option<u64>,
     ellipse_center_sensor: (f64, f64),
-    slice_depth: f64,
+    limbus_plane_offset_px: f64,
     observed_gaze: (f64, f64),
     global_similarity: Option<NativeGlobalSimilarityEvidence>,
 ) -> GazeSignCorrection {
@@ -300,8 +302,8 @@ pub(crate) fn kinematic_gaze_sign_correction(
         resolved: false,
     };
     if history.is_empty()
-        || !slice_depth.is_finite()
-        || slice_depth <= 1.0e-6
+        || !limbus_plane_offset_px.is_finite()
+        || limbus_plane_offset_px <= 1.0e-6
         || !observed_gaze.0.is_finite()
         || !observed_gaze.1.is_finite()
     {
@@ -324,18 +326,18 @@ pub(crate) fn kinematic_gaze_sign_correction(
                         .as_secs_f64()
                 })
         };
-    let current_dt = elapsed_seconds(last, observed_at, source_timestamp_ns);
-    if current_dt < 1.0e-4 || current_dt > 0.75 {
+    let current_interval_s = elapsed_seconds(last, observed_at, source_timestamp_ns);
+    if current_interval_s < 1.0e-4 || current_interval_s > 0.75 {
         return unchanged;
     }
-    let (predicted_gaze, velocity_center, velocity_globe_center, previous_angular_speed) =
+    let (predicted_gaze, extrapolated_center_sensor_px, extrapolated_pivot_sensor_px, previous_angular_speed_rad_s) =
         if history.len() >= 2 {
             let previous = history[history.len() - 2];
-            let history_dt = elapsed_seconds(previous, last.observed_at, last.source_timestamp_ns);
-            if history_dt < 1.0e-4 {
+            let history_interval_s = elapsed_seconds(previous, last.observed_at, last.source_timestamp_ns);
+            if history_interval_s < 1.0e-4 {
                 return unchanged;
             }
-            let extrapolation = current_dt / history_dt;
+            let extrapolation = current_interval_s / history_interval_s;
             (
                 (
                     last.projected_gaze.0
@@ -352,17 +354,17 @@ pub(crate) fn kinematic_gaze_sign_correction(
                             * extrapolation,
                 ),
                 (
-                    last.implied_globe_center_sensor.0
-                        + (last.implied_globe_center_sensor.0
-                            - previous.implied_globe_center_sensor.0)
+                    last.implied_pivot_sensor_px.0
+                        + (last.implied_pivot_sensor_px.0
+                            - previous.implied_pivot_sensor_px.0)
                             * extrapolation,
-                    last.implied_globe_center_sensor.1
-                        + (last.implied_globe_center_sensor.1
-                            - previous.implied_globe_center_sensor.1)
+                    last.implied_pivot_sensor_px.1
+                        + (last.implied_pivot_sensor_px.1
+                            - previous.implied_pivot_sensor_px.1)
                             * extrapolation,
                 ),
                 projected_gaze_angle_between(previous.projected_gaze, last.projected_gaze)
-                    / history_dt,
+                    / history_interval_s,
             )
         } else {
             // With one prior frame there is no velocity estimate yet, but the
@@ -371,7 +373,7 @@ pub(crate) fn kinematic_gaze_sign_correction(
             (
                 last.projected_gaze,
                 last.ellipse_center_sensor,
-                last.implied_globe_center_sensor,
+                last.implied_pivot_sensor_px,
                 0.0,
             )
         };
@@ -384,12 +386,12 @@ pub(crate) fn kinematic_gaze_sign_correction(
         (
             point.0
                 + f64::from(global.motion.translation[0])
-                + f64::from(global.motion.scale_delta) * x
-                - f64::from(global.motion.rotation) * y,
+                + f64::from(global.motion.diagonal_coefficient_delta) * x
+                - f64::from(global.motion.rotation_coefficient) * y,
             point.1
                 + f64::from(global.motion.translation[1])
-                + f64::from(global.motion.rotation) * x
-                + f64::from(global.motion.scale_delta) * y,
+                + f64::from(global.motion.rotation_coefficient) * x
+                + f64::from(global.motion.diagonal_coefficient_delta) * y,
         )
     };
     // A reliable whole-ROI transform removes head/camera translation from
@@ -398,44 +400,47 @@ pub(crate) fn kinematic_gaze_sign_correction(
     // otherwise unresolved physical sign in SurfaceGazeTracker.
     let predicted_center = global_similarity
         .filter(|evidence| evidence.reliable)
-        .map_or(velocity_center, |_| {
+        .map_or(extrapolated_center_sensor_px, |_| {
             predict_global(last.ellipse_center_sensor)
         });
-    let predicted_globe_center = global_similarity
+    let predicted_pivot_sensor_px = global_similarity
         .filter(|evidence| evidence.reliable)
-        .map_or(velocity_globe_center, |_| {
-            predict_global(last.implied_globe_center_sensor)
+        .map_or(extrapolated_pivot_sensor_px, |_| {
+            predict_global(last.implied_pivot_sensor_px)
         });
-    let translation_innovation = (ellipse_center_sensor.0 - predicted_center.0)
+    let normalized_center_position_residual = (ellipse_center_sensor.0 - predicted_center.0)
         .hypot(ellipse_center_sensor.1 - predicted_center.1)
-        / slice_depth;
+        / limbus_plane_offset_px;
 
     let candidates = [
         (observed_gaze, false),
         ((-observed_gaze.0, -observed_gaze.1), true),
     ];
     let score = |candidate: (f64, f64), flipped: bool| {
-        let gaze_prediction_error =
+        let transverse_direction_residual =
             (candidate.0 - predicted_gaze.0).hypot(candidate.1 - predicted_gaze.1);
-        let angular_speed =
-            projected_gaze_angle_between(last.projected_gaze, candidate) / current_dt;
-        let angular_acceleration = (angular_speed - previous_angular_speed).abs() * current_dt;
-        let implied_globe_center = (
-            ellipse_center_sensor.0 - slice_depth * candidate.0,
-            ellipse_center_sensor.1 - slice_depth * candidate.1,
+        let angular_speed_rad_s =
+            projected_gaze_angle_between(last.projected_gaze, candidate) / current_interval_s;
+        // This legacy regularizer has units of angle: |delta angular speed|
+        // times this interval. It is NOT angular acceleration (rad/s^2), nor
+        // angular jerk. Renaming documents the existing math without changing it.
+        let angular_speed_change_step_rad = (angular_speed_rad_s - previous_angular_speed_rad_s).abs() * current_interval_s;
+        let implied_pivot_sensor_px = (
+            ellipse_center_sensor.0 - limbus_plane_offset_px * candidate.0,
+            ellipse_center_sensor.1 - limbus_plane_offset_px * candidate.1,
         );
-        let globe_translation_error = (implied_globe_center.0 - predicted_globe_center.0)
-            .hypot(implied_globe_center.1 - predicted_globe_center.1)
-            / slice_depth;
-        3.0 * gaze_prediction_error
-            + 1.25 * angular_acceleration
-            + globe_translation_error / (1.0 + translation_innovation)
+        let normalized_pivot_position_residual = (implied_pivot_sensor_px.0 - predicted_pivot_sensor_px.0)
+            .hypot(implied_pivot_sensor_px.1 - predicted_pivot_sensor_px.1)
+            / limbus_plane_offset_px;
+        3.0 * transverse_direction_residual
+            + 1.25 * angular_speed_change_step_rad
+            + normalized_pivot_position_residual / (1.0 + normalized_center_position_residual)
             + 0.05 * f64::from(flipped)
     };
     let mut scored =
         candidates.map(|(candidate, flipped)| (score(candidate, flipped), candidate, flipped));
     scored.sort_by(|left, right| left.0.total_cmp(&right.0));
-    let required_improvement = 0.10 + 0.40 * translation_innovation.min(1.0);
+    let required_improvement = 0.10 + 0.40 * normalized_center_position_residual.min(1.0);
     if scored[1].0 - scored[0].0 < required_improvement {
         unchanged
     } else {
@@ -448,7 +453,7 @@ pub(crate) fn kinematic_gaze_sign_correction(
     }
 }
 
-pub(crate) fn rectified_ellipse_area_px2(major_radius: f64, minor_radius: f64) -> Option<f64> {
+pub(crate) fn frontal_equivalent_iris_disk_area_px2(major_radius: f64, minor_radius: f64) -> Option<f64> {
     let (major_radius, minor_radius) = if major_radius >= minor_radius {
         (major_radius, minor_radius)
     } else {
@@ -468,21 +473,21 @@ pub(crate) fn rectified_ellipse_area_px2(major_radius: f64, minor_radius: f64) -
     // area estimate: (pi*a*b)/(b/a) = pi*a^2.
     let projected_area = std::f64::consts::PI * major_radius * minor_radius;
     let camera_normal_cosine = minor_radius / major_radius;
-    let rectified_area = projected_area / camera_normal_cosine;
-    rectified_area.is_finite().then_some(rectified_area)
+    let frontal_equivalent_disk_area = projected_area / camera_normal_cosine;
+    frontal_equivalent_disk_area.is_finite().then_some(frontal_equivalent_disk_area)
 }
 
-pub(crate) fn bucket_surface_area(rectified_area_px2: f64) -> Option<(i32, f64)> {
-    if !rectified_area_px2.is_finite() || rectified_area_px2 <= 0.0 {
+pub(crate) fn quantize_frontal_disk_area(frontal_equivalent_disk_area_px2: f64) -> Option<(i32, f64)> {
+    if !frontal_equivalent_disk_area_px2.is_finite() || frontal_equivalent_disk_area_px2 <= 0.0 {
         return None;
     }
     let logarithmic_bucket =
-        (rectified_area_px2.ln() / GAZE_SURFACE_AREA_BUCKET_RATIO.ln()).round();
+        (frontal_equivalent_disk_area_px2.ln() / FRONTAL_DISK_AREA_BIN_RATIO.ln()).round();
     if logarithmic_bucket < i32::MIN as f64 || logarithmic_bucket > i32::MAX as f64 {
         return None;
     }
     let bucket = logarithmic_bucket as i32;
-    let representative_area = GAZE_SURFACE_AREA_BUCKET_RATIO.powi(bucket);
+    let representative_area = FRONTAL_DISK_AREA_BIN_RATIO.powi(bucket);
     representative_area
         .is_finite()
         .then_some((bucket, representative_area))
@@ -490,6 +495,7 @@ pub(crate) fn bucket_surface_area(rectified_area_px2: f64) -> Option<(i32, f64)>
 
 impl SurfaceGazeTracker {
     pub(crate) fn clear_floating_point(&mut self) {
+        self.motion_sign_window.clear();
         self.floating_center_sensor = None;
         self.floating_near_point_sensor = None;
         self.area_bucket = None;
@@ -512,6 +518,7 @@ impl SurfaceGazeTracker {
     /// whole tracker, while a sustained scale-family change still calls the
     /// full reset above and advances the epoch.
     pub(crate) fn clear_stale_motion_preserving_sign(&mut self) {
+        self.motion_sign_window.clear();
         self.floating_center_sensor = None;
         self.floating_near_point_sensor = None;
         self.pending_area_bucket = None;
@@ -538,7 +545,7 @@ impl SurfaceGazeTracker {
     /// reset gaze sign or enter calibration.
     pub(crate) fn consider_area_bucket_jump(&mut self, candidate: i32) -> bool {
         let continues_pending = self.pending_area_bucket.is_some_and(|pending| {
-            (pending - candidate).abs() <= GAZE_SURFACE_SCALE_SWITCH_BUCKET_TOLERANCE
+            (pending - candidate).abs() <= FRONTAL_DISK_AREA_RELOCK_BIN_TOLERANCE
         });
         if continues_pending {
             self.pending_area_bucket_frames = self.pending_area_bucket_frames.saturating_add(1);
@@ -549,7 +556,7 @@ impl SurfaceGazeTracker {
             self.pending_area_bucket = Some(candidate);
             self.pending_area_bucket_frames = 1;
         }
-        self.pending_area_bucket_frames >= GAZE_SURFACE_SCALE_SWITCH_FRAMES
+        self.pending_area_bucket_frames >= FRONTAL_DISK_SCALE_RELOCK_UPDATES
     }
 
     pub(crate) fn consider_sign_hypothesis(&mut self, candidate: usize) {
@@ -564,7 +571,7 @@ impl SurfaceGazeTracker {
             self.pending_sign_hypothesis = Some(candidate);
             self.pending_sign_frames = 1;
         }
-        if self.pending_sign_frames >= GAZE_SURFACE_SIGN_SWITCH_FRAMES {
+        if self.pending_sign_frames >= CONTACT_SIGN_CONFIRMATION_UPDATES {
             if candidate != self.selected_sign_hypothesis {
                 self.selected_sign_hypothesis = candidate;
                 self.sign_epoch = self.sign_epoch.wrapping_add(1);
@@ -592,7 +599,7 @@ impl SurfaceGazeTracker {
             self.pending_kinematic_sign_hypothesis = Some(candidate);
             self.pending_kinematic_sign_frames = 1;
         }
-        if self.pending_kinematic_sign_frames < GAZE_SURFACE_SIGN_SWITCH_FRAMES {
+        if self.pending_kinematic_sign_frames < CONTACT_SIGN_CONFIRMATION_UPDATES {
             return false;
         }
         self.selected_sign_hypothesis = candidate;
@@ -665,12 +672,12 @@ impl SurfaceGazeTracker {
                 outer.angle + std::f64::consts::FRAC_PI_2,
             )
         };
-        let rectified_area_px2 = rectified_ellipse_area_px2(major_radius, minor_radius)?;
-        let (area_bucket, bucketed_area_px2) = bucket_surface_area(rectified_area_px2)?;
-        let bucketed_face_radius_px = (bucketed_area_px2 / std::f64::consts::PI).sqrt();
+        let frontal_equivalent_disk_area_px2 = frontal_equivalent_iris_disk_area_px2(major_radius, minor_radius)?;
+        let (area_bucket, bucketed_area_px2) = quantize_frontal_disk_area(frontal_equivalent_disk_area_px2)?;
+        let quantized_frontal_disk_radius_px = (bucketed_area_px2 / std::f64::consts::PI).sqrt();
         let axis_ratio = (minor_radius / major_radius).clamp(0.0, 1.0);
         let projected_normal_length = (1.0 - axis_ratio * axis_ratio).sqrt();
-        if !bucketed_face_radius_px.is_finite() || !projected_normal_length.is_finite() {
+        if !quantized_frontal_disk_radius_px.is_finite() || !projected_normal_length.is_finite() {
             return None;
         }
 
@@ -679,7 +686,7 @@ impl SurfaceGazeTracker {
             .is_some_and(|last| now.saturating_duration_since(last) > GAZE_SURFACE_RESET_AFTER);
         let bucket_jump = self
             .area_bucket
-            .is_some_and(|previous| (previous - area_bucket).abs() > GAZE_SURFACE_MAX_BUCKET_JUMP);
+            .is_some_and(|previous| (previous - area_bucket).abs() > FRONTAL_DISK_AREA_MAX_BIN_JUMP);
         if stale {
             self.clear_stale_motion_preserving_sign();
         } else if bucket_jump {
@@ -689,6 +696,7 @@ impl SurfaceGazeTracker {
                 // is neither published nor allowed into motion history.
                 self.last_observed = Some(now);
                 self.kinematic_history.clear();
+                self.motion_sign_window.clear();
                 return None;
             }
             // A sustained new scale estimate invalidates both the floating
@@ -715,8 +723,8 @@ impl SurfaceGazeTracker {
         // sign on the first valid frame.
         let projected_axis = (-major_angle.sin(), major_angle.cos());
         let positive_offset = (
-            projected_axis.0 * bucketed_face_radius_px * projected_normal_length,
-            projected_axis.1 * bucketed_face_radius_px * projected_normal_length,
+            projected_axis.0 * quantized_frontal_disk_radius_px * projected_normal_length,
+            projected_axis.1 * quantized_frontal_disk_radius_px * projected_normal_length,
         );
         let negative_offset = (-positive_offset.0, -positive_offset.1);
         let sign_anchor = pupil_limbus_gaze_anchor.filter(|anchor| {
@@ -754,24 +762,24 @@ impl SurfaceGazeTracker {
         } else {
             negative_offset
         };
-        let sphere_radius = bucketed_face_radius_px * 1.83;
-        let slice_depth = (sphere_radius * sphere_radius
-            - bucketed_face_radius_px * bucketed_face_radius_px)
+        let sphere_radius = quantized_frontal_disk_radius_px * 1.83;
+        let limbus_plane_offset_px = (sphere_radius * sphere_radius
+            - quantized_frontal_disk_radius_px * quantized_frontal_disk_radius_px)
             .max(0.0)
             .sqrt();
         let offsets = [positive_offset, negative_offset];
         let candidates = offsets.map(|offset| {
             let near = (center_sensor.0 + offset.0, center_sensor.1 + offset.1);
             let normal = (
-                offset.0 / bucketed_face_radius_px,
-                offset.1 / bucketed_face_radius_px,
+                offset.0 / quantized_frontal_disk_radius_px,
+                offset.1 / quantized_frontal_disk_radius_px,
             );
             ContactSignHypothesis {
-                pivot_sensor: (
-                    center_sensor.0 - slice_depth * normal.0,
-                    center_sensor.1 - slice_depth * normal.1,
+                effective_pivot_sensor_px: (
+                    center_sensor.0 - limbus_plane_offset_px * normal.0,
+                    center_sensor.1 - limbus_plane_offset_px * normal.1,
                 ),
-                near_sensor: near,
+                near_surface_sensor_px: near,
                 residual_ema: 0.0,
                 observations: 1,
             }
@@ -781,6 +789,8 @@ impl SurfaceGazeTracker {
             self.sign_resolved,
             self.sign_epoch,
         );
+        let mut motion_window_switch = false;
+        let mut motion_window_supported = false;
         if let Some(previous) = self.contact_sign_hypotheses {
             let temporal_motion_reliable = global_similarity.is_some_and(|global| global.reliable);
             let predict = |point: (f64, f64)| {
@@ -792,23 +802,23 @@ impl SurfaceGazeTracker {
                 (
                     point.0
                         + f64::from(global.motion.translation[0])
-                        + f64::from(global.motion.scale_delta) * x
-                        - f64::from(global.motion.rotation) * y,
+                        + f64::from(global.motion.diagonal_coefficient_delta) * x
+                        - f64::from(global.motion.rotation_coefficient) * y,
                     point.1
                         + f64::from(global.motion.translation[1])
-                        + f64::from(global.motion.rotation) * x
-                        + f64::from(global.motion.scale_delta) * y,
+                        + f64::from(global.motion.rotation_coefficient) * x
+                        + f64::from(global.motion.diagonal_coefficient_delta) * y,
                 )
             };
-            let predicted = previous.map(|hypothesis| predict(hypothesis.pivot_sensor));
+            let predicted = previous.map(|hypothesis| predict(hypothesis.effective_pivot_sensor_px));
             let error = |prediction: (f64, f64), candidate: ContactSignHypothesis| {
-                (prediction.0 - candidate.pivot_sensor.0)
-                    .hypot(prediction.1 - candidate.pivot_sensor.1)
+                (prediction.0 - candidate.effective_pivot_sensor_px.0)
+                    .hypot(prediction.1 - candidate.effective_pivot_sensor_px.1)
             };
             let direction = |hypothesis: ContactSignHypothesis| {
                 let vector = (
-                    hypothesis.near_sensor.0 - hypothesis.pivot_sensor.0,
-                    hypothesis.near_sensor.1 - hypothesis.pivot_sensor.1,
+                    hypothesis.near_surface_sensor_px.0 - hypothesis.effective_pivot_sensor_px.0,
+                    hypothesis.near_surface_sensor_px.1 - hypothesis.effective_pivot_sensor_px.1,
                 );
                 let length = vector.0.hypot(vector.1);
                 (length.is_finite() && length > 1.0e-9)
@@ -821,8 +831,8 @@ impl SurfaceGazeTracker {
                         let transported = global_similarity
                             .filter(|global| global.reliable)
                             .map_or(left, |global| {
-                                let a = 1.0 + f64::from(global.motion.scale_delta);
-                                let b = f64::from(global.motion.rotation);
+                                let a = 1.0 + f64::from(global.motion.diagonal_coefficient_delta);
+                                let b = f64::from(global.motion.rotation_coefficient);
                                 let length = a.hypot(b).max(1.0e-12);
                                 (
                                     (a * left.0 - b * left.1) / length,
@@ -862,11 +872,20 @@ impl SurfaceGazeTracker {
                 candidate
             });
             self.contact_sign_hypotheses = Some(updated);
+            // Both histories use their OWN transported pivots. Sustained
+            // current-source evidence may challenge a resolved sign without
+            // penalizing that retrospective correction as a new saccade.
+            let residuals = (temporal_motion_reliable && projected_normal_length >= 0.08)
+                .then(|| [0, 1].map(|i| error(predicted[i], updated[i])));
+            let motion_decision = self.motion_sign_window.observe(
+                source_timestamp_ns, now, residuals, quantized_frontal_disk_radius_px,
+                global_similarity.map_or(0.0, |g| f64::from(g.motion.residual)),
+            );
             let anchor_candidate = sign_anchor.map(|anchor| {
                 let score = |hypothesis: ContactSignHypothesis| {
                     let offset = (
-                        hypothesis.near_sensor.0 - center_sensor.0,
-                        hypothesis.near_sensor.1 - center_sensor.1,
+                        hypothesis.near_surface_sensor_px.0 - center_sensor.0,
+                        hypothesis.near_surface_sensor_px.1 - center_sensor.1,
                     );
                     offset.0 * anchor.0 + offset.1 * anchor.1
                 };
@@ -883,7 +902,21 @@ impl SurfaceGazeTracker {
                 && updated[0].observations >= 2
                 && temporal_residual_gap >= temporal_resolution_threshold)
                 .then(|| usize::from(updated[1].residual_ema < updated[0].residual_ema));
-            if let Some(candidate) = anchor_candidate {
+            if let Some(decision) = motion_decision.filter(|_| self.sign_resolved) {
+                motion_window_supported = true;
+                self.pending_sign_hypothesis = None;
+                self.pending_sign_frames = 0;
+                self.pending_kinematic_sign_hypothesis = None;
+                self.pending_kinematic_sign_frames = 0;
+                if decision.candidate != self.selected_sign_hypothesis {
+                    self.selected_sign_hypothesis = decision.candidate;
+                    self.sign_epoch = self.sign_epoch.wrapping_add(1);
+                    motion_window_switch = true;
+                    eprintln!("SURFACE_SIGN_MOTION source_ns={source_timestamp_ns:?} branch={} support={} normalized_pivot_costs={:?} epoch={}",
+                        decision.candidate, decision.support, decision.mean_costs, self.sign_epoch);
+                    self.motion_sign_window.clear();
+                }
+            } else if let Some(candidate) = anchor_candidate {
                 // A RAW dark component may be an eyelid shadow. It can seed
                 // an unresolved branch, but overturning an established one
                 // also requires independent current-interval motion evidence.
@@ -917,6 +950,7 @@ impl SurfaceGazeTracker {
                 self.pending_sign_frames = 0;
             }
         } else {
+            self.motion_sign_window.observe(source_timestamp_ns, now, None, quantized_frontal_disk_radius_px, 0.0);
             self.contact_sign_hypotheses = Some(candidates);
             self.selected_sign_hypothesis = usize::from(
                 (continuity_offset.0 - negative_offset.0)
@@ -958,19 +992,19 @@ impl SurfaceGazeTracker {
         // never bypass it for a one-frame sign decision.
         let selected = self.contact_sign_hypotheses?[self.selected_sign_hypothesis];
         let selected_offset = (
-            selected.near_sensor.0 - center_sensor.0,
-            selected.near_sensor.1 - center_sensor.1,
+            selected.near_surface_sensor_px.0 - center_sensor.0,
+            selected.near_surface_sensor_px.1 - center_sensor.1,
         );
         let raw_projected_gaze = (
-            selected_offset.0 / bucketed_face_radius_px,
-            selected_offset.1 / bucketed_face_radius_px,
+            selected_offset.0 / quantized_frontal_disk_radius_px,
+            selected_offset.1 / quantized_frontal_disk_radius_px,
         );
         let sign_correction = kinematic_gaze_sign_correction(
             &self.kinematic_history,
             now,
             source_timestamp_ns,
             center_sensor,
-            slice_depth,
+            limbus_plane_offset_px,
             raw_projected_gaze,
             global_similarity,
         );
@@ -980,6 +1014,7 @@ impl SurfaceGazeTracker {
             self.selected_sign_hypothesis
         };
         let kinematic_switch_committed = sign_correction.resolved
+            && !motion_window_supported
             && self.sign_resolved
             && global_similarity.is_some_and(|global| global.reliable)
             && self.consider_kinematic_sign_hypothesis(kinematic_candidate);
@@ -987,7 +1022,7 @@ impl SurfaceGazeTracker {
             // Never average opposite normals together. The first sample in a
             // new sign epoch seeds both presentation smoothing and motion.
             reset_projection_smoothing = true;
-        } else if !sign_correction.resolved
+        } else if motion_window_supported || !sign_correction.resolved
             || !self.sign_resolved
             || !global_similarity.is_some_and(|global| global.reliable)
         {
@@ -999,28 +1034,28 @@ impl SurfaceGazeTracker {
         // immediately moves to the newly selected antipode.
         let selected = self.contact_sign_hypotheses?[self.selected_sign_hypothesis];
         let selected_projected_gaze = (
-            (selected.near_sensor.0 - center_sensor.0) / bucketed_face_radius_px,
-            (selected.near_sensor.1 - center_sensor.1) / bucketed_face_radius_px,
+            (selected.near_surface_sensor_px.0 - center_sensor.0) / quantized_frontal_disk_radius_px,
+            (selected.near_surface_sensor_px.1 - center_sensor.1) / quantized_frontal_disk_radius_px,
         );
         let selected_offset = (
-            selected_projected_gaze.0 * bucketed_face_radius_px,
-            selected_projected_gaze.1 * bucketed_face_radius_px,
+            selected_projected_gaze.0 * quantized_frontal_disk_radius_px,
+            selected_projected_gaze.1 * quantized_frontal_disk_radius_px,
         );
-        let implied_globe_center_sensor = (
-            center_sensor.0 - slice_depth * selected_projected_gaze.0,
-            center_sensor.1 - slice_depth * selected_projected_gaze.1,
+        let implied_pivot_sensor_px = (
+            center_sensor.0 - limbus_plane_offset_px * selected_projected_gaze.0,
+            center_sensor.1 - limbus_plane_offset_px * selected_projected_gaze.1,
         );
         self.kinematic_history.push_back(GazeKinematicFrame {
             observed_at: now,
             source_timestamp_ns,
             ellipse_center_sensor: center_sensor,
             projected_gaze: selected_projected_gaze,
-            implied_globe_center_sensor,
+            implied_pivot_sensor_px,
         });
         while self.kinematic_history.len() > GAZE_KINEMATIC_HISTORY_FRAMES {
             self.kinematic_history.pop_front();
         }
-        let camera_near_point_sensor = (
+        let near_surface_point_sensor_px = (
             center_sensor.0 + selected_offset.0,
             center_sensor.1 + selected_offset.1,
         );
@@ -1036,8 +1071,8 @@ impl SurfaceGazeTracker {
             });
         let floating_near_point_sensor = self
             .floating_near_point_sensor
-            .map_or(camera_near_point_sensor, |previous| {
-                blend_point(previous, camera_near_point_sensor, alpha)
+            .map_or(near_surface_point_sensor_px, |previous| {
+                blend_point(previous, near_surface_point_sensor_px, alpha)
             });
         // The temporal state above stabilizes *which sign* is physical. Once
         // selected, publish this exposure's direction immediately. Averaging
@@ -1059,14 +1094,14 @@ impl SurfaceGazeTracker {
         self.last_observed = Some(now);
         Some(SurfaceGazeSample {
             source_timestamp_ns,
-            rectified_area_px2,
+            frontal_equivalent_disk_area_px2,
             area_bucket,
-            bucketed_face_radius_px,
-            camera_near_point_sensor,
+            quantized_frontal_disk_radius_px,
+            near_surface_point_sensor_px,
             relative_gaze,
             sign_resolved: self.sign_resolved,
             sign_epoch: self.sign_epoch,
-            kinematic_sign_correction: [kinematic_switch_committed; 2],
+            kinematic_sign_correction: [kinematic_switch_committed || motion_window_switch; 2],
         })
     }
 
@@ -1355,7 +1390,7 @@ pub(crate) fn projected_pose_temporal_penalty(
     let pole_translation = (candidate.pole.0 - prior.pole.0).hypot(candidate.pole.1 - prior.pole.1);
     let prior_length = prior.pole.0.hypot(prior.pole.1);
     let candidate_length = candidate.pole.0.hypot(candidate.pole.1);
-    let rotation = if prior_length > 1.0e-6 && candidate_length > 1.0e-6 {
+    let pole_angle_change_rad = if prior_length > 1.0e-6 && candidate_length > 1.0e-6 {
         ((prior.pole.0 * candidate.pole.0 + prior.pole.1 * candidate.pole.1)
             / (prior_length * candidate_length))
             .clamp(-1.0, 1.0)
@@ -1363,24 +1398,24 @@ pub(crate) fn projected_pose_temporal_penalty(
     } else {
         0.0
     };
-    center_translation * 0.55 + pole_translation * 0.30 + rotation * ring_radius.max(1.0) * 0.75
+    center_translation * 0.55 + pole_translation * 0.30 + pole_angle_change_rad * ring_radius.max(1.0) * 0.75
 }
 
 pub(crate) fn resolve_projected_surface_normal(
     projected_gaze_pole: Option<(f64, f64)>,
     boundary_center: (f64, f64),
     rotation_center: (f64, f64),
-    slice_depth: f64,
+    limbus_plane_offset_px: f64,
 ) -> Option<[f64; 3]> {
     let projected_gaze_pole = projected_gaze_pole.filter(|pole| {
-        pole.0.is_finite() && pole.1.is_finite() && pole.0.hypot(pole.1) >= slice_depth * 0.03
+        pole.0.is_finite() && pole.1.is_finite() && pole.0.hypot(pole.1) >= limbus_plane_offset_px * 0.03
     });
     let (mut normal_x, mut normal_y) = projected_gaze_pole
-        .map(|pole| (pole.0 / slice_depth, pole.1 / slice_depth))
+        .map(|pole| (pole.0 / limbus_plane_offset_px, pole.1 / limbus_plane_offset_px))
         .unwrap_or_else(|| {
             (
-                (boundary_center.0 - rotation_center.0) / slice_depth,
-                (boundary_center.1 - rotation_center.1) / slice_depth,
+                (boundary_center.0 - rotation_center.0) / limbus_plane_offset_px,
+                (boundary_center.1 - rotation_center.1) / limbus_plane_offset_px,
             )
         });
     let projected_length = normal_x.hypot(normal_y);
@@ -1406,7 +1441,7 @@ pub(crate) struct RotationRenderGeometry {
     pub(crate) boundary_center: (f64, f64),
     pub(crate) boundary_radius: f64,
     pub(crate) sphere_radius: f64,
-    pub(crate) slice_depth: f64,
+    pub(crate) limbus_plane_offset_px: f64,
     pub(crate) rotation_center: (f64, f64),
 }
 
@@ -1471,15 +1506,15 @@ pub(crate) fn camera_facing_convex_contact(
     }
     let normal = relative_gaze.as_array();
     let rotation_center_z =
-        proposed_rotation_center_z.unwrap_or(-geometry.slice_depth * relative_gaze.toward_camera);
-    if !rotation_center_z.is_finite() || rotation_center_z >= -CAMERA_FACING_CONTACT_EPSILON {
+        proposed_rotation_center_z.unwrap_or(-geometry.limbus_plane_offset_px * relative_gaze.toward_camera);
+    if !rotation_center_z.is_finite() || rotation_center_z >= -CAMERA_FACING_NORMAL_MIN_Z {
         return None;
     }
 
     // The outward pole itself must emerge in front of the observed limbus
     // plane; otherwise this is the rear/concave sphere intersection.
     let apex_z = rotation_center_z + geometry.sphere_radius * relative_gaze.toward_camera;
-    if !apex_z.is_finite() || apex_z <= CAMERA_FACING_CONTACT_EPSILON {
+    if !apex_z.is_finite() || apex_z <= CAMERA_FACING_NORMAL_MIN_Z {
         return None;
     }
 
@@ -1492,12 +1527,12 @@ pub(crate) fn camera_facing_convex_contact(
         (center_to_limbus[0].powi(2) + center_to_limbus[1].powi(2) + center_to_limbus[2].powi(2))
             .sqrt();
     if !center_to_limbus_length.is_finite()
-        || center_to_limbus_length <= CAMERA_FACING_CONTACT_EPSILON
+        || center_to_limbus_length <= CAMERA_FACING_NORMAL_MIN_Z
     {
         return None;
     }
     let outward_alignment = dot3(normal, center_to_limbus) / center_to_limbus_length;
-    if !outward_alignment.is_finite() || outward_alignment <= CAMERA_FACING_CONTACT_EPSILON {
+    if !outward_alignment.is_finite() || outward_alignment <= CAMERA_FACING_NORMAL_MIN_Z {
         return None;
     }
     Some(CameraFacingConvexContact { rotation_center_z })
@@ -1533,10 +1568,10 @@ pub(crate) fn provisional_surface_pose(
         .map(|point| (point.0 - boundary_center.0).hypot(point.1 - boundary_center.1))
         .sum::<f64>()
         / outer_prediction_points.len() as f64;
-    let sphere_radius = surface_gaze.bucketed_face_radius_px * 1.83;
-    let slice_depth_squared =
+    let sphere_radius = surface_gaze.quantized_frontal_disk_radius_px * 1.83;
+    let limbus_plane_offset_squared_px2 =
         sphere_radius * sphere_radius - projected_boundary_radius * projected_boundary_radius;
-    if !sphere_radius.is_finite() || !slice_depth_squared.is_finite() || slice_depth_squared <= 0.0
+    if !sphere_radius.is_finite() || !limbus_plane_offset_squared_px2.is_finite() || limbus_plane_offset_squared_px2 <= 0.0
     {
         return None;
     }
@@ -1550,11 +1585,11 @@ pub(crate) fn provisional_surface_pose(
         normal_x *= 0.85 / projected_length;
         normal_y *= 0.85 / projected_length;
     }
-    let slice_depth = slice_depth_squared.sqrt();
+    let limbus_plane_offset_px = limbus_plane_offset_squared_px2.sqrt();
     Some(ProvisionalSurfacePose {
         rotation_center: (
-            boundary_center.0 - slice_depth * normal_x,
-            boundary_center.1 - slice_depth * normal_y,
+            boundary_center.0 - limbus_plane_offset_px * normal_x,
+            boundary_center.1 - limbus_plane_offset_px * normal_y,
         ),
         relative_gaze: RelativeGazeVector::from_projected(normal_x, normal_y)?,
         sphere_radius,
@@ -1583,7 +1618,7 @@ pub(crate) fn relative_gaze_for_contact(
             projected_gaze_pole,
             geometry.boundary_center,
             geometry.rotation_center,
-            geometry.slice_depth,
+            geometry.limbus_plane_offset_px,
         ) {
             return RelativeGazeVector::from_projected(normal[0], normal[1])
                 .filter(|gaze| gaze.is_camera_facing());
@@ -1626,16 +1661,16 @@ pub(crate) fn resolve_rotation_render_geometry(
     let sphere_radius = sphere_radius_override
         .filter(|radius| radius.is_finite() && *radius > boundary_radius)
         .unwrap_or(boundary_radius * SPHERE_TO_RING_RADIUS);
-    let slice_depth_squared = sphere_radius * sphere_radius - boundary_radius * boundary_radius;
-    if !slice_depth_squared.is_finite() || slice_depth_squared <= 0.0 {
+    let limbus_plane_offset_squared_px2 = sphere_radius * sphere_radius - boundary_radius * boundary_radius;
+    if !limbus_plane_offset_squared_px2.is_finite() || limbus_plane_offset_squared_px2 <= 0.0 {
         return None;
     }
-    let slice_depth = slice_depth_squared.sqrt();
+    let limbus_plane_offset_px = limbus_plane_offset_squared_px2.sqrt();
     let inferred_rotation_center = infer_rotation_center_from_inner_ring(
         inner_ring_points,
         boundary_center,
         sphere_radius,
-        slice_depth,
+        limbus_plane_offset_px,
     );
     // Callers only supply a projected center after an independently admitted
     // motion lock, a manual XYZ lock, or the explicitly provisional limbus
@@ -1652,7 +1687,7 @@ pub(crate) fn resolve_rotation_render_geometry(
         boundary_center,
         boundary_radius,
         sphere_radius,
-        slice_depth,
+        limbus_plane_offset_px,
         rotation_center,
     })
 }
@@ -1661,7 +1696,7 @@ pub(crate) fn infer_rotation_center_from_inner_ring(
     inner_ring_points: &[(f64, f64)],
     boundary_center: (f64, f64),
     sphere_radius: f64,
-    slice_depth: f64,
+    limbus_plane_offset_px: f64,
 ) -> Option<(f64, f64)> {
     if inner_ring_points.len() < 8 {
         return None;
@@ -1673,7 +1708,7 @@ pub(crate) fn infer_rotation_center_from_inner_ring(
         inner_center.0 / inner_ring_points.len() as f64,
         inner_center.1 / inner_ring_points.len() as f64,
     );
-    let apex_above_slice = sphere_radius - slice_depth;
+    let apex_above_slice = sphere_radius - limbus_plane_offset_px;
     if apex_above_slice <= 1.0e-6 {
         return None;
     }
@@ -1688,8 +1723,8 @@ pub(crate) fn infer_rotation_center_from_inner_ring(
         normal_y *= 0.75 / projected_length;
     }
     Some((
-        boundary_center.0 - slice_depth * normal_x,
-        boundary_center.1 - slice_depth * normal_y,
+        boundary_center.0 - limbus_plane_offset_px * normal_x,
+        boundary_center.1 - limbus_plane_offset_px * normal_y,
     ))
 }
 

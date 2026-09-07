@@ -1201,7 +1201,7 @@ mod enabled {
         let split = ((0.5 * (xx - yy)).powi(2) + xy * xy).sqrt();
         let major_variance = (0.5 * trace + split).max(1.0e-6);
         let minor_variance = (0.5 * trace - split).max(1.0e-6);
-        let variance_ratio = (major_variance / minor_variance).sqrt().clamp(1.0, 8.0);
+        let standard_deviation_ratio = (major_variance / minor_variance).sqrt().clamp(1.0, 8.0);
         let native_area =
             count * native_width as f64 * native_height as f64 / (mask_width * mask_height) as f64;
         let equivalent_radius = (native_area / std::f64::consts::PI).sqrt();
@@ -1210,8 +1210,8 @@ mod enabled {
                 mean_x * native_width as f64 / mask_width as f64,
                 mean_y * native_height as f64 / mask_height as f64,
             ),
-            major_radius: equivalent_radius * variance_ratio.sqrt(),
-            minor_radius: equivalent_radius / variance_ratio.sqrt(),
+            major_radius: equivalent_radius * standard_deviation_ratio.sqrt(),
+            minor_radius: equivalent_radius / standard_deviation_ratio.sqrt(),
             angle: 0.5 * (2.0 * xy).atan2(xx - yy),
         })
     }
@@ -2220,12 +2220,14 @@ mod enabled {
         // it changes smoothly. Penalize high-frequency curvature jerk rather
         // than deviation from constant (circular) curvature.
         let mean_turn = total_abs / turns.len() as f64;
-        let curvature_jerk = turns
+        // Adjacent spatial turn variation along an outline, not a third
+        // time derivative of position or an angular jerk measurement.
+        let mean_abs_turn_angle_change_rad = turns
             .windows(2)
             .map(|pair| (pair[1] - pair[0]).abs())
             .sum::<f64>()
             / turns.len().saturating_sub(1).max(1) as f64;
-        let smooth_curvature = 1.0 / (1.0 + 1.6 * curvature_jerk / (mean_turn + 0.025));
+        let smooth_curvature = 1.0 / (1.0 + 1.6 * mean_abs_turn_angle_change_rad / (mean_turn + 0.025));
 
         let chord = points
             .first()

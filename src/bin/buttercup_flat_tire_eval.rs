@@ -684,13 +684,13 @@ fn scale_key(
     )
 }
 
-fn similarity_linear_scale(scale_delta: f64, rotation: f64) -> Option<f64> {
-    if !scale_delta.is_finite() || !rotation.is_finite() {
+fn similarity_linear_scale(diagonal_coefficient_delta: f64, rotation_coefficient: f64) -> Option<f64> {
+    if !diagonal_coefficient_delta.is_finite() || !rotation_coefficient.is_finite() {
         return None;
     }
     // Native SimilarityMotion uses [[1+d,-r],[r,1+d]], so sqrt(det A)
     // is hypot(1+d,r); r is a matrix coefficient, not a standalone angle.
-    let scale = (1.0 + scale_delta).hypot(rotation);
+    let scale = (1.0 + diagonal_coefficient_delta).hypot(rotation_coefficient);
     (scale.is_finite() && scale > 0.0).then_some(scale)
 }
 fn load_scales(paths: &[String]) -> Result<BTreeMap<String, ScaleEvidence>> {
@@ -712,7 +712,7 @@ fn load_scales(paths: &[String]) -> Result<BTreeMap<String, ScaleEvidence>> {
             let previous = &frames[i - 1];
             let motion = &current["shared_global_scale"];
             let delta = motion["scale_delta"].as_f64().unwrap_or(f64::NAN);
-            let rotation = motion["rotation"].as_f64().unwrap_or(f64::NAN);
+            let rotation_coefficient = motion["rotation"].as_f64().unwrap_or(f64::NAN);
             let residual = motion["motion_residual"].as_f64().unwrap_or(f64::NAN);
             let support = motion["motion_support"].as_u64().unwrap_or(0);
             let timestamp = integer(current, "timestamp_ns")?;
@@ -725,8 +725,8 @@ fn load_scales(paths: &[String]) -> Result<BTreeMap<String, ScaleEvidence>> {
                 && motion["occupied_quadrants"].as_u64().unwrap_or(0) >= 3
                 && delta.is_finite()
                 && delta.abs() <= 0.04
-                && rotation.is_finite()
-                && rotation.abs() <= 0.10
+                && rotation_coefficient.is_finite()
+                && rotation_coefficient.abs() <= 0.10
                 && current["width"] == previous["width"]
                 && current["height"] == previous["height"]
                 && timestamp
@@ -750,7 +750,7 @@ fn load_scales(paths: &[String]) -> Result<BTreeMap<String, ScaleEvidence>> {
                 reference = previous_timestamp;
             }
             let new_scale =
-                old_scale * similarity_linear_scale(delta, rotation).expect("validated similarity");
+                old_scale * similarity_linear_scale(delta, rotation_coefficient).expect("validated similarity");
             let provenance = hash(&format!("{path}:{reference}"));
             for (frame, scale, uncertainty) in [
                 (previous, old_scale, old_uncertainty),

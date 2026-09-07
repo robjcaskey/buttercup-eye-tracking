@@ -107,6 +107,7 @@ pub fn buttercup_map(virtual_mouse: bool, driving: bool) -> HotkeyMap {
     add("Esc", "Exit", true);
     add("Q", "Exit", true);
     add("M", "Mouse mode", true);
+    add("\\", "Accuracy check (20 targets)", !virtual_mouse);
     add("B", "Lightbox", true);
     add(
         "[",

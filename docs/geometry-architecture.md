@@ -151,6 +151,72 @@ SAM identity-carry experiment, see [ROI reframe continuity](roi-reframe-continui
 - A score, heuristic sigma, support interval and calibrated probability are
   different quantities. Do not rename one to another to make an API uniform.
 
+## Single-eye temporal sign correction (September 7)
+
+`eye_scene_model::sign_motion` compares the two camera-facing tilt hypotheses
+using only one eye's source-timed geometry and independently extracted RAW
+image motion. Neither the other eye nor monitor calibration is an input.
+The earlier one-interval temporal path could seed a sign, but deliberately
+could not revise an established sign. Its later kinematic check compared an
+alternative against already-signed history, potentially penalizing correction
+of a wrong initial choice as an abrupt physical saccade.
+
+The bounded window keeps up to 12 interval scores over 1.25 seconds. Each
+branch has its own implied-pivot trajectory. Each previous pivot is transported
+into the current sensor frame using source-aligned whole-ROI similarity,
+including its actual center, scale and rotation, and compared to the current
+pivot of that SAME branch. At least four fresh, discriminating intervals must
+support the correction, with limited contrary evidence and a sustained bounded
+cost margin. Re-scoring one old fit or a neutral current frame cannot vote.
+This intentionally abstains when movement is too small relative to fit and
+transport error; it does not claim every non-frontal motion is identifiable.
+
+The pivot uses the existing projected contact-depth approximation, not a
+fixed, measured anatomical rotation center. Its error allowance includes a
+0.5-pixel floor, 1.5% of apparent limbus radius, and twice the current-interval
+RAW transport residual. These are defeasible engineering margins, not calibrated confidence
+intervals or measured physiological limits. Missing/untrusted transport breaks
+the chain; it never implies a stationary head. Near-frontal projected normals
+below 0.08, invalid geometry, stale intervals, and scale-family resets discard
+the relevant motion evidence. Repeated/out-of-order source results cannot vote.
+
+A supported correction changes the persistent branch and advances the sign
+epoch once, clears incompatible signed velocity/smoothing state, and publishes
+the current source direction immediately. Existing calibration-basis guards
+therefore invalidate an affine trained on the old sign. The physical monitor
+pose is not adjusted to conceal a sign correction. The convex/camera-facing
+proof remains mandatory; this change does not manufacture independently
+reflected X-only or Y-only normals.
+
+Validation uses mirrored upward/downward, horizontal and oblique synthetic
+sweeps, approaching/receding tilt, initially correct and incorrectly resolved
+seeds, several scales, head translation, ROI nudges, equivalent ellipse angles,
+small pivot drift, weak/uncertain motion, jitter, single-frame
+outliers, missing/uncertain motion, and stale/duplicate clocks. The offline
+`--offline-contact-sign-eval OUTPUT.json CAPTURE_DIR subject-right|subject-left
+[START] [COUNT]` command runs matched old/new policies on frozen recorded SAM
+ellipse geometry while recomputing RAW transport. Its baseline disables only
+the new window; it is not a byte-identical reproduction of live inference
+scheduling. All captures/reports remain below `outputs`.
+
+This is sign-policy validation, not a new limbus fitter or a complete 3D eye
+model. Sign alternatives preserve the fitted ellipse and frontal-equivalent
+disk area. SN-FEIDA therefore cannot determine which sign is right. Human sign
+labels and independently measured scale are absent in the current recording;
+cross-eye disagreement may be measured afterward as a diagnostic but is never
+used to choose either eye's sign or claimed to be ground-truth gaze accuracy.
+
+A wider, median-centered whole-trajectory scatter alternative was tested and
+rejected: in the same recording it increased strongly opposite vertical pairs
+from 494/1,220 to 518/1,220 and made 41 motion corrections, versus one correction
+and 408/1,220 opposite pairs for the first conservative candidate. These are
+matched offline rollouts seeded from the recorded sign, not the original live
+publication counts. Both alternatives preserved ellipse-area and fit coverage.
+The rejected source and reports are retained under
+`outputs/sign-audit-20260907`; its permissive trajectory scoring is not enabled.
+This experiment does not establish which eye is correct, and unresolved
+disagreements remain.
+
 ## Existing custom types
 
 Related types are grouped below, including types deliberately left with their

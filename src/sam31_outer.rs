@@ -1228,7 +1228,7 @@ fn arbitration_expectation(
     for step in snapshot.timeline.steps.iter().filter(|step|
         step.to_timestamp_ns > prior.input.timestamp_ns && step.from_timestamp_ns < input.timestamp_ns) {
         let motion = step.evidence.motion;
-        let scale = f64::from(1.0 + motion.scale_delta).hypot(f64::from(motion.rotation));
+        let scale = f64::from(1.0 + motion.diagonal_coefficient_delta).hypot(f64::from(motion.rotation_coefficient));
         if !step.evidence.reliable || motion.support < 8 || !motion.residual.is_finite()
             || motion.residual < 0.0 || !(0.8..=1.25).contains(&scale) { return None; }
         residual += f64::from(motion.residual);
@@ -1236,8 +1236,8 @@ fn arbitration_expectation(
     }
     if steps == 0 || steps > 8 || residual > 8.0 { return None; }
     let evidence = snapshot.timeline.reliable_between(prior.input.timestamp_ns, input.timestamp_ns)?;
-    let a = 1.0 + f64::from(evidence.motion.scale_delta);
-    let b = f64::from(evidence.motion.rotation);
+    let a = 1.0 + f64::from(evidence.motion.diagonal_coefficient_delta);
+    let b = f64::from(evidence.motion.rotation_coefficient);
     let radius = prior.ellipse.major_radius * a.hypot(b);
     if !radius.is_finite() || radius <= 0.0 { return None; }
     let x = prior.ellipse.center.0 + f64::from(prior.input.sensor_origin.0);
@@ -8662,8 +8662,8 @@ mod tests {
                             (source.sensor_x, source.sensor_y), None, &boundary, None)
                     });
                     let legacy_filtered = gazes[eye].floating_center_sensor.zip(gazes[eye].floating_near_point_sensor)
-                        .zip(surface).map(|((center, near), s)| [(near.0-center.0)/s.bucketed_face_radius_px,
-                            (near.1-center.1)/s.bucketed_face_radius_px]);
+                        .zip(surface).map(|((center, near), s)| [(near.0-center.0)/s.quantized_frontal_disk_radius_px,
+                            (near.1-center.1)/s.quantized_frontal_disk_radius_px]);
                     observations.push(serde_json::json!({"pair":pair_index,"eye":eye,"sequence":source.sequence,
                         "source_ns":source.timestamp_ns,"accepted":accepted[eye],
                         "ellipse":ellipse.map(|e|[e.center.0,e.center.1,e.major_radius,e.minor_radius,e.angle]),
@@ -8959,8 +8959,8 @@ mod tests {
             clock, timeline: GlobalSimilarityTimeline::default() };
         snapshot.timeline.observe_frame(before.timestamp_ns, NativeGlobalSimilarityEvidence::default());
         snapshot.timeline.observe_frame(after.timestamp_ns, NativeGlobalSimilarityEvidence {
-            reliable: true, motion: SimilarityMotion { support: 12, residual: 1.0, rotation: 0.1,
-                scale_delta: 0.02, ..SimilarityMotion::default() }, ..NativeGlobalSimilarityEvidence::default()
+            reliable: true, motion: SimilarityMotion { support: 12, residual: 1.0, rotation_coefficient: 0.1,
+                diagonal_coefficient_delta: 0.02, ..SimilarityMotion::default() }, ..NativeGlobalSimilarityEvidence::default()
         });
         let expected = arbitration_expectation(prior, after, 0, &snapshot).unwrap();
         assert!((expected.major_radius - 80.0 * (1.02f64).hypot(0.1)).abs() < 1e-5);

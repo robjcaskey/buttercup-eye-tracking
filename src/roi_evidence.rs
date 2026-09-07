@@ -131,8 +131,11 @@ pub const RESIDUAL_LAYER: usize = 3;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SimilarityMotion {
     pub translation: [f32; 2],
-    pub rotation: f32,
-    pub scale_delta: f32,
+    /// Off-diagonal coefficient b of [[1+d, -b], [b, 1+d]], not an angle.
+    pub rotation_coefficient: f32,
+    /// d in that matrix, not the exact similarity-scale change. The exact
+    /// angle is atan2(b, 1+d) and the scale is hypot(1+d, b).
+    pub diagonal_coefficient_delta: f32,
     pub residual: f32,
     pub support: usize,
 }
@@ -163,8 +166,8 @@ impl SimilarityMotion {
         let x = point[0] - center[0];
         let y = point[1] - center[1];
         [
-            point[0] + self.translation[0] + self.scale_delta * x - self.rotation * y,
-            point[1] + self.translation[1] + self.rotation * x + self.scale_delta * y,
+            point[0] + self.translation[0] + self.diagonal_coefficient_delta * x - self.rotation_coefficient * y,
+            point[1] + self.translation[1] + self.rotation_coefficient * x + self.diagonal_coefficient_delta * y,
         ]
     }
 }
@@ -283,8 +286,8 @@ impl GlobalSimilarityTimeline {
                 return None;
             }
             let motion = step.evidence.motion;
-            let step_a = 1.0 + f64::from(motion.scale_delta);
-            let step_b = f64::from(motion.rotation);
+            let step_a = 1.0 + f64::from(motion.diagonal_coefficient_delta);
+            let step_b = f64::from(motion.rotation_coefficient);
             let center_x = f64::from(step.evidence.motion_center_sensor[0]);
             let center_y = f64::from(step.evidence.motion_center_sensor[1]);
             let step_tx =
@@ -319,8 +322,8 @@ impl GlobalSimilarityTimeline {
         }
         let motion = SimilarityMotion {
             translation: [tx as f32, ty as f32],
-            rotation: b as f32,
-            scale_delta: (a - 1.0) as f32,
+            rotation_coefficient: b as f32,
+            diagonal_coefficient_delta: (a - 1.0) as f32,
             residual,
             support,
         };

@@ -89,7 +89,7 @@ pub(crate) struct PivotObservation {
     pub identity: u64,
     pub source_lineage: u64,
     pub source_timestamp_ns: u64,
-    pub pivot_sensor: [f64; 2],
+    pub effective_pivot_sensor_px: [f64; 2],
     /// Current iris-cap center minus the projected globe pivot. This offset is
     /// support geometry, never a head-translation observation.
     pub support_offset_px: [f64; 2],
@@ -107,7 +107,7 @@ impl PivotObservation {
     fn valid(self) -> bool {
         self.source_timestamp_ns > 0
             && self
-                .pivot_sensor
+                .effective_pivot_sensor_px
                 .iter()
                 .all(|x| x.is_finite() && x.abs() <= 1e6)
             && self
@@ -332,7 +332,7 @@ impl PivotRegionScheduler {
                 + elapsed * c.uncertainty_growth_px_s;
             // Cover the swept interval, not only its endpoint. Head translation
             // may move the pivot; rotating the gaze does not drag the ROI.
-            let support_center = o.pivot_sensor[axis] + o.support_offset_px[axis];
+            let support_center = o.effective_pivot_sensor_px[axis] + o.support_offset_px[axis];
             let lo = support_center + delta.min(0.0) - extent;
             let hi = support_center + delta.max(0.0) + extent;
             if lo < 0.0 || hi > c.sensor_size[axis] as f64 {
@@ -348,7 +348,7 @@ impl PivotRegionScheduler {
             ranges[axis] = [lower as u32, upper as u32];
             // Prefer the pivot, shifting only as far toward the cap as needed
             // to retain its guarded support. Gaze offset never becomes velocity.
-            let center = o.pivot_sensor[axis] + delta * 0.5 - c.roi_size[axis] as f64 * 0.5;
+            let center = o.effective_pivot_sensor_px[axis] + delta * 0.5 - c.roi_size[axis] as f64 * 0.5;
             preferred[axis] = ((center / align).round() * align).clamp(lower, upper) as u32;
             if let Some(rect) = track.rect {
                 let previous = if axis == 0 { rect.x } else { rect.y };
@@ -526,7 +526,7 @@ mod tests {
             identity: id,
             source_lineage: 7,
             source_timestamp_ns: time,
-            pivot_sensor: [x, y],
+            effective_pivot_sensor_px: [x, y],
             support_offset_px: [0.0; 2],
             velocity_sensor_px_s: [0.0, 0.0],
             uncertainty_px: [4.0, 4.0],
@@ -728,7 +728,7 @@ mod tests {
         s.observe(o);
         let mut invalid = o;
         invalid.source_timestamp_ns = 2;
-        invalid.pivot_sensor[0] = f64::NAN;
+        invalid.effective_pivot_sensor_px[0] = f64::NAN;
         assert!(!s.observe(invalid));
         invalid = o;
         invalid.quality = f64::INFINITY;
@@ -878,7 +878,7 @@ mod tests {
         s.observe(o);
         let p = s.plan(1, 2200);
         let r = p.regions[0].rect.expect("visible 228px cap fits 280px ROI");
-        assert!(r.y as f64 > o.pivot_sensor[1]);
+        assert!(r.y as f64 > o.effective_pivot_sensor_px[1]);
         assert!(r.y as f64 <= 2400.0 - 130.0);
         assert!((r.y + r.height) as f64 >= 2400.0 + 130.0);
         validate(&p);

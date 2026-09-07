@@ -79,6 +79,24 @@ scripts/run-viewer.sh --offline-sam-sequence-eval \
   outputs/replay.json outputs/EXTRACTED_CAPTURE subject-right 0 32 1
 ```
 
+For a browser/video showcase using the live annotation renderer, set an output
+directory that does not already exist:
+
+```bash
+BUTTERCUP_REPLAY_RENDER_DIR=outputs/showcase/native-frames \
+  scripts/run-viewer.sh --offline-sam-sequence-eval \
+  outputs/showcase/replay.json outputs/EXTRACTED_CAPTURE subject-right 0 120 1
+```
+
+Each replay case includes a `point_stream` with source-keyed retained/rejected
+flat-tire points, dense ellipse points, and a fresh presentation contact pose.
+Nanosecond point-stream timestamps are strings for lossless JavaScript use.
+The optional renderer exports RAW color, blue-filter, RAW-luma, flat-tire, and
+virtual-contact PPM streams using the same preview and annotation functions as
+the live viewer. Missing fits remain visible as missing; stale contacts are
+not exported as fresh. Rendering is supported only for native ROI replay.
+All artifacts belong beneath the checked `outputs` link.
+
 Replay includes the post-SAM pupil solver under an explicitly optimistic
 settled-focus assumption. Candidate counts are not accuracy measurements;
 pupil accuracy needs pupil-specific human reference.
@@ -142,6 +160,15 @@ press `S` again after the viewer returns. Each bundle includes a
 `predictions.jsonl` trace keyed by ROI id, sensor sequence, and sensor
 timestamp; unclassified or unanalysed ROIs remain in the trace instead of
 being discarded.
+
+`S` bundles also include `metadata.oim1`: framed target/presentation events,
+unclamped predicted 2D gaze, the actual drawn cursor, source clocks, and
+change-only monitor/per-eye scene metadata. This uses the existing typed framing,
+not a new JSONL stream or gzip. Unknown metric camera/eye poses remain null.
+Native global and sensor-band thumbnails are retained without re-encoding
+in `thumbnails.oic1`, indexed by `thumbnails.jsonl`. Host submission times are
+kept separate from sensor exposure clocks. See [RAW recording evidence](docs/raw-recording-evidence.md)
+for coordinates, snapshot/held-state semantics and the socket-stream format.
 
 The matching lossless RAW decoder searches native packed-RAW recordings for
 the repeated chromatic lattice without using desktop captures, resized

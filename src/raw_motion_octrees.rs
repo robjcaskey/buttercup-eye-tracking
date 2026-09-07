@@ -2716,7 +2716,7 @@ impl NativeHorizontalRowIntegrals {
 #[derive(Clone, Copy, Debug, Default)]
 struct HorizontalWalkTransform {
     translation: f32,
-    scale_delta: f32,
+    diagonal_coefficient_delta: f32,
     vertical_nuisance: f32,
 }
 
@@ -2811,7 +2811,7 @@ fn score_horizontal_walk(
     let mut cross = 0.0f64;
     for sample in &source.samples {
         let current_x =
-            sample.x + transform.translation + transform.scale_delta * (sample.x - center_x);
+            sample.x + transform.translation + transform.diagonal_coefficient_delta * (sample.x - center_x);
         let current_y = sample.y + transform.vertical_nuisance;
         let current_value = current.sample_horizontal_blur(current_x, current_y, radius)?;
         let current_value = f64::from(current_value);
@@ -2865,7 +2865,7 @@ fn append_horizontal_light_field_node(
         LIGHT_FIELD_TRANSLATION_STEP[level],
     );
     let scales = inclusive_search_values(
-        prior.scale_delta,
+        prior.diagonal_coefficient_delta,
         LIGHT_FIELD_SCALE_RADIUS[level],
         LIGHT_FIELD_SCALE_STEP[level],
     );
@@ -2881,8 +2881,8 @@ fn append_horizontal_light_field_node(
             .saturating_mul(vertical.len()),
     );
     for translation in translations {
-        for scale_delta in scales.iter().copied() {
-            if !scale_delta.is_finite() || scale_delta.abs() > 0.12 {
+        for diagonal_coefficient_delta in scales.iter().copied() {
+            if !diagonal_coefficient_delta.is_finite() || diagonal_coefficient_delta.abs() > 0.12 {
                 continue;
             }
             for vertical_nuisance in vertical.iter().copied() {
@@ -2894,7 +2894,7 @@ fn append_horizontal_light_field_node(
                     LIGHT_FIELD_BLUR_RADIUS[level],
                     HorizontalWalkTransform {
                         translation,
-                        scale_delta,
+                        diagonal_coefficient_delta,
                         vertical_nuisance,
                     },
                 ) {
@@ -2911,7 +2911,7 @@ fn append_horizontal_light_field_node(
         .find(|candidate| {
             (candidate.transform.translation - best.transform.translation).abs()
                 >= LIGHT_FIELD_TRANSLATION_STEP[level] * 1.5
-                || (candidate.transform.scale_delta - best.transform.scale_delta).abs() * span
+                || (candidate.transform.diagonal_coefficient_delta - best.transform.diagonal_coefficient_delta).abs() * span
                     >= 3.0
                 || (candidate.transform.vertical_nuisance - best.transform.vertical_nuisance).abs()
                     >= LIGHT_FIELD_VERTICAL_STEP[level] * 1.5
@@ -2946,7 +2946,7 @@ fn append_horizontal_light_field_node(
         local_translation_px: best.transform.translation,
         sensor_translation_px: sensor_translation,
         vertical_nuisance_px: best.transform.vertical_nuisance,
-        horizontal_scale_delta: best.transform.scale_delta,
+        horizontal_scale_delta: best.transform.diagonal_coefficient_delta,
         blur_radius_px: LIGHT_FIELD_BLUR_RADIUS[level] as u8,
         correlation: best.correlation,
         ambiguity_margin,
@@ -2996,8 +2996,8 @@ fn append_horizontal_light_field_node(
         let child_center_x = 0.5 * (child_bounds[0] + child_bounds[2]);
         let child_prior = HorizontalWalkTransform {
             translation: best.transform.translation
-                + best.transform.scale_delta * (child_center_x - center[0]),
-            scale_delta: best.transform.scale_delta,
+                + best.transform.diagonal_coefficient_delta * (child_center_x - center[0]),
+            diagonal_coefficient_delta: best.transform.diagonal_coefficient_delta,
             vertical_nuisance: best.transform.vertical_nuisance,
         };
         children += usize::from(
@@ -3075,17 +3075,17 @@ fn summarize_horizontal_light_field(
     } else {
         weighted_node_scale
     };
-    let scale_delta =
+    let diagonal_coefficient_delta =
         (0.72 * regression_scale + 0.28 * weighted_node_scale).clamp(-0.12, 0.12) as f32;
     let center_sensor_x = previous.sensor_x as f64 + previous.width as f64 * 0.5;
     let translation =
-        (mean_displacement + f64::from(scale_delta) * (center_sensor_x - mean_x)) as f32;
+        (mean_displacement + f64::from(diagonal_coefficient_delta) * (center_sensor_x - mean_x)) as f32;
     let mut residual_sum = 0.0f64;
     let mut confidence_sum = 0.0f64;
     for node in &leaves {
         let weight = f64::from(node.confidence.max(0.03)).powi(2) * f64::from(node.samples.max(1));
         let x = previous.sensor_x as f64 + f64::from(node.source_center[0]) - center_sensor_x;
-        let predicted = f64::from(translation) + f64::from(scale_delta) * x;
+        let predicted = f64::from(translation) + f64::from(diagonal_coefficient_delta) * x;
         residual_sum += weight * (predicted - f64::from(node.sensor_translation_px)).abs();
         confidence_sum += weight * f64::from(node.confidence);
     }
@@ -3103,12 +3103,12 @@ fn summarize_horizontal_light_field(
         && residual_px <= 4.0
         && translation.is_finite()
         && translation.abs() <= 48.0
-        && scale_delta.is_finite()
-        && scale_delta.abs() <= 0.10;
+        && diagonal_coefficient_delta.is_finite()
+        && diagonal_coefficient_delta.abs() <= 0.10;
     HorizontalLightFieldStatus {
         nodes,
         horizontal_translation_px: translation,
-        horizontal_scale_delta: scale_delta,
+        horizontal_scale_delta: diagonal_coefficient_delta,
         residual_px,
         confidence,
         horizontal_coverage,
@@ -3144,16 +3144,16 @@ fn horizontal_light_field_tree(
         [0.0; 2]
     };
     let prior_scale = if prior_motion.support >= 4
-        && prior_motion.scale_delta.is_finite()
-        && prior_motion.scale_delta.abs() <= 0.06
+        && prior_motion.diagonal_coefficient_delta.is_finite()
+        && prior_motion.diagonal_coefficient_delta.abs() <= 0.06
     {
-        prior_motion.scale_delta
+        prior_motion.diagonal_coefficient_delta
     } else {
         0.0
     };
     let root_prior = HorizontalWalkTransform {
         translation: previous.sensor_x as f32 - current.sensor_x as f32 + prior_translation[0],
-        scale_delta: prior_scale,
+        diagonal_coefficient_delta: prior_scale,
         vertical_nuisance: previous.sensor_y as f32 - current.sensor_y as f32
             + prior_translation[1],
     };
@@ -3784,10 +3784,10 @@ fn gradients_scalar(
                 + middle * at(0, 1)
                 + corner * at(1, 1);
             let index = y * width + x;
-            let power = gx.hypot(gy);
+            let gradient_magnitude = gx.hypot(gy);
             gradient_x[index] = gx;
             gradient_y[index] = gy;
-            magnitude[index] = power;
+            magnitude[index] = gradient_magnitude;
             let (absolute_x, absolute_y) = (gx.abs(), gy.abs());
             direction[index] = if absolute_x >= absolute_y * 2.414 {
                 0
@@ -4428,8 +4428,8 @@ fn measured_edge_score_attributes(
     let broad_magnitude = broad_gx.hypot(broad_gy);
     let signed_alignment =
         (gx * broad_gx + gy * broad_gy) / (magnitude * broad_magnitude).max(1.0e-6);
-    let broad_power = (broad_magnitude / (magnitude * 0.34).max(1.0e-6)).clamp(0.0, 1.0);
-    let multiscale_consistency = signed_alignment.clamp(0.0, 1.0) * broad_power;
+    let broad_gradient_ratio = (broad_magnitude / (magnitude * 0.34).max(1.0e-6)).clamp(0.0, 1.0);
+    let multiscale_consistency = signed_alignment.clamp(0.0, 1.0) * broad_gradient_ratio;
 
     let normal_x = gx / magnitude;
     let normal_y = gy / magnitude;
@@ -4841,8 +4841,8 @@ fn reanchor_similarity_motion(
     let x = new_center[0] - old_center[0];
     let y = new_center[1] - old_center[1];
     motion.translation = [
-        motion.translation[0] + motion.scale_delta * x - motion.rotation * y,
-        motion.translation[1] + motion.rotation * x + motion.scale_delta * y,
+        motion.translation[0] + motion.diagonal_coefficient_delta * x - motion.rotation_coefficient * y,
+        motion.translation[1] + motion.rotation_coefficient * x + motion.diagonal_coefficient_delta * y,
     ];
     motion
 }
@@ -4872,8 +4872,8 @@ fn condition_upper_edges_by_iris_motion(
         || iris_motion.residual > 2.5
         || !iris_motion.translation[0].is_finite()
         || !iris_motion.translation[1].is_finite()
-        || !iris_motion.rotation.is_finite()
-        || !iris_motion.scale_delta.is_finite()
+        || !iris_motion.rotation_coefficient.is_finite()
+        || !iris_motion.diagonal_coefficient_delta.is_finite()
         || !iris_center_absolute[0].is_finite()
         || !iris_center_absolute[1].is_finite()
     {
@@ -4933,8 +4933,8 @@ fn condition_upper_edges_by_iris_motion(
         // rather than treating a rotating/scaling iris as translation-only.
         // This avoids labelling a real upper iris striation as a shadow merely
         // because it is far from the similarity center.
-        let affine_scale = 1.0 + iris_motion.scale_delta;
-        let determinant = affine_scale * affine_scale + iris_motion.rotation * iris_motion.rotation;
+        let affine_scale = 1.0 + iris_motion.diagonal_coefficient_delta;
+        let determinant = affine_scale * affine_scale + iris_motion.rotation_coefficient * iris_motion.rotation_coefficient;
         if !determinant.is_finite() || determinant < 0.25 {
             continue;
         }
@@ -4944,10 +4944,10 @@ fn condition_upper_edges_by_iris_motion(
         ];
         let predicted_previous_absolute = [
             iris_center_absolute[0]
-                + (affine_scale * current_relative[0] + iris_motion.rotation * current_relative[1])
+                + (affine_scale * current_relative[0] + iris_motion.rotation_coefficient * current_relative[1])
                     / determinant,
             iris_center_absolute[1]
-                + (-iris_motion.rotation * current_relative[0]
+                + (-iris_motion.rotation_coefficient * current_relative[0]
                     + affine_scale * current_relative[1])
                     / determinant,
         ];
@@ -5370,10 +5370,10 @@ impl BoundedIrisCannyTracker {
         let similarity_scale_reliable = similarity.support >= 6
             && similarity.residual.is_finite()
             && similarity.residual <= 2.0
-            && similarity.rotation.is_finite()
-            && similarity.rotation.abs() <= 0.08
-            && similarity.scale_delta.is_finite()
-            && similarity.scale_delta.abs() <= 0.08;
+            && similarity.rotation_coefficient.is_finite()
+            && similarity.rotation_coefficient.abs() <= 0.08
+            && similarity.diagonal_coefficient_delta.is_finite()
+            && similarity.diagonal_coefficient_delta.abs() <= 0.08;
         let motion_residual = if unique.is_empty() {
             0.0
         } else {
@@ -5391,13 +5391,13 @@ impl BoundedIrisCannyTracker {
         };
         let iris_motion_for_edges = SimilarityMotion {
             translation: common_motion,
-            rotation: if similarity_scale_reliable {
-                similarity.rotation
+            rotation_coefficient: if similarity_scale_reliable {
+                similarity.rotation_coefficient
             } else {
                 0.0
             },
-            scale_delta: if similarity_scale_reliable {
-                similarity.scale_delta
+            diagonal_coefficient_delta: if similarity_scale_reliable {
+                similarity.diagonal_coefficient_delta
             } else {
                 0.0
             },
@@ -5670,9 +5670,9 @@ impl BoundedIrisCannyTracker {
         if !global.reliable {
             coupled.cyan = KinematicDerivatives::default();
             coupled.green = KinematicDerivatives::default();
-            coupled.green_relative_to_cyan = KinematicDerivatives::default();
-            coupled.saccade_likelihood = 0.0;
-            coupled.micro_motion_likelihood = 0.0;
+            coupled.pupil_relative_to_general = KinematicDerivatives::default();
+            coupled.saccade_score = 0.0;
+            coupled.micro_motion_score = 0.0;
         }
         overlay.coupled_motion = coupled.translated(sensor_x as f32, sensor_y as f32);
         overlay.motions[GENERAL_LAYER] = motions[GENERAL_LAYER];
@@ -6286,12 +6286,12 @@ fn score_relation_tensor_scalar(
     for index in 0..nodes.len() {
         let x = nodes.previous_x[index] - center[0];
         let y = nodes.previous_y[index] - center[1];
-        let predicted_x = nodes.previous_x[index] + motion.translation[0] + motion.scale_delta * x
-            - motion.rotation * y;
+        let predicted_x = nodes.previous_x[index] + motion.translation[0] + motion.diagonal_coefficient_delta * x
+            - motion.rotation_coefficient * y;
         let predicted_y = nodes.previous_y[index]
             + motion.translation[1]
-            + motion.rotation * x
-            + motion.scale_delta * y;
+            + motion.rotation_coefficient * x
+            + motion.diagonal_coefficient_delta * y;
         let dx = predicted_x - nodes.current_x[index];
         let dy = predicted_y - nodes.current_y[index];
         let error_sq = dx * dx + dy * dy;
@@ -6327,8 +6327,8 @@ unsafe fn score_relation_tensor_avx2(
     let center_y = _mm256_set1_ps(center[1]);
     let translation_x = _mm256_set1_ps(motion.translation[0]);
     let translation_y = _mm256_set1_ps(motion.translation[1]);
-    let scale = _mm256_set1_ps(motion.scale_delta);
-    let rotation = _mm256_set1_ps(motion.rotation);
+    let scale = _mm256_set1_ps(motion.diagonal_coefficient_delta);
+    let rotation_coefficient = _mm256_set1_ps(motion.rotation_coefficient);
     let radius_sq = _mm256_set1_ps(radius * radius);
     let mut squared_sum = _mm256_setzero_ps();
     let mut support = 0usize;
@@ -6346,12 +6346,12 @@ unsafe fn score_relation_tensor_avx2(
                 _mm256_add_ps(previous_x, translation_x),
                 _mm256_mul_ps(scale, x),
             ),
-            _mm256_mul_ps(rotation, y),
+            _mm256_mul_ps(rotation_coefficient, y),
         );
         let predicted_y = _mm256_add_ps(
             _mm256_add_ps(
                 _mm256_add_ps(previous_y, translation_y),
-                _mm256_mul_ps(rotation, x),
+                _mm256_mul_ps(rotation_coefficient, x),
             ),
             _mm256_mul_ps(scale, y),
         );
@@ -6378,12 +6378,12 @@ unsafe fn score_relation_tensor_avx2(
     for index in simd_end..nodes.len() {
         let x = nodes.previous_x[index] - center[0];
         let y = nodes.previous_y[index] - center[1];
-        let predicted_x = nodes.previous_x[index] + motion.translation[0] + motion.scale_delta * x
-            - motion.rotation * y;
+        let predicted_x = nodes.previous_x[index] + motion.translation[0] + motion.diagonal_coefficient_delta * x
+            - motion.rotation_coefficient * y;
         let predicted_y = nodes.previous_y[index]
             + motion.translation[1]
-            + motion.rotation * x
-            + motion.scale_delta * y;
+            + motion.rotation_coefficient * x
+            + motion.diagonal_coefficient_delta * y;
         let dx = predicted_x - nodes.current_x[index];
         let dy = predicted_y - nodes.current_y[index];
         let error_sq = dx * dx + dy * dy;
@@ -6429,12 +6429,12 @@ fn relation_tensor_squared_errors_scalar(
     for index in 0..nodes.len() {
         let x = nodes.previous_x[index] - center[0];
         let y = nodes.previous_y[index] - center[1];
-        let predicted_x = nodes.previous_x[index] + motion.translation[0] + motion.scale_delta * x
-            - motion.rotation * y;
+        let predicted_x = nodes.previous_x[index] + motion.translation[0] + motion.diagonal_coefficient_delta * x
+            - motion.rotation_coefficient * y;
         let predicted_y = nodes.previous_y[index]
             + motion.translation[1]
-            + motion.rotation * x
-            + motion.scale_delta * y;
+            + motion.rotation_coefficient * x
+            + motion.diagonal_coefficient_delta * y;
         let dx = predicted_x - nodes.current_x[index];
         let dy = predicted_y - nodes.current_y[index];
         squared_errors[index] = dx * dx + dy * dy;
@@ -6455,8 +6455,8 @@ unsafe fn relation_tensor_squared_errors_avx2(
     let center_y = _mm256_set1_ps(center[1]);
     let translation_x = _mm256_set1_ps(motion.translation[0]);
     let translation_y = _mm256_set1_ps(motion.translation[1]);
-    let scale = _mm256_set1_ps(motion.scale_delta);
-    let rotation = _mm256_set1_ps(motion.rotation);
+    let scale = _mm256_set1_ps(motion.diagonal_coefficient_delta);
+    let rotation_coefficient = _mm256_set1_ps(motion.rotation_coefficient);
     let simd_end = nodes.len() / 8 * 8;
     for index in (0..simd_end).step_by(8) {
         let previous_x = _mm256_loadu_ps(nodes.previous_x.as_ptr().add(index));
@@ -6470,12 +6470,12 @@ unsafe fn relation_tensor_squared_errors_avx2(
                 _mm256_add_ps(previous_x, translation_x),
                 _mm256_mul_ps(scale, x),
             ),
-            _mm256_mul_ps(rotation, y),
+            _mm256_mul_ps(rotation_coefficient, y),
         );
         let predicted_y = _mm256_add_ps(
             _mm256_add_ps(
                 _mm256_add_ps(previous_y, translation_y),
-                _mm256_mul_ps(rotation, x),
+                _mm256_mul_ps(rotation_coefficient, x),
             ),
             _mm256_mul_ps(scale, y),
         );
@@ -6487,12 +6487,12 @@ unsafe fn relation_tensor_squared_errors_avx2(
     for index in simd_end..nodes.len() {
         let x = nodes.previous_x[index] - center[0];
         let y = nodes.previous_y[index] - center[1];
-        let predicted_x = nodes.previous_x[index] + motion.translation[0] + motion.scale_delta * x
-            - motion.rotation * y;
+        let predicted_x = nodes.previous_x[index] + motion.translation[0] + motion.diagonal_coefficient_delta * x
+            - motion.rotation_coefficient * y;
         let predicted_y = nodes.previous_y[index]
             + motion.translation[1]
-            + motion.rotation * x
-            + motion.scale_delta * y;
+            + motion.rotation_coefficient * x
+            + motion.diagonal_coefficient_delta * y;
         let dx = predicted_x - nodes.current_x[index];
         let dy = predicted_y - nodes.current_y[index];
         squared_errors[index] = dx * dx + dy * dy;
@@ -6570,27 +6570,27 @@ fn pairwise_motion_tensor(
         right_displacement[1] - left_displacement[1],
     ];
     let inverse_baseline = 1.0 / baseline_sq.max(1.0e-6);
-    let scale_delta = (baseline[0] * relative_displacement[0]
+    let diagonal_coefficient_delta = (baseline[0] * relative_displacement[0]
         + baseline[1] * relative_displacement[1])
         * inverse_baseline;
-    let rotation = (baseline[0] * relative_displacement[1]
+    let rotation_coefficient = (baseline[0] * relative_displacement[1]
         - baseline[1] * relative_displacement[0])
         * inverse_baseline;
-    if !scale_delta.is_finite() || !rotation.is_finite() {
+    if !diagonal_coefficient_delta.is_finite() || !rotation_coefficient.is_finite() {
         return None;
     }
     let left_about_center = [left.previous[0] - center[0], left.previous[1] - center[1]];
     let left_tensor_delta = [
-        scale_delta * left_about_center[0] - rotation * left_about_center[1],
-        rotation * left_about_center[0] + scale_delta * left_about_center[1],
+        diagonal_coefficient_delta * left_about_center[0] - rotation_coefficient * left_about_center[1],
+        rotation_coefficient * left_about_center[0] + diagonal_coefficient_delta * left_about_center[1],
     ];
     let motion = SimilarityMotion {
         translation: [
             left_displacement[0] - left_tensor_delta[0],
             left_displacement[1] - left_tensor_delta[1],
         ],
-        rotation,
-        scale_delta,
+        rotation_coefficient,
+        diagonal_coefficient_delta,
         residual: 0.0,
         support: 2,
     };
@@ -6610,15 +6610,15 @@ fn pairwise_motion_tensor(
     ];
     let local_scale = (baseline[0] * relative_residual[0] + baseline[1] * relative_residual[1])
         * inverse_baseline;
-    let local_rotation = (baseline[0] * relative_residual[1] - baseline[1] * relative_residual[0])
+    let local_rotation_coefficient = (baseline[0] * relative_residual[1] - baseline[1] * relative_residual[0])
         * inverse_baseline;
-    let local_rate_sq = local_scale * local_scale + local_rotation * local_rotation;
+    let local_rate_sq = local_scale * local_scale + local_rotation_coefficient * local_rotation_coefficient;
     let mut shared_origin = [0.0f32; 2];
     let mut origin_valid = local_rate_sq.sqrt() >= RELATION_ORIGIN_MIN_RATE;
     if origin_valid {
         let local_tensor_delta = [
-            local_scale * left_about_center[0] - local_rotation * left_about_center[1],
-            local_rotation * left_about_center[0] + local_scale * left_about_center[1],
+            local_scale * left_about_center[0] - local_rotation_coefficient * left_about_center[1],
+            local_rotation_coefficient * left_about_center[0] + local_scale * left_about_center[1],
         ];
         let local_translation = [
             left_residual[0] - local_tensor_delta[0],
@@ -6626,8 +6626,8 @@ fn pairwise_motion_tensor(
         ];
         let inverse = 1.0 / local_rate_sq.max(1.0e-9);
         let origin_offset = [
-            -(local_scale * local_translation[0] + local_rotation * local_translation[1]) * inverse,
-            (local_rotation * local_translation[0] - local_scale * local_translation[1]) * inverse,
+            -(local_scale * local_translation[0] + local_rotation_coefficient * local_translation[1]) * inverse,
+            (local_rotation_coefficient * local_translation[0] - local_scale * local_translation[1]) * inverse,
         ];
         shared_origin = [center[0] + origin_offset[0], center[1] + origin_offset[1]];
         origin_valid = shared_origin[0].is_finite()
@@ -6730,8 +6730,8 @@ impl PersistentMotionRelationGraph {
                         - tensor.motion.translation[0])
                         .hypot(edge.tensor.motion.translation[1] - tensor.motion.translation[1])
                         + 36.0
-                            * ((edge.tensor.motion.rotation - tensor.motion.rotation).abs()
-                                + (edge.tensor.motion.scale_delta - tensor.motion.scale_delta)
+                            * ((edge.tensor.motion.rotation_coefficient - tensor.motion.rotation_coefficient).abs()
+                                + (edge.tensor.motion.diagonal_coefficient_delta - tensor.motion.diagonal_coefficient_delta)
                                     .abs());
                     let parameter_continuity = (-parameter_jump / 8.0).exp().clamp(0.20, 1.0);
                     let continuity = 0.85 * support_continuity + 0.15 * parameter_continuity;
@@ -7414,10 +7414,10 @@ impl NativeGlobalSimilarityTracker {
             && motion.residual.is_finite()
             && motion.residual <= 2.0
             && motion.translation[0].hypot(motion.translation[1]) <= 24.0
-            && motion.rotation.is_finite()
-            && motion.rotation.abs() <= 0.10
-            && motion.scale_delta.is_finite()
-            && motion.scale_delta.abs() <= 0.08;
+            && motion.rotation_coefficient.is_finite()
+            && motion.rotation_coefficient.abs() <= 0.10
+            && motion.diagonal_coefficient_delta.is_finite()
+            && motion.diagonal_coefficient_delta.abs() <= 0.08;
         self.stable_frames = if reliable {
             self.stable_frames.saturating_add(1)
         } else {
@@ -9190,18 +9190,18 @@ fn fit_similarity_selected(selected: &[&Match], center: [f32; 2]) -> SimilarityM
         scale_numerator += x * dx + y * dy;
         rotation_numerator += x * dy - y * dx;
     }
-    let scale_delta = scale_numerator / denominator.max(1.0);
-    let rotation = rotation_numerator / denominator.max(1.0);
+    let diagonal_coefficient_delta = scale_numerator / denominator.max(1.0);
+    let rotation_coefficient = rotation_numerator / denominator.max(1.0);
     let translation = [
-        dc[0] - scale_delta * pc[0] + rotation * pc[1],
-        dc[1] - rotation * pc[0] - scale_delta * pc[1],
+        dc[0] - diagonal_coefficient_delta * pc[0] + rotation_coefficient * pc[1],
+        dc[1] - rotation_coefficient * pc[0] - diagonal_coefficient_delta * pc[1],
     ];
     let mut residual = 0.0f32;
     for item in selected {
         let predicted = SimilarityMotion {
             translation,
-            rotation,
-            scale_delta,
+            rotation_coefficient,
+            diagonal_coefficient_delta,
             ..SimilarityMotion::default()
         }
         .predict(item.previous, center);
@@ -9209,8 +9209,8 @@ fn fit_similarity_selected(selected: &[&Match], center: [f32; 2]) -> SimilarityM
     }
     SimilarityMotion {
         translation,
-        rotation,
-        scale_delta,
+        rotation_coefficient,
+        diagonal_coefficient_delta,
         residual: residual * inverse,
         support: selected.len(),
     }
@@ -9248,8 +9248,8 @@ fn stable_similarity_prior(selected: &[&Match], center: [f32; 2]) -> SimilarityM
     // gate. Retain only translation until normal-flow constraints span it.
     if x_span.1 - x_span.0 < 28.0
         || y_span.1 - y_span.0 < 20.0
-        || fitted.rotation.abs() > 0.08
-        || fitted.scale_delta.abs() > 0.08
+        || fitted.rotation_coefficient.abs() > 0.08
+        || fitted.diagonal_coefficient_delta.abs() > 0.08
     {
         fitted = SimilarityMotion {
             translation,
@@ -9387,8 +9387,8 @@ fn fit_similarity_with_normal_constraints(
     let prior_values = [
         prior.translation[0] as f64,
         prior.translation[1] as f64,
-        prior.scale_delta as f64,
-        prior.rotation as f64,
+        prior.diagonal_coefficient_delta as f64,
+        prior.rotation_coefficient as f64,
     ];
     for parameter in 0..4 {
         let weight = if parameter < 2 { 0.35 } else { 900.0 };
@@ -9400,14 +9400,14 @@ fn fit_similarity_with_normal_constraints(
     };
     let mut fitted = SimilarityMotion {
         translation: [solution[0] as f32, solution[1] as f32],
-        scale_delta: solution[2] as f32,
-        rotation: solution[3] as f32,
+        diagonal_coefficient_delta: solution[2] as f32,
+        rotation_coefficient: solution[3] as f32,
         support: point_indices.len() + normal_indices.len() + radial_constraints.len(),
         ..SimilarityMotion::default()
     };
     if fitted.translation[0].hypot(fitted.translation[1]) > SEARCH_RADIUS as f32 * 1.75
-        || fitted.rotation.abs() > 0.12
-        || fitted.scale_delta.abs() > 0.12
+        || fitted.rotation_coefficient.abs() > 0.12
+        || fitted.diagonal_coefficient_delta.abs() > 0.12
     {
         return SimilarityMotion {
             support: fitted.support,
@@ -9499,8 +9499,8 @@ fn robust_global_similarity(matches: &[Match], center: [f32; 2]) -> SimilarityMo
         fitted = fit_similarity_selected(&selected, center);
     }
     if fitted.translation[0].hypot(fitted.translation[1]) > SEARCH_RADIUS as f32 * 1.75
-        || fitted.rotation.abs() > 0.12
-        || fitted.scale_delta.abs() > 0.12
+        || fitted.rotation_coefficient.abs() > 0.12
+        || fitted.diagonal_coefficient_delta.abs() > 0.12
     {
         SimilarityMotion {
             translation,
@@ -9619,17 +9619,17 @@ fn shared_native_robust_global_similarity(
                 second.current[0] - first.current[0],
                 second.current[1] - first.current[1],
             ];
-            let scale_delta = (previous_delta[0] * current_delta[0]
+            let diagonal_coefficient_delta = (previous_delta[0] * current_delta[0]
                 + previous_delta[1] * current_delta[1])
                 / denominator
                 - 1.0;
-            let rotation = (previous_delta[0] * current_delta[1]
+            let rotation_coefficient = (previous_delta[0] * current_delta[1]
                 - previous_delta[1] * current_delta[0])
                 / denominator;
-            if !scale_delta.is_finite()
-                || !rotation.is_finite()
-                || scale_delta.abs() > 0.10
-                || rotation.abs() > 0.12
+            if !diagonal_coefficient_delta.is_finite()
+                || !rotation_coefficient.is_finite()
+                || diagonal_coefficient_delta.abs() > 0.10
+                || rotation_coefficient.abs() > 0.12
             {
                 continue;
             }
@@ -9637,8 +9637,8 @@ fn shared_native_robust_global_similarity(
                 let x = item.previous[0] - center[0];
                 let y = item.previous[1] - center[1];
                 [
-                    item.current[0] - item.previous[0] - scale_delta * x + rotation * y,
-                    item.current[1] - item.previous[1] - rotation * x - scale_delta * y,
+                    item.current[0] - item.previous[0] - diagonal_coefficient_delta * x + rotation_coefficient * y,
+                    item.current[1] - item.previous[1] - rotation_coefficient * x - diagonal_coefficient_delta * y,
                 ]
             };
             let first_translation = translation_for(first);
@@ -9648,8 +9648,8 @@ fn shared_native_robust_global_similarity(
                     0.5 * (first_translation[0] + second_translation[0]),
                     0.5 * (first_translation[1] + second_translation[1]),
                 ],
-                scale_delta,
-                rotation,
+                diagonal_coefficient_delta,
+                rotation_coefficient,
                 ..SimilarityMotion::default()
             };
             if motion.translation[0].hypot(motion.translation[1]) > 32.0 {
@@ -10927,8 +10927,8 @@ fn radial_limbus_motion_ranking(
         || consensus.residual > RADIAL_LIMBUS_CONSENSUS_MAX_FIT_RESIDUAL_PX
         || consensus.translation[0].hypot(consensus.translation[1])
             > RADIAL_LIMBUS_CONSENSUS_MAX_TRANSLATION_PX
-        || consensus.scale_delta.abs() > 0.08
-        || consensus.rotation.abs() > 0.08
+        || consensus.diagonal_coefficient_delta.abs() > 0.08
+        || consensus.rotation_coefficient.abs() > 0.08
     {
         return strict_selected;
     }
@@ -10985,8 +10985,8 @@ fn radial_limbus_robust_consensus_ranking(
         if !fitted.residual.is_finite()
             || fitted.translation[0].hypot(fitted.translation[1])
                 > RADIAL_LIMBUS_CONSENSUS_MAX_TRANSLATION_PX
-            || fitted.scale_delta.abs() > 0.08
-            || fitted.rotation.abs() > 0.08
+            || fitted.diagonal_coefficient_delta.abs() > 0.08
+            || fitted.rotation_coefficient.abs() > 0.08
         {
             return Vec::new();
         }
@@ -12171,8 +12171,8 @@ fn cluster_relation_motion_layers(
                         .hypot(motions[object].translation[1] - motions[*other].translation[1]);
                     translation
                         + 36.0
-                            * ((motions[object].rotation - motions[*other].rotation).abs()
-                                + (motions[object].scale_delta - motions[*other].scale_delta).abs())
+                            * ((motions[object].rotation_coefficient - motions[*other].rotation_coefficient).abs()
+                                + (motions[object].diagonal_coefficient_delta - motions[*other].diagonal_coefficient_delta).abs())
                 })
                 .fold(f32::INFINITY, f32::min);
             layers[object].separation = if nearest.is_finite() { nearest } else { 0.0 };
@@ -13131,7 +13131,7 @@ impl FourMotionOctrees {
             } else if horizontal_light_field.reliable {
                 SimilarityMotion {
                     translation: [horizontal_light_field.horizontal_translation_px, 0.0],
-                    scale_delta: horizontal_light_field.horizontal_scale_delta,
+                    diagonal_coefficient_delta: horizontal_light_field.horizontal_scale_delta,
                     support: horizontal_light_field.leaf_nodes,
                     residual: horizontal_light_field.residual_px,
                     ..SimilarityMotion::default()
@@ -13139,12 +13139,12 @@ impl FourMotionOctrees {
             } else {
                 SimilarityMotion::default()
             };
-            let scale = (1.0 + prior.scale_delta).clamp(0.88, 1.12);
+            let scale = (1.0 + prior.diagonal_coefficient_delta).clamp(0.88, 1.12);
             EyeMotionRegion {
                 center: prior.predict(region.center, center),
                 major: region.major * scale,
                 minor: region.minor * scale,
-                angle: (region.angle + prior.rotation).rem_euclid(std::f32::consts::PI),
+                angle: (region.angle + prior.rotation_coefficient).rem_euclid(std::f32::consts::PI),
             }
         });
         let measured_radial_region =
@@ -15001,11 +15001,11 @@ mod tests {
         let center = [100.0f32, 80.0f32];
         let truth = SimilarityMotion {
             translation: [2.0, -1.5],
-            scale_delta: 0.035,
+            diagonal_coefficient_delta: 0.035,
             // A radial band contributes normal flow. It should sharpen
             // translation/scale, but must not invent tangential identity or
             // angular motion on an otherwise featureless circular contour.
-            rotation: 0.0,
+            rotation_coefficient: 0.0,
             ..SimilarityMotion::default()
         };
         let matches = [[-5.0f32, -4.0], [5.0, -4.0], [5.0, 4.0], [-5.0, 4.0]]
@@ -15061,11 +15061,11 @@ mod tests {
             "{fitted:#?}"
         );
         assert!(
-            (fitted.scale_delta - truth.scale_delta).abs() <= 0.010,
+            (fitted.diagonal_coefficient_delta - truth.diagonal_coefficient_delta).abs() <= 0.010,
             "{fitted:#?}"
         );
         assert!(
-            (fitted.rotation - truth.rotation).abs() <= 0.010,
+            (fitted.rotation_coefficient - truth.rotation_coefficient).abs() <= 0.010,
             "{fitted:#?}"
         );
         assert_eq!(fitted.support, 16);
@@ -15848,7 +15848,7 @@ mod tests {
                         reliable += 1;
                         prior = SimilarityMotion {
                             translation: [field.horizontal_translation_px, 0.0],
-                            scale_delta: field.horizontal_scale_delta,
+                            diagonal_coefficient_delta: field.horizontal_scale_delta,
                             residual: field.residual_px,
                             support: field.leaf_nodes,
                             ..SimilarityMotion::default()
@@ -15861,7 +15861,7 @@ mod tests {
                                     <= 4.0,
                             );
                             scale_agreement += usize::from(
-                                (field.horizontal_scale_delta - reference.motion.scale_delta).abs()
+                                (field.horizontal_scale_delta - reference.motion.diagonal_coefficient_delta).abs()
                                     <= 0.030,
                             );
                         }
@@ -16078,7 +16078,7 @@ mod tests {
         assert!(second.reliable, "{second:?}");
         assert_eq!(second.candidate_motion.support, second.motion.support);
         assert!(
-            (second.motion.scale_delta - 0.02).abs() <= 0.010,
+            (second.motion.diagonal_coefficient_delta - 0.02).abs() <= 0.010,
             "{second:?}"
         );
         assert_eq!(second.stable_frames, 1, "{second:?}");
@@ -16095,7 +16095,7 @@ mod tests {
             "{third:?}"
         );
         assert!(
-            (third.motion.scale_delta - 0.02).abs() <= 0.010,
+            (third.motion.diagonal_coefficient_delta - 0.02).abs() <= 0.010,
             "{third:?}"
         );
         assert!(third.stable_frames >= 2, "{third:?}");
@@ -16122,9 +16122,9 @@ mod tests {
             assert!(evidence.reliable, "step={index} {evidence:?}");
             assert_eq!(usize::from(evidence.stable_frames), index);
             assert!(evidence.motion.translation[0].hypot(evidence.motion.translation[1]) < 0.20, "{evidence:?}");
-            assert!(evidence.motion.rotation.abs() < 0.002, "{evidence:?}");
-            assert!(evidence.motion.scale_delta.abs() < 0.002, "{evidence:?}");
-            let independent_scale = (1.0 + evidence.motion.scale_delta).hypot(evidence.motion.rotation);
+            assert!(evidence.motion.rotation_coefficient.abs() < 0.002, "{evidence:?}");
+            assert!(evidence.motion.diagonal_coefficient_delta.abs() < 0.002, "{evidence:?}");
+            let independent_scale = (1.0 + evidence.motion.diagonal_coefficient_delta).hypot(evidence.motion.rotation_coefficient);
             // Exact same scene/iris scale: SN-FEIDA must not acquire a crop
             // area factor. This scale comes from separate RAW texture.
             assert!((independent_scale.powi(-2) - 1.0).abs() < 0.004, "{evidence:?}");
@@ -16152,7 +16152,7 @@ mod tests {
             let fixed_prediction = control.motion.predict(point, control.motion_center_sensor);
             assert!((predicted[0] - fixed_prediction[0]).hypot(predicted[1] - fixed_prediction[1]) < 0.6,
                 "control={control:?} reframe={reframed:?}");
-            let independent_scale = (1.0 + reframed.motion.scale_delta).hypot(reframed.motion.rotation);
+            let independent_scale = (1.0 + reframed.motion.diagonal_coefficient_delta).hypot(reframed.motion.rotation_coefficient);
             assert!((independent_scale - 1.015).abs() < 0.006, "{reframed:?}");
             assert_eq!(usize::from(reframed.stable_frames), index);
         }
@@ -16205,8 +16205,8 @@ mod tests {
         let center = [50.0, 40.0];
         let truth = SimilarityMotion {
             translation: [3.0, -2.0],
-            rotation: 0.04,
-            scale_delta: 0.015,
+            rotation_coefficient: 0.04,
+            diagonal_coefficient_delta: 0.015,
             ..SimilarityMotion::default()
         };
         let points = [
@@ -16235,8 +16235,8 @@ mod tests {
         let fit = fit_similarity(&matches, 2, center);
         assert!((fit.translation[0] - truth.translation[0]).abs() < 1.0e-4);
         assert!((fit.translation[1] - truth.translation[1]).abs() < 1.0e-4);
-        assert!((fit.rotation - truth.rotation).abs() < 1.0e-4);
-        assert!((fit.scale_delta - truth.scale_delta).abs() < 1.0e-4);
+        assert!((fit.rotation_coefficient - truth.rotation_coefficient).abs() < 1.0e-4);
+        assert!((fit.diagonal_coefficient_delta - truth.diagonal_coefficient_delta).abs() < 1.0e-4);
     }
 
     #[test]
@@ -16255,8 +16255,8 @@ mod tests {
         let center = [100.0, 70.0];
         let truth = SimilarityMotion {
             translation: [1.5, -0.75],
-            rotation: 0.006,
-            scale_delta: 0.018,
+            rotation_coefficient: 0.006,
+            diagonal_coefficient_delta: 0.018,
             ..SimilarityMotion::default()
         };
         let broad = [
@@ -16317,9 +16317,9 @@ mod tests {
             (fit.translation[1] - truth.translation[1]).abs() < 0.05,
             "{fit:?}"
         );
-        assert!((fit.rotation - truth.rotation).abs() < 0.001, "{fit:?}");
+        assert!((fit.rotation_coefficient - truth.rotation_coefficient).abs() < 0.001, "{fit:?}");
         assert!(
-            (fit.scale_delta - truth.scale_delta).abs() < 0.001,
+            (fit.diagonal_coefficient_delta - truth.diagonal_coefficient_delta).abs() < 0.001,
             "{fit:?}"
         );
     }
@@ -16329,8 +16329,8 @@ mod tests {
         let center = [4_200.0, 2_100.0];
         let truth = SimilarityMotion {
             translation: [2.5, -1.5],
-            rotation: 0.018,
-            scale_delta: 0.035,
+            rotation_coefficient: 0.018,
+            diagonal_coefficient_delta: 0.035,
             ..SimilarityMotion::default()
         };
         let pairs = [
@@ -16354,8 +16354,8 @@ mod tests {
         assert!(measured.residual < 1.0e-3, "measured={measured:?}");
         assert!((measured.translation[0] - truth.translation[0]).abs() < 1.0e-3);
         assert!((measured.translation[1] - truth.translation[1]).abs() < 1.0e-3);
-        assert!((measured.rotation - truth.rotation).abs() < 1.0e-3);
-        assert!((measured.scale_delta - truth.scale_delta).abs() < 1.0e-3);
+        assert!((measured.rotation_coefficient - truth.rotation_coefficient).abs() < 1.0e-3);
+        assert!((measured.diagonal_coefficient_delta - truth.diagonal_coefficient_delta).abs() < 1.0e-3);
     }
 
     #[test]
@@ -16364,8 +16364,8 @@ mod tests {
         let new_center = [4_096.0, 2_160.0];
         let motion = SimilarityMotion {
             translation: [3.5, -2.25],
-            rotation: 0.037,
-            scale_delta: -0.021,
+            rotation_coefficient: 0.037,
+            diagonal_coefficient_delta: -0.021,
             residual: 0.4,
             support: 9,
         };
@@ -16452,11 +16452,11 @@ mod tests {
             );
             last = overlay;
         }
-        let relative = last.coupled_motion.green_relative_to_cyan;
+        let relative = last.coupled_motion.pupil_relative_to_general;
         assert!(relative.samples >= 4, "{relative:?}");
         assert!(relative.speed_px_s < 0.5, "{relative:?}");
         assert!(
-            last.coupled_motion.saccade_likelihood < 0.10,
+            last.coupled_motion.saccade_score < 0.10,
             "{:?}",
             last.coupled_motion
         );
@@ -16479,12 +16479,12 @@ mod tests {
             );
             last = overlay;
         }
-        let relative = last.coupled_motion.green_relative_to_cyan;
+        let relative = last.coupled_motion.pupil_relative_to_general;
         assert!(relative.samples >= 4, "{relative:?}");
         assert!(relative.confidence >= 0.12, "{relative:?}");
         assert!(relative.speed_px_s >= 70.0, "{relative:?}");
         assert!(
-            last.coupled_motion.saccade_likelihood >= 0.68,
+            last.coupled_motion.saccade_score >= 0.68,
             "{:?}",
             last.coupled_motion
         );
@@ -16499,8 +16499,8 @@ mod tests {
             4_000,
             3_000,
         );
-        assert_eq!(dropout.coupled_motion.green_relative_to_cyan.samples, 0);
-        assert_eq!(dropout.coupled_motion.saccade_likelihood, 0.0);
+        assert_eq!(dropout.coupled_motion.pupil_relative_to_general.samples, 0);
+        assert_eq!(dropout.coupled_motion.saccade_score, 0.0);
     }
 
     fn synthetic_native_similarity_texture(
@@ -16568,7 +16568,7 @@ mod tests {
         assert!(motion.support >= 6, "motion={motion:?}");
         assert!(motion.residual <= 2.0, "motion={motion:?}");
         assert!(
-            (motion.scale_delta - 0.025).abs() <= 0.012,
+            (motion.diagonal_coefficient_delta - 0.025).abs() <= 0.012,
             "motion={motion:?}",
         );
         assert!(overlays[2].layers[PUPIL_LAYER].stable_frames >= 2);
@@ -16876,8 +16876,8 @@ mod tests {
         );
         assert!((fitted.translation[0] - translation[0]).abs() < 0.05);
         assert!((fitted.translation[1] - translation[1]).abs() < 0.05);
-        assert!(fitted.rotation.abs() < 0.01);
-        assert!(fitted.scale_delta.abs() < 0.01);
+        assert!(fitted.rotation_coefficient.abs() < 0.01);
+        assert!(fitted.diagonal_coefficient_delta.abs() < 0.01);
         assert!(fitted.residual < 0.05);
     }
 
@@ -17358,8 +17358,8 @@ mod tests {
         let center = [64.0f32, 48.0f32];
         let motion = SimilarityMotion {
             translation: [1.7, -0.8],
-            rotation: 0.018,
-            scale_delta: -0.006,
+            rotation_coefficient: 0.018,
+            diagonal_coefficient_delta: -0.006,
             ..SimilarityMotion::default()
         };
         let matches = (0..19)
