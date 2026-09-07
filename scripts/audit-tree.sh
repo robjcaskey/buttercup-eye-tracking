@@ -16,6 +16,7 @@ mapfile -t unexpected_files < <(
       ./AGENTS.md \
       ./Cargo.lock \
       ./Cargo.toml \
+      ./crates/buttercup/Cargo.toml \
       ./build.rs \
       ./README.md \
       ./docs/viewer-overview.png \
