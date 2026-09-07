@@ -9,6 +9,7 @@ import argparse
 import collections
 import json
 import math
+import itertools
 from pathlib import Path
 import statistics
 
@@ -21,11 +22,116 @@ def distribution(values):
             "p95": values[round((len(values)-1)*0.95)], "maximum": values[-1]}
 
 
+def adjacent_area_steps(timeline):
+    """Reports emit pairs before pending singletons, not in exposure order."""
+    pixel_steps,normalized_steps=[],[]
+    previous=None
+    for clock,timestamp,sequence,dimensions,radii,normalized in sorted(timeline,key=lambda r:(r[0],r[1],r[2])):
+        current=(clock,timestamp,sequence,dimensions,radii,normalized)
+        if previous and radii and previous[4] and clock==previous[0] and dimensions==previous[3] \
+                and 0<timestamp-previous[1]<=500_000_000 and sequence!=previous[2]:
+            pixel_steps.append(tuple(abs(2*math.log(r/previous_r)) for r,previous_r in zip(radii,previous[4])))
+            if all(v is not None and v>0 for v in normalized+previous[5]):
+                normalized_steps.append(tuple(abs(math.log(v/previous_v)) for v,previous_v in zip(normalized,previous[5])))
+        # Missing/rejected observations explicitly break the chain, including
+        # when that single-ROI read was emitted after the complete pairs.
+        previous=current
+    return pixel_steps,normalized_steps
+
+
+def matched_algorithm_report(baseline, candidate, index_ranges):
+    """Stream exact source-matched rows; never silently compare different probes.
+
+    This contract is for optimizer-only A/B trials with the same extraction.
+    Arc index/type/count equality is checked; callers must also keep extraction
+    and withheld coordinates unchanged (the old exports predate probe hashes).
+    """
+    coverage=[collections.Counter(),collections.Counter()]
+    residuals=[[],[]]
+    supported=[[],[]]
+    area_steps=[[],[]]
+    normalized_steps=[[],[]]
+    timeline=[[],[]]
+    regressions=[]
+    probe_verification=collections.Counter()
+    rows=0
+    def in_scope(row):
+        return not index_ranges or all(any(lo<=item["index"]<hi for lo,hi in index_ranges)
+            for item in row["inputs"] if item)
+    with baseline.open() as first,candidate.open() as second:
+        for line_a,line_b in itertools.zip_longest(first,second):
+            if line_a is None or line_b is None:
+                raise ValueError("baseline/candidate source-read counts differ")
+            a,b=json.loads(line_a),json.loads(line_b)
+            if a["inputs"]!=b["inputs"]:
+                raise ValueError("baseline/candidate source identity or row order differs")
+            if not in_scope(b):
+                continue
+            rows+=1
+            for eye,source in enumerate(b["inputs"]):
+                if source is None:
+                    continue
+                fits=[row.get("joint",{}) for row in (a,b)]
+                admitted=[fit.get("available",False) and fit["contributing_eyes"][eye] for fit in fits]
+                coverage[eye][f"baseline:{admitted[0]},candidate:{admitted[1]}"]+=1
+                frame=source["frame"]
+                dimensions=tuple(frame.get(k) for k in ("width","height","stride"))
+                observed_outer=all(admitted) and all(any(a["roi"]==eye+1 and a["kind"]=="OuterLimbus" and a["used"]
+                    for a in fit.get("support",[])) for fit in fits)
+                radii=[fit["outer_ellipses"][eye]["major_radius"] for fit in fits] if observed_outer else None
+                normalized=[fit["sn_feida_mm2"][eye] for fit in fits] if observed_outer else None
+                timeline[eye].append((source["clock_lineage"],int(frame["timestamp_ns"]),int(frame["sequence"]),dimensions,radii,normalized))
+                if not all(admitted):
+                    continue
+                probes=[fit["withheld_sample_residuals"][eye] for fit in fits]
+                if all(p and p["rms_px"] is not None for p in probes):
+                    keys=lambda p:[(g["arc"],g["group"],g["kind"],g["points"]) for g in p["groups"]]
+                    if keys(probes[0])!=keys(probes[1]):
+                        raise ValueError("A/B withheld probe structure changed; optimizer-only comparison is invalid")
+                    for ga,gb in zip(probes[0]["groups"],probes[1]["groups"]):
+                        if ga.get("sample_fingerprint") and gb.get("sample_fingerprint"):
+                            if ga["sample_fingerprint"]!=gb["sample_fingerprint"]:
+                                raise ValueError("A/B withheld coordinates changed despite matching counts")
+                            probe_verification["coordinate_fingerprints_matched"]+=1
+                        else:
+                            probe_verification["legacy_structure_only_checks"]+=1
+                    residuals[eye].append(tuple(p["rms_px"] for p in probes))
+                    common=[(ga,gb) for ga,gb in zip(probes[0]["groups"],probes[1]["groups"])
+                        if ga["used"] and gb["used"]]
+                    if common:
+                        count=sum(ga["points"] for ga,gb in common)
+                        supported[eye].append(tuple(math.sqrt(sum(pair[i]["rms_px"]**2*pair[i]["points"] for pair in common)/count) for i in (0,1)))
+                    regressions.append({"eye":eye,"index":source["index"],"baseline_rms_px":probes[0]["rms_px"],
+                        "candidate_rms_px":probes[1]["rms_px"],"delta_rms_px":probes[1]["rms_px"]-probes[0]["rms_px"]})
+    for eye in range(2):
+        area_steps[eye],normalized_steps[eye]=adjacent_area_steps(timeline[eye])
+    def comparison(pairs):
+        return {"matched":len(pairs),"baseline":distribution([a for a,b in pairs]),
+            "candidate":distribution([b for a,b in pairs]),"candidate_minus_baseline":distribution([b-a for a,b in pairs]),
+            "improved_over_1px":sum(b<a-1 for a,b in pairs),"regressed_over_1px":sum(b>a+1 for a,b in pairs)}
+    return {"baseline":str(baseline),"candidate":str(candidate),"matched_reads":rows,"index_ranges":index_ranges,
+        "probe_verification":probe_verification,
+        "eye_admission":coverage,"all_withheld_samples":[comparison(p) for p in residuals],
+        "common_accepted_arc_samples":[comparison(p) for p in supported],
+        "frontal_equivalent_pixel_area_log_steps":[{"matched":len(p),"baseline":distribution([a for a,b in p]),
+            "candidate":distribution([b for a,b in p])} for p in area_steps],
+        "independent_SN_FEIDA_log_steps":[{"matched":len(p),"baseline":distribution([a for a,b in p]),
+            "candidate":distribution([b for a,b in p])} for p in normalized_steps],
+        "largest_regressions":sorted(regressions,key=lambda r:-r["delta_rms_px"])[:30],
+        "limitations":["Optimizer-only comparison: unchanged extraction/withheld coordinates must be verified separately for old exports lacking probe hashes.",
+            "Pixel-area steps are unnormalized, include genuine motion, and do not establish physical area stability.",
+            "Short adjacent same-clock intervals only; no bridging absent fits or treating held source exposures as new.",
+            "Limbus localization and gaze/pose ground truth remain separate post-fit validations."]}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("evaluation", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--expected-manifest", type=Path)
+    parser.add_argument("--baseline-evaluation", type=Path)
+    parser.add_argument("--index-range", type=int, nargs=2, action="append", default=[], metavar=("START", "END"),
+        help="optional source-index intervals for the separate optimizer A/B report; END is exclusive")
     args = parser.parse_args()
     methods = ("joint", "monocular_right", "monocular_left")
     summary = {m: {"available": 0, "unavailable": collections.Counter(),
@@ -128,6 +234,8 @@ def main():
                         "Withheld contour samples do not make upstream segmentation/search independent of that image.",
                         "SN-FEIDA is absent when external coarse scale is unavailable; no self-radius normalization.",
                         "Comparison against human native-RAW localization labels and sequence continuity remains separately required."]}
+    if args.baseline_evaluation:
+        report["matched_algorithm_comparison"]=matched_algorithm_report(args.baseline_evaluation,args.evaluation,args.index_range)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps({"scope": report["scope"], "withheld_sample_comparisons": comparisons}, indent=2))
 

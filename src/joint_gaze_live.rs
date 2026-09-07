@@ -179,7 +179,8 @@ pub(crate) fn json(frame:&EyeFrame)->Value {
         "eye_centers":s.eye_centers_camera_mm,"surface_normals":s.eye_normals,"gaze_directions":s.eye_gaze_directions,
         "contributing_eyes":s.contributing_eyes,"cost":s.robust_cost,"alternative_cost_margin":s.alternative_cost_margin,
         "arcs":s.arcs.iter().map(|a|json!({"roi_id":a.exposure.roi.0,"group":a.evidence_group,"kind":format!("{:?}",a.kind),
-            "used":a.used,"rms_px":a.rms_px,"sigma_px":a.sigma_px})).collect::<Vec<_>>(),
+            "used":a.used,"rms_px":a.rms_px,"sigma_px":a.sigma_px,
+            "support_length_px":a.support_length_px,"evidence_weight":a.evidence_weight})).collect::<Vec<_>>(),
         "uncertainty":"conditional engineering supports; not calibrated probabilities or measured anatomical pose",
         "transform_to_legacy_monitor_frame":null})
 }

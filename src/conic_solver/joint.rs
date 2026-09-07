@@ -25,6 +25,9 @@ const MAX_HYPOTHESES: usize = 24;
 const MAX_REFINEMENTS: usize = 16;
 const HUBER_TRANSITION: f64 = 3.0;
 const MAXIMUM_GROUP_COST: f64 = 9.0;
+/// Conservative native-image correlation length, not a count of detector
+/// samples. Splitting/resampling a contour must not create more evidence.
+const SUPPORT_CORRELATION_LENGTH_PX: f64 = 32.0;
 
 /// Bounded engineering support with a soft center. This is not a confidence
 /// interval. All bounds are frozen before the candidate is evaluated.
@@ -193,6 +196,7 @@ pub(crate) enum JointConicUnavailable {
     IncompatibleClocks,
     ExcessiveSourceSkew,
     NoBoundaryEvidence,
+    NoFeasibleInitialization,
     NoFeasibleHypothesis,
 }
 
@@ -204,6 +208,8 @@ pub(crate) struct ArcSupport {
     pub(crate) kind: BoundaryKind,
     pub(crate) rms_px: f64,
     pub(crate) sigma_px: f64,
+    pub(crate) support_length_px: f64,
+    pub(crate) evidence_weight: f64,
     pub(crate) used: bool,
 }
 
@@ -300,8 +306,20 @@ fn boundary_index(kind: BoundaryKind) -> Option<usize> {
 /// point. The ellipse center is NOT assumed to be the projected circle center.
 pub(crate) fn circle_normal_hypotheses(camera:PinholeCamera,ellipse:Ellipse,origin:[u32;2])
     -> Option<[[f64;3];2]> {
+    circle_pose_hypotheses(camera,ellipse,origin).map(|poses|poses.map(|p|p.normal))
+}
+
+#[derive(Clone,Copy,Debug)]
+struct CirclePoseSeed {normal:[f64;3],center_per_radius:[f64;3]}
+
+/// A conic determines two circular sections up to one metric scale. Keep that
+/// scale conditional on the caller's frozen scene support; this is a start,
+/// not another pixel factor or an independent scale measurement.
+fn circle_pose_hypotheses(camera:PinholeCamera,ellipse:Ellipse,origin:[u32;2])
+    ->Option<[CirclePoseSeed;2]> {
     if !camera.valid() || !ellipse.major_radius.is_finite() || !ellipse.minor_radius.is_finite()
-        || ellipse.minor_radius<=0.0 || ellipse.major_radius<ellipse.minor_radius || !ellipse.angle.is_finite() {return None;}
+        || ellipse.minor_radius<=0.0 || ellipse.major_radius<ellipse.minor_radius || !ellipse.angle.is_finite()
+        || !ellipse.center.0.is_finite() || !ellipse.center.1.is_finite() {return None;}
     let (s,c)=ellipse.angle.sin_cos();
     let aa=ellipse.major_radius.powi(-2);let bb=ellipse.minor_radius.powi(-2);
     let a=c*c*aa+s*s*bb;let b=c*s*(aa-bb);let d=s*s*aa+c*c*bb;
@@ -320,13 +338,24 @@ pub(crate) fn circle_normal_hypotheses(camera:PinholeCamera,ellipse:Ellipse,orig
     if middle<=0.0 || smallest>=0.0 {return None;}
     let first=((largest-middle)/(largest-smallest)).clamp(0.0,1.0).sqrt();
     let last=((middle-smallest)/(largest-smallest)).clamp(0.0,1.0).sqrt();
-    let mut normals=[[0.0;3];2];
+    let mut poses=[CirclePoseSeed {normal:[0.0;3],center_per_radius:[0.0;3]};2];
     for (i,sign) in [-1.0,1.0].into_iter().enumerate() {
         let n=std::array::from_fn(|r|sign*first*vectors[r][order[0]]+last*vectors[r][order[2]]);
         let n=normalized3(n)?;
-        normals[i]=if n[2]<0.0 {scale3(n,-1.0)} else {n};
+        let n=if n[2]<0.0 {scale3(n,-1.0)} else {n};
+        // For plane n.C=k, the middle cone eigenvalue is proportional to k².
+        // Hn/k² = -C/k + (|C|²-r²)n/k². Its transverse part gives C/k;
+        // n.C/k=1 then fixes its axial part. Choose k<0 to face the camera.
+        let hn=std::array::from_fn(|r|(0..3).map(|c|cone[r][c]*n[c]/middle).sum::<f64>());
+        let axial=dot3(n,hn);
+        let center_per_plane_offset=sub3(scale3(n,1.0+axial),hn);
+        let radius_squared=dot3(center_per_plane_offset,center_per_plane_offset)-1.0-axial;
+        if radius_squared<=0.0 || !radius_squared.is_finite() {return None;}
+        let center_per_radius=scale3(center_per_plane_offset,-radius_squared.sqrt().recip());
+        if center_per_radius[2]>=0.0 {return None;}
+        poses[i]=CirclePoseSeed {normal:n,center_per_radius};
     }
-    Some(normals)
+    Some(poses)
 }
 
 fn symmetric_eigen_3x3(mut a:[[f64;3];3])->Option<([f64;3],[[f64;3];3])> {
@@ -355,9 +384,30 @@ fn symmetric_eigen_3x3(mut a:[[f64;3];3])->Option<([f64;3],[[f64;3];3])> {
 struct SparseArc {
     eye: usize, index: usize, kind: BoundaryKind, boundary: usize,
     group: u32, points: Vec<(f64,f64)>, sigma: f64,
+    quadrature: Vec<f64>, length_px:f64, weight:f64,
 }
 
-struct Group { alternatives: Vec<SparseArc> }
+impl SparseArc {
+    fn mean_cost(&self,conic:ProjectedCircle)->f64 {
+        self.points.iter().zip(&self.quadrature).map(|(&p,&w)|w*robust_residual(conic.residual_px(p)/self.sigma).powi(2)).sum()
+    }
+}
+
+struct Group { alternatives: Vec<SparseArc>, weight:f64 }
+
+/// Trapezoidal integration along the actual observed polyline. Duplicate
+/// points add zero length. Point count itself supplies no information mass.
+fn polyline_quadrature(points:&[(f64,f64)])->Option<(Vec<f64>,f64)> {
+    let mut weights=vec![0.0;points.len()];
+    for (i,pair) in points.windows(2).enumerate() {
+        let length=(pair[1].0-pair[0].0).hypot(pair[1].1-pair[0].1);
+        weights[i]+=0.5*length;weights[i+1]+=0.5*length;
+    }
+    let length=weights.iter().sum::<f64>();
+    if !length.is_finite() || length<=1.0e-9 {return None;}
+    for weight in &mut weights {*weight/=length;}
+    Some((weights,length))
+}
 type Parameters = [f64; PARAMETERS];
 
 struct Problem<'a> {
@@ -405,13 +455,17 @@ impl<'a> Problem<'a> {
                 let count = arc.points_roi_px.len().min(MAX_POINTS_PER_ARC);
                 let points = (0..count).map(|j| arc.points_roi_px[j*(arc.points_roi_px.len()-1)/(count-1)]).collect::<Vec<_>>();
                 if points.iter().any(|&(x,y)| !x.is_finite() || !y.is_finite()) { continue; }
+                let Some((quadrature,length_px))=polyline_quadrature(&points) else {continue;};
                 let existing = (start..groups.len()).find(|&i| groups[i].alternatives[0].group == arc.evidence_group);
                 if existing.is_none() && groups.len()-start >= MAX_GROUPS_PER_EYE { continue; }
-                let i = existing.unwrap_or_else(|| { groups.push(Group { alternatives: Vec::new() }); groups.len()-1 });
+                let i = existing.unwrap_or_else(|| { groups.push(Group { alternatives: Vec::new(),weight:0.0 }); groups.len()-1 });
                 if groups[i].alternatives.len() >= MAX_ALTERNATIVES_PER_GROUP { continue; }
                 let band = arc.normal_band_half_width_px.filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.0);
+                let sigma=optical_sigma.hypot(band).hypot(timing_sigma);
+                let weight=(length_px/SUPPORT_CORRELATION_LENGTH_PX.max(8.0*sigma)).min(16.0);
+                groups[i].weight=groups[i].weight.max(weight);
                 groups[i].alternatives.push(SparseArc { eye, index, kind: arc.kind, boundary,
-                    group: arc.evidence_group, points, sigma: optical_sigma.hypot(band).hypot(timing_sigma) });
+                    group: arc.evidence_group, points, sigma,quadrature,length_px,weight });
                 present[eye] = true;
             }
         }
@@ -473,7 +527,75 @@ impl<'a> Problem<'a> {
             p.initial[k+4]=p.initial[k+4].min(p.initial[k+3]*0.98).max(p.lower[k+4]);
             p.initial[k+5]=p.initial[k+5].min(p.initial[k+4]*0.90).max(p.lower[k+5]);
         }
+        let nominal_geometry=p.initial;
+        for eye in 0..2 {if present[eye] {
+            let hint=request.eyes[eye].and_then(|e|e.conics.iter().find(|c|c.kind==BoundaryKind::OuterLimbus)
+                .and_then(|c|circle_pose_hypotheses(scene.camera,c.ellipse_roi_px,e.sensor_origin_px)));
+            if let Some(poses)=hint {
+                if let Some(initial)=p.seed_circle_geometry(p.initial,eye,poses[0]) {p.initial=initial;}
+            }
+        }}
+        // Two individually plausible conic-scale starts can violate a joint
+        // IPD bound. Move only the INITIAL nuisance parameters back toward the
+        // frozen nominal scene until their pair is feasible. Otherwise every
+        // target/sign start fails before the joint objective sees any pixels.
+        if !p.interocular_feasible(&p.initial) {
+            let conic_geometry=p.initial;
+            for fraction in [0.5,0.25,0.125,0.0] {
+                for i in TARGET_PARAMETERS..PARAMETERS {
+                    p.initial[i]=nominal_geometry[i]+fraction*(conic_geometry[i]-nominal_geometry[i]);
+                }
+                if p.interocular_feasible(&p.initial) {break;}
+            }
+        }
         Ok(p)
+    }
+
+    fn interocular_feasible(&self,p:&Parameters)->bool {
+        self.request.scene.interocular_distance_mm.filter(|_|self.present==[true,true]).is_none_or(|ipd| {
+            let other=TARGET_PARAMETERS+EYE_PARAMETERS;
+            let distance=norm3(sub3([p[3],p[4],p[5]],[p[other],p[other+1],p[other+2]]));
+            distance>=ipd.minimum && distance<=ipd.maximum
+        })
+    }
+
+    fn seed_circle_geometry(&self,mut p:Parameters,eye:usize,pose:CirclePoseSeed)->Option<Parameters> {
+        let prior=self.request.scene.eyes[eye]?;
+        let position=prior.limbus_center;
+        let radius=prior.radii_mm[0];
+        let mut lower=radius.minimum.max(prior.radii_mm[1].minimum);
+        let mut upper=radius.maximum;
+        let mut numerator=radius.nominal/radius.sigma.powi(2);
+        let mut denominator=radius.sigma.powi(2).recip();
+        for axis in 0..3 {
+            if axis<2 && matches!(position.transverse_frame,TransversePositionFrame::AtNominalDepth) {continue;}
+            let slope=pose.center_per_radius[axis];
+            if slope.abs()>1.0e-12 {
+                let endpoints=[(position.camera_mm[axis]-position.maximum_displacement_mm[axis])/slope,
+                    (position.camera_mm[axis]+position.maximum_displacement_mm[axis])/slope];
+                lower=lower.max(endpoints[0].min(endpoints[1]));
+                upper=upper.min(endpoints[0].max(endpoints[1]));
+            }
+            numerator+=slope*position.camera_mm[axis]/position.sigma_mm[axis].powi(2);
+            denominator+=slope*slope/position.sigma_mm[axis].powi(2);
+        }
+        if lower>upper {return None;}
+        let r=(numerator/denominator).clamp(lower,upper);
+        let center=scale3(pose.center_per_radius,r);
+        if position.displacement(center).into_iter().zip(position.maximum_displacement_mm)
+            .any(|(d,b)|d.abs()>b+1.0e-9) {return None;}
+        let k=TARGET_PARAMETERS+eye*EYE_PARAMETERS;
+        let depth_ratio=center[2]/p[k+2];
+        p[k..k+3].copy_from_slice(&center);p[k+3]=r;
+        // Keep inner/pupil hint starts on this depth scale, while respecting
+        // the same fixed bounds and nesting. No prior or diagnostic is changed.
+        for boundary in 1..3 {
+            let observed=self.request.eyes[eye]?.conics.iter().any(|c|boundary_index(c.kind)==Some(boundary));
+            if observed {p[k+3+boundary]=(p[k+3+boundary]*depth_ratio).clamp(self.lower[k+3+boundary],self.upper[k+3+boundary]);}
+        }
+        p[k+4]=p[k+4].min(p[k+3]).max(self.lower[k+4]);
+        p[k+5]=p[k+5].min(p[k+4]-1.0e-6).max(self.lower[k+5]);
+        Some(p)
     }
 
     fn target(&self, p: &Parameters) -> [f64; 3] {
@@ -523,11 +645,7 @@ impl<'a> Problem<'a> {
         for eye in 0..2 { if self.present[eye] {
             conics[eye] = self.geometry(p,eye)?.2.map(Some);
         }}
-        if let Some(ipd) = self.request.scene.interocular_distance_mm.filter(|_| self.present == [true,true]) {
-            let other=TARGET_PARAMETERS+EYE_PARAMETERS;
-            let distance = norm3(sub3([p[3],p[4],p[5]], [p[other],p[other+1],p[other+2]]));
-            if distance < ipd.minimum || distance > ipd.maximum { return None; }
-        }
+        if !self.interocular_feasible(p) {return None;}
         Some(conics)
     }
 
@@ -535,9 +653,10 @@ impl<'a> Problem<'a> {
         self.groups.iter().map(|g| {
             g.alternatives.iter().enumerate().map(|(i,a)| {
                 let c = conics[a.eye][a.boundary].unwrap();
-                let cost = a.points.iter().map(|&p| robust_residual(c.residual_px(p)/a.sigma).powi(2)).sum::<f64>()/a.points.len() as f64;
-                (i,cost)
-            }).min_by(|a,b| a.1.total_cmp(&b.1)).unwrap().0
+                let mean=a.mean_cost(c);
+                let cost=a.weight*mean.min(MAXIMUM_GROUP_COST)+(g.weight-a.weight)*MAXIMUM_GROUP_COST;
+                (i,cost,mean)
+            }).min_by(|a,b| a.1.total_cmp(&b.1).then(a.2.total_cmp(&b.2))).unwrap().0
         }).collect()
     }
 
@@ -547,14 +666,19 @@ impl<'a> Problem<'a> {
         for (group,&choice) in self.groups.iter().zip(selected) {
             let arc = &group.alternatives[choice];
             let conic = conics[arc.eye][arc.boundary]?;
-            let normalization = (arc.points.len() as f64).sqrt();
-            let terms=arc.points.iter().map(|&point| robust_residual(conic.residual_px(point)/arc.sigma)/normalization).collect::<Vec<_>>();
-            if squared_norm(&terms)>=MAXIMUM_GROUP_COST {
+            let outlier=arc.mean_cost(conic)>=MAXIMUM_GROUP_COST;
+            if outlier {
                 // An incompatible arc group is an outlier hypothesis with a
                 // fixed cost, NOT a spring that can keep dragging the other
                 // eye. Bounded multiple starts retain a way back into support.
-                r.extend(std::iter::repeat_n(MAXIMUM_GROUP_COST.sqrt()/normalization,terms.len()));
-            } else {r.extend(terms);}
+                r.extend(arc.quadrature.iter().map(|&w|(MAXIMUM_GROUP_COST*arc.weight*w).sqrt()));
+            } else {
+                r.extend(arc.points.iter().zip(&arc.quadrature).map(|(&point,&w)|
+                    robust_residual(conic.residual_px(point)/arc.sigma)*(arc.weight*w).sqrt()));
+            }
+            // A shorter correlated alternative cannot inherit the longer
+            // one's weight, or win merely by omitting most of its coverage.
+            r.push(((group.weight-arc.weight)*MAXIMUM_GROUP_COST).sqrt());
         }
         let scene = self.request.scene;
         // Scale/position priors are separate from arc residuals. A radius does
@@ -608,7 +732,8 @@ impl<'a> Problem<'a> {
             for eye in 0..2 {
                 if !self.present[eye] { continue; }
                 let evidence = self.request.eyes[eye].unwrap();
-                let center = self.request.scene.eyes[eye].unwrap().limbus_center.camera_mm;
+                let k=TARGET_PARAMETERS+eye*EYE_PARAMETERS;
+                let center = [self.initial[k],self.initial[k+1],self.initial[k+2]];
                 let toward = normalized3(scale3(center,-1.0)).unwrap();
                 let u = normalized3(cross3([0.0,1.0,0.0],toward)).unwrap();
                 let v = cross3(toward,u);
@@ -711,11 +836,12 @@ impl<'a> Problem<'a> {
             let a = &g.alternatives[selection];
             let c = conics[a.eye][a.boundary]?;
             let rms = (a.points.iter().map(|&p| c.residual_px(p).powi(2)).sum::<f64>()/a.points.len() as f64).sqrt();
-            let group_cost=a.points.iter().map(|&p|robust_residual(c.residual_px(p)/a.sigma).powi(2)).sum::<f64>()/a.points.len() as f64;
+            let group_cost=a.mean_cost(c);
             let used = group_cost < MAXIMUM_GROUP_COST;
             result.contributing_eyes[a.eye] |= used;
             result.arcs.push(ArcSupport { exposure: self.request.eyes[a.eye]?.exposure,
-                evidence_group: a.group, arc_index: a.index, kind: a.kind, rms_px: rms, sigma_px: a.sigma, used });
+                evidence_group: a.group, arc_index: a.index, kind: a.kind, rms_px: rms, sigma_px: a.sigma,
+                support_length_px:a.length_px,evidence_weight:a.weight,used });
         }
         for eye in 0..2 { if self.present[eye] {
             let (center,normal,_) = self.geometry(p,eye)?;
@@ -787,7 +913,7 @@ pub(crate) fn solve_joint_conics(request: JointConicRequest<'_>) -> Result<Joint
     let hypotheses = seeds.len();
     let mut fits = seeds.into_iter().filter_map(|p| problem.refine(p)).collect::<Vec<_>>();
     fits.sort_by(|a,b| a.1.total_cmp(&b.1));
-    let (p,cost,_) = fits.first().ok_or(JointConicUnavailable::NoFeasibleHypothesis)?;
+    let (p,cost,_) = fits.first().ok_or(JointConicUnavailable::NoFeasibleInitialization)?;
     let mut solution = problem.solution(p,*cost).ok_or(JointConicUnavailable::NoFeasibleHypothesis)?;
     solution.hypotheses_evaluated = hypotheses;
     solution.refinement_steps = fits.iter().map(|f| f.2).sum();

@@ -36,6 +36,14 @@ fn ellipse_json(e:Option<geometry::Ellipse>)->Value {e.map(|e|json!({"center":e.
 fn points(v:&Value)->Vec<(f64,f64)> {v.as_array().map(|a|a.iter().filter_map(|p|Some((p[0].as_f64()?,p[1].as_f64()?))).collect()).unwrap_or_default()}
 fn hash(s:&str)->u64 {s.bytes().fold(14695981039346656037,|h,b|(h^b as u64).wrapping_mul(1099511628211))}
 
+fn sample_fingerprint(points:&[(f64,f64)])->String {
+    let mut digest=14695981039346656037u64;
+    for &(x,y) in points {for coordinate in [x,y] {for byte in coordinate.to_bits().to_le_bytes() {
+        digest=(digest^byte as u64).wrapping_mul(1099511628211);
+    }}}
+    format!("{digest:016x}")
+}
+
 struct Frame {
     input:Value,
     packet:OwnedRoiEvidence,
@@ -110,7 +118,8 @@ fn heldout(solution:&JointConicSolution,frames:&[Option<Frame>;2])->[Value;2] {
             let used=solution.arcs.iter().any(|a|a.exposure.roi==frame.packet.exposure.roi&&a.arc_index==*index&&a.used);
             if used {supported.extend_from_slice(&residuals);}
             groups.push(json!({"arc":index,"group":group,"kind":format!("{kind:?}"),"used":used,
-                "points":residuals.len(),"rms_px":(residuals.iter().map(|v|v*v).sum::<f64>()/residuals.len() as f64).sqrt()}));
+                "points":residuals.len(),"sample_fingerprint":sample_fingerprint(points),
+                "rms_px":(residuals.iter().map(|v|v*v).sum::<f64>()/residuals.len() as f64).sqrt()}));
             values.extend(residuals);
         }
         json!({"points":values.len(),"rms_px":(!values.is_empty()).then(||(values.iter().map(|v|v*v).sum::<f64>()/values.len() as f64).sqrt()),
@@ -131,7 +140,8 @@ fn solution_json(result:Result<JointConicSolution,JointConicUnavailable>,frames:
             "hypotheses":solution.hypotheses_evaluated,"refinement_steps":solution.refinement_steps,
             "outer_ellipses":solution.ellipses_roi_px.map(|e|ellipse_json(e[0])),
             "support":solution.arcs.iter().map(|a|json!({"roi":a.exposure.roi.0,"kind":format!("{:?}",a.kind),
-                "group":a.evidence_group,"arc":a.arc_index,"rms_px":a.rms_px,"sigma_px":a.sigma_px,"used":a.used})).collect::<Vec<_>>(),
+                "group":a.evidence_group,"arc":a.arc_index,"rms_px":a.rms_px,"sigma_px":a.sigma_px,"used":a.used,
+                "support_length_px":a.support_length_px,"evidence_weight":a.evidence_weight})).collect::<Vec<_>>(),
             "withheld_sample_residuals":heldout(&solution,frames),"elapsed_ms":elapsed,
             "sn_feida_mm2":std::array::from_fn::<_,2,_>(|eye| {
                 let frame=frames[eye].as_ref()?;let scale=frame.pose.pixels_per_10mm?[0]/10.0;

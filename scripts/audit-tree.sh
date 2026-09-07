@@ -36,6 +36,8 @@ mapfile -t unexpected_files < <(
       ./scripts/inventory-stereo-corpus.py \
       ./scripts/prepare-stereo-replay.py \
       ./scripts/report-stereo-conics.py \
+      ./scripts/report-stereo-motion.py \
+      ./scripts/test-stereo-conics-report.py \
       ./scripts/score-stereo-labels.py \
       ./scripts/validate-recording.py \
       ./scripts/toggle-mouse-output.py \

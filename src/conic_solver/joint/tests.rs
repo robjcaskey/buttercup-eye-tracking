@@ -138,6 +138,31 @@ fn nested_radius_projection_moves_coupled_radii_without_relaxing_frozen_bounds()
 }
 
 #[test]
+fn a_large_observed_limbus_can_initialize_inside_a_broad_range_prior() {
+    let mut fixture=Fixture::new([40.0,-120.0,260.0]);
+    fixture.scene.camera.focal_px=[4000.0;2];
+    fixture.origins[0]=[2560,960];
+    fixture.scene.eyes[0].as_mut().unwrap().limbus_center.camera_mm=[-58.0,-89.0,-190.0];
+    fixture.arcs=[Vec::new(),Vec::new()];fixture.hints=[Vec::new(),Vec::new()];
+    for (group,(begin,end)) in [(0.1,0.7),(1.1,1.7),(3.2,3.8),(4.1,4.7)].into_iter().enumerate() {
+        fixture.add_arc(0,BoundaryKind::OuterLimbus,begin,end,12,group as u32);
+    }
+    let truth=fixture.hints[0][0].1;
+    let prior=fixture.scene.eyes[0].as_mut().unwrap();
+    prior.limbus_center=PositionSupport {camera_mm:scale3(prior.limbus_center.camera_mm,350.0/190.0),
+        sigma_mm:[2.5,2.5,122.5],maximum_displacement_mm:[10.0,10.0,245.0],
+        transverse_frame:TransversePositionFrame::AtNominalDepth};
+    prior.radii_mm=[support(6.0,2.0,1.0),support(5.6,1.9,1.0),support(2.4,1.8,1.2)];
+    fixture.scene.target_reference_camera_mm=prior.limbus_center.camera_mm;
+    fixture.scene.interocular_distance_mm=None;
+    let solution=fixture.solve([true,false],16).unwrap();
+    let ellipse=solution.ellipses_roi_px[0][0].unwrap();
+    let error=truth.dense_points(64).into_iter().map(|p|crate::conic_solver::ellipse_residual(p,ellipse).powi(2)).sum::<f64>();
+    assert!((error/64.0).sqrt()<1.0,"an arbitrary range start must not censor good limbus arcs: {ellipse:?}");
+    assert!(solution.arcs.iter().all(|a|a.used));
+}
+
+#[test]
 fn joint_fixation_recovers_both_vertical_signs_from_mixed_boundary_samples() {
     for y in [-180.0,180.0] {
         let fixture = Fixture::new([95.0,y,250.0]);
@@ -315,7 +340,66 @@ fn perspective_circle_normal_decomposition_recovers_off_axis_planes_and_both_mir
                 let error=normals.into_iter().map(|n|norm3(sub3(n,normal))).fold(f64::INFINITY,f64::min);
                 assert!(error<1.0e-7,"center={center:?} normal={normal:?} solutions={normals:?} error={error}");
                 assert!(normals.into_iter().all(|n|n[2]>0.0));
+                let poses=circle_pose_hypotheses(camera,ellipse,origin).unwrap();
+                let closest=poses.into_iter().min_by(|a,b|norm3(sub3(a.normal,normal)).total_cmp(&norm3(sub3(b.normal,normal)))).unwrap();
+                assert!(norm3(sub3(scale3(closest.center_per_radius,6.0),center))<1.0e-6);
+                for pose in poses {
+                    let regenerated=ProjectedCircle::project(camera,scale3(pose.center_per_radius,6.0),pose.normal,6.0,origin).unwrap();
+                    assert!(ellipse.dense_points(32).into_iter().all(|p|regenerated.residual_px(p).abs()<1.0e-7));
+                }
             }
         }
     }
+}
+
+#[test]
+fn polyline_information_is_geometric_not_the_number_of_fragments_or_points() {
+    let points=[(0.0,0.0),(10.0,0.0),(30.0,0.0),(30.0,40.0)];
+    let (weights,length)=polyline_quadrature(&points).unwrap();
+    assert_eq!(length,70.0);
+    assert!((weights.iter().sum::<f64>()-1.0).abs()<1.0e-12);
+    let repeated=points.iter().flat_map(|p|std::iter::repeat_n(*p,4)).collect::<Vec<_>>();
+    assert_eq!(polyline_quadrature(&repeated).unwrap().1,length);
+    let split=polyline_quadrature(&points[..=2]).unwrap().1+polyline_quadrature(&points[2..]).unwrap().1;
+    assert_eq!(split,length);
+    let resampled=[(0.0,0.0),(1.0,0.0),(2.0,0.0),(20.0,0.0),(30.0,0.0),(30.0,20.0),(30.0,40.0)];
+    assert_eq!(polyline_quadrature(&resampled).unwrap().1,length);
+    assert!(polyline_quadrature(&[(2.0,3.0);10]).is_none());
+}
+
+#[test]
+fn many_short_pupil_fragments_cannot_outvote_a_long_well_supported_limbus() {
+    let mut fixture=Fixture::new([70.0,-130.0,250.0]);
+    fixture.arcs=[Vec::new(),Vec::new()];fixture.hints=[Vec::new(),Vec::new()];
+    fixture.add_arc(0,BoundaryKind::OuterLimbus,0.0,TAU,64,0);
+    let outer=fixture.hints[0][0].1;
+    for sector in 0..8 {
+        fixture.add_arc(0,BoundaryKind::PupillaryBoundary,sector as f64*TAU/8.0,(sector+1) as f64*TAU/8.0,8,100+sector);
+        // A displaced shadow/glint boundary is not a second iris-center vote.
+        for point in &mut fixture.arcs[0].last_mut().unwrap().points {point.0+=16.0;point.1+=10.0;}
+    }
+    let solution=fixture.solve([true,false],16).unwrap();
+    let fitted=solution.ellipses_roi_px[0][0].unwrap();
+    assert!(outer.dense_points(48).into_iter().all(|p|crate::conic_solver::ellipse_residual(p,fitted)<1.0));
+    assert!(solution.arcs.iter().any(|a|a.kind==BoundaryKind::PupillaryBoundary&&!a.used));
+}
+
+#[test]
+fn independently_scaled_seed_radii_do_not_make_every_joint_start_infeasible() {
+    let mut fixture=Fixture::new([70.0,-130.0,250.0]);
+    // Bad scale hypotheses on one defocused eye, with broad range support.
+    // The other eye remains useful. The frozen center/IPD bounds do not move.
+    for prior in fixture.scene.eyes.iter_mut().flatten() {
+        prior.limbus_center.transverse_frame=TransversePositionFrame::AtNominalDepth;
+        prior.limbus_center.sigma_mm[2]=122.5;
+        prior.limbus_center.maximum_displacement_mm[2]=245.0;
+    }
+    for (_,hint) in &mut fixture.hints[1] {hint.major_radius*=1.7;hint.minor_radius*=1.7;}
+    fixture.detail[1]=0.2;
+    let solution=fixture.solve([true,true],24).unwrap();
+    assert!(solution.contributing_eyes[0]);
+    assert!(angular_error(&solution,&fixture,0)<1.0);
+    let distance=norm3(sub3(solution.eye_centers_camera_mm[0].unwrap(),solution.eye_centers_camera_mm[1].unwrap()));
+    let support=fixture.scene.interocular_distance_mm.unwrap();
+    assert!(distance>=support.minimum&&distance<=support.maximum);
 }

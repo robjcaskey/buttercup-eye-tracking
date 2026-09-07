@@ -35,6 +35,12 @@ are provisional engineering choices, not derived population intervals.
   ellipse is only a search guide. Flat/saturated/no-edge data yields no arcs.
 - Alternatives from one profile sector share a correlation group. The solver
   selects one alternative per group, never votes once per resampled pixel.
+  Residuals are integrated along observed polylines. Information mass uses a
+  provisional 32-native-pixel correlation length (wider for large blur bands),
+  capped per arc. Eight tiny pupil fragments no longer receive eight times
+  the weight of a long limbus arc. Shorter alternatives cannot inherit a longer
+  alternative's coverage. These weights are heuristics, not sample counts or
+  calibrated probabilities; their lengths/weights are exported for inspection.
 - Point residuals use a robust loss; grossly incompatible whole groups have
   a capped cost and zero pulling force. Their rejection remains in diagnostics.
 - Native sensor origins remain attached, so a crop translation is not measured
@@ -52,6 +58,15 @@ An important optimizer correction projects trial radius updates onto the
 **already bounded** nested-radius set. Simply rejecting a trial whenever an
 unobserved inner radius crossed the observed outer radius could freeze both
 eyes' refinement. The projection does not widen any anatomical bound.
+
+Conic decomposition now also yields the circle-center/radius ratio. It starts
+the nuisance depth/radius inside the **existing** scene support. An arbitrary
+350 mm starting range must not put a large observed limbus outside every arc's
+robust-loss basin. The nominal prior, hard bounds and independent SN-FEIDA scale
+remain unchanged. If the two initialized depths violate the shared IPD bound,
+the initial geometry is moved toward the nominal scene until feasible; the
+constraint itself is never widened. No-feasible-initialization and
+all-evidence-rejected outcomes have separate diagnostics.
 
 ## Source time and live routing
 
@@ -140,27 +155,101 @@ radius normalization. See [its definition and caveats](flat-tire-area-and-motion
 The post-fit label audit finds 16 reviewed native labels after excluding
 assistant, backup and unreviewed documents; ten match available stereo RAW
 bytes and geometry exactly. None falls in this first 20,000-exposure subset.
-Those labeled exposures still need evaluation. Visible and guessed landmarks
-are separate, and limbus localization is not gaze ground truth.
+All ten are now evaluated, using 76 fresh native SAM exposures around their
+source positions (49 reads). Labels entered scoring only after fitting.
+Eight targets have a fit and two still have no boundary evidence. The latest
+candidate is frozen as `eval-pair-init`; the comparison baseline is
+`eval-projected` (before conic depth initialization and geometric arc weights).
+Visible and guessed landmarks are separate; limbus localization is not gaze
+ground truth.
 
-The full viewer suite currently has 945 passing tests, the same 41 failures as
+| Reviewed source index | Baseline joint visible RMS, px | Candidate, px | Original SAM, px |
+| --- | ---: | ---: | ---: |
+| 105182 | 52.51 | 9.80 | 8.63 |
+| 105191 | 44.13 | 35.92 | 46.14 |
+| 105933 | 33.57 | 3.33 | 3.28 |
+| 105935 | 3.11 | 3.33 | 3.40 |
+| 105937 | 3.62 | 3.29 | 3.23 |
+| 106295 | 9.26 | 8.92 | 8.17 |
+| 105983 | 4.61 | 4.48 | 4.51 |
+| 107262 | 2.59 | 2.40 | 2.95 |
+
+Indices 106191 and 106217 remain absent in both algorithms; index 105191 remains
+bad, not a success merely because its error decreased. Index 105935 regressed
+by 0.21 px. Six reviewed labels have no exact match to this stereo RAW inventory.
+
+### Expanded matched evaluation
+
+Both frozen algorithms have now evaluated 50,000 exposures: indices 100–25099
+and 193759–218758, with 30,973 reads, 19,027 RAW pairs, 10,483 reads with both
+current extractor packets, and 61 capture entries. The candidate supplies
+21,808 shared solves, including 10,444 with both eyes contributing. There are
+9,161 no-boundary reads and four all-evidence-rejected reads, with no remaining
+initialization failure on this subset. This is still **not all 387,519 exposures**.
+
+The separate development-excluded comparison uses indices 10100–25099 and
+203759–218758: 30,000 exposures in 17,979 reads. On exactly matched, admitted
+joint outputs, right-eye withheld RMS median/p95 changes from 1.918/7.537 to
+1.839/5.894 px (12,059 comparisons); left-eye from 1.928/7.218 to 1.810/5.640 px
+(8,193). Right-eye errors improve by over one pixel on 808 reads and regress
+on 366; left improves on 639 and regresses on 264. Admission gains are 130/26
+right/left, with two/zero losses. Common accepted-arc comparisons are reported
+separately, so rejecting a troublesome arc does not conceal the change.
+
+These are **optimizer-only** trials: the cache, extraction and withheld points
+are unchanged. The older frozen exports predate coordinate fingerprints; their
+source identity, arc IDs/kinds/counts and unchanged extractor code establish
+the comparison contract. New exports add withheld-coordinate fingerprints,
+and the reporter rejects mismatches even when point counts agree.
+
+On all 30,973 solver requests, including early abstentions, joint solve median/p95/max
+is 2.41/10.30/18.14 ms while sharing CPU resources with the SAM exports. This is
+not an uncontended benchmark or end-to-end live latency measurement.
+
+### Independently scale-normalized motion check
+
+The 50,000-exposure subset still has no recovered independent scale. A separate
+post-fit audit joins the labeled-neighborhood exposures to the existing
+`manual35` and `low0`–`low7` native RAW similarity reports. Exact RAW SHA256,
+ROI geometry, sequence, timestamp and source lineage must agree. Of 109 motion
+links, 75 meet the inherited motion-support heuristic; 61 lack an unambiguous
+exact exposure join and two lack a fresh accepted outer boundary, leaving
+**12 matched SN-FEIDA transitions** and **zero ROI reframes**.
+
+For each link the previous exposure supplies a fresh local pixel-scale reference;
+the independent scale ratio is `hypot(1 + scale_delta, rotation_coefficient)`.
+The absolute log SN-FEIDA step median/mean/p95 changes from
+0.05575/0.19379/0.52878 to 0.03280/0.03457/0.05892. This small subset supports the
+initialization/weighting fixes alongside the labels; it does not establish
+anatomical constancy or ROI-reframe performance. The emitted scale-only bounds
+omit conic uncertainty and are not confidence intervals. Unnormalized area
+tails on the larger subset still regress and cannot be relabeled SN-FEIDA.
+
+The full viewer suite currently has 949 passing tests, the same 41 failures as
 the pre-change baseline, and 24 ignored tests. Live-adapter tests additionally
 check source deduplication, different ROI sequences on one clock, crop transport,
 missing-eye behavior, provider changes, radius units and shared gaze mapping.
 No live user calibration or desktop-pointer trial has been performed for this
 new path.
+The standalone solver has 57 passing tests. The independent report tests also
+exercise source matching, probe changes, missing-read accounting, chronological
+area transitions, rejected geometry and determinant-based scale normalization.
 
 ## Known failures and remaining work
 
 Native RAW inspection of pair [7358,7359] exposes a serious failure: a few
 compatible upper-eyelid arcs can leave a fitted ellipse above the iris, despite
-other groups being rejected. Pair [5460,5461] also contains rejected upstream
+other groups being rejected. New weighting preserves the good right-eye limbus
+in that pair but does not establish a correct left-eye localization. Native
+inspection of 6185, 196553 and 6531 confirms eyelid/skin or clipped-eye detections
+whose small surviving sections still receive influence. Pair [5460,5461] also contains rejected upstream
 fits and large contour disagreements. These are not successful localizations
 merely because an accepted subset has a small residual.
 
-Still required: stronger spatial/boundary support accounting; useful partial
-evidence when a full upstream conic cannot be fitted; post-fit human-label
-scoring; independent source-motion/scale/SN-FEIDA sequence analysis; inspection
+Still required: stronger boundary identity and ambiguity/fidelity accounting;
+useful partial evidence when a full upstream conic cannot be fitted; broader
+human-label and independent source-motion/scale/SN-FEIDA checks, including actual
+ROI reframes; inspection
 of all completed corpus results and regressions; and live/source-replay checks
 of every presentation/calibration consumer. Full implementation validation is
 not complete until those checks are actually run and inspected.
@@ -172,6 +261,8 @@ viewer --offline-stereo-sam-export frames.jsonl cache.jsonl START COUNT
 buttercup_stereo_conic_eval output.jsonl cache.jsonl...
 report-stereo-conics.py output.jsonl report.json --expected-manifest manifest.json
 score-stereo-labels.py inventory.json frames.jsonl labels.json output.jsonl...
+python3 scripts/report-stereo-motion.py baseline.jsonl candidate.jsonl motion.json SCALE_REPORT.json...
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-stereo-conics-report.py
 buttercup_raw10_preview --source-index frames.jsonl INDEX comparison.png output.jsonl
 ```
 
