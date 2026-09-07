@@ -6,7 +6,7 @@
 //! geometry together. There are no independently solved gaze points to average.
 //!
 //! Camera/scale, coplanarity, pupil depth and decentration are explicit model
-//! assumptions. Results and curvature diagnostics are conditional on those
+//! assumptions. Results and competing-hypothesis diagnostics are conditional on those
 //! assumptions, not calibrated gaze probabilities or measured anatomy.
 
 use crate::geometry::{add3, cross3, dot3, norm3, normalized3, scale3, sub3, Ellipse};
@@ -707,12 +707,29 @@ impl<'a> Problem<'a> {
     }
 
     fn residuals(&self, p: &Parameters, selected: &[usize]) -> Option<Vec<f64>> {
+        self.residuals_with_rejection(p,selected,None)
+    }
+
+    fn rejected_groups(&self, conics:&[[Option<ProjectedCircle>;3];2], selected:&[usize]) -> Vec<bool> {
+        self.groups.iter().zip(selected).map(|(group,&choice)| {
+            let arc=&group.alternatives[choice];
+            arc.mean_cost(conics[arc.eye][arc.boundary].unwrap())>=MAXIMUM_GROUP_COST
+        }).collect()
+    }
+
+    /// Freeze the current arc activity ONLY for a local numerical derivative.
+    /// Switching between capped position-only residuals and uncapped mixed
+    /// position/direction residuals rotates the residual vector discontinuously,
+    /// even when their squared costs are almost equal. Differencing across that
+    /// switch manufactures a force for a rejected arc. Actual trial objectives
+    /// pass None and reconsider both alternatives and rejection every time.
+    fn residuals_with_rejection(&self, p:&Parameters, selected:&[usize], fixed_rejection:Option<&[bool]>) -> Option<Vec<f64>> {
         let conics = self.conics(p)?;
         let mut r = Vec::with_capacity(self.groups.len()*MAX_POINTS_PER_ARC*2 + PARAMETERS + 8);
-        for (group,&choice) in self.groups.iter().zip(selected) {
+        for (group_index,(group,&choice)) in self.groups.iter().zip(selected).enumerate() {
             let arc = &group.alternatives[choice];
             let conic = conics[arc.eye][arc.boundary]?;
-            let outlier=arc.mean_cost(conic)>=MAXIMUM_GROUP_COST;
+            let outlier=fixed_rejection.map_or_else(||arc.mean_cost(conic)>=MAXIMUM_GROUP_COST,|rejected|rejected[group_index]);
             for (index,(&point,&w)) in arc.points.iter().zip(&arc.quadrature).enumerate() {
                 // Position and measured direction describe ONE correlated
                 // contour, sharing its geometric mass and full outlier cap.
@@ -839,6 +856,7 @@ impl<'a> Problem<'a> {
         for _ in 0..self.request.maximum_refinements.min(MAX_REFINEMENTS) {
             let conics = self.conics(&p)?;
             let selected = self.select(&conics);
+            let rejected = self.rejected_groups(&conics,&selected);
             let residuals = self.residuals(&p,&selected)?;
             let cost = squared_norm(&residuals);
             let mut derivatives: Vec<Vec<f64>> = Vec::with_capacity(PARAMETERS);
@@ -852,7 +870,7 @@ impl<'a> Problem<'a> {
                 // A one-sided derivative at a hard boundary must point inward.
                 let delta = if q[parameter] > self.upper[parameter] { -step } else { step };
                 q[parameter] = p[parameter]+delta;
-                let d = self.residuals(&q,&selected).map(|rr| rr.iter().zip(&residuals)
+                let d = self.residuals_with_rejection(&q,&selected,Some(&rejected)).map(|rr| rr.iter().zip(&residuals)
                     .map(|(a,b)| (a-b)/delta*self.scales[parameter]).collect())
                     .unwrap_or_else(|| vec![0.0;residuals.len()]);
                 derivatives.push(d);

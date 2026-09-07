@@ -66,6 +66,44 @@ mod tests {
         assert!(matches!(tracker.observe(invalid,camera()),Err(TrackingUnavailable::NoSceneSupport)));
         assert!(tracker.latest(0,clock,time+100_000_000,500_000_000).is_none());
     }
+
+    #[test]
+    fn paired_initialization_cannot_depend_on_which_eye_arrived_first() {
+        let time=1_000_000_000;
+        let clock=frame(0,time).packet.exposure.clock;
+        let mut a=JointTracker::default();a.begin(clock,1);
+        let mut b=JointTracker::default();b.begin(clock,1);
+        // Both schedules know the same earlier single-eye observation. A
+        // newer first arrival must not hide or expose that hint asymmetrically
+        // when the identical current pair is finally solved.
+        for tracker in [&mut a,&mut b] {tracker.observe(frame(0,time),camera()).unwrap();}
+        a.observe(frame(0,time+100_000_000),camera()).unwrap();
+        let right_first=a.observe(frame(1,time+100_000_000),camera()).unwrap().unwrap();
+        b.observe(frame(1,time+100_000_000),camera()).unwrap();
+        let left_first=b.observe(frame(0,time+100_000_000),camera()).unwrap().unwrap();
+        assert_eq!(right_first.scene.prior.target_seed_camera_mm,left_first.scene.prior.target_seed_camera_mm,
+            "a final paired solve must use source-keyed joint history, not an arrival-specific surviving display slot");
+        assert_eq!(right_first.solution.target_camera_mm,left_first.solution.target_camera_mm);
+    }
+
+    #[test]
+    fn a_joint_initialization_survives_display_invalidation_without_resurrecting_display_geometry() {
+        let time=1_000_000_000;
+        let clock=frame(0,time).packet.exposure.clock;
+        let mut tracker=JointTracker::default();tracker.begin(clock,1);
+        tracker.observe(frame(0,time),camera()).unwrap();
+        let paired=tracker.observe(frame(1,time),camera()).unwrap().unwrap();
+        let mut rejected=frame(0,time+100_000_000);rejected.packet.arcs.clear();rejected.packet.conics.clear();
+        assert!(tracker.observe(rejected,camera()).is_err());
+        assert!(tracker.latest(0,clock,time+100_000_000,500_000_000).is_none());
+        tracker.observe(frame(1,time+200_000_000),camera()).unwrap();
+        let historical=tracker.observe(frame(1,time+100_000_000),camera()).unwrap().unwrap();
+        assert_eq!(historical.scene.prior.target_seed_camera_mm,Some(paired.solution.target_camera_mm),
+            "a bounded past joint seed is not erased by rejected/newer display slots and is not a fresh observation");
+        assert!(!historical.solution.contributing_eyes[0],"the empty current eye must not regain old evidence");
+        assert_eq!(tracker.latest(1,clock,time+200_000_000,500_000_000).unwrap().exposures[1].unwrap().timestamp_ns,
+            time+200_000_000,"a historical pair cannot rewind the newer presentation");
+    }
 }
 
 #[derive(Clone, Debug)]

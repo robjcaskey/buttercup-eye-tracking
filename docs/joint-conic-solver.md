@@ -256,14 +256,14 @@ anatomical constancy or ROI-reframe performance. The emitted scale-only bounds
 omit conic uncertainty and are not confidence intervals. Unnormalized area
 tails on the larger subset still regress and cannot be relabeled SN-FEIDA.
 
-The full viewer suite currently has 967 passing tests, the same 41 failures as
+The full viewer suite currently has 974 passing tests, the same 41 failures as
 the pre-change baseline, and 24 ignored tests. Live-adapter tests additionally
 check source deduplication, different ROI sequences on one clock, crop transport,
 missing-eye behavior, provider changes, radius units and shared gaze mapping.
 No live user calibration or desktop-pointer trial has been performed for this
 new path.
-The standalone evaluator has 77 passing tests, including its source-replay,
-shared live-tracker and partial-extraction tests. All 15 independent report tests pass and
+The standalone evaluator has 85 passing tests, including its source-replay,
+shared live-tracker, partial-extraction and local-linearization tests. All 15 independent report tests pass and
 exercise source matching, probe changes, missing-read accounting, chronological
 area transitions, rejected geometry and determinant-based scale normalization.
 
@@ -505,6 +505,137 @@ still no independently validated crop moves in this small motion subset.
 The SAM viewer build succeeds, with exactly the same 41 full-suite failure
 names as the pre-change baseline. No viewer restart, live calibration, SAM
 memory change or partial-extractor enablement accompanies these experiments.
+
+### Measured image-boundary directions
+
+`BoundaryNormalObservation` preserves a measured outward **2D image-boundary
+normal** and an engineering angular sigma alongside its actual contour sample.
+It is not the 3D iris normal or gaze ray. Missing observations remain missing;
+the accepted-complete-SAM and RAW-pupil adapters do not manufacture directions
+from fitted ellipses. The partial adapter retains the measured ordered-contour
+tangent already used for its RAW polarity check. Winding, point/normal alignment,
+training decimation and malformed-input behavior have tests.
+
+Direction uncertainty combines a 15-degree floor with 1.5-model-pixel endpoint
+jitter over the measured tangent span. These are engineering assumptions, not
+empirical confidence intervals. Position and direction share one arc's length
+weight, correlation group and complete outlier cost; directions do not create
+independent votes. Two mirror-related 3D circles with the same projected conic
+also have identical image normals. A separate test explicitly prevents calling
+that observation new 3D sign evidence.
+
+Frozen `eval-boundary-normal-v7` penalized angular error directly. Against v6
+on the same 50k partial-extraction exposure subset above, it loses 1,231/2,406
+right/left admissions and gains 32/20. Fixed-probe regressions over one pixel
+outnumber improvements, 2,091/931 versus 1,610/741. Its 143,577 matching probe
+fingerprints verify unchanged coordinates, not anatomical correctness. The
+reviewed bad target 105191 returns with 43.81 px error, while 106191 and 106217
+worsen to 21.42 and 14.76 px. The 14 independent-motion links also worsen:
+mean absolute SN-FEIDA log change 0.08220→0.10574, maximum 0.67411→0.99068.
+This is a rejected direct-penalty formulation, not a claimed improvement.
+
+`eval-normal-band-v8` instead uses direction as a compatibility allowance:
+there is no angular pulling force within two supplied engineering sigmas;
+only excess disagreement is penalized. This is not a statistical two-sigma CI.
+Against the point-only v6 control, the same 50k comparison verifies 148,986
+probe fingerprints. Admissions still lose 616/1,567 and gain only 27/30.
+Right/left fixed-probe improvements number 1,266/738 and regressions 1,340/956.
+The common accepted-arc subset improves more often, but selecting that subset
+alone would hide dropouts and incompatible groups. Unnormalized area tails
+still regress, and this large subset has no independent scale support.
+
+The reviewed-label bad revival at 105191 is gone in v8; that eye is rejected,
+not recovered. Target 106191 is 20.31 px versus v6's 20.29, and 106217 is
+14.28 px in both. The other seven accepted reviewed targets are unchanged.
+Mean absolute SN-FEIDA log change on the same 14 links is 0.08220→0.08210,
+with unchanged median and no ROI reframes. This negligible area difference
+does not establish an accuracy win. Native inspection confirms that source
+106195 still fits a reflection-bounded slice rather than the whole iris.
+The largest 50k residual regressions at 15361 and 19316 show clipped-eye/lid
+or off-target structure in both arms, not established correct limbuses.
+
+The separate ordinary 50k comparison, where no measured directions are supplied,
+has exactly unchanged admission and residuals relative to the frozen v3
+ordinary solver: 107,888 probe fingerprints match. Thus the new optional
+observation contract does not silently alter ordinary extraction. Neither
+partial-boundary formulation has been enabled in the live bridge.
+
+### Rejection activity during numerical linearization
+
+Frozen `eval-active-arc-v9` fixes a reproduced optimizer defect independently
+of the boundary identity problem. At a capped arc's rejection boundary, the
+old finite-difference calculation could cross from a constant position-only
+cost vector to an uncapped mixed position/direction vector. Their squared
+costs are nearly equal, but their residual components jump. Differencing that
+jump gives a rejected arc a fictitious force in the shared solve.
+
+The selected alternatives and rejection activity are now fixed only while
+estimating one iteration's local derivatives. Every actual proposed step
+reselects alternatives and recomputes the original capped objective, and the
+next iteration refreshes activity. This is not temporal exclusion memory,
+weaker rejection, extra anatomical bounds, or averaged monocular gaze.
+The regression test failed before the fix, exercises a real finite-difference
+gate crossing, and verifies both zero rejected-arc force and re-admission.
+A second test reproduces the same discontinuity with negative position
+residuals and no measured directions, covering ordinary live evidence too.
+This residual-vector sign issue is not itself a physical gaze-sign correction.
+
+All 85 standalone tests pass. The ten matching reviewed-label outcomes are
+unchanged from v8, including the rejected eye; six of 16 reviewed labels still
+lack matching RAW. The SAM viewer builds, with 974 passing tests, the same
+41 pre-existing failure names, and 24 ignored tests. The 14 independently
+supported RAW-motion/SN-FEIDA links are exactly unchanged, with no ROI reframes.
+
+The completed strict 50k partial-arc comparison verifies 149,155 fixed-probe
+fingerprints. Right/left improvements over one pixel number 4/0 and regressions
+1/6. There is one right-eye admission gain and one loss in each eye. Most
+outputs are identical. Native inspection of 19023 and 18520 shows the same
+clipped-eye or off-target failure class in both arms. Source pair [15823,15824]
+is different: these are actual visible eyes, not disposable negative examples.
+The old solution omits the right eye. The new shared solution uses its 139 px
+arc and two left-eye arcs while rejecting a 75 px left arc; the left fixed-probe
+RMS changes 1.57→10.51 px. Both eyes' measured arcs and reconstructed ellipses
+were inspected separately. Without human labels for this pair, the anatomical
+winner is unresolved; a smaller coupled objective does not settle it.
+
+The expanded ordinary comparison uses indices 100–80099 and 193759–273758:
+160,000 exposures, 91,564 reads, 68,436 RAW pairs and 137 capture entries.
+This leaves **227,519 available exposures outside this comparison**. Both arms
+use the identical extraction and frozen priors; 338,819 probe fingerprints
+match. There are 67,244 available shared solutions, 36,245 using both eyes,
+and no initialization failures. Compared with v8, one right eye is newly
+admitted and none are lost. Right/left improvements over one pixel number 3/5
+and regressions 1/4; p95 fixed-probe errors change only slightly, from
+6.241→6.236 and 6.814→6.804 px. This is not a broad accuracy breakthrough.
+
+Separately reporting the 60k exposures beyond the earlier 100k comparison
+avoids hiding new failures in a mostly unchanged earlier prefix. That subset
+has 33,311 matched reads, 79,157 verified probe fingerprints and unchanged
+admission. It has no improvements over one pixel and 1/2 right/left regressions.
+All three sources were inspected natively: 54454 contains a real eye whose
+ellipse changes, 53310 is heavily clipped, and 244852 is partially clipped
+with an occluded upper boundary. They are unlabeled localization questions,
+not evidence of improved anatomy simply because a different hypothesis wins.
+
+The 2,399/1,205 normalized-area transitions in the larger report are unchanged.
+Those use held coarse MediaPipe scale under the existing assumed 12 mm limbus,
+not that many fresh independent physical-scale measurements. They are distinct
+from the 14 exact-RAW-motion links above. The 16-start cap remains verified;
+shared-host joint-solve time, including unavailable reads but excluding RAW
+preparation and SAM, is 2.44 ms median / 8.45 ms p95 / 14.81 ms maximum. These
+are workload diagnostics, not isolated end-to-end real-time benchmarks.
+
+Expanded 160k source-order replays with native, right-delayed and left-delayed
+arrival schedules are running separately. Their initiation does not establish
+source-continuity or ROI-reframe correctness until the outputs are audited.
+
+Read-only metadata inspection also found recorded nine-point calibration
+episodes, including original capture entries 104, 107–109 and 116–118. These
+can support a separate post-fit target-response study. Their target events
+are host submissions, not measured scanout or eye fixation, and the archives
+do not supply a measured camera-to-monitor transform or bounded sensor/host
+clock mapping. Recorded gaze estimates have not been fed to this solver or
+substituted for true gaze labels.
 
 The video worker now publishes fresh rejected/empty proposal packets even
 when no complete single-eye ellipse exists, retaining exact source RAW,

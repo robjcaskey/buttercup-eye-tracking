@@ -401,6 +401,88 @@ fn uncertain_contour_directions_are_a_compatibility_band_not_a_second_precise_fi
 }
 
 #[test]
+fn numerical_linearization_cannot_turn_a_capped_arc_into_a_force() {
+    let scene=scene();
+    let center=scene.eyes[0].unwrap().limbus_center.camera_mm;
+    let target=add3(scene.target_reference_camera_mm,[0.0,0.0,scene.fixation_forward_mm.nominal]);
+    let points=ring_points(scene.camera,center,normalized3(sub3(target,center)).unwrap(),6.0,[3500,2850],0.1,0.5,12);
+    let arcs=[BoundaryArcObservation {evidence_group:0,kind:BoundaryKind::OuterLimbus,points_roi_px:&points,
+        outward_normals_roi:None,normal_band_half_width_px:Some(0.0),detector_score:None}];
+    let evidence=RoiConicEvidence {exposure:exposure(0),sensor_origin_px:[3500,2850],dimensions_px:[420,280],
+        arcs:&arcs,conics:&[],detail_reliability:Some(1.0)};
+    let mut problem=Problem::new(JointConicRequest {eyes:[Some(evidence),None],scene:&scene,
+        maximum_hypotheses:16,maximum_refinements:12,maximum_source_skew_ns:0,
+        exposure_uncertainty_ns:0,motion_bound_px_per_second:0.0}).unwrap();
+    let base=problem.initial;
+    let conic=problem.conics(&base).unwrap()[0][0].unwrap();
+    let [a,b,c,d,e,_]=conic.0;
+    let (s,co)=0.6f64.sin_cos();
+    // The arc sits just outside the existing capped compatibility cost. A
+    // finite-difference perturbation crosses that gate while its position and
+    // direction residual components are entirely different vectors.
+    problem.groups[0].alternatives[0].outward_normals=points.iter().map(|&(x,y)| {
+        let u=2.0*a*x+b*y+d;let v=b*x+2.0*c*y+e;let length=u.hypot(v);
+        Some(BoundaryNormalObservation {unit_outward_roi:[(co*u-s*v)/length,(s*u+co*v)/length],
+            angular_sigma_radians:0.6/(BOUNDARY_DIRECTION_ALLOWANCE_SIGMAS+3.0+1.0e-8)})
+    }).collect();
+    let arc=&problem.groups[0].alternatives[0];
+    assert!(arc.mean_cost(conic)>MAXIMUM_GROUP_COST);
+    let trial=(0..PARAMETERS).flat_map(|i|[-1.0,1.0].map(move|direction|(i,direction))).find_map(|(i,direction)| {
+        let mut q=base;q[i]+=direction*1.0e-4*problem.scales[i];
+        if q[i]<problem.lower[i]||q[i]>problem.upper[i] {return None;}
+        let trial_conic=problem.conics(&q)?[0][0]?;
+        (arc.mean_cost(trial_conic)<MAXIMUM_GROUP_COST).then_some(q)
+    }).expect("exercise a real finite-difference crossing, not merely a far rejected arc");
+    let selected=problem.select(&problem.conics(&base).unwrap());
+    let rejected=problem.rejected_groups(&problem.conics(&base).unwrap(),&selected);
+    assert_eq!(rejected,vec![true]);
+    let before=problem.residuals(&base,&selected).unwrap();
+    let actual=problem.residuals(&trial,&selected).unwrap();
+    let linearized=problem.residuals_with_rejection(&trial,&selected,Some(&rejected)).unwrap();
+    let sample_terms=points.len()*2;
+    assert!(before[..sample_terms].iter().zip(&actual).any(|(a,b)|(a-b).abs()>0.1),
+        "a real objective evaluation must still reconsider previously rejected evidence");
+    assert_eq!(&before[..sample_terms],&linearized[..sample_terms],
+        "a rejected arc has constant cost and zero force during this local derivative; a new trial rechecks admission separately");
+    let readmitted=problem.rejected_groups(&problem.conics(&trial).unwrap(),&selected);
+    assert_eq!(readmitted,vec![false],"this is not persistent exclusion memory");
+    let reverse=problem.residuals_with_rejection(&base,&selected,Some(&readmitted)).unwrap();
+    assert!(reverse[..sample_terms].iter().skip(1).step_by(2).all(|&r|r.abs()>0.1),
+        "an admitted arc retains its actual direction derivatives even if a numerical step crosses the cap");
+}
+
+#[test]
+fn capped_negative_position_residuals_cannot_pull_ordinary_live_evidence() {
+    let mut scene=scene();scene.eyes[0].as_mut().unwrap().limbus_center.camera_mm[0]=0.0;
+    let center=scene.eyes[0].unwrap().limbus_center.camera_mm;
+    let image_radius=6.0*scene.camera.focal_px[0]/(-center[2]);
+    let gap=3.0*0.75*(1.0+1.0e-8);
+    // For an observed radius r inside circle R, Sampson residual is
+    // (r²-R²)/(2r). Choose r so the existing rejection cost is just exceeded.
+    let observed_radius=(image_radius.hypot(gap)-gap)*(-center[2])/scene.camera.focal_px[0];
+    let points=ring_points(scene.camera,center,[0.0,0.0,1.0],observed_radius,[3800,2850],0.1,0.5,12);
+    let arcs=[BoundaryArcObservation {evidence_group:0,kind:BoundaryKind::OuterLimbus,points_roi_px:&points,
+        outward_normals_roi:None,normal_band_half_width_px:Some(0.0),detector_score:None}];
+    let evidence=RoiConicEvidence {exposure:exposure(0),sensor_origin_px:[3800,2850],dimensions_px:[420,280],
+        arcs:&arcs,conics:&[],detail_reliability:Some(1.0)};
+    let problem=Problem::new(JointConicRequest {eyes:[Some(evidence),None],scene:&scene,
+        maximum_hypotheses:16,maximum_refinements:12,maximum_source_skew_ns:0,
+        exposure_uncertainty_ns:0,motion_bound_px_per_second:0.0}).unwrap();
+    let base=problem.initial;let selected=vec![0];
+    let rejected=problem.rejected_groups(&problem.conics(&base).unwrap(),&selected);
+    assert_eq!(rejected,vec![true]);
+    let mut trial=base;trial[6]-=1.0e-4*problem.scales[6];
+    assert_eq!(problem.rejected_groups(&problem.conics(&trial).unwrap(),&selected),vec![false]);
+    let before=problem.residuals(&base,&selected).unwrap();
+    let actual=problem.residuals(&trial,&selected).unwrap();
+    assert!(before[..points.len()].iter().all(|&r|r>0.0));
+    assert!(actual[..points.len()].iter().all(|&r|r<0.0),
+        "the unfixed derivative crosses a residual sign discontinuity even without measured directions");
+    let linearized=problem.residuals_with_rejection(&trial,&selected,Some(&rejected)).unwrap();
+    assert_eq!(&before[..points.len()],&linearized[..points.len()]);
+}
+
+#[test]
 fn joint_selection_uses_measured_direction_not_just_equal_point_alternatives() {
     use crate::outline_conic_segments::sparse_evidence::{OwnedBoundaryArc,OwnedConicHint,OwnedRoiEvidence};
     let fixture=Fixture::new([70.0,-130.0,250.0]);
