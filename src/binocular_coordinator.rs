@@ -6,6 +6,7 @@
 //! This module supplies constraints; gaze_target_solver owns the final target.
 
 use crate::roi_evidence::RoiConicEvidence;
+pub(crate) mod source_pairing;
 
 /// Future coordination must accept either missing eye without inventing its
 /// pose. Each present packet retains its own clock, exposure and optical state.

@@ -4,7 +4,7 @@ mod raw10;
 use serde_json::Value;
 use std::env;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy)]
@@ -221,8 +221,69 @@ fn write_png(path: &Path, width: usize, height: usize, rgb: &[u8]) -> Result<(),
     fs::write(path, png).map_err(|error| format!("write {}: {error}", path.display()))
 }
 
+/// Read an inventory's exact native source receipt, including tar member
+/// offsets, without extracting/copying a recording or using an image utility.
+fn indexed_preview(arguments:&[String])->Result<(),String> {
+    if arguments.len()<4 || arguments.len()>5 {return Err("usage: --source-index INPUT.jsonl INDEX OUTPUT.png [EVALUATION.jsonl]".into());}
+    let index=arguments[2].parse::<u64>().map_err(|e|e.to_string())?;
+    let source=File::open(&arguments[1]).map_err(|e|e.to_string())?;
+    let mut record=None;
+    for line in BufReader::new(source).lines() {
+        let row:Value=serde_json::from_str(&line.map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+        if row["index"].as_u64()==Some(index) {record=Some(row);break;}
+    }
+    let record=record.ok_or("source index absent")?;
+    let meta=&record["frame"];
+    let width=number(meta,"width")? as usize;let height=number(meta,"height")? as usize;
+    let mut file=File::open(record["raw_file"].as_str().ok_or("missing raw_file")?).map_err(|e|e.to_string())?;
+    file.seek(SeekFrom::Start(number(&record,"raw_offset")?)).map_err(|e|e.to_string())?;
+    let mut packed=vec![0;number(&record,"raw_length")? as usize];file.read_exact(&mut packed).map_err(|e|e.to_string())?;
+    let raw=raw10::try_unpack_raw10(&packed,width,height,number(meta,"stride")? as usize)?;
+    let rgb=decode_quad_bayer(&raw,width,height,number(meta,"sensor_x")? as u32,number(meta,"sensor_y")? as u32,PreviewMode::Color,1.0);
+    let mut evaluated=None;
+    if let Some(path)=arguments.get(4) {
+        for line in BufReader::new(File::open(path).map_err(|e|e.to_string())?).lines() {
+            let row:Value=serde_json::from_str(&line.map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+            if row["inputs"].as_array().is_some_and(|inputs|inputs.iter().any(|v|v["index"].as_u64()==Some(index))) {evaluated=Some(row);break;}
+        }
+    }
+    let panels=if evaluated.is_some() {4} else {1};
+    let mut comparison=vec![0;width*panels*height*3];
+    for y in 0..height {for panel in 0..panels {
+        let begin=(y*width*panels+panel*width)*3;
+        comparison[begin..begin+width*3].copy_from_slice(&rgb[y*width*3..(y+1)*width*3]);
+    }}
+    if let Some(row)=evaluated {
+        let eye=number(meta,"eye_id")? as usize-1;
+        let mono=if eye==0 {"monocular_right"} else {"monocular_left"};
+        for (panel,ellipse,color) in [(1,&row["baseline_sam_outer"][eye],[255,80,220]),
+            (2,&row["joint"]["outer_ellipses"][eye],[40,255,100]),(3,&row[mono]["outer_ellipses"][eye],[255,210,30])] {
+            let Some(x)=ellipse["center"][0].as_f64() else {continue;};
+            let y=ellipse["center"][1].as_f64().ok_or("missing center y")?;
+            let a=ellipse["major_radius"].as_f64().ok_or("missing major")?;
+            let b=ellipse["minor_radius"].as_f64().ok_or("missing minor")?;
+            let (s,c)=ellipse["angle"].as_f64().ok_or("missing angle")?.sin_cos();
+            for i in 0..1024 {
+                let phase=std::f64::consts::TAU*i as f64/1024.0;
+                let px=(x+a*phase.cos()*c-b*phase.sin()*s).round() as isize;
+                let py=(y+a*phase.cos()*s+b*phase.sin()*c).round() as isize;
+                if px>=0 && py>=0 && px<width as isize && py<height as isize {
+                    let at=(py as usize*width*panels+panel*width+px as usize)*3;
+                    comparison[at..at+3].copy_from_slice(&color);
+                }
+            }
+        }
+    }
+    let output=Path::new(&arguments[3]);
+    if let Some(parent)=output.parent() {fs::create_dir_all(parent).map_err(|e|e.to_string())?;}
+    write_png(output,width*panels,height,&comparison)?;
+    eprintln!("native RAW source {index}: left-to-right raw / magenta SAM baseline / green joint / yellow monocular -> {}",output.display());
+    Ok(())
+}
+
 fn main() -> Result<(), String> {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
+    if arguments.first().map(String::as_str)==Some("--source-index") {return indexed_preview(&arguments);}
     if arguments.len() < 4 || arguments.len() > 6 {
         return Err(usage());
     }

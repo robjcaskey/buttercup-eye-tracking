@@ -13,6 +13,7 @@ mod gaze_focus;
 mod gaze_accuracy;
 mod eye_scene_model;
 mod gaze_target_solver;
+mod joint_gaze_live;
 mod geometry;
 mod keyboard_peeper;
 mod native_mediapipe;
@@ -4817,6 +4818,9 @@ struct EyeFrame {
     /// this same solve so its cursor and visible contact share one authority;
     /// it never enters ray-origin, segmentation, or pupil state.
     virtual_contact_surface_gaze: Option<SurfaceGazeSample>,
+    joint_gaze_active: bool,
+    joint_conic: Option<Arc<gaze_target_solver::joint_tracking::PublishedJoint>>,
+    joint_conic_status: Option<String>,
     motion_octrees: Arc<raw_motion_octrees::MotionOctreeOverlay>,
     /// Blue-channel scleral vessel topology, temporal relocation, and its
     /// diagnostic lift onto the current Clusters globe estimate.
@@ -5200,6 +5204,7 @@ fn roi_prediction_record(frame: &EyeFrame) -> serde_json::Value {
                     "detected_gaze_feature": json_optional_point(frame.detected_gaze_feature),
                     "surface_gaze": json_surface_gaze(frame.surface_gaze),
                     "virtual_contact_surface_gaze": json_surface_gaze(frame.virtual_contact_surface_gaze),
+                    "joint_conics": joint_gaze_live::json(frame),
                 },
                 "limbus": {
                     "published_points": json_points(frame.outer_iris_points.as_slice()),
@@ -25519,6 +25524,7 @@ fn gaze_feature(frame: &EyeFrame) -> Option<(f64, f64)> {
 }
 
 fn mouse_gaze_surface(frame: &EyeFrame) -> Option<SurfaceGazeSample> {
+    if frame.joint_gaze_active {return joint_gaze_live::surface(frame,true);}
     match frame.segmentation_mode {
         SegmentationMode::Sam31 => frame.virtual_contact_surface_gaze,
         _ => frame.surface_gaze,
@@ -30997,6 +31003,7 @@ fn receive(
     let mut virtual_contact_surface_trackers: [SurfaceGazeTracker; 2] =
         std::array::from_fn(|_| SurfaceGazeTracker::default());
     let mut gaze_authority_generations = [0u64; 2];
+    let mut joint_gaze_bridge = joint_gaze_live::Bridge::default();
     let mut source_clock_epoch = 0u64;
     let mut active_gaze_input_generation: Option<u64> = None;
     let mut shared_iris_radius_trackers: [SharedLimbusRadiusTracker; 2] =
@@ -32481,6 +32488,7 @@ fn receive(
                 // publication. This also guarantees that the incremental 3D
                 // iris/lens builders receive subject-right evidence only.
                 let second_roi_enabled = shared.lock().is_ok_and(|state| state.second_roi_enabled);
+                joint_gaze_bridge.set_enabled(second_roi_enabled,&mut gaze_authority_generations);
                 if !subject_eye_analysis_enabled(index, second_roi_enabled) {
                     // Never let a result from a previous enabled interval
                     // re-enter after toggling back on. Preserve primary history.
@@ -36590,6 +36598,9 @@ fn receive(
                     detected_gaze_feature: measured_gaze_feature,
                     surface_gaze,
                     virtual_contact_surface_gaze,
+                    joint_gaze_active: false,
+                    joint_conic: None,
+                    joint_conic_status: None,
                     motion_octrees,
                     sclera_vein_graph,
                     sclera_red_canny: Arc::new(sclera_red_canny),
@@ -36832,6 +36843,7 @@ fn receive(
                         None
                     },
                 };
+                joint_gaze_bridge.update(&mut frame,&recording_stream_epoch,gaze_authority_generations,&recording_trace);
                 frame.recording_ready = recording_trace.stamp_json();
                 if !model_publishers.is_empty() {
                     let (
@@ -36958,6 +36970,9 @@ fn receive(
                 }
                 previous[index] = Some(Arc::clone(&raw));
                 if let Ok(mut state) = shared.lock() {
+                    if let Some(partner)=state.eyes[1-index].as_mut() {
+                        joint_gaze_bridge.refresh_partner(partner,&recording_stream_epoch);
+                    }
                     state.eyes[index] = Some(frame);
                     if !display_only_reacquisition {
                         state.reacquire_status = None;
@@ -38284,9 +38299,12 @@ fn draw_sensor_overview_eye_laser(
     let Some(start) = project_sensor_point_to_image(apex_sensor, image_rect) else {
         return;
     };
+    let laser_gaze=if frame.joint_gaze_active {
+        let Some(gaze)=joint_gaze_live::gaze(frame) else {return;};gaze
+    } else {pose.relative_gaze};
     let direction = (
-        pose.relative_gaze.right * image_rect.2 as f64 / PREVIEW_SENSOR_WIDTH.max(1) as f64,
-        pose.relative_gaze.down * image_rect.3 as f64 / PREVIEW_SENSOR_HEIGHT.max(1) as f64,
+        laser_gaze.right * image_rect.2 as f64 / PREVIEW_SENSOR_WIDTH.max(1) as f64,
+        laser_gaze.down * image_rect.3 as f64 / PREVIEW_SENSOR_HEIGHT.max(1) as f64,
     );
     let clip = (
         image_rect.0 as f64,
@@ -39474,9 +39492,11 @@ fn draw_sam31_deflattened_virtual_contact(
     pixel_scale: usize,
     frame: &EyeFrame,
 ) -> usize {
+    let joint_ellipse=joint_gaze_live::source_ellipse(frame);
+    let surface=if frame.joint_gaze_active && joint_ellipse.is_none() {None} else {frame.virtual_contact_surface_gaze};
     draw_sam31_virtual_contact_source(pixels, width, height, origin_x, origin_y,
         pixel_scale, frame.sequence, frame.sam31_proposal_masks.as_deref(),
-        frame.virtual_contact_surface_gaze)
+        surface,joint_ellipse)
 }
 
 /// Shared renderer for live presentation and offline source-aligned exports.
@@ -39486,6 +39506,7 @@ fn draw_sam31_virtual_contact_source(
     origin_x: i32, origin_y: i32, pixel_scale: usize, sequence: u64,
     proposals: Option<&sam31_outer::ProposalMasks>,
     surface_gaze: Option<SurfaceGazeSample>,
+    joint_ellipse: Option<geometry::Ellipse>,
 ) -> usize {
     let count = draw_sam31_outer_iris_fit(
         pixels,
@@ -39503,7 +39524,7 @@ fn draw_sam31_virtual_contact_source(
     let Some(review) = proposals.outer_fit.as_ref() else {
         return count;
     };
-    let boundary = review.ellipse.dense_points(240);
+    let boundary = joint_ellipse.unwrap_or(review.ellipse).dense_points(240);
     let Some(pose) = provisional_surface_pose(surface_gaze, &boundary) else {
         draw_text(
             pixels,
@@ -39541,7 +39562,7 @@ fn draw_sam31_virtual_contact_source(
         height,
         origin_x + 6,
         origin_y + 24,
-        "VIRTUAL CONTACT FROM DE-FLAT-TIRE LIMBUS",
+        if joint_ellipse.is_some() {"VIRTUAL CONTACT FROM JOINT CONIC LIMBUS"} else {"VIRTUAL CONTACT FROM DE-FLAT-TIRE LIMBUS"},
         0x0000_ffff,
     );
     count
@@ -40214,6 +40235,7 @@ fn draw_eye_with_spatial_debug(
         };
         let sam_contact_boundary = (frame.segmentation_mode == SegmentationMode::Sam31)
             .then(|| {
+                if frame.joint_gaze_active {return joint_gaze_live::ellipse(frame).map(|e|e.dense_points(240));}
                 frame.sam31_proposal_masks.as_deref().and_then(|proposals| {
                     sam31_presentation_boundary_for_frame(
                         proposals,
@@ -40290,7 +40312,7 @@ fn draw_eye_with_spatial_debug(
         if frame.eye_laser_enabled {
             if let Some(pose) = virtual_contact_pose {
                 if let Some(style) = pose.authority.eye_laser_style() {
-                    draw_rotation_meridians(
+                    draw_rotation_meridians_with_laser_axis(
                         pixels,
                         width,
                         height,
@@ -40308,6 +40330,7 @@ fn draw_eye_with_spatial_debug(
                         meridian_boundary,
                         frame.width,
                         frame.height,
+                        joint_gaze_live::gaze(frame),
                     );
                 }
             }
@@ -41559,6 +41582,19 @@ fn draw_rotation_meridians(
     frame_width: usize,
     frame_height: usize,
 ) {
+    draw_rotation_meridians_with_laser_axis(pixels,width,height,x,y,pixel_scale,
+        rotation_center,rotation_center_z,relative_gaze,sphere_radius_override,sweep_phase,
+        show_meridians,eye_laser_style,inner_ring_points,outer_prediction_points,frame_width,frame_height,None);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_rotation_meridians_with_laser_axis(
+    pixels:&mut [u32],width:usize,height:usize,x:i32,y:i32,pixel_scale:usize,
+    rotation_center:Option<(f64,f64)>,rotation_center_z:Option<f64>,relative_gaze:Option<RelativeGazeVector>,
+    sphere_radius_override:Option<f64>,sweep_phase:Option<f64>,show_meridians:bool,eye_laser_style:Option<EyeLaserStyle>,
+    inner_ring_points:&[(f64,f64)],outer_prediction_points:&[(f64,f64)],frame_width:usize,frame_height:usize,
+    laser_axis:Option<RelativeGazeVector>,
+) {
     if !show_meridians && eye_laser_style.is_none() {
         return;
     }
@@ -41698,7 +41734,7 @@ fn draw_rotation_meridians(
     ];
     // A camera-normal gaze ray projects to a point. The contact remains
     // meaningful, but drawing a 2D laser direction would be an invention.
-    let Some(direction) = relative_gaze.projected_direction() else {
+    let Some(direction) = laser_axis.unwrap_or(relative_gaze).projected_direction() else {
         return;
     };
     // The axis is still defined by the anatomical rotation center and the
@@ -41815,6 +41851,13 @@ fn checked_virtual_contact_pose(
 }
 
 fn virtual_contact_pose(frame: &EyeFrame) -> Option<VirtualContactPose> {
+    if frame.joint_gaze_active && !frame.presentation_pivot_held {
+        let boundary=joint_gaze_live::ellipse(frame)?.dense_points(240);
+        let provisional=provisional_surface_pose(joint_gaze_live::surface(frame,false),&boundary)?;
+        return checked_virtual_contact_pose(VirtualContactPose {rotation_center:provisional.rotation_center,
+            rotation_center_z:None,relative_gaze:provisional.relative_gaze,sphere_radius:Some(provisional.sphere_radius),
+            authority:VirtualContactAuthority::SamEllipseProvisional},&boundary,frame.width,frame.height);
+    }
     // A SAM lease contains the exact sensor-space boundary and ray copied
     // from an earlier current SAM solve. Honor that UI-only bridge before the
     // exact-current proposal gate; otherwise a missing asynchronous proposal
@@ -41996,6 +42039,7 @@ fn virtual_contact_pose(frame: &EyeFrame) -> Option<VirtualContactPose> {
 }
 
 fn current_virtual_contact_boundary(frame: &EyeFrame) -> Option<Arc<Vec<(f64, f64)>>> {
+    if frame.joint_gaze_active {return joint_gaze_live::ellipse(frame).map(|e|Arc::new(e.dense_points(240)));}
     // SAM contact and its lease must remain on the same fitted-ellipse
     // lineage even if stale native/presentation geometry shares the frame.
     if frame.segmentation_mode == SegmentationMode::Sam31 {
@@ -43199,6 +43243,7 @@ fn recording_gaze(
             "sam_prompt_generation": frame.and_then(|f| f.gaze_authority_sam_prompt_generation).map(|n| n.to_string()),
             "sign_epoch": surface.map(|s| s.sign_epoch.to_string()),
             "sign_resolved": surface.map(|s| s.sign_resolved),
+            "solver": frame.map(|f|if f.joint_gaze_active {"shared-target-mixed-conics"} else {"monocular-surface"}),
         }),
         roi_frame: frame.map(|f| if !f.recording_clock.is_null() { f.recording_clock["source_key"].clone() } else { serde_json::json!({
             "roi_id": f.eye_id, "sequence": f.sequence.to_string(),
@@ -43301,7 +43346,9 @@ fn refresh_viewer_frames(app: &mut App) -> Result<(), String> {
                 // Sensor timestamps remain unique across those reconnects.
                 if app.eyes[index]
                     .as_ref()
-                    .map(|shown| shown.timestamp_ns != frame.timestamp_ns)
+                    .map(|shown| shown.timestamp_ns != frame.timestamp_ns || match (&shown.joint_conic,&frame.joint_conic) {
+                        (Some(a),Some(b))=>!Arc::ptr_eq(a,b), (None,None)=>false, _=>true,
+                    })
                     .unwrap_or(true)
                 {
                     app.sequences[index] = frame.sequence;
@@ -43343,6 +43390,11 @@ fn prepare_current_contact_frame(app: &App, eye: usize, frame: &mut EyeFrame, pr
     } else if let Some(contact) = app.presentation_pivot_contact {
         if contact.eye == eye { apply_presentation_pivot_contact(eye, frame, contact); }
     }
+}
+
+fn pose_for_cursor(frame:&EyeFrame,mut pose:VirtualContactPose)->Option<VirtualContactPose> {
+    if frame.joint_gaze_active {pose.relative_gaze=joint_gaze_live::gaze(frame)?;}
+    Some(pose)
 }
 
 fn display_gaze_target(pose: VirtualContactPose, calibration: Option<CalibratedDisplay>, plane: VirtualDisplayPlane)
@@ -43571,6 +43623,7 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
         virtual_contact_authority.and_then(VirtualContactAuthority::eye_laser_style);
     let active_frame = presented_eyes[app.focus_eye].as_ref();
     let active_surface = active_frame.and_then(mouse_gaze_surface);
+    let selected_gaze_pose=active_frame.zip(selected_virtual_contact).and_then(|(f,p)|pose_for_cursor(f,p));
     let stored_calibration = app
         .calibrated_display
         .filter(|calibration| calibration.eye == app.focus_eye);
@@ -43620,7 +43673,7 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
         }
         let observation=active_surface.filter(|s|s.sign_resolved).and_then(|surface| {
             let source=surface.source_timestamp_ns?;
-            let pose=selected_virtual_contact?;
+            let pose=selected_gaze_pose?;
             let target=check.calibration.map_or_else(||check.plane.target(pose.relative_gaze),|cal|cal.target(pose.relative_gaze))?;
             Some((source,target))
         });
@@ -43638,7 +43691,7 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
                     pose.authority == VirtualContactAuthority::MotionHeld)),
             display:display_metadata,
             scene:recording_trace::scene::snapshot(&presented_eyes, recording_trace::scene::Input {
-                reference_eye:app.focus_eye,plane:check.plane,selected_ray:selected_virtual_contact.map(|p|p.relative_gaze),
+                reference_eye:app.focus_eye,plane:check.plane,selected_ray:selected_gaze_pose.map(|p|p.relative_gaze),
                 selected_prediction:observation.map(|(_,p)|p),camera:camera_metadata,
                 calibration:serde_json::json!({"phase":"accuracy-check-frozen-mapping","outcome":check.session.finished}),
             }, &app.shared, &recording_trace),
@@ -43652,7 +43705,7 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
     }
     // Compute the same mapping while J is off too: hiding a cursor must not
     // discard the gaze prediction from an S recording.
-    let predicted_display_target = selected_virtual_contact
+    let predicted_display_target = selected_gaze_pose
         .and_then(|pose| display_gaze_target(pose, calibrated_display, default_monitor_plane));
     let raw_display_target = eye_laser_enabled.then_some(predicted_display_target).flatten();
     // Present the absolute target immediately, with no redraw-rate easing.
@@ -43678,7 +43731,7 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
         display:display_metadata,
         scene:recording_trace::scene::snapshot(&presented_eyes, recording_trace::scene::Input {
             reference_eye:app.focus_eye,plane:calibrated_display.map_or(default_monitor_plane,|c|c.plane),
-            selected_ray:selected_virtual_contact.map(|p|p.relative_gaze),selected_prediction:predicted_display_target,
+            selected_ray:selected_gaze_pose.map(|p|p.relative_gaze),selected_prediction:predicted_display_target,
             camera:camera_metadata,calibration:serde_json::json!({"phase":cursor_mapping.status_label(),
                 "stored_calibration":stored_calibration.is_some(),"active_calibration":calibrated_display.is_some(),
                 "training_sign_epoch":stored_calibration.map(|c|c.sign_epoch.to_string()),
@@ -44102,7 +44155,7 @@ impl ApplicationHandler for App {
                             if let Ok(mut shared) = self.shared.lock() {
                                 let enabled = !shared.second_roi_enabled;
                                 set_second_roi_analysis(&mut shared, enabled);
-                                eprintln!("Second ROI (subject-left) analysis {} by 3; joint stereo solver not yet implemented", if shared.second_roi_enabled { "enabled" } else { "disabled" });
+                                eprintln!("Second ROI (subject-left) analysis {} by 3; SAM uses source-matched joint conic segments when enabled", if shared.second_roi_enabled { "enabled" } else { "disabled" });
                             }
                         }
                     }
@@ -51050,6 +51103,9 @@ mod tests {
             detected_gaze_feature: None,
             surface_gaze: None,
             virtual_contact_surface_gaze: None,
+            joint_gaze_active: false,
+            joint_conic: None,
+            joint_conic_status: None,
             motion_octrees: Arc::new(raw_motion_octrees::MotionOctreeOverlay::default()),
             sclera_vein_graph: Arc::new(raw_sclera_vein_graph::ScleraVeinGraphOverlay::default()),
             sclera_red_canny: Arc::new(raw_sclera_red_canny::ScleraRedCannyOverlay::default()),

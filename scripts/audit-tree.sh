@@ -21,6 +21,7 @@ mapfile -t unexpected_files < <(
       ./README.md \
       ./docs/viewer-overview.png \
       ./docs/geometry-architecture.md \
+      ./docs/joint-conic-solver.md \
       ./docs/flat-tire-area-and-motion.md \
       ./docs/sign-acquisition-trials.md \
       ./docs/meridian-sign-continuity.md \
@@ -35,6 +36,7 @@ mapfile -t unexpected_files < <(
       ./scripts/inventory-stereo-corpus.py \
       ./scripts/prepare-stereo-replay.py \
       ./scripts/report-stereo-conics.py \
+      ./scripts/score-stereo-labels.py \
       ./scripts/validate-recording.py \
       ./scripts/toggle-mouse-output.py \
       ./scripts/test-mouse-output.py \
@@ -75,7 +77,10 @@ mapfile -t unexpected_files < <(
       ./src/eye_scene_model/sign_motion.rs \
       ./src/eye_scene_model/sign_continuity.rs \
       ./src/gaze_target_solver.rs \
+      ./src/joint_gaze_live.rs \
+      ./src/gaze_target_solver/joint_tracking.rs \
       ./src/binocular_coordinator.rs \
+      ./src/binocular_coordinator/source_pairing.rs \
       ./src/bin/buttercup_screen_reflection_raw_decode.rs \
       ./src/bin/buttercup_sam31_arc_trial.rs \
       ./src/bin/buttercup_flat_tire_eval.rs \

@@ -228,6 +228,7 @@ pub(crate) enum SurfaceSignEvidence {
     PupilAnchor,
     MotionWindow,
     KinematicCorrection,
+    JointConics,
 }
 
 impl SurfaceSignEvidence {
@@ -238,10 +239,11 @@ impl SurfaceSignEvidence {
             Self::PupilAnchor => "pupil-anchor",
             Self::MotionWindow => "motion-window",
             Self::KinematicCorrection => "kinematic-correction",
+            Self::JointConics => "joint-conics",
         }
     }
     pub(crate) fn sustained_acquisition_support(self) -> bool {
-        matches!(self, Self::PupilAnchor | Self::MotionWindow)
+        matches!(self, Self::PupilAnchor | Self::MotionWindow | Self::JointConics)
     }
 }
 

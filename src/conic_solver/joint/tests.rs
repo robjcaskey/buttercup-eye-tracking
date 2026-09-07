@@ -127,6 +127,17 @@ fn camera_facing_is_a_hard_projection_constraint() {
 }
 
 #[test]
+fn nested_radius_projection_moves_coupled_radii_without_relaxing_frozen_bounds() {
+    let q=project_nested_radii([4.1,5.6,2.4],[4.0,3.5,0.6],[8.0,7.5,4.5],[1.0;3]).unwrap();
+    assert!((q[0]-4.85).abs()<1.0e-10);
+    assert_eq!(q[0],q[1]);
+    assert!((q[2]-2.4).abs()<1.0e-10);
+    let q=project_nested_radii([4.1,5.6,6.0],[4.0,3.5,0.6],[4.4,7.5,4.5],[1.0;3]).unwrap();
+    assert!(q[0]<=4.4&&q[1]<=q[0]&&q[2]<q[1]);
+    assert!(project_nested_radii([4.0,5.6,2.4],[3.0,5.0,0.6],[4.0,7.5,4.5],[1.0;3]).is_none());
+}
+
+#[test]
 fn joint_fixation_recovers_both_vertical_signs_from_mixed_boundary_samples() {
     for y in [-180.0,180.0] {
         let fixture = Fixture::new([95.0,y,250.0]);

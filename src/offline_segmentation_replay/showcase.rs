@@ -28,7 +28,7 @@ pub(super) fn render(
         match mode {
             "flat-tire" => { draw_sam31_outer_iris_fit(&mut pixels,width,height,0,0,SCALE,frame.sequence,proposal); }
             "contact" => { draw_sam31_virtual_contact_source(&mut pixels,width,height,0,0,SCALE,
-                frame.sequence,proposal,contact); }
+                frame.sequence,proposal,contact,None); }
             _ => {}
         }
         let name = format!("{mode}/{index:06}.ppm");

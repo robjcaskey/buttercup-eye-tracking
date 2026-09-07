@@ -542,6 +542,20 @@ impl ProposalMasks {
     }
 }
 
+/// Recheck the existing RAW admission rule on this proposal's own source.
+/// Joint solving may retain rejected contour sections with wider support,
+/// but must not promote a rejected full ellipse to a high-fidelity measure.
+pub(crate) fn proposal_raw_outer_admitted(proposal:&ProposalMasks)->bool {
+    let Some(review)=proposal.outer_fit.as_ref() else {return false;};
+    if proposal.source_width<2 || proposal.source_height<2
+        || proposal.source_width.checked_mul(proposal.source_height)!=Some(proposal.source_raw.len()) {return false;}
+    let frame=Arc::new(RawFrame {eye_index:proposal.eye_index,sequence:proposal.source_sequence,
+        timestamp_ns:proposal.source_timestamp_ns,sensor_x:proposal.source_sensor_origin.0,
+        sensor_y:proposal.source_sensor_origin.1,width:proposal.source_width,height:proposal.source_height,
+        registration_anchor:None,pupil_component_seed:None,pixels:Arc::clone(&proposal.source_raw)});
+    raw_luma(&[frame]).first().is_some_and(|image|live_detector_raw_gate_passes(raw_ring_support(image,review.ellipse)))
+}
+
 /// One synchronous, offline prompt-engineering run over a fixed native RAW10
 /// history.  Unlike the live mailbox API, this retains every requested
 /// semantic answer so combinations of one to three follow-on questions can be

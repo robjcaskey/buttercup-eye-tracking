@@ -10,6 +10,7 @@ use crate::eye_scene_model::RelativeGazeVector;
 use crate::geometry::{add3, cross3, dot3, norm3, normalized3, scale3, solve_3x3, sub3};
 use crate::roi_evidence::RoiConicEvidence;
 use crate::conic_solver::joint::{JointConicRequest, JointConicSolution, JointConicUnavailable, JointScenePrior};
+pub(crate) mod joint_tracking;
 
 /// Joint target solving is intentionally distinct from the migrated
 /// monocular display mapping below. Do not choose a winning eye before this
@@ -30,9 +31,10 @@ pub(crate) enum JointGazeUnavailable {
     Conic(JointConicUnavailable),
 }
 
-/// Unlike a display cursor, the joint target may have metric depth. Unknown
-/// metric origin/scale must leave the target absent even when a direction is
-/// observable. Camera-frame axes follow RelativeGazeVector (+Z toward camera).
+/// Unlike a display cursor, this target has depth conditional on the request's
+/// explicit metric scene support. A nominal prior is not measured anatomy;
+/// callers must preserve that provenance. Camera-frame axes follow
+/// RelativeGazeVector (+Z toward camera).
 #[derive(Clone, Debug)]
 pub(crate) struct JointGazeSolution {
     pub(crate) eye_directions: [Option<RelativeGazeVector>; 2],

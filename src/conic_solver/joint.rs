@@ -481,6 +481,18 @@ impl<'a> Problem<'a> {
         add3(self.request.scene.target_reference_camera_mm, [p[0]*depth,p[1]*depth,depth])
     }
 
+    fn project_step(&self, mut p:Parameters) -> Option<Parameters> {
+        for i in 0..PARAMETERS {p[i]=p[i].clamp(self.lower[i],self.upper[i]);}
+        for eye in 0..2 {if self.present[eye] {
+            let k=TARGET_PARAMETERS+eye*EYE_PARAMETERS+3;
+            let nested=project_nested_radii(std::array::from_fn(|i|p[k+i]),
+                std::array::from_fn(|i|self.lower[k+i]),std::array::from_fn(|i|self.upper[k+i]),
+                std::array::from_fn(|i|self.scales[k+i]))?;
+            p[k..k+3].copy_from_slice(&nested);
+        }}
+        Some(p)
+    }
+
     fn geometry(&self, p: &Parameters, eye: usize) -> Option<([f64;3],[f64;3], [ProjectedCircle;3])> {
         let k = TARGET_PARAMETERS + eye*EYE_PARAMETERS;
         let c = [p[k], p[k+1], p[k+2]];
@@ -667,7 +679,11 @@ impl<'a> Problem<'a> {
                 for i in 0..PARAMETERS { regularized[i][i] += damping*(matrix[i][i]+1.0); }
                 let Some(delta) = solve_dense(regularized,rhs) else { damping *= 10.0; continue; };
                 let mut q = p;
-                for i in 0..PARAMETERS { q[i] = (p[i]+delta[i]*self.scales[i]).clamp(self.lower[i],self.upper[i]); }
+                for i in 0..PARAMETERS { q[i] = p[i]+delta[i]*self.scales[i]; }
+                // Project onto the bounded nested-radius set. Rejecting every
+                // coupled step when an unobserved inner radius crosses the
+                // observed outer radius can otherwise freeze BOTH eyes.
+                let Some(q)=self.project_step(q) else {damping*=5.0;continue;};
                 let candidate_cost = self.conics(&q).and_then(|c| self.residuals(&q,&self.select(&c)))
                     .map(|r| squared_norm(&r)).unwrap_or(f64::INFINITY);
                 steps += 1;
@@ -712,6 +728,32 @@ impl<'a> Problem<'a> {
         }}
         result.contributing_eyes.into_iter().any(|x| x).then_some(result)
     }
+}
+
+/// Exact weighted least-squares projection onto outer >= inner > pupil within
+/// frozen individual bounds. Three variables have only four contiguous active
+/// block partitions; enumerate those rather than opening any anatomical bound.
+fn project_nested_radii(values:[f64;3],lower:[f64;3],upper:[f64;3],scales:[f64;3])->Option<[f64;3]> {
+    let offset=[0.0,0.0,1.0e-6];
+    let values=std::array::from_fn::<_,3,_>(|i|values[i]+offset[i]);
+    let lower=std::array::from_fn::<_,3,_>(|i|lower[i]+offset[i]);
+    let upper=std::array::from_fn::<_,3,_>(|i|upper[i]+offset[i]);
+    let weights=scales.map(|s|s.powi(-2));
+    let mut best=None;
+    for cuts in 0..4 {
+        let mut q=[0.0;3];let mut start=0;let mut feasible=true;
+        for end in 0..3 {if end==2 || cuts&(1<<end)!=0 {
+            let lo=lower[start..=end].iter().copied().fold(f64::NEG_INFINITY,f64::max);
+            let hi=upper[start..=end].iter().copied().fold(f64::INFINITY,f64::min);
+            if lo>hi {feasible=false;break;}
+            let mean=(start..=end).map(|i|weights[i]*values[i]).sum::<f64>()/weights[start..=end].iter().sum::<f64>();
+            q[start..=end].fill(mean.clamp(lo,hi));start=end+1;
+        }}
+        if !feasible || q[0]<q[1] || q[1]<q[2] {continue;}
+        let cost=(0..3).map(|i|weights[i]*(q[i]-values[i]).powi(2)).sum::<f64>();
+        if best.is_none_or(|(_,old)|cost<old) {best=Some((q,cost));}
+    }
+    best.map(|(q,_)|std::array::from_fn(|i|q[i]-offset[i]))
 }
 
 fn robust_residual(value: f64) -> f64 {

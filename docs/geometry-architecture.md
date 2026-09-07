@@ -1,20 +1,22 @@
 # Geometry module boundaries and type inventory
 
-This is an incremental extraction checkpoint, not the completed probabilistic
-solver. Existing algorithms, thresholds, random streams, source clocks and
-publication gates are preserved. The new joint-solver entry points return
-`NotImplemented`; they are not connected to live publication.
+This remains an incremental geometry architecture, not a calibrated
+probabilistic eye model. A sparse shared-target conic solver and source-keyed
+live adapter now exist; their corpus validation is in progress. See
+[joint conic solving](joint-conic-solver.md) for the objective, assumptions,
+live routing, evaluated scope and known failures. The default single-ROI
+route retains the established monocular surface tracker.
 
 ## Responsibilities
 
 | Module | Existing functionality now owned here | Still missing |
 | --- | --- | --- |
 | `roi_evidence` | RAW model-frame record; image-motion records; source-exposure-aligned whole-ROI motion timeline | Uniform evidence packets from every detector, including correlated arc alternatives |
-| `outline_conic_segments` | Ordered component contours, resampling, flat-tire/chord exclusion, tangent support and conic-fit feedback | Alternative gradient-band segmentation, explicit arc identities and iterative resegmentation |
-| `conic_solver` | Deterministic RANSAC/refit, tangent/coverage/conditioning culling, apparent-radius support, projected-circle camera envelope | Joint mixed-boundary/multi-ROI hypotheses, calibrated uncertainty and sparse probabilistic ranking |
-| `eye_scene_model` | Relative gaze convention, surface/sign and effective-pivot histories, convex-contact proof, coarse scale projection; shared limbus-scale, pupil-projection, center and size state; owns `coupled_eye_kinematics` | Uncertain metric eye/camera pose, cooperative 3D pivot updates and a joint anatomical motion model |
-| `binocular_coordinator` | Explicit request/factor contracts and an abstaining stub | Per-eye settling histories, clock alignment policy, learned vergence/IPD factors |
-| `gaze_target_solver` | Existing monocular physical-display/ray intersection, affine fitting and robust calibration geometry | Joint gaze-target inference from heterogeneous conics/arcs and uncertain eye origins |
+| `outline_conic_segments` | Ordered contours, flat-tire exclusion, tangent support; owned source-keyed retained SAM arcs and bounded RAW gradient alternatives | Unfitted multi-query arc admission and iterative resegmentation |
+| `conic_solver` | Legacy RANSAC/refit plus exact projected-circle mixed-boundary/multi-ROI shared-target hypotheses and bounded robust refinement | Calibrated uncertainty, stronger boundary-selection/observability accounting |
+| `eye_scene_model` | Relative gaze, surface/sign and effective-pivot histories, convex-contact proof, coarse scale; shared limbus/pupil state; coarse binocular metric support | Calibrated metric camera/eye pose, learned mobile-pivot feedback and a joint anatomical motion model |
+| `binocular_coordinator` | Same-source-clock policy and bounded per-ROI exact-exposure pairing | Per-eye settling histories, measured rolling-row clock bounds, learned vergence/IPD factors |
+| `gaze_target_solver` | Monocular display mapping/calibration plus joint shared-fixation inference and asynchronous source-keyed orchestration | Validated optical-to-visual-axis calibration and a metric transform to the legacy display frame |
 | `geometry` | Shared ellipse shape, image-axis helpers and small numerical/vector routines | Further coordinate-safe primitives as callers migrate |
 
 The live SAM route now calls the extracted outline and conic modules, then
@@ -51,8 +53,10 @@ fit; an incompatible second eye must not degrade a good one by forced averaging.
 The sparse request contracts borrow native-ROI arcs and supported conics rather
 than cloning frames. They preserve boundary kind, evidence-group correlation,
 ROI identity and exposure. Joint conic requests have explicit hypothesis and
-refinement budgets, but no search uses those budgets yet. The migrated legacy
-fitter still uses its original bounded sampling/refit loops.
+refinement budgets, enforced by the joint optimizer. The migrated legacy
+fitter still uses its original bounded sampling/refit loops. The viewer adapter
+is `joint_gaze_live`: no window state or calibrated screen target enters the
+joint segment objective.
 
 ## Coordinate and uncertainty rules
 
@@ -81,9 +85,10 @@ distinct latent variables.
   hard geometry/convexity limits stay fixed during this refinement; the
   approximate pivot is a soft constraint, not an immutable anatomical hinge.
 
-This is a requirement for the **still-unimplemented joint solver**. The existing
-single-ellipse fitter and temporal trackers do not yet implement this coupled
-optimization.
+The joint solver implements the same-frame coupled nested-circle model and
+optional independent mobile-pivot support. Persistent anatomical learning,
+iterative resegmentation and calibrated uncertainty remain incomplete. The
+current live prior does not invent an independent pivot from its own candidate.
 
 ### Executable constraint examples and conditional fidelity
 
@@ -139,9 +144,9 @@ SAM identity-carry experiment, see [ROI reframe continuity](roi-reframe-continui
   the camera**. Do not silently reinterpret it using the common +z-away camera
   convention. Current display geometry is eye-relative **inches**.
 - Contact sphere/pivot depth is currently in image-scale units relative to the
-  limbus slice. It is not metric camera distance. The future joint target
-  contract names millimeters explicitly and leaves unavailable metric position
-  and covariance absent.
+  limbus slice. It is not metric camera distance. The joint target contract
+  names millimeters explicitly, preserves its metric-prior provenance, and
+  leaves uncalibrated covariance absent.
 - Effective rotation centers are movable approximations, not rigid anatomical
   hinges. Muscle-driven translation and model mismatch need nuisance/uncertainty
   terms. Motion history supplies defeasible support; the visible convex surface
@@ -323,9 +328,10 @@ independent. This is bounded reacquisition, not a probabilistic joint solver.
 2. Adapt both SAM and native RAW arcs into the shared evidence packet. Retain
    alternative inner/outer edges and occlusion explanations without counting
    their shared pixels as independent observations.
-3. Implement bounded joint hypotheses, with separate hard physical rejection,
-   defeasible priors and explicitly calibrated uncertainty. The effective
-   pivot/camera pose should receive soft residual feedback, not be fixed.
+3. Validate the implemented bounded joint hypotheses across the complete
+   available stereo corpus; improve boundary selection and calibrated
+   uncertainty. The effective pivot/camera pose should receive independent
+   soft residual feedback, not become a fixed or self-fulfilling prior.
 4. Add per-ROI settling/vergence coordination and target observability tests
    covering one missing eye, one defocused eye and incompatible second-eye
    evidence. Unknown depth must not become an invented 3D target.

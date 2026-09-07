@@ -114,7 +114,7 @@ pub fn geometry(plane: VirtualDisplayPlane, reference_eye: usize, camera: Value)
             "local_rotation_center_and_radius": "estimated model-space sensor pixels; never metric eye position/radius",
             "scale_hint": "MediaPipe iris projection plus assumed 12mm limbus; heuristic bounds, not calibrated probability",
             "other_eye_origin": "unavailable; no nominal IPD inserted",
-            "binocular": "unavailable; joint-gaze solver remains NotImplemented"}})
+            "binocular": "source-keyed conditional joint conics are exported separately in fused; no transform to this legacy monitor frame is asserted"}})
 }
 
 /// Reuses the same plane/ray convention as VirtualDisplayPlane::target, while
@@ -191,7 +191,8 @@ pub fn snapshot(
         states.push(json!({"roi_id": index+1, "enabled": enabled[index], "sensor_resident": resident, "state": state}));
         let reference = index == input.reference_eye;
         let usable = enabled[index] && !stale && resident != Some(false) && transport["global_capture_active"] != true;
-        let axis = surface.map(|s| s.relative_gaze.as_array());
+        let contact_surface=frame.and_then(|f|if f.segmentation_mode==crate::SegmentationMode::Sam31 {f.virtual_contact_surface_gaze} else {f.surface_gaze});
+        let axis = contact_surface.map(|s| s.relative_gaze.as_array());
         let source = hub.source_reference(index as u32 + 1, surface.and_then(|s| s.source_timestamp_ns));
         let analysis_pending = transport["latest_ingress"][index]["source_key"].as_object().is_some()
             && frame.is_none_or(|f|transport["latest_ingress"][index]["source_key"] != f.recording_clock["source_key"]);
@@ -209,7 +210,9 @@ pub fn snapshot(
             "basis": frame.map(|f| json!({"authority_generation": f.gaze_authority_generation.to_string(),
                 "prompt_generation": f.gaze_authority_sam_prompt_generation.map(|n|n.to_string()),
                 "sign_epoch": surface.map(|s|s.sign_epoch.to_string()), "sign_resolved":surface.map(|s|s.sign_resolved)})),
-            "contact_axis_candidate": axis, "admitted_contact_axis": admitted.map(|g|g.as_array()),
+            "contact_axis_candidate": axis, "admitted_contact_axis": pose.filter(|_|usable&&contact_surface.is_some_and(|s|s.sign_resolved)).map(|p|p.relative_gaze.as_array()),
+            "gaze_axis_candidate": surface.map(|s|s.relative_gaze.as_array()),
+            "joint_conics":frame.filter(|f|f.joint_gaze_active).map(crate::joint_gaze_live::json),
             "contact_authority": pose.map(|p|p.authority.label()), "visual_axis": null,
             "held_geometry": pose.is_some_and(|p|p.authority == crate::VirtualContactAuthority::MotionHeld),
             "same_source_as_displayed_exposure": frame.zip(surface).map(|(f,s)| s.source_timestamp_ns==Some(f.timestamp_ns)),
@@ -227,8 +230,11 @@ pub fn snapshot(
                 "bounds_px_per_10mm":[s.minimum_px,s.maximum_px],"reacquisitions":s.reacquisition_count})),
         })
     }).collect();
+    let fused=eyes.iter().flatten().filter(|f|f.joint_gaze_active&&f.joint_conic.is_some())
+        .max_by_key(|f|f.joint_conic.as_ref().and_then(|p|p.exposures.iter().flatten().map(|e|e.timestamp_ns).max()))
+        .map(crate::joint_gaze_live::json).unwrap_or_else(||json!({"target":null,"status":"joint-conics-inactive-or-unavailable"}));
     json!({"geometry": geometry(input.plane,input.reference_eye,input.camera), "calibration": input.calibration,
-        "eyes":samples,"roi_states":states})
+        "eyes":samples,"roi_states":states,"fused":fused})
 }
 
 #[cfg(test)]

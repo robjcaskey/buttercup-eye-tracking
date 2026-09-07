@@ -8,9 +8,12 @@
     pub(crate) mod conic_solver;
     pub(crate) mod outline_conic_segments;
     pub(crate) mod roi_evidence;
+    pub(crate) mod binocular_coordinator;
     pub(crate) mod eye_scene_model {pub(crate) mod binocular_pose;}
 }
 use native::{conic_solver,outline_conic_segments,roi_evidence};
+use native::{binocular_coordinator,eye_scene_model};
+#[path="../gaze_target_solver/joint_tracking.rs"] mod joint_tracking;
 use native::eye_scene_model::binocular_pose::{approximate_scene,EyePoseInput};
 use conic_solver::joint::*;
 use outline_conic_segments::sparse_evidence::*;
@@ -37,7 +40,7 @@ struct Frame {
     input:Value,
     packet:OwnedRoiEvidence,
     pose:EyePoseInput,
-    validation:Vec<(BoundaryKind,Vec<(f64,f64)>)>,
+    validation:Vec<(usize,u32,BoundaryKind,Vec<(f64,f64)>)>,
     baseline:Option<geometry::Ellipse>,
     selected_raw_admitted:bool,
 }
@@ -85,9 +88,9 @@ fn prepare(row:Value)->Result<Frame,String> {
     let scale=scale["pixels_per_10mm"].as_f64().zip(scale["bounds_px_per_10mm"].as_array()).and_then(|(n,b)|Some([n,b.first()?.as_f64()?,b.get(1)?.as_f64()?]));
     let pose=EyePoseInput {limbus_center_sensor_px:center,pixels_per_10mm:scale};
     let mut validation=Vec::new();
-    for arc in &mut packet.arcs {
+    for (index,arc) in packet.arcs.iter_mut().enumerate() {
         if arc.points_roi_px.len()>=6 {
-            validation.push((arc.kind,arc.points_roi_px.iter().skip(1).step_by(2).copied().collect()));
+            validation.push((index,arc.evidence_group,arc.kind,arc.points_roi_px.iter().skip(1).step_by(2).copied().collect()));
             arc.points_roi_px=arc.points_roi_px.iter().step_by(2).copied().collect();
         }
     }
@@ -98,12 +101,21 @@ fn heldout(solution:&JointConicSolution,frames:&[Option<Frame>;2])->[Value;2] {
     std::array::from_fn(|eye| {
         let Some(frame)=&frames[eye] else {return Value::Null;};
         let mut values=Vec::new();
-        for (kind,points) in &frame.validation {
+        let mut supported=Vec::new();
+        let mut groups=Vec::new();
+        for (index,group,kind,points) in &frame.validation {
             let boundary=match kind {BoundaryKind::OuterLimbus=>0,BoundaryKind::InnerLimbus=>1,BoundaryKind::PupillaryBoundary=>2,BoundaryKind::Unclassified=>continue};
             let Some(e)=solution.ellipses_roi_px[eye][boundary] else {continue;};
-            values.extend(points.iter().map(|&p|conic_solver::ellipse_residual(p,e)));
+            let residuals=points.iter().map(|&p|conic_solver::ellipse_residual(p,e)).collect::<Vec<_>>();
+            let used=solution.arcs.iter().any(|a|a.exposure.roi==frame.packet.exposure.roi&&a.arc_index==*index&&a.used);
+            if used {supported.extend_from_slice(&residuals);}
+            groups.push(json!({"arc":index,"group":group,"kind":format!("{kind:?}"),"used":used,
+                "points":residuals.len(),"rms_px":(residuals.iter().map(|v|v*v).sum::<f64>()/residuals.len() as f64).sqrt()}));
+            values.extend(residuals);
         }
-        json!({"points":values.len(),"rms_px":(!values.is_empty()).then(||(values.iter().map(|v|v*v).sum::<f64>()/values.len() as f64).sqrt())})
+        json!({"points":values.len(),"rms_px":(!values.is_empty()).then(||(values.iter().map(|v|v*v).sum::<f64>()/values.len() as f64).sqrt()),
+            "supported_points":supported.len(),"supported_rms_px":(!supported.is_empty()).then(||(supported.iter().map(|v|v*v).sum::<f64>()/supported.len() as f64).sqrt()),
+            "groups":groups})
     })
 }
 
@@ -160,7 +172,14 @@ fn evaluate(frames:[Option<Frame>;2])->Value {
 fn run()->Result<(),String> {
     let mut args=std::env::args().skip(1);
     let output=PathBuf::from(args.next().ok_or("usage: buttercup_stereo_conic_eval OUTPUT.jsonl SAM_CACHE.jsonl...")?);
-    let files=args.collect::<Vec<_>>();
+    let mut files=Vec::new();
+    let mut maximum_frames_per_cache=usize::MAX;
+    while let Some(arg)=args.next() {
+        if arg=="--max-frames-per-cache" {
+            maximum_frames_per_cache=args.next().ok_or("missing frame limit")?.parse::<usize>().map_err(|e|e.to_string())?;
+            if maximum_frames_per_cache==0 {return Err("frame limit must be positive".into());}
+        } else {files.push(arg);}
+    }
     if files.is_empty() {return Err("at least one SAM evidence cache is required".into());}
     let allowed=std::fs::canonicalize("outputs").map_err(|e|e.to_string())?;
     if !std::fs::canonicalize(output.parent().ok_or("missing output directory")?).map_err(|e|e.to_string())?.starts_with(allowed) {return Err("output must be under outputs".into());}
@@ -174,7 +193,7 @@ fn run()->Result<(),String> {
         Ok(())
     };
     for path in files {
-        for (line_number,line) in BufReader::new(File::open(&path).map_err(|e|e.to_string())?).lines().enumerate() {
+        for (line_number,line) in BufReader::new(File::open(&path).map_err(|e|e.to_string())?).lines().take(maximum_frames_per_cache).enumerate() {
             let row=serde_json::from_str(&line.map_err(|e|e.to_string())?).map_err(|e|format!("{path}:{}: {e}",line_number+1))?;
             let frame=prepare(row)?;
             let eye=frame.packet.exposure.roi.0.checked_sub(1).filter(|e|*e<2).ok_or("invalid ROI")? as usize;

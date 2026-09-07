@@ -359,7 +359,7 @@ impl Hub {
             ));
         }
         let scene = json!({"eyes": presentation.scene["eyes"], "roi_states": roi_states,
-            "fused": {"target": null, "status": "joint-gaze-solver-not-implemented"},
+            "fused": presentation.scene.get("fused").cloned().unwrap_or_else(||json!({"target":null,"status":"joint-conics-unavailable"})),
             "configuration_revision": journal.config_revision.to_string()});
         if scene != journal.scene {
             journal.scene_revision += 1;

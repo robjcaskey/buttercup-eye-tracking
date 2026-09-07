@@ -117,6 +117,7 @@ fn current_sample(app: &App) -> Result<Sample, &'static str> {
     if pose.authority == VirtualContactAuthority::MotionHeld {
         return Err("paused: held contact is not a fresh observation");
     }
+    let pose=crate::pose_for_cursor(&frame,pose).ok_or("paused: no current joint gaze ray")?;
     let calibration = app
         .calibrated_display
         .and_then(|c| c.for_frame(app.focus_eye, Some(&frame)));
