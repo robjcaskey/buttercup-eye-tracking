@@ -107,7 +107,7 @@ pub fn buttercup_map(virtual_mouse: bool, driving: bool) -> HotkeyMap {
     add("Esc", "Exit", true);
     add("Q", "Exit", true);
     add("M", "Mouse mode", true);
-    add("B", "Lightbox", virtual_mouse);
+    add("B", "Lightbox", true);
     add(
         "[",
         if virtual_mouse {
@@ -128,9 +128,15 @@ pub fn buttercup_map(virtual_mouse: bool, driving: bool) -> HotkeyMap {
     );
     add("-", "Iris max -", !virtual_mouse);
     add("=", "Iris max +", !virtual_mouse);
-    add("N", "Pattern", virtual_mouse);
+    add("N", "Pattern", true);
     add("V", "View", true);
-    add("F", "ROI labels", true);
+    add("F", "Scoped view", true);
+    add("Tab", "ROI / linked / global", !virtual_mouse);
+    add(",", "Inspector panel", !virtual_mouse);
+    add("F2", "AF reference = selected ROI", !virtual_mouse);
+    add("Space", "Object search start/stop", !virtual_mouse);
+    add("PageUp", "Inspector scroll up", !virtual_mouse);
+    add("PageDown", "Inspector scroll down", !virtual_mouse);
     add("X", "Lighthouse", true);
     add("Z", "Screen clock", true);
     add("K", "Edge map", true);
@@ -300,16 +306,20 @@ mod tests {
     #[test]
     fn contextual_buttons_report_enabled_state_and_current_action() {
         let normal = buttercup_map(false, false);
-        assert!(!binding(&normal, "B").enabled);
+        assert!(binding(&normal, "B").enabled);
         assert!(!binding(&normal, "T").enabled);
         assert!(binding(&normal, "-").enabled);
         assert_eq!(binding(&normal, "[").label, "Iris min -");
-        assert_eq!(binding(&normal, "F").label, "ROI labels");
+        assert_eq!(binding(&normal, "F").label, "Scoped view");
+        assert!(binding(&normal, ",").enabled);
+        assert_eq!(binding(&normal, ",").label, "Inspector panel");
+        assert!(normal.bindings.iter().all(|binding| binding.key != "F1"));
 
         let mouse_driving = buttercup_map(true, true);
         assert!(binding(&mouse_driving, "B").enabled);
         assert!(binding(&mouse_driving, "T").enabled);
         assert!(!binding(&mouse_driving, "-").enabled);
+        assert!(!binding(&mouse_driving, ",").enabled);
         assert_eq!(binding(&mouse_driving, "[").label, "Lightbox -");
     }
 

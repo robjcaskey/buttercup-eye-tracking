@@ -97,6 +97,7 @@ fn startup_assets_available(model: &Path, prompts: &Path, tracker: &Path) -> boo
 /// Keep offline reports explicit about the otherwise process-local settings.
 pub fn live_configuration() -> serde_json::Value {
     serde_json::json!({
+        "parallel_eye_workers": enabled_env_flag("BUTTERCUP_SAM31_PARALLEL_EYES", true),
         "preprocess": PreprocessRegime::configured_live().ok().map(PreprocessRegime::label),
         "stable_photometry_enabled": enabled_env_flag("BUTTERCUP_SAM31_STABLE_PHOTOMETRY", false),
         "photometry_policy": if enabled_env_flag("BUTTERCUP_SAM31_STABLE_PHOTOMETRY", false) {
@@ -1256,12 +1257,18 @@ struct Batch {
     eye_index: usize,
     frames: Vec<Arc<RawFrame>>,
     motion: Option<SourceMotionSnapshot>,
+    prompt_bundle: PromptBundle,
 }
 
 enum WorkerRequest {
     Batch(Batch),
-    ReloadPrompts(PathBuf),
     Scene(SceneRequest),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PromptBundle {
+    revision: u64,
+    path: PathBuf,
 }
 
 struct SceneRequest {
@@ -1306,6 +1313,11 @@ fn scene_candidate(masks: &[u8], scores: &[f32], width: usize, height: usize) ->
 }
 
 pub struct Client {
+    lanes: Vec<WorkerLane>,
+    prompt_bundle: Mutex<PromptBundle>,
+}
+
+struct WorkerLane {
     request: Option<SyncSender<WorkerRequest>>,
     results: Receiver<OuterResult>,
     proposal_masks: Receiver<Arc<ProposalMasks>>,
@@ -1315,14 +1327,14 @@ pub struct Client {
 }
 
 impl Client {
-    /// Uses the existing serial GPU worker, never a second model or eye tracker.
+    /// Global searches use the primary lane, without touching eye memory.
     pub fn submit_scene(&self, pixels: Arc<Vec<u32>>, width: usize, height: usize,
         prompt_bundle: Option<PathBuf>) -> Result<Receiver<Result<Option<SceneCandidate>, String>>, String> {
         if width == 0 || height == 0 || width.checked_mul(height) != Some(pixels.len()) {
             return Err("invalid scene image".into());
         }
         let (reply, result) = sync_channel(1);
-        self.request.as_ref().ok_or("SAM worker stopped")?
+        self.lanes[0].request.as_ref().ok_or("SAM worker stopped")?
             .try_send(WorkerRequest::Scene(SceneRequest { pixels, width, height, prompt_bundle, reply }))
             .map_err(|_| "SAM worker busy or stopped".to_string())?;
         Ok(result)
@@ -1335,6 +1347,16 @@ impl Client {
         model: impl AsRef<Path>,
         prompt_bundle_override: Option<impl AsRef<Path>>,
     ) -> Result<Self, String> {
+        let count = if enabled_env_flag("BUTTERCUP_SAM31_PARALLEL_EYES", true) { 2 } else { 1 };
+        Self::start_with_lanes(model, prompt_bundle_override, count)
+    }
+
+    fn start_with_lanes(
+        model: impl AsRef<Path>,
+        prompt_bundle_override: Option<impl AsRef<Path>>,
+        count: usize,
+    ) -> Result<Self, String> {
+        if !(1..=2).contains(&count) { return Err("SAM requires one or two worker lanes".into()); }
         PreprocessRegime::configured_live()?;
         let model = model.as_ref().to_path_buf();
         if !model.is_file() {
@@ -1352,38 +1374,25 @@ impl Client {
                 prompt_bundle.display()
             ));
         }
-        // The live tracker currently submits only anatomical subject-right.
-        // A rendezvous channel deliberately keeps no FIFO backlog: while the
-        // model is busy, stale frames are dropped and the first current frame
-        // offered after completion wins. A two-batch FIFO
-        // at 42 Hz made every displayed fit roughly three inference periods
-        // old even though each individual inference was healthy.
-        let (request_tx, request_rx) = sync_channel(0);
-        let (result_tx, result_rx) = sync_channel(4);
-        // Diagnostic masks are independently published even when anatomical
-        // consensus rejects the batch. A capacity of one plus non-blocking
-        // publication always favors a recent diagnostic without allowing the
-        // renderer to back-pressure CUDA inference.
-        let (proposal_tx, proposal_rx) = sync_channel(1);
-        let status = Arc::new(Mutex::new(StatusSnapshot::default()));
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker = start_worker(
-            model,
-            prompt_bundle,
-            request_rx,
-            result_tx,
-            proposal_tx,
-            Arc::clone(&status),
-            Arc::clone(&stop),
-        )?;
-        Ok(Self {
-            request: Some(request_tx),
-            results: result_rx,
-            proposal_masks: proposal_rx,
-            status,
-            stop,
-            worker: Some(worker),
-        })
+        let mut lanes = Vec::with_capacity(count);
+        for lane in 0..count {
+            // No queued RAW backlog and no cross-eye admission starvation.
+            // Each lane loads tensors lazily on its first admitted request.
+            let (request_tx, request_rx) = sync_channel(0);
+            let (result_tx, result_rx) = sync_channel(4);
+            let (proposal_tx, proposal_rx) = sync_channel(1);
+            let status = Arc::new(Mutex::new(StatusSnapshot::default()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker = start_worker(
+                lane, model.clone(), prompt_bundle.clone(), request_rx, result_tx,
+                proposal_tx, Arc::clone(&status), Arc::clone(&stop),
+            )?;
+            lanes.push(WorkerLane {
+                request: Some(request_tx), results: result_rx, proposal_masks: proposal_rx,
+                status, stop, worker: Some(worker),
+            });
+        }
+        Ok(Self { lanes, prompt_bundle: Mutex::new(PromptBundle { revision: 0, path: prompt_bundle }) })
     }
 
     pub fn submit_history(
@@ -1432,7 +1441,7 @@ impl Client {
                     && frame.pixels.len() == frame.width * frame.height
             });
         if !valid {
-            if let Ok(mut status) = self.status.lock() {
+            if let Ok(mut status) = self.lanes[0].status.lock() {
                 status.state = "error";
                 status.detail = format!(
                     "SAM31 video tracking requires one current RAW frame with {}:{} aspect ratio from one eye",
@@ -1441,9 +1450,11 @@ impl Client {
             }
             return SubmitOutcome::Invalid;
         }
-        let Some(request) = self.request.as_ref() else {
+        let lane = &self.lanes[eye_index % self.lanes.len()];
+        let Some(request) = lane.request.as_ref() else {
             return SubmitOutcome::Invalid;
         };
+        let Ok(prompt_bundle) = self.prompt_bundle.lock() else { return SubmitOutcome::Invalid; };
         match request.try_send(WorkerRequest::Batch(Batch {
             target,
             semantic_prompt: semantic_prompt.min(SEMANTIC_PROMPT_COUNT - 1),
@@ -1452,9 +1463,10 @@ impl Client {
             eye_index,
             frames,
             motion,
+            prompt_bundle: prompt_bundle.clone(),
         })) {
             Ok(()) => {
-                if let Ok(mut status) = self.status.lock() {
+                if let Ok(mut status) = lane.status.lock() {
                     status.accepted_batches = status.accepted_batches.saturating_add(1);
                     if status.state == "idle" {
                         status.state = "queued";
@@ -1464,13 +1476,13 @@ impl Client {
                 SubmitOutcome::Accepted
             }
             Err(TrySendError::Full(_)) => {
-                if let Ok(mut status) = self.status.lock() {
+                if let Ok(mut status) = lane.status.lock() {
                     status.dropped_batches = status.dropped_batches.saturating_add(1);
                 }
                 SubmitOutcome::DroppedBusy
             }
             Err(TrySendError::Disconnected(_)) => {
-                if let Ok(mut status) = self.status.lock() {
+                if let Ok(mut status) = lane.status.lock() {
                     status.state = "error";
                     status.detail = "SAM31 worker stopped".to_string();
                 }
@@ -1479,27 +1491,25 @@ impl Client {
         }
     }
 
-    /// Replace the six-row semantic bundle without unloading the resident
-    /// image graph. The caller supplies an already encoded native prompt
-    /// bundle; a rendezvous send prevents this control update from joining a
-    /// stale frame FIFO.
+    /// Atomically bind subsequent submissions on *both* lanes to one revision.
+    /// In-flight requests retain their own prompt/generation. Idle lanes load
+    /// the newest revision on their next frame; no partial broadcast/retry.
     pub fn reload_prompt_bundle(&self, path: impl AsRef<Path>) -> SubmitOutcome {
-        let Some(request) = self.request.as_ref() else {
-            return SubmitOutcome::Invalid;
-        };
-        match request.try_send(WorkerRequest::ReloadPrompts(path.as_ref().to_path_buf())) {
-            Ok(()) => SubmitOutcome::Accepted,
-            Err(TrySendError::Full(_)) => SubmitOutcome::DroppedBusy,
-            Err(TrySendError::Disconnected(_)) => SubmitOutcome::Invalid,
-        }
+        if !path.as_ref().is_file() { return SubmitOutcome::Invalid; }
+        let Ok(mut bundle) = self.prompt_bundle.lock() else { return SubmitOutcome::Invalid; };
+        bundle.revision = bundle.revision.wrapping_add(1);
+        bundle.path = path.as_ref().to_path_buf();
+        SubmitOutcome::Accepted
     }
 
     pub fn drain_results(&self) -> Vec<OuterResult> {
         let mut results = Vec::new();
-        loop {
-            match self.results.try_recv() {
-                Ok(result) => results.push(result),
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        for lane in &self.lanes {
+            loop {
+                match lane.results.try_recv() {
+                    Ok(result) => results.push(result),
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                }
             }
         }
         results
@@ -1507,16 +1517,35 @@ impl Client {
 
     pub fn drain_proposal_masks(&self) -> Vec<Arc<ProposalMasks>> {
         let mut proposals = Vec::new();
-        loop {
-            match self.proposal_masks.try_recv() {
-                Ok(candidate) => proposals.push(candidate),
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        for lane in &self.lanes {
+            loop {
+                match lane.proposal_masks.try_recv() {
+                    Ok(candidate) => proposals.push(candidate),
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                }
             }
         }
         proposals
     }
 
     pub fn status(&self) -> StatusSnapshot {
+        let mut snapshot = self.status_for_eye(0);
+        for eye in 1..self.lanes.len() {
+            let other = self.status_for_eye(eye);
+            snapshot.accepted_batches += other.accepted_batches;
+            snapshot.dropped_batches += other.dropped_batches;
+            snapshot.completed_batches += other.completed_batches;
+        }
+        snapshot
+    }
+
+    pub fn status_for_eye(&self, eye: usize) -> StatusSnapshot {
+        self.lanes[eye % self.lanes.len()].snapshot()
+    }
+}
+
+impl WorkerLane {
+    fn snapshot(&self) -> StatusSnapshot {
         self.status
             .lock()
             .map(|status| status.clone())
@@ -1528,7 +1557,7 @@ impl Client {
     }
 }
 
-impl Drop for Client {
+impl Drop for WorkerLane {
     fn drop(&mut self) {
         // CUDA and LibTorch process-global state must outlive every tensor.
         // Stop accepting queued work, wake the receiver, and join the worker
@@ -1543,6 +1572,7 @@ impl Drop for Client {
 
 #[cfg(not(feature = "sam31"))]
 fn start_worker(
+    _lane: usize,
     _model: PathBuf,
     _prompt_bundle: PathBuf,
     _request: Receiver<WorkerRequest>,
@@ -1556,6 +1586,7 @@ fn start_worker(
 
 #[cfg(feature = "sam31")]
 fn start_worker(
+    lane: usize,
     model: PathBuf,
     prompt_bundle: PathBuf,
     request: Receiver<WorkerRequest>,
@@ -1565,9 +1596,10 @@ fn start_worker(
     stop: Arc<AtomicBool>,
 ) -> Result<std::thread::JoinHandle<()>, String> {
     thread::Builder::new()
-        .name("sam31-iris-segmenter".to_string())
+        .name(format!("sam31-eye-{lane}"))
         .spawn(move || {
             runtime::worker(
+                lane,
                 model,
                 prompt_bundle,
                 request,
@@ -4131,6 +4163,26 @@ mod runtime {
         fn dlerror() -> *const c_char;
         #[link_name = "_ZN2at8autocast18set_autocast_dtypeEN3c1010DeviceTypeENS1_10ScalarTypeE"]
         fn torch_set_autocast_dtype(device_type: i8, scalar_type: i8);
+        fn buttercup_sam_stream_enter(error: *mut c_char, size: usize) -> *mut c_void;
+        fn buttercup_sam_stream_id(handle: *mut c_void) -> i64;
+        fn buttercup_sam_stream_leave(handle: *mut c_void);
+    }
+
+    // Construct/use/drop on one OS thread; all tensors in that worker are
+    // created and consumed on its private stream. No CUDA tensors cross lanes.
+    struct WorkerStream(*mut c_void);
+    impl WorkerStream {
+        fn enter() -> Result<Self, String> {
+            let mut error = [0 as c_char; 1024];
+            let handle = unsafe { buttercup_sam_stream_enter(error.as_mut_ptr(), error.len()) };
+            if handle.is_null() {
+                Err(unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy().into_owned())
+            } else { Ok(Self(handle)) }
+        }
+        fn id(&self) -> i64 { unsafe { buttercup_sam_stream_id(self.0) } }
+    }
+    impl Drop for WorkerStream {
+        fn drop(&mut self) { unsafe { buttercup_sam_stream_leave(self.0) }; }
     }
 
     fn load_cuda_dispatch_library() -> Result<(), String> {
@@ -6850,6 +6902,7 @@ mod runtime {
     }
 
     pub(super) fn worker(
+        lane: usize,
         model_path: PathBuf,
         prompt_bundle_path: PathBuf,
         request: Receiver<WorkerRequest>,
@@ -6871,8 +6924,12 @@ mod runtime {
         // Autocast is thread-local. Keep one guard around the worker lifetime
         // instead of toggling deprecated LibTorch state around every query.
         tch::autocast(true, || {
+            // Declared before tensor owners, therefore dropped after them.
+            // Lazily initialized so an unused second ROI allocates no model.
+            let mut stream: Option<WorkerStream> = None;
             let mut module: Option<CModule> = None;
             let mut prompts: Option<RuntimePrompts> = None;
+            let mut loaded_prompt: Option<PromptBundle> = None;
             let mut tracker_encoder: Option<NativeMaskMemoryEncoder> = None;
             let mut tracker_states = HashMap::<usize, LiveTrackerState>::new();
             // Photometric history belongs to an eye/source session, not the
@@ -6885,6 +6942,15 @@ mod runtime {
             while let Ok(request) = request.recv() {
                 if stop.load(AtomicOrdering::Acquire) {
                     break;
+                }
+                if stream.is_none() {
+                    match WorkerStream::enter() {
+                        Ok(owned) => {
+                            eprintln!("SAM31_LANE_READY lane={lane} cuda_stream={}", owned.id());
+                            stream = Some(owned);
+                        }
+                        Err(error) => { update_status(&status, "error", &error); break; }
+                    }
                 }
                 let batch = match request {
                     WorkerRequest::Scene(scene) => {
@@ -6915,23 +6981,6 @@ mod runtime {
                         continue;
                     }
                     WorkerRequest::Batch(batch) => batch,
-                    WorkerRequest::ReloadPrompts(path) => {
-                        update_status(&status, "loading", "loading custom SAM prompt embedding");
-                        match load_runtime_prompts(&path, device, SEMANTIC_PROMPT_COUNT) {
-                            Ok(loaded) => {
-                                prompts = Some(loaded);
-                                tracker_states.clear();
-                                photometric_states.clear();
-                                update_status(
-                                    &status,
-                                    "idle",
-                                    "custom outer-iris prompt active; waiting for RAW10 history",
-                                );
-                            }
-                            Err(error) => update_status(&status, "error", &error),
-                        }
-                        continue;
-                    }
                 };
                 let started = Instant::now();
                 if module.is_none() {
@@ -6947,9 +6996,14 @@ mod runtime {
                         }
                     }
                 }
-                if prompts.is_none() {
-                    match load_runtime_prompts(&prompt_bundle_path, device, SEMANTIC_PROMPT_COUNT) {
-                        Ok(loaded) => prompts = Some(loaded),
+                if loaded_prompt.as_ref() != Some(&batch.prompt_bundle) {
+                    match load_runtime_prompts(&batch.prompt_bundle.path, device, SEMANTIC_PROMPT_COUNT) {
+                        Ok(loaded) => {
+                            prompts = Some(loaded);
+                            loaded_prompt = Some(batch.prompt_bundle.clone());
+                            tracker_states.clear();
+                            photometric_states.clear();
+                        }
                         Err(error) => {
                             update_status(&status, "error", &error);
                             break;
@@ -7077,10 +7131,12 @@ mod runtime {
                 let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
                 if std::env::var_os("BUTTERCUP_SAM31_VIDEO_TRACE").is_some() {
                     eprintln!(
-                        "SAM31_VIDEO_QUERY sequence={} elapsed_ms={} result={}",
+                        "SAM31_VIDEO_QUERY sequence={} elapsed_ms={} result={} eye={} lane={} source_ns={}",
                         batch.frames.last().map_or(0, |frame| frame.sequence),
                         elapsed_ms,
                         if run.is_ok() { "accepted" } else { "rejected" },
+                        batch.eye_index, lane,
+                        batch.frames.last().map_or(0, |frame| frame.timestamp_ns),
                     );
                 }
                 match run {
@@ -8326,6 +8382,192 @@ mod runtime {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "sam31")]
+    #[test]
+    #[ignore = "requires external paired RAW corpus and coordinated CUDA resources"]
+    fn parallel_eye_corpus_latency_and_geometry() {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::time::{Duration, Instant};
+        let capture = PathBuf::from(std::env::var("BUTTERCUP_PARALLEL_TEST_CAPTURE").unwrap());
+        let report_path = std::env::var("BUTTERCUP_PARALLEL_TEST_REPORT").unwrap();
+        let rows = std::fs::read_to_string(capture.join("frames.jsonl")).unwrap();
+        let mut frames = std::collections::BTreeMap::<u64, [Option<Arc<RawFrame>>; 2]>::new();
+        for line in rows.lines() {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            let n = |key| row[key].as_u64().unwrap();
+            let sequence = n("sequence");
+            let eye = n("eye_id") as usize - 1;
+            if eye > 1 { continue; }
+            let mut file = std::fs::File::open(capture.join(row["stream"].as_str().unwrap())).unwrap();
+            file.seek(SeekFrom::Start(n("offset"))).unwrap();
+            let mut bytes = vec![0; n("length") as usize];
+            file.read_exact(&mut bytes).unwrap();
+            let pixels = crate::raw10::try_unpack_raw10(&bytes, n("width") as usize,
+                n("height") as usize, n("stride") as usize).unwrap();
+            frames.entry(sequence).or_default()[eye] = Some(Arc::new(RawFrame {
+                eye_index: eye, sequence, timestamp_ns: n("timestamp_ns"),
+                sensor_x: n("sensor_x") as u32, sensor_y: n("sensor_y") as u32,
+                width: n("width") as usize, height: n("height") as usize,
+                pixels: Arc::new(pixels), registration_anchor: None, pupil_component_seed: None,
+            }));
+        }
+        let pairs: Vec<_> = frames.into_values().filter(|pair| pair.iter().all(Option::is_some)).take(24).collect();
+        assert!(pairs.len() >= 10);
+        let mut reports = Vec::new();
+        for lanes in [1, 2] {
+            let client = Client::start_with_lanes(default_model_path(), None::<&Path>, lanes).unwrap();
+            let mut observations = Vec::new();
+            let mut timings = Vec::new();
+            let mut gazes: [crate::eye_scene_model::SurfaceGazeTracker; 2] = Default::default();
+            let gaze_start = Instant::now();
+            let first_source_ns = pairs[0][0].as_ref().unwrap().timestamp_ns;
+            for (pair_index, pair) in pairs.iter().enumerate() {
+                let started = Instant::now();
+                let mut submit_ms = [0.0; 2];
+                let mut done_ms = [0.0; 2];
+                let mut completed = [false; 2];
+                let before = [client.status_for_eye(0).completed_batches,
+                    client.status_for_eye(1).completed_batches];
+                let mut submitted = [false; 2];
+                let mut proposals: [Option<Arc<ProposalMasks>>; 2] = Default::default();
+                let mut accepted = [false; 2];
+                while !completed.iter().all(|v| *v) {
+                    assert!(started.elapsed() < Duration::from_secs(90), "SAM workers stalled");
+                    for eye in 0..2 {
+                        if !submitted[eye] && (lanes == 2 || eye == 0 || completed[0]) {
+                            let history = VecDeque::from([Arc::clone(pair[eye].as_ref().unwrap())]);
+                            match client.submit_history(&history, Target::OuterLimbus, 0, 0, 1) {
+                                SubmitOutcome::Accepted => {
+                                    submitted[eye] = true;
+                                    submit_ms[eye] = started.elapsed().as_secs_f64()*1000.0;
+                                }
+                                SubmitOutcome::DroppedBusy => {},
+                                SubmitOutcome::Invalid => panic!("SAM lane disconnected"),
+                            }
+                        }
+                        let status = client.status_for_eye(eye);
+                        let expected = before[eye] + if lanes == 1 { eye as u64 + 1 } else { 1 };
+                        if submitted[eye] && !completed[eye] && status.completed_batches >= expected {
+                            completed[eye] = true;
+                            done_ms[eye] = started.elapsed().as_secs_f64()*1000.0;
+                        }
+                        assert_ne!(status.state, "error", "{}", status.detail);
+                    }
+                    for proposal in client.drain_proposal_masks() {
+                        let eye = proposal.eye_index;
+                        assert_eq!(proposal.source_timestamp_ns, pair[eye].as_ref().unwrap().timestamp_ns);
+                        proposals[eye] = Some(proposal);
+                    }
+                    for result in client.drain_results() { accepted[result.eye_index] = true; }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                for eye in 0..2 {
+                    let source = pair[eye].as_ref().unwrap();
+                    let ellipse = proposals[eye].as_ref().and_then(|p| p.outer_fit.as_ref()).map(|f|f.ellipse);
+                    let surface = ellipse.and_then(|e| {
+                        let boundary = crate::raw_iris_focus::OuterIrisBoundary {
+                            center: e.center, major_radius: e.major_radius, minor_radius: e.minor_radius,
+                            angle: e.angle,
+                            points: vec![crate::raw_iris_focus::OuterIrisPoint::default(); 8],
+                            ..Default::default()
+                        };
+                        gazes[eye].observe_keyed_with_global_similarity(source.timestamp_ns,
+                            gaze_start + Duration::from_nanos(source.timestamp_ns-first_source_ns),
+                            (source.sensor_x, source.sensor_y), None, &boundary, None)
+                    });
+                    let legacy_filtered = gazes[eye].floating_center_sensor.zip(gazes[eye].floating_near_point_sensor)
+                        .zip(surface).map(|((center, near), s)| [(near.0-center.0)/s.bucketed_face_radius_px,
+                            (near.1-center.1)/s.bucketed_face_radius_px]);
+                    observations.push(serde_json::json!({"pair":pair_index,"eye":eye,"sequence":source.sequence,
+                        "source_ns":source.timestamp_ns,"accepted":accepted[eye],
+                        "ellipse":ellipse.map(|e|[e.center.0,e.center.1,e.major_radius,e.minor_radius,e.angle]),
+                        "frontal_disk_area_px2":ellipse.map(|e|std::f64::consts::PI*e.major_radius.powi(2)),
+                        "current_gaze":surface.map(|s|s.relative_gaze.projected()),
+                        "legacy_filtered_gaze":legacy_filtered,
+                        "submit_ms":submit_ms[eye],"done_ms":done_ms[eye]}));
+                }
+                if pair_index >= 4 { timings.push(started.elapsed().as_secs_f64()*1000.0); }
+            }
+            timings.sort_by(f64::total_cmp);
+            let median_ms = timings[timings.len()/2];
+            let p95_ms = timings[(timings.len()*95/100).min(timings.len()-1)];
+            eprintln!("PAIRED_SAM_BENCH lanes={lanes} pairs={} warmup_pairs=4 median_ms={median_ms:.2} p95_ms={p95_ms:.2}",pairs.len());
+            reports.push(serde_json::json!({"lanes":lanes,"median_pair_ms":median_ms,"p95_pair_ms":p95_ms,"observations":observations}));
+        }
+        std::fs::write(report_path, serde_json::to_vec_pretty(&serde_json::json!({
+            "capture":capture,"warmup_pairs":4,"runs":reports,
+            "limitations":"Scheduling parity on identical paired RAW. No human labels, independent scale or gaze truth; frontal area is not independently normalized SN-FEIDA. All fits and gates unchanged."
+        })).unwrap()).unwrap();
+    }
+
+    // Real rendezvous admission without CUDA: a busy eye must never block
+    // another eye, nor accumulate work to execute after a prompt change.
+    #[test]
+    fn independent_lanes_admit_both_eyes_without_queueing_or_mixing_prompts() {
+        let mut lanes = Vec::new();
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let (tx, rx) = sync_channel(0);
+            let (_, result_rx) = sync_channel(4);
+            let (_, proposal_rx) = sync_channel(1);
+            lanes.push(WorkerLane {
+                request: Some(tx), results: result_rx, proposal_masks: proposal_rx,
+                status: Arc::new(Mutex::new(StatusSnapshot::default())),
+                stop: Arc::new(AtomicBool::new(false)), worker: None,
+            });
+            requests.push(rx);
+        }
+        let client = Client { lanes, prompt_bundle: Mutex::new(PromptBundle {
+            revision: 0, path: "old-prompts".into(),
+        }) };
+        let histories: [VecDeque<_>; 2] = std::array::from_fn(|eye| VecDeque::from([
+            Arc::new(RawFrame {
+                eye_index: eye, sequence: 11, timestamp_ns: 500_000_000,
+                sensor_x: 100 + eye as u32 * 200, sensor_y: 100,
+                width: 12, height: 8, pixels: Arc::new(vec![100; 96]),
+                registration_anchor: None, pupil_component_seed: None,
+            })
+        ]));
+        let submit = |eye| client.submit_history(&histories[eye], Target::OuterLimbus, 0, 7, 8);
+        // No receiver waiting means no backlog, including for an idle sibling.
+        assert_eq!(submit(0), SubmitOutcome::DroppedBusy);
+        let (completed_tx, completed_rx) = sync_channel(2);
+        let mut workers = Vec::new();
+        let mut releases = Vec::new();
+        for (eye, rx) in requests.into_iter().enumerate() {
+            let (release, wait) = sync_channel(1);
+            releases.push(release);
+            let done = completed_tx.clone();
+            workers.push(std::thread::spawn(move || {
+                let WorkerRequest::Batch(batch) = rx.recv().unwrap() else { panic!("expected frame") };
+                done.send((eye, batch)).unwrap();
+                wait.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+            }));
+        }
+        for eye in 0..2 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while submit(eye) != SubmitOutcome::Accepted {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            let (observed_eye, batch) = completed_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            assert_eq!(observed_eye, eye);
+            assert_eq!(batch.eye_index, eye);
+            assert_eq!(batch.frames[0].timestamp_ns, 500_000_000);
+            assert_eq!(batch.prompt_bundle.path, PathBuf::from("old-prompts"));
+            assert_eq!(batch.prompt_generation, 7);
+            assert_eq!(submit(eye), SubmitOutcome::DroppedBusy);
+        }
+        assert_eq!(client.status().accepted_batches, 2);
+        // Reload does not wait for either in-flight query, or partially reload
+        // one eye. Every later submission gets the same immutable revision.
+        assert_eq!(client.reload_prompt_bundle("Cargo.toml"), SubmitOutcome::Accepted);
+        assert_eq!(client.prompt_bundle.lock().unwrap().revision, 1);
+        for release in releases { release.send(()).unwrap(); }
+        for worker in workers { worker.join().unwrap(); }
+    }
+
     #[test]
     fn scene_candidate_accepts_non_elliptical_objects_and_rejects_empty_or_weak_masks() {
         let mut mask=vec![0;100*100];

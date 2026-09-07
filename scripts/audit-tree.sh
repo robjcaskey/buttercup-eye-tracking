@@ -16,11 +16,14 @@ mapfile -t unexpected_files < <(
       ./AGENTS.md \
       ./Cargo.lock \
       ./Cargo.toml \
+      ./build.rs \
       ./README.md \
       ./docs/viewer-overview.png \
       ./docs/geometry-architecture.md \
       ./docs/flat-tire-area-and-motion.md \
       ./docs/roi-reframe-continuity.md \
+      ./docs/viewer-workspaces.md \
+      ./docs/sam-concurrency-and-gaze-latency.md \
       ./scripts/audit-tree.sh \
       ./scripts/run-viewer.sh \
       ./scripts/audit-readmission-corpus.py \
@@ -57,6 +60,7 @@ mapfile -t unexpected_files < <(
       ./src/coupled_eye_kinematics.rs \
       ./src/keyboard_peeper.rs \
       ./src/main.rs \
+      ./src/viewer_ui.rs \
       ./src/native_mediapipe.rs \
       ./src/offline_segmentation_replay.rs \
       ./src/pupil_clock_supervision.rs \
@@ -68,6 +72,7 @@ mapfile -t unexpected_files < <(
       ./src/raw_sclera_vein_graph.rs \
       ./src/raw_sclera_red_canny.rs \
       ./src/sam31_outer.rs \
+      ./src/sam31_cuda_stream.cpp \
       ./src/sam31_photometric.rs \
       ./src/sam31_text.rs \
       ./src/screen_reflection_clock.rs \

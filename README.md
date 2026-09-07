@@ -157,19 +157,57 @@ cargo run --release --bin buttercup-screen-reflection-raw-decode -- \
   --host-phase-prior \
   --output outputs/screen-reflection-calibration/RECOVERED.jsonl
 ```
+# Main-screen workspaces
+
+Click the **ROI / Linked ROIs / Global** tabs, or press **Tab**. **F** cycles
+views within the current workspace; browsing never starts object acquisition.
+
+- **ROI:** one large region with global context underneath. **1** selects
+  subject-left, **2** subject-right. Each retains its own **V** pixel view and
+  **F** overlay. Selection does not change the physical autofocus reference.
+- **Linked ROIs:** compare both retained ROI views, inspect separate source
+  timings, or compare contacts. Missing/disabled ROIs are labelled explicitly;
+  paired presentation is not an implemented joint stereo solve. **V** here
+  deliberately changes both ROI pixel views together.
+- **Global:** full sensor snapshot or prompted object search with an object crop.
+
+The inspector has **View / Model / Cam / More** tabs (comma **,** cycles them).
+View controls, shared analysis, physical whole-camera controls, and diagnostics
+are separate. **PgUp/PgDn** or the wheel scrolls long panels. On smaller windows
+the inspector moves below the images. **F2** explicitly sets the selected ROI
+as the camera autofocus reference. Existing **J**, **M**, and lightbox controls
+remain available; calibration still has its distraction-free screen.
+
+The **J** cursor and post-calibration cursor use absolute placement: each new
+gaze target is displayed immediately, without cursor or gaze-direction easing.
+Temporal sign validation and scale/geometry admission remain intact; SAM inference
+latency still applies, and unsmoothed gaze can show more measurement jitter.
+
+The local control socket supports `VIEW STATUS`, `VIEW ROI|LINKED|GLOBAL`,
+`VIEW LEFT|RIGHT`, and `VIEW NEXT`. `VIEW PROMPT text` applies a prompt to the
+current ROI/global-object context; `VIEW SEARCH` explicitly starts/stops object
+search (start is only valid in its Global view). `VIEW STATUS` reports the current scope,
+view, selected ROI, autofocus reference, both prompts, and object-search state.
+
 # Optional second-eye analysis
 
 Press **3** to toggle subject-left (second ROI) analysis. It starts off; subject-right
 remains enabled. Both enabled eyes may submit SAM requests with separate source
-histories. The worker currently processes these serially without a stale-frame FIFO.
+histories. Each eye has its own lazily loaded SAM worker and private CUDA stream;
+the eyes process concurrently, but each eye's video memory advances in source order.
+There is no queued frame backlog. Prompt reloads bind both workers to the same
+revision while preserving the generation of any in-flight result.
 This is not yet a joint stereo solve: the joint-conic and binocular coordinator
 interfaces remain unimplemented. Enabling the second ROI can increase inference
 contention; physical sensor-band eviction still takes precedence.
+The local control socket also supports `SECOND ROI ON|OFF|STATUS`.
+See [concurrency and gaze latency](docs/sam-concurrency-and-gaze-latency.md)
+for architecture, runtime requirements and the matched RAW timing/geometry check.
 
-In SAM mode, **F → SAM CUSTOM PROMPT: SEGMENTATION ONLY** is a generic object
-inspector: **Enter** edits the shared custom prompt, including objects such as
+In SAM mode, **Global → F → Prompted Object Search** is a generic object
+inspector: **Enter** edits its independent object prompt, including objects such as
 hat, mouth or ear. It exclusively captures a fresh full-sensor presentation,
-runs the prompt through the existing serial SAM worker, and shows the selected
+runs the prompt through the primary SAM worker, and shows the selected
 mask plus a 10%-padded object crop. The global view is always visible; a miss
 clears the old crop and retries after a two-second cooldown. Scores >=0.5 and
 nontrivial mask support are heuristic acceptance gates, not calibrated confidence.
@@ -180,8 +218,9 @@ high-resolution physical sensor ROI. Global inference currently resizes the
 presentation to 384x256, so small objects may be missed. This explicit inspection
 mode captures independently of the eye-specific R recovery switch; it pauses
 fine-eye analysis and cannot supply eye presence, gaze or mouse calibration.
-F leaves inspection and resumes eye revalidation. It shares the custom prompt
-with the other SAM views: restore an iris prompt before returning to eye tracking.
+After applying a prompt, **Space** explicitly starts/stops search. Search remains
+active when browsing another workspace; Space can stop it there too. Stopping
+resumes eye revalidation. Object prompts no longer overwrite the iris prompt.
 Normal eye recovery also publishes each global thumbnail before MediaPipe runs,
 including detection failures.
 

@@ -108,6 +108,7 @@ pub use coupled_eye_kinematics::{
 };
 
 pub(crate) const GAZE_SURFACE_AREA_BUCKET_RATIO: f64 = 1.04;
+// Continuity evidence only; never apply this averaging to published gaze.
 pub(crate) const GAZE_SURFACE_AVERAGE_ALPHA: f64 = 0.35;
 pub(crate) const GAZE_SURFACE_RESET_AFTER: Duration = Duration::from_millis(1_250);
 pub(crate) const GAZE_SURFACE_MAX_BUCKET_JUMP: i32 = 8;
@@ -1038,11 +1039,12 @@ impl SurfaceGazeTracker {
             .map_or(camera_near_point_sensor, |previous| {
                 blend_point(previous, camera_near_point_sensor, alpha)
             });
-        let projected_gaze = (
-            (floating_near_point_sensor.0 - floating_center_sensor.0) / bucketed_face_radius_px,
-            (floating_near_point_sensor.1 - floating_center_sensor.1) / bucketed_face_radius_px,
-        );
-        let relative_gaze = RelativeGazeVector::from_projected(projected_gaze.0, projected_gaze.1)?;
+        // The temporal state above stabilizes *which sign* is physical. Once
+        // selected, publish this exposure's direction immediately. Averaging
+        // the output made absolute gaze cursors creep for several SAM periods.
+        let relative_gaze = RelativeGazeVector::from_projected(
+            selected_projected_gaze.0, selected_projected_gaze.1,
+        )?;
 
         self.floating_center_sensor = Some(floating_center_sensor);
         self.floating_near_point_sensor = Some(floating_near_point_sensor);
@@ -1060,7 +1062,7 @@ impl SurfaceGazeTracker {
             rectified_area_px2,
             area_bucket,
             bucketed_face_radius_px,
-            camera_near_point_sensor: floating_near_point_sensor,
+            camera_near_point_sensor,
             relative_gaze,
             sign_resolved: self.sign_resolved,
             sign_epoch: self.sign_epoch,

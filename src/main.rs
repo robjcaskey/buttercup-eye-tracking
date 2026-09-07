@@ -31,6 +31,7 @@ mod screen_reflection_raw;
 mod screen_reflection_stimulus;
 mod specular_map;
 mod visible_lighthouse_control;
+mod viewer_ui;
 
 use eye_scene_model::limbus_scale::{LimbusRadiusAdmission, LimbusRadiusObservation};
 use eye_scene_model::pupil_center::{
@@ -636,6 +637,15 @@ fn subject_eye_label(index: usize) -> &'static str {
 
 fn subject_eye_analysis_enabled(index: usize, second_roi_enabled: bool) -> bool {
     index == 0 || (index == 1 && second_roi_enabled)
+}
+
+fn set_second_roi_analysis(state: &mut SharedState, enabled: bool) {
+    state.second_roi_enabled = enabled;
+    if !enabled {
+        state.eyes[1] = None;
+        state.eye_identity_present[1] = false;
+        state.eye_presence_stacks[1] = EyePresenceStackStatus::default();
+    }
 }
 
 fn has_eye_border_structure(score: f64, point_count: usize) -> bool {
@@ -5417,6 +5427,9 @@ fn eye_presence_stack_text_rows(
 
 #[derive(Default)]
 struct SharedState {
+    ui_action: Option<viewer_ui::Action>,
+    ui_prompt_request: Option<String>,
+    ui_snapshot: serde_json::Value,
     eyes: [Option<EyeFrame>; 2],
     raw_arrival_generations: [u64; 2],
     eye_identity_present: [bool; 2],
@@ -5522,6 +5535,10 @@ struct SharedState {
     sam31_prompt_status: String,
     sam31_object_inspection: bool,
     sam31_scene_candidate: Option<sam31_outer::SceneCandidate>,
+    sam31_scene_prompt_text: String,
+    sam31_scene_prompt_bundle: Option<PathBuf>,
+    sam31_scene_prompt_generation: u64,
+    sam31_scene_prompt_status: String,
     pupil_size_runtime: PupilSizeRuntimeStatus,
     checkerboard_active: bool,
     checkerboard_generation: u64,
@@ -7465,6 +7482,28 @@ fn handle_control_command(command: &str, shared: &Arc<Mutex<SharedState>>) -> St
     match fields {
         [ping] if ping.eq_ignore_ascii_case("PING") => "{\"ok\":true,\"reply\":\"PONG\"}".to_string(),
         [status] if status.eq_ignore_ascii_case("STATUS") => control_status_json(&state),
+        [view, status] if view.eq_ignore_ascii_case("VIEW") && status.eq_ignore_ascii_case("STATUS") => {
+            serde_json::json!({"ok":true,"ui":state.ui_snapshot}).to_string()
+        }
+        [view, prompt, words @ ..] if view.eq_ignore_ascii_case("VIEW") && prompt.eq_ignore_ascii_case("PROMPT") && !words.is_empty() => {
+            let prompt=words.join(" ");
+            if prompt.chars().count()>240 {control_error("prompt limit is 240 characters")}
+            else {state.ui_prompt_request=Some(prompt);"{\"ok\":true,\"queued\":\"prompt\"}".into()}
+        }
+        [view, action] if view.eq_ignore_ascii_case("VIEW") => {
+            let action=match action.to_ascii_uppercase().as_str() {
+                "ROI"=>Some(viewer_ui::Action::Scope(viewer_ui::Scope::Roi)),
+                "LINKED"=>Some(viewer_ui::Action::Scope(viewer_ui::Scope::Linked)),
+                "GLOBAL"=>Some(viewer_ui::Action::Scope(viewer_ui::Scope::Global)),
+                "NEXT"=>Some(viewer_ui::Action::NextView),
+                "LEFT"=>Some(viewer_ui::Action::Select(1)),
+                "RIGHT"=>Some(viewer_ui::Action::Select(0)),
+                "SEARCH"=>Some(viewer_ui::Action::Search),
+                _=>None,
+            };
+            if let Some(action)=action { state.ui_action=Some(action); "{\"ok\":true,\"queued\":\"view\"}".into() }
+            else {"{\"ok\":false,\"error\":\"VIEW STATUS|ROI|LINKED|GLOBAL|NEXT|LEFT|RIGHT|SEARCH|PROMPT text\"}".into()}
+        }
         [checkerboard, status]
             if (checkerboard.eq_ignore_ascii_case("CHECKERBOARD")
                 || checkerboard.eq_ignore_ascii_case("CALIBRATION"))
@@ -7507,6 +7546,18 @@ fn handle_control_command(command: &str, shared: &Arc<Mutex<SharedState>>) -> St
                 "{{\"ok\":true,\"active\":true,\"generation\":{}}}",
                 state.checkerboard_generation,
             )
+        }
+        [second, roi, value]
+            if second.eq_ignore_ascii_case("SECOND") && roi.eq_ignore_ascii_case("ROI") =>
+        {
+            if value.eq_ignore_ascii_case("ON") {
+                set_second_roi_analysis(&mut state, true);
+            } else if value.eq_ignore_ascii_case("OFF") {
+                set_second_roi_analysis(&mut state, false);
+            } else if !value.eq_ignore_ascii_case("STATUS") {
+                return control_error("SECOND ROI must be ON, OFF, or STATUS");
+            }
+            format!("{{\"ok\":true,\"second_roi_enabled\":{}}}", state.second_roi_enabled)
         }
         [segmentation, status]
             if segmentation.eq_ignore_ascii_case("SEGMENTATION")
@@ -7659,6 +7710,24 @@ fn handle_control_command(command: &str, shared: &Arc<Mutex<SharedState>>) -> St
                 state.segmentation_generation,
                 state.iris_segmentation_generation,
             )
+        }
+        [iris, bounds, set, minimum, maximum]
+            if iris.eq_ignore_ascii_case("IRIS") && bounds.eq_ignore_ascii_case("BOUNDS")
+                && set.eq_ignore_ascii_case("SET") =>
+        {
+            let limits = minimum.parse::<f64>().ok().zip(maximum.parse::<f64>().ok());
+            let Some((minimum, maximum)) = limits.filter(|(lo, hi)| {
+                lo.is_finite() && hi.is_finite()
+                    && *lo >= IRIS_RADIUS_OPERATOR_MINIMUM_PX
+                    && *hi <= IRIS_RADIUS_OPERATOR_MAXIMUM_PX
+                    && *hi >= *lo + IRIS_RADIUS_OPERATOR_MINIMUM_GAP_PX
+            }) else { return control_error("IRIS BOUNDS SET needs finite ordered native-pixel radii within operator limits"); };
+            if iris_radius_operator_limits(&state) != Some((minimum, maximum)) {
+                state.iris_radius_minimum_px = Some(minimum);
+                state.iris_radius_maximum_px = Some(maximum);
+                bump_iris_segmentation_generation(&mut state);
+            }
+            format!("{{\"ok\":true,\"radius_bounds\":{}}}", iris_radius_support_json(&state))
         }
         [iris, bounds, auto]
             if iris.eq_ignore_ascii_case("IRIS")
@@ -8298,7 +8367,7 @@ impl RoiOverlayMode {
         match self {
             Self::FullDiagnostics => "FULL DIAGNOSTICS",
             Self::SamOuterIrisMasks => "SAM PROMPT: OUTER IRIS DISK  ENTER EDIT",
-            Self::SamSegmentationOnly => "SAM CUSTOM PROMPT: SEGMENTATION ONLY  ENTER EDIT",
+            Self::SamSegmentationOnly => "SAM SEGMENTATION MASKS  ENTER EDIT",
             Self::SamOuterIrisFit => "SAM OUTER IRIS: DE-FLAT-TIRE FIT",
             Self::SamConicSegments => "CONIC SEGMENTS",
             Self::SamDeflattenedVirtualContact => "VIRTUAL CONTACT: DE-FLAT-TIRE FIT",
@@ -9388,13 +9457,9 @@ impl VirtualMouseMode {
                             .and_then(|gaze| display_plane.target(gaze))
                     });
                 if let Some(mapped) = mapped {
-                    self.reticle = Some(match self.reticle {
-                        Some(previous) => (
-                            previous.0 * 0.78 + mapped.0 * 0.22,
-                            previous.1 * 0.78 + mapped.1 * 0.22,
-                        ),
-                        None => mapped,
-                    });
+                    // Absolute placement: a fresh gaze target must not ease
+                    // toward its destination over subsequent observations.
+                    self.reticle = Some(mapped);
                 }
             }
             return;
@@ -9527,6 +9592,7 @@ impl VirtualMouseMode {
 }
 
 struct App {
+    ui: viewer_ui::Workspace,
     context: Context<DisplayHandle<'static>>,
     window_state: Option<ScreenWindow>,
     shared: Arc<Mutex<SharedState>>,
@@ -9663,17 +9729,35 @@ fn finalize_calibration_session_document(
         serde_json::json!(sequence_completed && fit_accepted && recording_complete);
 }
 
-fn compile_live_sam31_outer_prompt(shared: Arc<Mutex<SharedState>>, prompt: String) {
+fn prompt_status(state: &mut SharedState, object: bool) -> &mut String {
+    if object { &mut state.sam31_scene_prompt_status } else { &mut state.sam31_prompt_status }
+}
+
+fn install_compiled_prompt(state: &mut SharedState, object: bool, output: PathBuf, prompt: String) {
+    if object {
+        state.sam31_scene_prompt_bundle = Some(output);
+        state.sam31_scene_prompt_generation = state.sam31_scene_prompt_generation.wrapping_add(1);
+        state.sam31_scene_prompt_text = prompt;
+        state.sam31_scene_candidate = None;
+    } else {
+        state.sam31_prompt_bundle_override = Some(output);
+        state.sam31_prompt_bundle_generation = state.sam31_prompt_bundle_generation.wrapping_add(1);
+        state.sam31_prompt_text = prompt;
+    }
+    *prompt_status(state, object) = "PROMPT READY".to_string();
+}
+
+fn compile_live_sam31_outer_prompt(shared: Arc<Mutex<SharedState>>, prompt: String, object: bool) {
     let prompt = prompt.trim().to_string();
     if prompt.is_empty() {
         if let Ok(mut state) = shared.lock() {
-            state.sam31_prompt_status = "PROMPT REJECTED: EMPTY".to_string();
+            *prompt_status(&mut state, object) = "PROMPT REJECTED: EMPTY".to_string();
         }
         return;
     }
     let epoch = if let Ok(mut state) = shared.lock() {
         state.sam31_prompt_compile_epoch = state.sam31_prompt_compile_epoch.wrapping_add(1);
-        state.sam31_prompt_status = "ENCODING CUSTOM PROMPT...".to_string();
+        *prompt_status(&mut state, object) = "ENCODING CUSTOM PROMPT...".to_string();
         state.sam31_prompt_compile_epoch
     } else {
         return;
@@ -9736,23 +9820,17 @@ fn compile_live_sam31_outer_prompt(shared: Arc<Mutex<SharedState>>, prompt: Stri
                 }
                 match result {
                     Ok(()) => {
-                        state.sam31_prompt_bundle_override = Some(output);
-                        state.sam31_prompt_bundle_generation =
-                            state.sam31_prompt_bundle_generation.wrapping_add(1);
-                        state.sam31_prompt_text = prompt;
-                        state.sam31_scene_candidate = None;
-                        state.sam31_prompt_status =
-                            "CUSTOM PROMPT ENCODED; WAITING FOR SAM BATCH BOUNDARY".to_string();
+                        install_compiled_prompt(&mut state,object,output,prompt);
                     }
                     Err(error) => {
-                        state.sam31_prompt_status = format!("PROMPT ERROR: {error}");
+                        *prompt_status(&mut state, object) = format!("PROMPT ERROR: {error}");
                     }
                 }
             }
         });
     if let Err(error) = spawn_result {
         if let Ok(mut state) = shared.lock() {
-            state.sam31_prompt_status = format!("PROMPT THREAD ERROR: {error}");
+            *prompt_status(&mut state, object) = format!("PROMPT THREAD ERROR: {error}");
         }
     }
 }
@@ -30818,12 +30896,12 @@ fn inspect_prompt_scene(config: &Config, shared: &Mutex<SharedState>, client: Op
     let (generation, bundle) = {
         let mut state = shared.lock().map_err(|_| "viewer lock poisoned")?;
         state.reacquire_status = Some("OBJECT GLOBAL SEARCH: CAPTURING FULL SENSOR".into());
-        (state.sam31_prompt_bundle_generation, state.sam31_prompt_bundle_override.clone())
+        (state.sam31_scene_prompt_generation, state.sam31_scene_prompt_bundle.clone())
     };
     let capture = capture_global_presentation(config)?;
     let backdrop = load_ppm(&capture.path)?;
     let current = || !stop.load(Ordering::Relaxed) && shared.lock().is_ok_and(|state|
-        state.sam31_object_inspection && state.sam31_prompt_bundle_generation == generation);
+        state.sam31_object_inspection && state.sam31_scene_prompt_generation == generation);
     if !current() { return Ok(()); }
     if let Ok(mut state) = shared.lock() {
         state.presentation_backdrop = Some(backdrop.clone());
@@ -30847,7 +30925,7 @@ fn inspect_prompt_scene(config: &Config, shared: &Mutex<SharedState>, client: Op
         }
     };
     if let Ok(mut state) = shared.lock() {
-        if state.sam31_object_inspection && state.sam31_prompt_bundle_generation == generation {
+        if state.sam31_object_inspection && state.sam31_scene_prompt_generation == generation {
             state.reacquire_status = Some(if let Some(candidate) = &candidate {
                 format!("OBJECT ROI: GLOBAL-IMAGE CROP; SCORE {:.2} (HEURISTIC)", candidate.score)
             } else {
@@ -34762,7 +34840,7 @@ fn receive(
                                     }
                                 },
                                 |client| {
-                                    let status = client.status();
+                                    let status = client.status_for_eye(index);
                                     let fallback = if native_boundary_ready {
                                         "NATIVE FALLBACK"
                                     } else {
@@ -38323,6 +38401,15 @@ fn glyph(character: char) -> [u8; 7] {
         'W' => [17, 17, 17, 21, 21, 21, 10],
         'X' => [17, 17, 10, 4, 10, 17, 17],
         'Y' => [17, 17, 10, 4, 4, 4, 4],
+        'Z' => [31, 1, 2, 4, 8, 16, 31],
+        '+' => [0, 4, 4, 31, 4, 4, 0],
+        ';' => [0, 4, 4, 0, 4, 4, 8],
+        '\'' => [4, 4, 8, 0, 0, 0, 0],
+        '?' => [14, 17, 1, 2, 4, 0, 4],
+        '(' => [2, 4, 8, 8, 8, 4, 2],
+        ')' => [8, 4, 2, 2, 2, 4, 8],
+        ',' => [0, 0, 0, 0, 4, 4, 8],
+        '_' => [0, 0, 0, 0, 0, 0, 31],
         '-' => [0, 0, 0, 31, 0, 0, 0],
         '/' => [1, 2, 2, 4, 8, 8, 16],
         '%' => [17, 18, 4, 8, 9, 17, 0],
@@ -43077,6 +43164,15 @@ fn fulfill_pending_presentation_export(
 }
 
 fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
+    let action=app.shared.lock().ok().and_then(|mut shared|shared.ui_action.take());
+    if let Some(action)=action {viewer_ui::apply(app,action);}
+    let prompt=app.shared.lock().ok().and_then(|mut shared|shared.ui_prompt_request.take());
+    if let Some(prompt)=prompt {
+        if app.ui.object_view() || app.ui.scope==viewer_ui::Scope::Roi {
+            compile_live_sam31_outer_prompt(Arc::clone(&app.shared),prompt,app.ui.object_view());
+        }
+    }
+    viewer_ui::remember_roi(app);
     if let Ok(shared) = app.shared.lock() {
         app.focus_target = shared.focus_target;
         app.focus_position = shared.focus_position;
@@ -43249,50 +43345,6 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
         state.window.pre_present_notify();
         return buffer.present().map_err(|error| error.to_string());
     }
-    pixels.fill(0x0007_0b10);
-    if app.shared.lock().is_ok_and(|shared| shared.sam31_object_inspection) {
-        let (backdrop, candidate, status, prompt, prompt_status) = {
-            let shared = app.shared.lock().map_err(|_| "viewer lock poisoned")?;
-            (shared.presentation_backdrop.clone(), shared.sam31_scene_candidate.clone(),
-                shared.reacquire_status.clone().unwrap_or_default(), shared.sam31_prompt_text.clone(), shared.sam31_prompt_status.clone())
-        };
-        draw_text(pixels,width,height,12,12,"SAM CUSTOM OBJECT  F NEXT VIEW  ENTER PROMPT  ESC CANCEL EDIT",0x00ff_ffff);
-        draw_text(pixels,width,height,12,34,&format!("PROMPT> {}",app.sam31_prompt_editor.as_deref().unwrap_or(&prompt)),0x00ff_d860);
-        draw_text(pixels,width,height,12,56,&status,0x00ff_d860);
-        draw_text(pixels,width,height,12,74,&prompt_status,0x00c8_d6e5);
-        if let Some(backdrop) = backdrop {
-            let mut tinted = (*backdrop.pixels).clone();
-            if let Some(candidate) = &candidate {
-                let (mw,mh)=candidate.mask_size;
-                for y in 0..backdrop.height {
-                    for x in 0..backdrop.width {
-                        if candidate.mask[y*mh/backdrop.height*mw+x*mw/backdrop.width] != 0 {
-                            let i=y*backdrop.width+x;
-                            tinted[i]=((tinted[i]&0x00fe_fefe)>>1)+0x0000_6040;
-                        }
-                    }
-                }
-            }
-            let overview_height = if candidate.is_some() { height.saturating_sub(120)/2 } else { height.saturating_sub(110) };
-            let rect=blit_scaled(pixels,width,height,&tinted,backdrop.width,backdrop.height,8,90,width.saturating_sub(16),overview_height);
-            if let Some(candidate) = candidate {
-                let [x0,y0,x1,y1]=candidate.bounds;
-                let crop=scene_crop_bounds(candidate.bounds,backdrop.width,backdrop.height);
-                draw_outline(pixels,width,height,(rect.0+(x0*rect.2 as f64) as usize,
-                    rect.1+(y0*rect.3 as f64) as usize,((x1-x0)*rect.2 as f64).ceil() as usize,
-                    ((y1-y0)*rect.3 as f64).ceil() as usize),2,0x0000_ff80);
-                let mut crop_pixels=Vec::with_capacity(crop.2*crop.3);
-                for y in crop.1..crop.1+crop.3 {
-                    crop_pixels.extend_from_slice(&tinted[y*backdrop.width+crop.0..y*backdrop.width+crop.0+crop.2]);
-                }
-                let y=100+overview_height;
-                blit_scaled(pixels,width,height,&crop_pixels,crop.2,crop.3,8,y,width.saturating_sub(16),height.saturating_sub(y+12));
-            }
-        }
-        fulfill_pending_presentation_export(&app.shared,pixels,width,height);
-        state.window.pre_present_notify();
-        return buffer.present().map_err(|error| error.to_string());
-    }
     let mut presented_eyes = app.eyes.clone();
     // Prompt compilation and CUDA inference are asynchronous. Clear any
     // prior-prompt answer immediately when a replacement bundle is ready,
@@ -43355,342 +43407,8 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
             lease.apply_held(frame);
         }
     }
-    let left = presented_eyes[0].as_ref();
-    let right = presented_eyes[1].as_ref();
-    let eye_width = left.or(right).map(|frame| frame.width).unwrap_or(384);
-    let eye_height = left.or(right).map(|frame| frame.height).unwrap_or(256);
-    let status_panel_width = if width >= 1000 {
-        (width / 3).clamp(360, 440)
-    } else {
-        0
-    };
-    let status_gap = usize::from(status_panel_width != 0) * 12;
-    let content_width = width.saturating_sub(status_panel_width + status_gap);
-    // Once the coarse sensor view is present, both native eye slices are the
-    // primary multi-ROI demo and should remain equally sized.  The old
-    // focus-eye magnification forced the second ROI below the fold and left no
-    // room for the overview in the default 1200x850 window.
-    let gap = if app.backdrop.is_some() { 20 } else { 28 };
-    let eye_scales = if app.backdrop.is_some() {
-        let paired_scale = (content_width.saturating_sub(gap) / (eye_width.max(1) * 2)).clamp(1, 3);
-        [paired_scale, paired_scale]
-    } else {
-        let focus_scale = (content_width.saturating_sub(16) / eye_width.max(1)).clamp(1, 3);
-        if app.focus_eye == 0 {
-            [focus_scale, 1]
-        } else {
-            [1, focus_scale]
-        }
-    };
-    let display_widths = [eye_width * eye_scales[0], eye_width * eye_scales[1]];
-    let display_heights = [eye_height * eye_scales[0], eye_height * eye_scales[1]];
-    let total = display_widths[0] + display_widths[1] + gap;
-    let side_by_side = content_width >= total;
-    let eye_area_height = if side_by_side {
-        display_heights[0].max(display_heights[1])
-    } else {
-        display_heights[0] + display_heights[1] + gap
-    };
-    let start_x = if side_by_side {
-        content_width.saturating_sub(total) / 2
-    } else {
-        content_width.saturating_sub(display_widths[0].max(display_widths[1])) / 2
-    };
-    let start_y = height.saturating_sub(eye_area_height + 16).max(28);
-    let segmentation_mode = app
-        .shared
-        .lock()
-        .map(|state| state.segmentation_mode)
-        .unwrap_or(SegmentationMode::Native);
-    let driving_mode = segmentation_mode == SegmentationMode::Driving;
-    let sclera_red_canny_mode = segmentation_mode == SegmentationMode::ScleraRedCanny;
-    if let Some(backdrop) = app.backdrop.as_ref() {
-        let backdrop_y = if status_panel_width == 0 { 168 } else { 28 };
-        let backdrop_height = start_y.saturating_sub(backdrop_y + 28);
-        let image_rect = blit_scaled(
-            pixels,
-            width,
-            height,
-            &backdrop.pixels,
-            backdrop.width,
-            backdrop.height,
-            0,
-            backdrop_y,
-            content_width,
-            backdrop_height,
-        );
-        draw_text(
-            pixels,
-            width,
-            height,
-            image_rect.0 as i32,
-            backdrop_y as i32 - 20,
-            "LAST COARSE SENSOR SNAPSHOT  DISPLAY ONLY",
-            0x00c8_d6e5,
-        );
-        draw_sensor_band_overlay(pixels, width, height, image_rect, [left, right]);
-        for (index, frame, normal_color) in [(0, left, 0x0000_e5ff), (1, right, 0x00ff_4f81)] {
-            if let Some(frame) = frame {
-                let color = if app.eye_identity_present[index] {
-                    normal_color
-                } else {
-                    0x00ff_3030
-                };
-                let roi = project_sensor_rect(
-                    (frame.sensor_x, frame.sensor_y, frame.width, frame.height),
-                    image_rect,
-                );
-                draw_outline(
-                    pixels,
-                    width,
-                    height,
-                    roi,
-                    if app.focus_eye == index { 7 } else { 3 },
-                    color,
-                );
-                draw_sensor_overview_eye_laser(pixels, width, height, image_rect, frame);
-            }
-        }
-        if let Some(scale) = left
-            .and_then(|frame| frame.centimeter_scale)
-            .or_else(|| right.and_then(|frame| frame.centimeter_scale))
-        {
-            draw_centimeter_scale(
-                pixels,
-                width,
-                height,
-                image_rect.0 as i32,
-                image_rect.1 as i32,
-                86.min(image_rect.3),
-                image_rect.2 as f64 / PREVIEW_SENSOR_WIDTH.max(1) as f64,
-                scale,
-            );
-        }
-        draw_text(
-            pixels,
-            width,
-            height,
-            image_rect.0 as i32 + 8,
-            (image_rect.1 + image_rect.3).saturating_sub(20) as i32,
-            if !app.eye_identity_present[0] {
-                "SUBJECT RIGHT ID HELD"
-            } else if app.focus_eye == 0 {
-                "SUBJECT RIGHT ROI FOCUS"
-            } else {
-                "SUBJECT RIGHT ROI"
-            },
-            0x0000_e5ff,
-        );
-        draw_text(
-            pixels,
-            width,
-            height,
-            (image_rect.0 + image_rect.2).saturating_sub(116) as i32,
-            (image_rect.1 + image_rect.3).saturating_sub(20) as i32,
-            if !app.eye_identity_present[1] {
-                "SUBJECT LEFT ID HELD"
-            } else if app.focus_eye == 1 {
-                "SUBJECT LEFT ROI FOCUS"
-            } else {
-                "SUBJECT LEFT ROI"
-            },
-            0x00ff_4f81,
-        );
-    }
-    if let Some(frame) = left {
-        let checkerboard = app.checkerboard_status.overlay.as_ref().filter(|overlay| {
-            overlay.eye_index == 0
-                && overlay.sensor_origin == (frame.sensor_x, frame.sensor_y)
-                && overlay.timestamp_ns.abs_diff(frame.timestamp_ns) <= 1_000_000_000
-        });
-        draw_eye_with_spatial_debug(
-            pixels,
-            width,
-            height,
-            frame,
-            start_x as i32,
-            start_y as i32,
-            app.mode,
-            if !app.eye_identity_present[0] {
-                "SUBJECT RIGHT ID HELD"
-            } else if app.focus_eye == 0 {
-                "SUBJECT RIGHT EYE FOCUS"
-            } else {
-                "SUBJECT RIGHT EYE"
-            },
-            app.focus_eye == 0,
-            app.eye_identity_present[0],
-            eye_scales[0],
-            app.roi_overlay_mode,
-            checkerboard,
-        );
-    }
-    if let Some(frame) = right {
-        let checkerboard = app.checkerboard_status.overlay.as_ref().filter(|overlay| {
-            overlay.eye_index == 1
-                && overlay.sensor_origin == (frame.sensor_x, frame.sensor_y)
-                && overlay.timestamp_ns.abs_diff(frame.timestamp_ns) <= 1_000_000_000
-        });
-        let right_x = if side_by_side {
-            start_x + display_widths[0] + gap
-        } else {
-            start_x
-        };
-        let right_y = if side_by_side {
-            start_y
-        } else {
-            start_y + display_heights[0] + gap
-        };
-        draw_eye_with_spatial_debug(
-            pixels,
-            width,
-            height,
-            frame,
-            right_x as i32,
-            right_y as i32,
-            app.mode,
-            if !app.eye_identity_present[1] {
-                "SUBJECT LEFT ID HELD"
-            } else if app.focus_eye == 1 {
-                "SUBJECT LEFT EYE FOCUS"
-            } else {
-                "SUBJECT LEFT EYE"
-            },
-            app.focus_eye == 1,
-            app.eye_identity_present[1],
-            eye_scales[1],
-            app.roi_overlay_mode,
-            checkerboard,
-        );
-    }
-    if app.checkerboard_status.active {
-        if let Some(overlay) = app
-            .checkerboard_status
-            .overlay
-            .as_ref()
-            .filter(|overlay| overlay.full_sensor)
-        {
-            draw_full_checkerboard_preview(pixels, width, height, content_width, overlay);
-        }
-    }
-    let specular_temporal_state = if app
-        .eyes
-        .iter()
-        .flatten()
-        .any(|frame| frame.specular_motion_compensated)
-    {
-        "MOTION-REGISTERED"
-    } else {
-        "SPATIAL-ONLY"
-    };
-    let mode = match app.mode {
-        ViewMode::QuadColor => "VIEW QUAD BAYER COLOR".to_string(),
-        ViewMode::RawColor => "VIEW RAW10 CFA COLOR".to_string(),
-        ViewMode::BlueFilter => "VIEW BLUE CHANNEL FILTER".to_string(),
-        ViewMode::RedFilter => "VIEW RED CHANNEL FILTER".to_string(),
-        ViewMode::GreenFilter => "VIEW GREEN CHANNEL FILTER".to_string(),
-        ViewMode::SpecularMap => {
-            format!("VIEW SPECULAR MAP {specular_temporal_state}")
-        }
-        ViewMode::CrossPolarized => {
-            format!("VIEW CROSS-POLARIZED ESTIMATE {specular_temporal_state}")
-        }
-        ViewMode::Diffuse => {
-            format!("VIEW DIFFUSE RECONSTRUCTION {specular_temporal_state}")
-        }
-        ViewMode::IlluminationMap => {
-            "VIEW BROAD ILLUMINATION ESTIMATE (MID-GRAY = FRAME REFERENCE)".to_string()
-        }
-        ViewMode::AlbedoMap => "VIEW ALBEDO MAP ESTIMATE (BROAD LIGHT REMOVED)".to_string(),
-        ViewMode::QuadLuma => "VIEW QUAD BAYER LUMA".to_string(),
-        ViewMode::RawLuma => "VIEW RAW10 LUMA 1X1".to_string(),
-        ViewMode::Canny => format!(
-            "VIEW EDGE {}/{} {}",
-            app.edge_map_variant.ordinal(),
-            EdgeMapVariant::COUNT,
-            app.edge_map_variant.label(),
-        ),
-    };
-    let focus_state = format!(
-        "FOCUS {} {} {}",
-        if app.manual_focus { "MANUAL" } else { "AUTO" },
-        if app.focus_eye == 0 { "RIGHT" } else { "LEFT" },
-        match app.focus_settled {
-            Some(true) => "SETTLED",
-            Some(false) => "MOVING",
-            None => "UNKNOWN",
-        },
-    );
-    let focus_values = format!(
-        "TARGET {} ACTUAL {} MOVE {}",
-        app.focus_target
-            .map(|position| position.to_string())
-            .unwrap_or_else(|| "UNKNOWN".to_string()),
-        app.focus_position
-            .map(|position| position.to_string())
-            .unwrap_or_else(|| "UNKNOWN".to_string()),
-        app.focus_generation
-            .map(|generation| generation.to_string())
-            .unwrap_or_else(|| "UNKNOWN".to_string()),
-    );
-    let exposure = format!(
-        "EXPOSURE {} {} ACTUAL {} P90 {}",
-        if app.manual_exposure {
-            "MANUAL"
-        } else {
-            "AUTO"
-        },
-        app.exposure_target
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "UNKNOWN".to_string()),
-        app.exposure_actual
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "UNKNOWN".to_string()),
-        app.exposure_meter_raw10
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "UNKNOWN".to_string()),
-    );
-    let (
-        contrast_percent,
-        reacquire_status,
-        mediapipe_enabled,
-        segmentation_status,
-        size_reticle_mode,
-        eye_laser_enabled,
-        sam31_prompt_text,
-        sam31_prompt_status,
-        eye_presence_stacks,
-        selected_segmentation_mode,
-    ) = app
-        .shared
-        .lock()
-        .ok()
-        .map(|state| {
-            (
-                state.contrast_percent,
-                state.reacquire_status.clone(),
-                selected_mediapipe_cadence(&state) != MediaPipeCadence::None,
-                state.segmentation_status.clone(),
-                state.size_reticle_mode,
-                state.eye_laser_enabled,
-                state.sam31_prompt_text.clone(),
-                state.sam31_prompt_status.clone(),
-                state.eye_presence_stacks.clone(),
-                state.segmentation_mode,
-            )
-        })
-        .unwrap_or((
-            100,
-            None,
-            true,
-            "OUTER SEGMENTATION UNKNOWN".to_string(),
-            SizeReticleMode::Off,
-            false,
-            sam31_outer::DEFAULT_OUTER_IRIS_PROMPT_TEXT.to_string(),
-            "CANONICAL OUTER-IRIS PROMPT".to_string(),
-            std::array::from_fn(|_| EyePresenceStackStatus::default()),
-            SegmentationMode::Native,
-        ));
+
+    let eye_laser_enabled = eye_laser_enabled_now;
     let selected_virtual_contact = presented_eyes[app.focus_eye]
         .as_ref()
         .and_then(virtual_contact_pose);
@@ -43732,14 +43450,8 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
             })
         })
         .flatten();
-    app.nominal_display_cursor = raw_display_target.map(|target| {
-        app.nominal_display_cursor.map_or(target, |previous| {
-            (
-                previous.0 * 0.78 + target.0 * 0.22,
-                previous.1 * 0.78 + target.1 * 0.22,
-            )
-        })
-    });
+    // Present the absolute target immediately, with no redraw-rate easing.
+    app.nominal_display_cursor = raw_display_target;
     let display_cursor_status = DisplayCursorStatus {
         mapping: cursor_mapping,
         display_distance_inches: calibrated_display
@@ -43752,504 +43464,7 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
     if let Ok(mut shared) = app.shared.lock() {
         shared.display_cursor_status = display_cursor_status;
     }
-    let kinematic_sign_correction = presented_eyes[app.focus_eye]
-        .as_ref()
-        .and_then(|frame| frame.virtual_contact_surface_gaze.or(frame.surface_gaze))
-        .map(|surface| surface.kinematic_sign_correction)
-        .unwrap_or([false; 2]);
-    let frame_contrast = format!(
-        "FRAME {} CONTRAST {contrast_percent}%",
-        app.exposure_frame_length
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "UNKNOWN".to_string()),
-    );
-    let focus_filter_status = "AF EYE ARC STREAM".to_string();
-    let camera_frame = timing_metric(
-        app.camera_telemetry.as_ref(),
-        CAMERA_STAGE_SENSOR_INTERVAL,
-        "FRAME",
-        true,
-    );
-    let camera_acquire = timing_metric(
-        app.camera_telemetry.as_ref(),
-        CAMERA_STAGE_SENSOR_ACQUIRE,
-        "READ",
-        false,
-    );
-    let camera_context = timing_metric(
-        app.camera_telemetry.as_ref(),
-        CAMERA_STAGE_CONTEXT_BUILD,
-        "CONTEXT",
-        false,
-    );
-    let camera_slice = timing_metric(
-        app.camera_telemetry.as_ref(),
-        CAMERA_STAGE_ROI_SLICE,
-        "SLICE",
-        false,
-    );
-    let camera_send = timing_metric(
-        app.camera_telemetry.as_ref(),
-        CAMERA_STAGE_STREAM_WRITE,
-        "SEND",
-        false,
-    );
-    let camera_vcm = timing_metric(
-        app.camera_telemetry.as_ref(),
-        CAMERA_STAGE_VCM_COMMAND,
-        "VCM",
-        false,
-    );
-    let camera_remaining = timing_metric(
-        app.camera_telemetry.as_ref(),
-        CAMERA_STAGE_VCM_REMAINING,
-        "SETTLE",
-        false,
-    );
-    let host_gap = timing_metric(
-        app.host_telemetry.as_ref(),
-        HOST_STAGE_PACKET_INTERVAL,
-        "GAP",
-        true,
-    );
-    let host_sets = timing_metric(
-        app.host_telemetry.as_ref(),
-        HOST_STAGE_RAW_SET_INTERVAL,
-        "SETS",
-        true,
-    );
-    let host_read = timing_metric(
-        app.host_telemetry.as_ref(),
-        HOST_STAGE_PACKET_READ,
-        "READ",
-        false,
-    );
-    let host_eye = timing_metric(
-        app.host_telemetry.as_ref(),
-        HOST_STAGE_EYE_PROCESS,
-        "EYE",
-        false,
-    );
-    let host_af = timing_metric(
-        app.host_telemetry.as_ref(),
-        HOST_STAGE_TRACK_AUTOFOCUS,
-        "AF",
-        false,
-    );
-    let host_reacquire = timing_metric(
-        app.host_telemetry.as_ref(),
-        HOST_STAGE_REACQUIRE,
-        "REACQ",
-        false,
-    );
-    let host_temporal_match = timing_metric(
-        app.host_telemetry.as_ref(),
-        HOST_STAGE_TEMPORAL_MATCH,
-        "TEMP MATCH",
-        false,
-    );
-    let host_cluster_fit = timing_metric(
-        app.host_telemetry.as_ref(),
-        HOST_STAGE_CLUSTER_FIT,
-        "CLUSTER FIT",
-        false,
-    );
-
-    let core_background = 0x0034_94d8;
-    let section_background = 0x0022_2d3a;
-    let camera_background = 0x001d_5748;
-    let host_background = 0x0040_365e;
-    let segmentation_background = if app.shared.lock().is_ok_and(|state| {
-        sam31_target_for_modes(state.segmentation_mode, state.rough_pupil_center_mode).is_some()
-    }) {
-        0x0065_4b1f
-    } else {
-        core_background
-    };
-
-    let mut roi_rows = vec![
-        (
-            "ROI ANALYSIS + PRESENTATION".to_string(),
-            section_background,
-        ),
-        (mode, core_background),
-    ];
-    if matches!(
-        app.roi_overlay_mode,
-        RoiOverlayMode::SamOuterIrisMasks | RoiOverlayMode::SamSegmentationOnly | RoiOverlayMode::SamOuterIrisFit
-    ) {
-        let shown_prompt = app
-            .sam31_prompt_editor
-            .as_deref()
-            .unwrap_or(&sam31_prompt_text);
-        roi_rows.push((
-            format!(
-                "{}PROMPT> {}",
-                if app.sam31_prompt_editor.is_some() {
-                    "EDITING  "
-                } else {
-                    "ENTER EDIT  "
-                },
-                shown_prompt
-            ),
-            0x0065_4b1f,
-        ));
-        roi_rows.push((sam31_prompt_status, 0x0065_4b1f));
-    }
-    if driving_mode && !size_reticle_mode.enabled() {
-        roi_rows.push((
-            "DRIVE DOTS EXACT FRAME: GREEN RAW+  ORANGE RAW-  PINK MODEL-FILL".to_string(),
-            0x0041_592c,
-        ));
-    }
-    if sclera_red_canny_mode {
-        roi_rows.push((
-            "VESSEL FEATURES: RED RAW LINES  BLUE RIDGES  YELLOW BRANCHES  GREEN RELOCATED"
-                .to_string(),
-            0x0058_2929,
-        ));
-    }
-    // Keep the method identity and cycle position visible regardless of
-    // reticle diagnostics. Those rows supplement the control, not replace it.
-    roi_rows.push((selected_segmentation_mode.method_control_label(), core_background));
-    roi_rows.push((
-        format!("W ROI/SENSOR FOLLOW {}", if app.shared.lock().is_ok_and(|state| state.region_follow_paused) {
-            "PAUSED"
-        } else { "ON" }),
-        core_background,
-    ));
-    if size_reticle_mode.enabled() && !sclera_red_canny_mode {
-        roi_rows.extend([
-            (
-                format!("U RETICLE {}  (U NEXT)", size_reticle_mode.screen_label()),
-                0x0065_4b1f,
-            ),
-            ("IRIS MIN [ ]  MAX - =  AUTO 0".to_string(), core_background),
-            (
-                "PUPIL MIN LEFT RIGHT  MAX DOWN UP".to_string(),
-                core_background,
-            ),
-            (
-                "GREEN MIN  ORANGE MAX  CYAN EST".to_string(),
-                core_background,
-            ),
-        ]);
-    }
-    roi_rows.extend([
-        (
-            format!(
-                "K LEARN-CANNY+VIEW {}/{} {}",
-                app.edge_map_variant.ordinal(),
-                EdgeMapVariant::COUNT,
-                app.edge_map_variant.label(),
-            ),
-            core_background,
-        ),
-        (
-            {
-                let overlay = app
-                    .roi_overlay_mode
-                    .normalized_for(selected_segmentation_mode);
-                let (ordinal, count) = overlay.position_for(selected_segmentation_mode);
-                format!("F ROI OVERLAY {ordinal}/{count} {}", overlay.label())
-            },
-            core_background,
-        ),
-    ]);
-
-    let second_roi_enabled = app.shared.lock().is_ok_and(|state| state.second_roi_enabled);
-    roi_rows.push((format!("3 SECOND ROI {} (SUBJECT LEFT)", if second_roi_enabled { "ON" } else { "OFF" }), core_background));
-    let presence_rows = eye_presence_stack_text_rows(&eye_presence_stacks, &segmentation_status, second_roi_enabled)
-        .into_iter()
-        .enumerate()
-        .map(|(row, text)| {
-            let background = if row == 0 {
-                section_background
-            } else if row % 2 == 0 {
-                // Each eye's active mode is deliberately the bottom row of
-                // that eye's stack.
-                segmentation_background
-            } else {
-                let stack = &eye_presence_stacks[(row - 1) / 2];
-                if stack.identity_present && stack.watchdog_state.starts_with("PRESENT") {
-                    0x0024_6b3b
-                } else if stack.watchdog_state.starts_with("LOSS") {
-                    0x00c2_4150
-                } else {
-                    core_background
-                }
-            };
-            (text, background)
-        });
-
-    let selected_roi_heading = format!(
-        "SELECTED ROI: SUBJECT {}",
-        if app.focus_eye == 0 { "RIGHT" } else { "LEFT" },
-    );
-    let selected_roi_rows = vec![
-        (selected_roi_heading, section_background),
-        (
-            format!(
-                "J EYE LASER {}  CONTACT {}",
-                if eye_laser_enabled {
-                    match eye_laser_style {
-                        Some(EyeLaserStyle::Locked) => "ON LOCKED",
-                        Some(EyeLaserStyle::SurfaceProvisional) => "ON PROVISIONAL",
-                        Some(EyeLaserStyle::Held) => "ON HELD",
-                        None => "WAIT",
-                    }
-                } else {
-                    "OFF"
-                },
-                virtual_contact_authority
-                    .map(VirtualContactAuthority::label)
-                    .unwrap_or("WAIT"),
-            ),
-            if eye_laser_enabled {
-                match eye_laser_style {
-                    Some(EyeLaserStyle::Locked) => 0x0024_6b3b,
-                    Some(EyeLaserStyle::SurfaceProvisional) => 0x0094_5f1d,
-                    Some(EyeLaserStyle::Held) => 0x0030_6478,
-                    None => 0x0081_5b20,
-                }
-            } else {
-                core_background
-            },
-        ),
-        (
-            format!(
-                "LASER TARGET {}  CURSOR {}",
-                display_cursor_status.mapping.screen_label(),
-                display_cursor_status.cursor_label(eye_laser_enabled),
-            ),
-            if display_cursor_status.mapping == DisplayCursorMapping::InvalidatedNominalFallback {
-                0x00c2_4150
-            } else if eye_laser_enabled
-                && display_cursor_status.mapping == DisplayCursorMapping::UncalibratedNominal
-            {
-                0x0081_5b20
-            } else if eye_laser_enabled {
-                0x0024_6b3b
-            } else {
-                section_background
-            },
-        ),
-        (
-            display_cursor_status.raw_target.map_or_else(
-                || {
-                    format!(
-                        "DISPLAY 27IN 16:9 DIST {:.1}IN  TARGET WAIT",
-                        display_cursor_status.display_distance_inches,
-                    )
-                },
-                |target| {
-                    format!(
-                        "DISPLAY 27IN 16:9 DIST {:.1}IN  RAW X {:+.2} Y {:+.2}",
-                        display_cursor_status.display_distance_inches, target.0, target.1,
-                    )
-                },
-            ),
-            core_background,
-        ),
-        (
-            match kinematic_sign_correction {
-                [true, true] => "VIRTUAL SIGN KINEMATIC CORRECTION X+Y".to_string(),
-                [true, false] => "VIRTUAL SIGN KINEMATIC CORRECTION X".to_string(),
-                [false, true] => "VIRTUAL SIGN KINEMATIC CORRECTION Y".to_string(),
-                [false, false] => "VIRTUAL SIGN KINEMATICS STABLE".to_string(),
-            },
-            if kinematic_sign_correction != [false; 2] {
-                0x0094_5f1d
-            } else {
-                core_background
-            },
-        ),
-        (
-            app.presentation_pivot_contact.map_or_else(
-                || "PIVOT CONTACT WAITING FOR PUBLISHED ANATOMY".to_string(),
-                |contact| {
-                    format!(
-                        "PIVOT CONTACT {} AGE {} X {:.1} Y {:.1}",
-                        if app.eyes[contact.eye]
-                            .as_ref()
-                            .is_some_and(|frame| frame.timestamp_ns == contact.source_timestamp_ns)
-                        {
-                            if contact.directly_published {
-                                "DIRECT"
-                            } else {
-                                "CANDIDATE"
-                            }
-                        } else if contact.directly_published {
-                            "DIRECT-HELD"
-                        } else {
-                            "CANDIDATE-HELD"
-                        },
-                        contact.held_frames,
-                        contact.sensor_xyz.0,
-                        contact.sensor_xyz.1,
-                    )
-                },
-            ),
-            if app.presentation_pivot_contact.is_some() {
-                0x0030_6478
-            } else {
-                core_background
-            },
-        ),
-        (
-            app.ray_origin_lock.map_or_else(
-                || "E ORIGIN FREE".to_string(),
-                |lock| {
-                    format!(
-                        "E ORIGIN AVG {} N {} X {:.1} Y {:.1} Z {:.1}",
-                        if lock.eye == 0 { "RIGHT" } else { "LEFT" },
-                        lock.samples,
-                        lock.sensor_xyz.0,
-                        lock.sensor_xyz.1,
-                        lock.sensor_xyz.2,
-                    )
-                },
-            ),
-            if app.ray_origin_lock.is_some() {
-                0x009c_5b18
-            } else {
-                core_background
-            },
-        ),
-    ];
-
-    let mut camera_rows = vec![
-        ("WHOLE CAMERA + SENSOR".to_string(), section_background),
-        (
-            format!(
-                "B LIGHTBOX {}  N {}  {}",
-                if app.main_lightbox.enabled {
-                    "ON"
-                } else {
-                    "OFF"
-                },
-                app.main_lightbox.pattern.label(),
-                if app.main_lightbox.enabled {
-                    "[] LIGHT WIDTH"
-                } else {
-                    ""
-                }
-            ),
-            core_background,
-        ),
-        (
-            app.checkerboard_status.one_line(),
-            if app.checkerboard_status.calibrated {
-                0x0024_6b3b
-            } else if app.checkerboard_status.active {
-                0x0081_5b20
-            } else {
-                core_background
-            },
-        ),
-        (focus_state, core_background),
-        (focus_values, core_background),
-        (exposure, core_background),
-        (frame_contrast, core_background),
-        (focus_filter_status, core_background),
-        (
-            "S/H RECORD TOGGLE + PREDICTIONS  D RIGHT STILL".to_string(),
-            core_background,
-        ),
-        (
-            format!(
-                "R REACQ+SIZE-FREEZE {}",
-                if mediapipe_enabled { "ON" } else { "OFF" }
-            ),
-            if mediapipe_enabled {
-                core_background
-            } else {
-                0x00c2_4150
-            },
-        ),
-        (
-            "EXPOSURE / DARKER  . BRIGHTER  A AUTO".to_string(),
-            core_background,
-        ),
-        (
-            "X LIGHTHOUSE  Z OPTICAL SCREEN CLOCK (Z/ESC RETURNS)".to_string(),
-            core_background,
-        ),
-    ];
-    if let Some(status) = reacquire_status {
-        camera_rows.push((status, 0x00c2_4150));
-    }
-    camera_rows.extend([
-        ("CAMERA MICROSECONDS".to_string(), camera_background),
-        (camera_frame, camera_background),
-        (camera_acquire, camera_background),
-        (camera_context, camera_background),
-        (camera_slice, camera_background),
-        (camera_send, camera_background),
-        (camera_vcm, camera_background),
-        (camera_remaining, camera_background),
-    ]);
-
-    let mut host_rows = vec![
-        ("HOST MICROSECONDS".to_string(), host_background),
-        (host_sets, host_background),
-        (host_gap, host_background),
-        (host_read, host_background),
-        (host_eye, host_background),
-        (host_af, host_background),
-        (host_reacquire, host_background),
-    ];
-    if segmentation_mode == SegmentationMode::Clusters {
-        host_rows.push((host_temporal_match, host_background));
-        host_rows.push((host_cluster_fit, host_background));
-    }
-
-    let mut rows = roi_rows;
-    rows.extend(presence_rows);
-    rows.extend(selected_roi_rows);
-    rows.extend(camera_rows);
-    rows.extend(host_rows);
-
-    if status_panel_width != 0 {
-        let panel_x = content_width + status_gap;
-        fill_rect(
-            pixels,
-            width,
-            height,
-            panel_x as i32 - 4,
-            0,
-            status_panel_width as i32 + 4,
-            height as i32,
-            0x000d_141c,
-        );
-        let mut status_y = 8;
-        for (text, background) in rows {
-            status_y = draw_status_row(
-                pixels,
-                width,
-                height,
-                panel_x,
-                status_y,
-                status_panel_width,
-                &text,
-                background,
-            );
-        }
-    } else {
-        let mut status_y = 8usize;
-        for (text, background) in rows.into_iter().take(5) {
-            status_y = draw_status_row(
-                pixels,
-                width,
-                height,
-                8,
-                status_y,
-                width.saturating_sub(16),
-                &text,
-                background,
-            );
-        }
-    }
+    viewer_ui::render(app, pixels, width, height, &presented_eyes);
     if app.main_lightbox.enabled && width > 2 && height > 2 {
         let scene = pixels.to_vec();
         let band = ((width.min(height) as f64 * app.main_lightbox.width_fraction).round() as usize)
@@ -44300,6 +43515,14 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
+            WindowEvent::CursorMoved { position, .. } => { self.ui.pointer=(position.x,position.y); }
+            WindowEvent::MouseInput { state:ElementState::Pressed, button:winit::event::MouseButton::Left, .. }
+                if self.virtual_mouse.is_none() && self.sam31_prompt_editor.is_none() => { viewer_ui::click(self); }
+            WindowEvent::MouseWheel { delta, .. } if self.virtual_mouse.is_none() => {
+                let y=match delta {winit::event::MouseScrollDelta::LineDelta(_,y)=>y as f64,
+                    winit::event::MouseScrollDelta::PixelDelta(p)=>p.y};
+                if y<0.0 {self.ui.scroll=self.ui.scroll.saturating_add(3);} else {self.ui.scroll=self.ui.scroll.saturating_sub(3);}
+            }
             WindowEvent::CloseRequested => {
                 self.request_shutdown(event_loop, "window-close");
             }
@@ -44321,7 +43544,7 @@ impl ApplicationHandler for App {
                 {
                     self.sam31_prompt_editor = None;
                     if let Ok(mut shared) = self.shared.lock() {
-                        shared.sam31_prompt_status = "PROMPT EDIT CANCELLED".to_string();
+                        *prompt_status(&mut shared, self.ui.object_view()) = "PROMPT EDIT CANCELLED".to_string();
                     }
                     return;
                 }
@@ -44330,7 +43553,7 @@ impl ApplicationHandler for App {
                         PhysicalKey::Code(KeyCode::Enter) if !event.repeat => {
                             let prompt = self.sam31_prompt_editor.take().unwrap_or_default();
                             eprintln!("SAM31 custom outer-iris prompt submitted: {prompt:?}");
-                            compile_live_sam31_outer_prompt(Arc::clone(&self.shared), prompt);
+                            compile_live_sam31_outer_prompt(Arc::clone(&self.shared), prompt, self.ui.object_view());
                         }
                         PhysicalKey::Code(KeyCode::Backspace) => {
                             editor.pop();
@@ -44351,12 +43574,15 @@ impl ApplicationHandler for App {
                 }
                 if event.physical_key == PhysicalKey::Code(KeyCode::Enter)
                     && !event.repeat
-                    && matches!(self.roi_overlay_mode, RoiOverlayMode::SamOuterIrisMasks | RoiOverlayMode::SamSegmentationOnly)
+                    && (self.ui.object_view() || (self.ui.scope==viewer_ui::Scope::Roi
+                        && matches!(self.roi_overlay_mode, RoiOverlayMode::SamOuterIrisMasks | RoiOverlayMode::SamSegmentationOnly)))
                 {
                     self.sam31_prompt_editor = Some(String::new());
+                    self.ui.panel = viewer_ui::Panel::Selection;
+                    self.ui.scroll = 0;
                     if let Ok(mut shared) = self.shared.lock() {
-                        shared.sam31_prompt_status =
-                            "TYPE REPLACEMENT OUTER-IRIS PROMPT; ENTER APPLY; ESC CANCEL"
+                        *prompt_status(&mut shared, self.ui.object_view()) =
+                            "TYPE PROMPT; ENTER APPLY; ESC CANCEL"
                                 .to_string();
                     }
                     return;
@@ -44585,41 +43811,25 @@ impl ApplicationHandler for App {
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyV) => {
-                        if !event.repeat {
-                            self.mode = self.mode.cycled();
-                            eprintln!(
-                                "view cycled by V to {}",
-                                annotated_view_mode_name(self.mode),
-                            );
-                        }
+                        if !event.repeat { viewer_ui::cycle_pixels(self); }
                     }
                     PhysicalKey::Code(KeyCode::KeyF) => {
-                        if !event.repeat {
-                            if let Ok(mut shared) = self.shared.lock() {
-                                self.roi_overlay_mode =
-                                    self.roi_overlay_mode.cycled_for(shared.segmentation_mode);
-                                shared.sam31_semantic_prompt =
-                                    self.roi_overlay_mode.sam31_prompt_index();
-                                shared.sam31_object_inspection = self.roi_overlay_mode == RoiOverlayMode::SamSegmentationOnly;
-                                shared.sam31_scene_candidate = None;
-                                let (ordinal, count) =
-                                    self.roi_overlay_mode.position_for(shared.segmentation_mode);
-                                eprintln!(
-                                    "ROI overlay cycled by F to {ordinal}/{count} {} for {}",
-                                    self.roi_overlay_mode.label(),
-                                    shared.segmentation_mode.label(),
-                                );
-                            }
-                            if self.roi_overlay_mode == RoiOverlayMode::SamSegmentationOnly {
-                                if let Some(mode) = self.virtual_mouse.take() {
-                                    self.main_lightbox = mode.lightbox;
-                                    self.stop_calibration_capture(false);
-                                    if let Some(state) = self.window_state.as_ref() {
-                                        state.window.set_fullscreen(None);
-                                    }
-                                }
-                                self.presentation_laser_lease = None;
-                            }
+                        if !event.repeat { viewer_ui::apply(self, viewer_ui::Action::NextView); }
+                    }
+                    PhysicalKey::Code(KeyCode::Tab) => {
+                        if !event.repeat { viewer_ui::apply(self, viewer_ui::Action::Scope(self.ui.scope.next())); }
+                    }
+                    PhysicalKey::Code(KeyCode::Comma) => {
+                        if !event.repeat { viewer_ui::next_panel(self); }
+                    }
+                    PhysicalKey::Code(KeyCode::F2) => {
+                        if !event.repeat { viewer_ui::apply(self,viewer_ui::Action::FocusReference); }
+                    }
+                    PhysicalKey::Code(KeyCode::PageDown) => { self.ui.scroll=self.ui.scroll.saturating_add(5); }
+                    PhysicalKey::Code(KeyCode::PageUp) => { self.ui.scroll=self.ui.scroll.saturating_sub(5); }
+                    PhysicalKey::Code(KeyCode::Space) => {
+                        if !event.repeat && (self.ui.object_view() || self.shared.lock().is_ok_and(|s|s.sam31_object_inspection)) {
+                            viewer_ui::apply(self,viewer_ui::Action::Search);
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyX) => {
@@ -44655,12 +43865,8 @@ impl ApplicationHandler for App {
                     PhysicalKey::Code(KeyCode::Digit3) => {
                         if !event.repeat {
                             if let Ok(mut shared) = self.shared.lock() {
-                                shared.second_roi_enabled = !shared.second_roi_enabled;
-                                if !shared.second_roi_enabled {
-                                    shared.eyes[1] = None;
-                                    shared.eye_identity_present[1] = false;
-                                    shared.eye_presence_stacks[1] = EyePresenceStackStatus::default();
-                                }
+                                let enabled = !shared.second_roi_enabled;
+                                set_second_roi_analysis(&mut shared, enabled);
                                 eprintln!("Second ROI (subject-left) analysis {} by 3; joint stereo solver not yet implemented", if shared.second_roi_enabled { "enabled" } else { "disabled" });
                             }
                         }
@@ -44925,17 +44131,8 @@ impl ApplicationHandler for App {
                     }
                     PhysicalKey::Code(KeyCode::Digit1) | PhysicalKey::Code(KeyCode::Digit2) => {
                         if !event.repeat {
-                            // 1 = subject-left, 2 = subject-right. Sensor/wire
-                            // order is the mirror image of anatomical order.
-                            let eye = usize::from(matches!(
-                                event.physical_key,
-                                PhysicalKey::Code(KeyCode::Digit1)
-                            ));
-                            if let Ok(mut shared) = self.shared.lock() {
-                                if local_camera_control_allowed(&mut shared, "FOCUS TARGET") {
-                                    shared.focus_action = Some(FocusAction::SelectEye(eye));
-                                }
-                            }
+                            let eye=usize::from(matches!(event.physical_key,PhysicalKey::Code(KeyCode::Digit1)));
+                            viewer_ui::apply(self,viewer_ui::Action::Select(eye));
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyR) => {
@@ -45116,9 +44313,15 @@ impl ApplicationHandler for App {
             .shared
             .lock()
             .is_ok_and(|shared| shared.segmentation_mode == SegmentationMode::Driving);
-        let hotkeys = self
+        let mut hotkeys = self
             .window_focused
             .then(|| keyboard_peeper::buttercup_map(self.virtual_mouse.is_some(), driving));
+        if self.virtual_mouse.is_none() {
+            if let Some(map)=hotkeys.as_mut() {
+                viewer_ui::configure_hotkeys(map,&self.ui,self.sam31_prompt_editor.is_some(),
+                    self.shared.lock().is_ok_and(|s|s.sam31_object_inspection));
+            }
+        }
         self.keyboard_peeper.replace_if_changed(hotkeys);
     }
 }
@@ -45372,6 +44575,9 @@ fn run() -> Result<(), String> {
         Err(error) => eprintln!("native Rust MediaPipe reacquisition unavailable: {error}"),
     }
     let shared = Arc::new(Mutex::new(SharedState {
+        ui_action: None,
+        ui_prompt_request: None,
+        ui_snapshot: serde_json::Value::Null,
         presentation_backdrop: backdrop.clone(),
         // A normal launch performs one native semantic scan. When the native
         // assets are absent, still fetch the lossless overview without
@@ -45397,6 +44603,10 @@ fn run() -> Result<(), String> {
         sam31_prompt_status: "CANONICAL OUTER-IRIS PROMPT".to_string(),
         sam31_object_inspection: false,
         sam31_scene_candidate: None,
+        sam31_scene_prompt_text: "NOT SET".to_string(),
+        sam31_scene_prompt_bundle: None,
+        sam31_scene_prompt_generation: 0,
+        sam31_scene_prompt_status: "ENTER AN OBJECT PROMPT, THEN SPACE TO START".to_string(),
         segmentation_status: match config.segmentation {
             SegmentationMode::Native => format!(
                 "IRIS NATIVE + CENTER {} (startup)",
@@ -45445,6 +44655,7 @@ fn run() -> Result<(), String> {
     })
     .map_err(|error| error.to_string())?;
     let mut app = App {
+        ui: viewer_ui::Workspace::default(),
         context,
         window_state: None,
         shared,
@@ -45483,7 +44694,7 @@ fn run() -> Result<(), String> {
         checkerboard_status: checkerboard_calibration::StatusSnapshot::default(),
         keyboard_peeper: keyboard_peeper::Registration::new(None),
         window_focused: false,
-        roi_overlay_mode: RoiOverlayMode::default(),
+        roi_overlay_mode: RoiOverlayMode::SamOuterIrisMasks,
         sam31_prompt_editor: None,
     };
     let event_result = event_loop
@@ -50150,6 +49361,45 @@ mod tests {
     }
 
     #[test]
+    fn iris_bounds_restore_without_an_observation_and_reject_invalid_values() {
+        let shared = Arc::new(Mutex::new(SharedState::default()));
+        let cmd = "IRIS BOUNDS SET 77.917887 116.906301";
+        assert!(handle_control_command(cmd, &shared).contains("\"ok\":true"));
+        let generation = shared.lock().unwrap().iris_segmentation_generation;
+        assert!(handle_control_command(cmd, &shared).contains("\"ok\":true"));
+        for invalid in ["NaN 100", "70 inf", "70 69", "1 100", "80 81", "80 5000"] {
+            assert!(handle_control_command(&format!("IRIS BOUNDS SET {invalid}"), &shared)
+                .contains("\"ok\":false"));
+        }
+        let state = shared.lock().unwrap();
+        assert_eq!(iris_radius_operator_limits(&state), Some((77.917887, 116.906301)));
+        assert_eq!(state.iris_segmentation_generation, generation);
+        assert!(state.iris_radius_observed_px.is_none());
+    }
+
+    #[test]
+    fn second_roi_control_preserves_primary_and_camera_focus() {
+        let shared = Arc::new(Mutex::new(SharedState::default()));
+        let status = handle_control_command("SECOND ROI STATUS", &shared);
+        assert!(status.contains("\"second_roi_enabled\":false"));
+        assert!(handle_control_command("SECOND ROI ON", &shared).contains("\"ok\":true"));
+        {
+            let mut state = shared.lock().unwrap();
+            assert!(state.second_roi_enabled);
+            assert!(state.focus_action.is_none());
+            state.eyes[0] = Some(control_eye_frame(1));
+            state.eyes[1] = Some(control_eye_frame(2));
+            state.eye_identity_present[1] = true;
+        }
+        assert!(handle_control_command("SECOND ROI OFF", &shared).contains("\"ok\":true"));
+        let state = shared.lock().unwrap();
+        assert!(!state.second_roi_enabled);
+        assert!(state.eyes[0].is_some() && state.eyes[1].is_none());
+        assert!(!state.eye_identity_present[1]);
+        assert!(state.focus_action.is_none());
+    }
+
+    #[test]
     fn temporary_analysis_and_incremental_model_input_are_subject_right_only() {
         assert!(!SharedState::default().second_roi_enabled);
         assert!(subject_eye_analysis_enabled(0, false));
@@ -51498,7 +50748,7 @@ mod tests {
         );
     }
 
-    fn control_eye_frame(sequence: u64) -> EyeFrame {
+    pub(super) fn control_eye_frame(sequence: u64) -> EyeFrame {
         EyeFrame {
             eye_id: 1,
             sequence,
@@ -52629,6 +51879,38 @@ mod tests {
         let (_, representative) = bucket_surface_area(tilted).unwrap();
         assert!((representative / tilted).ln().abs() <= GAZE_SURFACE_AREA_BUCKET_RATIO.ln());
         assert!(rectified_ellipse_area_px2(50.0, 15.0).is_none());
+    }
+
+    #[test]
+    fn surface_gaze_publishes_current_signed_direction_without_easing() {
+        let now = Instant::now();
+        let mut tracker = SurfaceGazeTracker::default();
+        // Constant outer disk area/independent scale; only disk tilt changes.
+        for (index, minor) in [45.0, 45.0, 45.0, 45.0, 35.0, 35.0, 45.0]
+            .into_iter().enumerate()
+        {
+            let mut outer = test_outer_boundary((100.0, 100.0), 50.0, minor);
+            outer.points = vec![raw_iris_focus::OuterIrisPoint::default(); 8];
+            let source = (index as u64 + 1) * 100_000_000;
+            let sample = tracker.observe_keyed_with_global_similarity(
+                source, now + Duration::from_millis(index as u64 * 100),
+                (3000, 1500), Some((0.0, 0.1)), &outer, None,
+            ).unwrap();
+            let current = tracker.kinematic_history.back().unwrap().projected_gaze;
+            let actual = sample.relative_gaze.projected();
+            assert!((actual.0-current.0).hypot(actual.1-current.1) < 1e-12);
+            assert!((actual.1.abs() - (1.0_f64-(minor/50.0).powi(2)).sqrt()).abs()<1e-12);
+            assert!((sample.rectified_area_px2-std::f64::consts::PI*2500.0).abs()<1e-8);
+            assert!(sample.relative_gaze.is_camera_facing());
+            let history_len = tracker.kinematic_history.len();
+            let repeat = tracker.observe_keyed_with_global_similarity(
+                source, now + Duration::from_secs(1), (3000, 1500),
+                Some((0.0, -0.1)), &outer, None,
+            ).unwrap();
+            assert_eq!(repeat.relative_gaze, sample.relative_gaze);
+            assert_eq!(tracker.kinematic_history.len(), history_len);
+        }
+        assert!(tracker.sign_resolved);
     }
 
     #[test]
@@ -61937,6 +61219,39 @@ mod tests {
     }
 
     #[test]
+    fn completed_calibration_cursor_jumps_to_each_fresh_absolute_target() {
+        let now = Instant::now();
+        for affine in [true, false] {
+            let mut mode = completed_mouse_calibration_fixture(now);
+            if !affine {
+                mode.gaze_affine = None;
+            }
+            for (index, feature) in [(0.3, -0.2), (-0.3, 0.2), (0.0, 0.0)]
+                .into_iter()
+                .enumerate()
+            {
+                let timestamp = index as u64 + 1;
+                let expected = mode.gaze_affine.map_or_else(
+                    || {
+                        mode.display_plane.unwrap().target(
+                            RelativeGazeVector::from_projected(feature.0, feature.1).unwrap(),
+                        ).unwrap()
+                    },
+                    |mapping| mapping.map(feature),
+                );
+                mode.observe_at_frame(now, Some(timestamp), Some((timestamp, feature, 0)));
+                assert_eq!(mode.reticle, Some(expected), "no intermediate easing step");
+                // Repainting the same observation must not make it creep.
+                mode.observe_at_frame(now, Some(timestamp), Some((timestamp, feature, 0)));
+                assert_eq!(mode.reticle, Some(expected));
+            }
+            assert_eq!(mode.unique_surface_updates, 3);
+            mode.observe_at_frame(now, Some(4), None);
+            assert_eq!(mode.reticle, None, "loss must not animate a stale target");
+        }
+    }
+
+    #[test]
     fn completed_monitor_wireframe_gates_ray_and_renders_result_only() {
         let mut mode = completed_mouse_calibration_fixture(Instant::now());
         let roll = 0.7_f64.to_radians();
@@ -66526,6 +65841,36 @@ mod tests {
             shared.lock().unwrap().manual_roi_action,
             Some(ManualRoiAction::Auto),
         );
+    }
+
+    #[test]
+    fn scoped_view_control_never_selects_camera_focus_or_starts_capture() {
+        let shared=Arc::new(Mutex::new(SharedState::default()));
+        for cmd in ["VIEW LEFT","VIEW RIGHT","VIEW ROI","VIEW LINKED","VIEW GLOBAL","VIEW NEXT"] {
+            assert!(handle_control_command(cmd,&shared).contains("true"));
+            let state=shared.lock().unwrap();
+            assert!(state.focus_action.is_none());
+            assert!(!state.sam31_object_inspection);
+            assert!(state.ui_action.is_some());
+        }
+        assert!(handle_control_command("VIEW PROMPT hat",&shared).contains("true"));
+        assert_eq!(shared.lock().unwrap().ui_prompt_request.as_deref(),Some("hat"));
+    }
+
+    #[test]
+    fn scoped_object_prompt_does_not_mutate_iris_prompt_or_generation() {
+        let mut state=SharedState::default();
+        install_compiled_prompt(&mut state,false,PathBuf::from("iris.pt"),"iris".into());
+        let iris_generation=state.sam31_prompt_bundle_generation;
+        install_compiled_prompt(&mut state,true,PathBuf::from("object.pt"),"hat".into());
+        assert_eq!(state.sam31_prompt_text,"iris");
+        assert_eq!(state.sam31_prompt_bundle_generation,iris_generation);
+        assert_eq!(state.sam31_prompt_bundle_override,Some(PathBuf::from("iris.pt")));
+        let object_generation=state.sam31_scene_prompt_generation;
+        install_compiled_prompt(&mut state,false,PathBuf::from("iris2.pt"),"limbus".into());
+        assert_eq!(state.sam31_scene_prompt_text,"hat");
+        assert_eq!(state.sam31_scene_prompt_generation,object_generation);
+        assert_eq!(state.sam31_scene_prompt_bundle,Some(PathBuf::from("object.pt")));
     }
 
     #[test]

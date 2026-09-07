@@ -20,6 +20,9 @@ default = ["checkerboard"]
 checkerboard = ["dep:opencv"]
 sam31 = ["dep:opencv", "dep:tch", "dep:flate2", "dep:regex"]
 
+[build-dependencies]
+cc = "1.4.3"
+
 [profile.release]
 strip = true
 lto = true
