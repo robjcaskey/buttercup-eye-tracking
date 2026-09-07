@@ -22,6 +22,8 @@ mapfile -t unexpected_files < <(
       ./docs/viewer-overview.png \
       ./docs/geometry-architecture.md \
       ./docs/flat-tire-area-and-motion.md \
+      ./docs/sign-acquisition-trials.md \
+      ./docs/meridian-sign-continuity.md \
       ./docs/roi-reframe-continuity.md \
       ./docs/viewer-workspaces.md \
       ./docs/sam-concurrency-and-gaze-latency.md \
@@ -38,6 +40,7 @@ mapfile -t unexpected_files < <(
       ./scripts/prompt-lab-troublesome-3.txt \
       ./scripts/prompt-lab-troublesome-20.txt \
       ./src/checkerboard_calibration.rs \
+      ./src/calibration_acquisition.rs \
       ./src/geometry.rs \
       ./src/display_pose_wireframe.rs \
       ./src/monitor_location.rs \
@@ -63,6 +66,7 @@ mapfile -t unexpected_files < <(
       ./src/eye_scene_model/pupil_projection.rs \
       ./src/eye_scene_model/pupil_size.rs \
       ./src/eye_scene_model/sign_motion.rs \
+      ./src/eye_scene_model/sign_continuity.rs \
       ./src/gaze_target_solver.rs \
       ./src/binocular_coordinator.rs \
       ./src/bin/buttercup_screen_reflection_raw_decode.rs \
@@ -80,6 +84,7 @@ mapfile -t unexpected_files < <(
       ./src/offline_segmentation_replay.rs \
       ./src/offline_segmentation_replay/showcase.rs \
       ./src/offline_segmentation_replay/contact_sign.rs \
+      ./src/offline_segmentation_replay/sign_acquisition.rs \
       ./src/pupil_clock_supervision.rs \
       ./src/pivot_region_scheduler.rs \
       ./src/raw10.rs \

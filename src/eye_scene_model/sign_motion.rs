@@ -147,10 +147,272 @@ impl MotionSignWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eye_scene_model::{quantize_frontal_disk_area, SurfaceGazeTracker};
+    use crate::eye_scene_model::{quantize_frontal_disk_area, SignAcquisitionPolicy, SurfaceGazeTracker};
     use crate::raw_iris_focus::{OuterIrisBoundary, OuterIrisPoint};
     use crate::roi_evidence::{NativeGlobalSimilarityEvidence, SimilarityMotion};
     use std::time::Duration;
+
+    const ACQUISITION_POLICIES: [SignAcquisitionPolicy; 4] = [
+        SignAcquisitionPolicy::Established,
+        SignAcquisitionPolicy::MotionWindowFallback,
+        SignAcquisitionPolicy::MotionWindowOnly,
+        SignAcquisitionPolicy::ReliableMotionSeed,
+    ];
+
+    /// Generate an independently transported, movable effective pivot. The
+    /// expected sign is supplied by construction, never by a pupil anchor.
+    fn bootstrap_input(frame: u64, sign: f64, tilt: f64) -> ((u32, u32), OuterIrisBoundary, NativeGlobalSimilarityEvidence) {
+        let radius = 80.0;
+        let (_, area) = quantize_frontal_disk_area(std::f64::consts::PI * radius * radius).unwrap();
+        let depth = (area / std::f64::consts::PI).sqrt() * (1.83_f64.powi(2) - 1.0).sqrt();
+        let origin = if frame < 8 { (3000, 1500) } else { (3020, 1480) };
+        let sensor = (3200.0 + frame as f64 * 2.0,
+            1700.0 - frame as f64 * 1.5 + depth * sign * tilt.sin());
+        let outer = OuterIrisBoundary {
+            center: (sensor.0 - origin.0 as f64, sensor.1 - origin.1 as f64),
+            major_radius: radius, minor_radius: radius * tilt.cos(),
+            angle: if frame % 2 == 0 { 0.0 } else { std::f64::consts::PI },
+            points: vec![OuterIrisPoint::default(); 8],
+            ..Default::default()
+        };
+        let motion = NativeGlobalSimilarityEvidence {
+            reliable: true,
+            motion: SimilarityMotion { translation: [2.0, -1.5], residual: 0.1, support: 16, ..Default::default() },
+            motion_center_sensor: [3200.0, 1700.0], ..Default::default()
+        };
+        (origin, outer, motion)
+    }
+
+    #[test]
+    fn later_same_branch_pupil_anchors_validate_a_motion_seed_without_changing_epoch() {
+        let now=Instant::now(); let mut tracker=SurfaceGazeTracker::default();
+        let (origin,outer,_)=bootstrap_input(0,1.0,0.4);
+        tracker.observe_keyed_with_global_similarity(1,now,origin,None,&outer,None).unwrap();
+        tracker.sign_resolved=true;
+        tracker.sign_evidence=crate::eye_scene_model::SurfaceSignEvidence::MotionInterval;
+        let epoch=tracker.sign_epoch;
+        for frame in 1..=4 {
+            let source=1+frame*100_000_000;
+            let at=now+Duration::from_millis(frame*100);
+            let s=tracker.observe_keyed_with_global_similarity(source,at,origin,Some((0.0,0.1)),&outer,None).unwrap();
+            assert_eq!(s.sign_epoch,epoch);
+            assert_eq!(s.sign_diagnostics.unwrap().evidence.sustained_acquisition_support(),frame==4);
+            for _ in 0..10 { tracker.observe_keyed_with_global_similarity(source,at,origin,Some((0.0,0.1)),&outer,None); }
+            assert_eq!(tracker.same_sign_anchor_support,frame as u8);
+        }
+    }
+
+    #[test]
+    fn acquisition_trials_resolve_both_antipodes_without_a_pupil_and_survive_roi_nudges() {
+        assert_eq!(SurfaceGazeTracker::default().acquisition_policy, SignAcquisitionPolicy::MotionWindowFallback);
+        for acquisition_policy in ACQUISITION_POLICIES {
+            for sign in [-1.0, 1.0] {
+                let mut tracker = SurfaceGazeTracker { acquisition_policy, ..Default::default() };
+                let now = Instant::now();
+                for frame in 0..20 {
+                    let (origin, outer, motion) = bootstrap_input(frame, sign, 0.3 + 0.03 * frame as f64);
+                    // Fixed delivery delay does not become eye velocity.
+                    let sample = tracker.observe_keyed_with_global_similarity(1 + frame * 100_000_000,
+                        now + Duration::from_millis(500 + frame * 100), origin, None, &outer,
+                        (frame > 0).then_some(motion)).unwrap();
+                    if acquisition_policy == SignAcquisitionPolicy::MotionWindowOnly && frame < 4 {
+                        assert!(!sample.sign_resolved);
+                    }
+                    if frame >= 8 {
+                        assert!(sample.sign_resolved, "{acquisition_policy:?} frame={frame}");
+                        assert!(sample.relative_gaze.down * sign > 0.0);
+                    }
+                    assert!(sample.relative_gaze.is_camera_facing());
+                    let state = (tracker.reliable_motion_observations, tracker.sign_epoch);
+                    for repeated in [1 + frame * 100_000_000, frame * 100_000_000] {
+                        tracker.observe_keyed_with_global_similarity(repeated, now + Duration::from_secs(10),
+                            origin, Some((0.0, -sign)), &outer, Some(motion));
+                        assert_eq!((tracker.reliable_motion_observations, tracker.sign_epoch), state);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn acquisition_trials_abstain_for_still_tilt_or_missing_independent_transport() {
+        for acquisition_policy in ACQUISITION_POLICIES {
+            for missing_motion in [false, true] {
+                for frontal in [false, true] {
+                    let mut tracker = SurfaceGazeTracker { acquisition_policy, ..Default::default() };
+                    let now = Instant::now();
+                    for frame in 0..20 {
+                        let tilt = if frontal { 0.0 } else { 0.4 + if missing_motion { 0.02 * frame as f64 } else { 0.0 } };
+                        let (origin, outer, motion) = bootstrap_input(frame, 1.0, tilt);
+                        let sample = tracker.observe_keyed_with_global_similarity(1 + frame * 100_000_000,
+                            now + Duration::from_millis(frame * 100), origin, None, &outer,
+                            (!missing_motion && frame > 0).then_some(motion)).unwrap();
+                        assert!(!sample.sign_resolved, "{acquisition_policy:?} missing_motion={missing_motion} frontal={frontal} frame={frame}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reliable_motion_seed_does_not_count_unsupported_frames_as_ema_evidence() {
+        let now = Instant::now();
+        let mut baseline = SurfaceGazeTracker::default();
+        let mut seeded = SurfaceGazeTracker { acquisition_policy: SignAcquisitionPolicy::ReliableMotionSeed, ..Default::default() };
+        for frame in 0..8 {
+            let (origin, outer, motion) = bootstrap_input(frame, 1.0, 0.3 + 0.025 * frame as f64);
+            for tracker in [&mut baseline, &mut seeded] {
+                tracker.observe_keyed_with_global_similarity(1 + frame * 100_000_000,
+                    now + Duration::from_millis(frame * 100), origin, None, &outer,
+                    (frame == 7).then_some(motion)).unwrap();
+            }
+        }
+        assert_eq!(seeded.reliable_motion_observations, 1);
+        for i in 0..2 {
+            assert!((seeded.contact_sign_hypotheses.unwrap()[i].residual_ema
+                - 4.0 * baseline.contact_sign_hypotheses.unwrap()[i].residual_ema).abs() < 1e-8);
+        }
+        seeded.clear_stale_motion_preserving_sign();
+        assert_eq!(seeded.reliable_motion_observations, 0);
+    }
+
+    /// Known weak-perspective disk motion through an image-axis meridian.
+    /// Scale is prescribed independently of the fitted radius, head transport
+    /// excludes the small additional effective-pivot drift, and pupil evidence
+    /// is available only during the four-frame initialization.
+    fn meridian_crossing_error(transverse: f64, direction: f64, angle: f64, phase_shift: f64,
+        turn_back: bool, transport_residual_px: f32, cadence_ms: u64) -> f64 {
+        let now = Instant::now();
+        let mut tracker = SurfaceGazeTracker::default();
+        let mut maximum_error: f64 = 0.0;
+        let mut initial_epoch = None;
+        for frame in 0..28u64 {
+            let progress = frame.saturating_sub(3) as f64;
+            let trajectory = -0.24 + phase_shift + 0.02 * progress;
+            let along = direction * if turn_back { -trajectory.abs() } else { trajectory };
+            let (sine, cosine) = angle.sin_cos();
+            let gaze = (cosine * along - sine * transverse, sine * along + cosine * transverse);
+            let scale = 1.0 + 0.002 * frame as f64;
+            let radius = 80.0 * scale;
+            // The generating geometry uses continuous physical scale, not the
+            // candidate tracker's quantized area family or fitted pivot.
+            let depth = radius * (1.83_f64.powi(2) - 1.0).sqrt();
+            let origin = if frame < 14 { (3000, 1500) } else { (3020, 1480) };
+            let head = (3200.0 + 1.2 * frame as f64, 1700.0 - 0.8 * frame as f64);
+            let outer = OuterIrisBoundary {
+                center: (head.0 + depth * gaze.0 - origin.0 as f64,
+                    head.1 + 0.01 * (frame * frame) as f64 + depth * gaze.1 - origin.1 as f64),
+                major_radius: radius,
+                minor_radius: radius * (1.0 - gaze.0 * gaze.0 - gaze.1 * gaze.1).sqrt(),
+                // At exact frontal the ellipse angle is genuinely unobservable.
+                angle: if gaze.0.hypot(gaze.1) < 1e-9 { 1.234 } else {
+                    (-gaze.0).atan2(gaze.1).rem_euclid(std::f64::consts::PI)
+                        + if frame % 2 == 0 { 0.0 } else { std::f64::consts::PI }
+                },
+                points: vec![OuterIrisPoint::default(); 8], ..Default::default()
+            };
+            let global = NativeGlobalSimilarityEvidence {
+                reliable: true,
+                motion: SimilarityMotion {
+                    translation: [1.2, -0.8],
+                    diagonal_coefficient_delta: (scale / (scale - 0.002) - 1.0) as f32,
+                    residual: transport_residual_px, support: 16, ..Default::default()
+                },
+                motion_center_sensor: [(head.0 - 1.2) as f32, (head.1 + 0.8) as f32],
+                ..Default::default()
+            };
+            let sample = tracker.observe_keyed_with_global_similarity(
+                1_000_000_000 + frame * cadence_ms * 1_000_000,
+                now + Duration::from_millis(400 + frame * cadence_ms), origin,
+                (frame < 4).then_some(gaze), &outer, (frame > 0).then_some(global),
+            ).expect("valid modeled meridian conic must remain available");
+            assert!(sample.relative_gaze.is_camera_facing());
+            let sn_feida = sample.frontal_equivalent_disk_area_px2 / (scale * scale);
+            assert!((sn_feida - std::f64::consts::PI * 80.0 * 80.0).abs() < 1e-7);
+            if frame >= 3 {
+                assert!(sample.sign_resolved);
+                let epoch = *initial_epoch.get_or_insert(sample.sign_epoch);
+                assert_eq!(sample.sign_epoch, epoch, "physical continuation is not a sign correction");
+                let error = (sample.relative_gaze.right - gaze.0).hypot(sample.relative_gaze.down - gaze.1);
+                maximum_error = maximum_error.max(error);
+                if error > 0.02 {
+                    eprintln!("MERIDIAN_ERROR transverse={transverse} direction={direction} angle={angle} frame={frame} truth={gaze:?} actual={:?} epoch={} error={error}",
+                        sample.relative_gaze.projected(), sample.sign_epoch);
+                }
+            }
+        }
+        maximum_error
+    }
+
+    #[test]
+    fn meridian_crossing_away_from_frontal_preserves_the_physical_branch() {
+        for angle in [0.0, std::f64::consts::FRAC_PI_2, 0.6] {
+            for direction in [-1.0, 1.0] {
+                for residual in [0.1, 1.5] {
+                    for cadence_ms in [100, 250] {
+                        assert!(meridian_crossing_error(0.3, direction, angle, 0.0,
+                            false, residual, cadence_ms) < 1e-6);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn meridian_crossing_through_frontal_does_not_reflect_the_real_trajectory() {
+        let mut maximum_error: f64 = 0.0;
+        for angle in [0.0, std::f64::consts::FRAC_PI_2, 0.6] {
+            for direction in [-1.0, 1.0] {
+                for phase_shift in [0.0, 0.005, -0.005, 0.02, -0.02] {
+                    for residual in [0.1, 1.5] {
+                        for cadence_ms in [100, 250] {
+                            maximum_error = maximum_error.max(meridian_crossing_error(0.0,
+                                direction, angle, phase_shift, false, residual, cadence_ms));
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("MERIDIAN_CROSSING maximum_projected_error={maximum_error}");
+        assert!(maximum_error < 0.02, "known crossing was reflected: maximum projected error {maximum_error}");
+    }
+
+    #[test]
+    fn meridian_crossing_near_frontal_without_exact_axis_alignment_remains_continuous() {
+        let mut maximum_error: f64 = 0.0;
+        for transverse in [0.002, 0.008] {
+            for angle in [0.0, std::f64::consts::FRAC_PI_2, 0.6] {
+                for direction in [-1.0, 1.0] {
+                    for phase_shift in [-0.005, 0.005] {
+                        for residual in [0.1, 1.5] {
+                            for cadence_ms in [100, 250] {
+                                maximum_error = maximum_error.max(meridian_crossing_error(transverse,
+                                    direction, angle, phase_shift, false, residual, cadence_ms));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("NEAR_MERIDIAN_CROSSING maximum_projected_error={maximum_error}");
+        assert!(maximum_error < 0.02);
+    }
+
+    #[test]
+    fn meridian_crossing_can_turn_back_at_frontal_without_inventing_a_crossing() {
+        for angle in [0.0, std::f64::consts::FRAC_PI_2, 0.6] {
+            for direction in [-1.0, 1.0] {
+                for phase_shift in [0.0, 0.02, -0.02] {
+                    for residual in [0.1, 1.5] {
+                        for cadence_ms in [100, 250] {
+                            assert!(meridian_crossing_error(0.0, direction, angle, phase_shift,
+                                true, residual, cadence_ms) < 0.02);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn single_eye_motion_corrects_a_resolved_wrong_sign_in_each_direction_and_scale() {

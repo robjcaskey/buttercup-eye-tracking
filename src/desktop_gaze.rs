@@ -144,6 +144,7 @@ mod tests {
             sign_resolved: true,
             sign_epoch: 7,
             kinematic_sign_correction: [false; 2],
+            sign_diagnostics: None,
         }
     }
 
@@ -221,6 +222,50 @@ mod tests {
         assert!(cal.for_frame(0, Some(&frame)).is_some());
         assert!(cal.for_frame(1, Some(&frame)).is_none());
         frame.surface_gaze.as_mut().unwrap().sign_epoch += 1;
+        assert!(cal.for_frame(0, Some(&frame)).is_some());
+        frame.surface_gaze.as_mut().unwrap().sign_resolved = false;
+        assert!(cal.for_frame(0, Some(&frame)).is_none());
+        frame.surface_gaze.as_mut().unwrap().sign_resolved = true;
+        frame.gaze_authority_generation += 1;
+        assert!(cal.for_frame(0, Some(&frame)).is_none());
+    }
+
+    #[test]
+    fn sam_calibration_keeps_its_affine_across_sign_changes_but_not_provider_changes() {
+        let mut frame = crate::tests::control_eye_frame(1);
+        frame.segmentation_mode = SegmentationMode::Sam31;
+        frame.gaze_authority_sam_prompt_generation = Some(3);
+        frame.virtual_contact_surface_gaze = Some(surface());
+        let cal = crate::CalibratedDisplay {
+            eye: 0,
+            segmentation_mode: SegmentationMode::Sam31,
+            sam_prompt_generation: Some(3),
+            gaze_authority_generation: frame.gaze_authority_generation,
+            sign_epoch: 7,
+            plane: crate::VirtualDisplayPlane::nominal(),
+            gaze_affine: crate::GazeAffine {
+                x: [1.0, 0.0, 0.5],
+                y: [0.0, 1.0, 0.5],
+            },
+        };
+        for epoch in [7, 8, 12] {
+            frame.virtual_contact_surface_gaze.as_mut().unwrap().sign_epoch = epoch;
+            let active = cal.for_frame(0, Some(&frame)).unwrap();
+            assert_eq!(active.sign_epoch, 7, "retain training provenance");
+            for feature in [(0.1, -0.2), (-0.1, 0.2)] {
+                let ray = crate::RelativeGazeVector::from_projected(feature.0, feature.1).unwrap();
+                assert_eq!(active.target(ray), Some(cal.gaze_affine.map(feature)));
+            }
+        }
+        assert!(cal.for_frame(0, None).is_none());
+        assert!(cal.for_frame(1, Some(&frame)).is_none());
+        frame.gaze_authority_sam_prompt_generation = Some(4);
+        assert!(cal.for_frame(0, Some(&frame)).is_none());
+        frame.gaze_authority_sam_prompt_generation = Some(3);
+        frame.virtual_contact_surface_gaze.as_mut().unwrap().sign_resolved = false;
+        assert!(cal.for_frame(0, Some(&frame)).is_none());
+        frame.virtual_contact_surface_gaze.as_mut().unwrap().sign_resolved = true;
+        frame.segmentation_mode = SegmentationMode::Native;
         assert!(cal.for_frame(0, Some(&frame)).is_none());
     }
 

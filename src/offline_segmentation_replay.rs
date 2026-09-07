@@ -12,6 +12,8 @@ use std::io::{Read as IoRead, Seek as IoSeek, SeekFrom};
 mod showcase;
 mod contact_sign;
 pub(super) use contact_sign::run as contact_sign_eval;
+mod sign_acquisition;
+pub(super) use sign_acquisition::run as sign_acquisition_trial;
 
 #[derive(Default)]
 struct ModelAggregate {

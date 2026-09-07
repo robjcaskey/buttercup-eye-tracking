@@ -3,6 +3,7 @@
 use softbuffer::{Context, Surface};
 mod binocular_coordinator;
 mod checkerboard_calibration;
+mod calibration_acquisition;
 mod conic_solver;
 mod display_pose_wireframe;
 mod monitor_location;
@@ -4940,6 +4941,15 @@ fn json_optional_ellipse_seed(
         .unwrap_or(serde_json::Value::Null)
 }
 
+fn json_surface_sign_diagnostics(diagnostics: Option<eye_scene_model::SurfaceSignDiagnostics>) -> serde_json::Value {
+    diagnostics.map(|d|serde_json::json!({"evidence":d.evidence.label(),"selected_branch":d.selected_branch,
+        "branch_residual_ema_px":d.branch_residual_ema_px.map(json_finite_number),
+        "source_motion_residual_px":d.source_motion_residual_px.map(json_finite_number),
+        "temporal_margin_px":d.temporal_margin_px.map(json_finite_number),
+        "pending_anchor_votes":d.pending_anchor_votes,
+        "near_frontal_continuation":d.near_frontal_continuation})).unwrap_or(serde_json::Value::Null)
+}
+
 fn json_surface_gaze(sample: Option<SurfaceGazeSample>) -> serde_json::Value {
     sample
         .filter(|sample| sample.relative_gaze.is_camera_facing())
@@ -4961,6 +4971,7 @@ fn json_surface_gaze(sample: Option<SurfaceGazeSample>) -> serde_json::Value {
                 ],
                 "sign_resolved": sample.sign_resolved,
                 "sign_epoch": sample.sign_epoch,
+                "sign_diagnostics": json_surface_sign_diagnostics(sample.sign_diagnostics),
                 "kinematic_sign_correction": {
                     "x": sample.kinematic_sign_correction[0],
                     "y": sample.kinematic_sign_correction[1],
@@ -9109,11 +9120,8 @@ fn calibration_frame_state(
     let Some(surface) = surface else {
         return CalibrationFrameState::NoSurface;
     };
-    if !surface.sign_resolved {
-        return CalibrationFrameState::UnresolvedSign;
-    }
     if frame.segmentation_mode != SegmentationMode::Sam31 {
-        return CalibrationFrameState::Ready;
+        return if surface.sign_resolved { CalibrationFrameState::Ready } else { CalibrationFrameState::UnresolvedSign };
     }
     let Some(source_timestamp_ns) = surface.source_timestamp_ns else {
         return CalibrationFrameState::SamSourceMismatch;
@@ -9147,14 +9155,18 @@ fn calibration_frame_state(
         .into_iter()
         .all(|clearance| clearance.is_finite() && clearance >= 0.0)
     });
-    if safely_contained {
-        CalibrationFrameState::Ready
-    } else {
+    if !safely_contained {
         CalibrationFrameState::OutsideSafeFrame
+    } else if !surface.sign_resolved {
+        CalibrationFrameState::UnresolvedSign
+    } else {
+        CalibrationFrameState::Ready
     }
 }
 
 struct VirtualMouseMode {
+    sign_acquisition: calibration_acquisition::Acquisition,
+    acquisition_source_generation: u64,
     /// The target clock is held until the paired RAW writer confirms that it
     /// is recording. This keeps every displayed fixation inside the retained
     /// calibration corpus instead of losing target one to recorder startup.
@@ -9192,8 +9204,8 @@ struct VirtualMouseMode {
     /// prompt. Such a reconnect invalidates partial target samples without
     /// making the operator leave calibration.
     calibration_authority_restarts: u64,
-    /// A completed mapping is immutable. A new gaze basis suspends its use,
-    /// not its storage; only an explicit new calibration may replace it.
+    /// A completed mapping is immutable. A provider/source change suspends its
+    /// use, not its storage. Sign-only epoch changes no longer suspend it.
     completed_basis_pause: Option<&'static str>,
     display_plane: Option<VirtualDisplayPlane>,
     display_dimensions: Option<(f64, f64)>,
@@ -9216,6 +9228,8 @@ struct VirtualMouseMode {
 impl VirtualMouseMode {
     fn new(now: Instant) -> Self {
         Self {
+            sign_acquisition: calibration_acquisition::Acquisition::default(),
+            acquisition_source_generation: 0,
             sequence_started: true,
             capture_arming_started_at: None,
             sequence_started_at: Some(now),
@@ -9378,7 +9392,8 @@ impl VirtualMouseMode {
         sign_epoch: u64,
     ) {
         if self.display_plane.is_some() {
-            self.pause_completed_calibration("GAZE SIGN CHANGED  CALIBRATION PRESERVED");
+            // Keep the completed mapping and its training-epoch provenance.
+            // A later sign epoch is diagnostic, not a cursor interlock.
             return;
         }
         self.sequence_completed = false;
@@ -9411,6 +9426,30 @@ impl VirtualMouseMode {
         );
     }
 
+    /// One definition shared by rendering and the recorded target stream.
+    fn target_visual(&self, now: Instant) -> ((f64, f64), Duration, usize) {
+        if self.sign_acquisition.active() {
+            let confirmed = self.sign_acquisition.ready_sources.min(calibration_acquisition::REQUIRED_SOURCES);
+            let count = confirmed * VIRTUAL_MOUSE_MIN_SAMPLES / calibration_acquisition::REQUIRED_SOURCES;
+            (self.sign_acquisition.target(now), self.sign_acquisition.elapsed(now),
+                if self.sign_acquisition.sustained_support { count } else { count.min(VIRTUAL_MOUSE_MIN_SAMPLES / 2) })
+        } else {
+            let index = self.target_index.min(VIRTUAL_MOUSE_CALIBRATION_TARGETS.len() - 1);
+            (VIRTUAL_MOUSE_CALIBRATION_TARGETS[index], now.saturating_duration_since(self.target_started), self.samples[index].len())
+        }
+    }
+
+    fn acquisition_json(&self, now: Instant) -> serde_json::Value {
+        serde_json::json!({"active":self.sign_acquisition.active(), "episodes":self.sign_acquisition.episodes,
+            "total_duration_ms":self.sign_acquisition.total_elapsed(now).as_millis(),
+            "timeout_ms":calibration_acquisition::MAX_DURATION.as_millis(),
+            "fresh_signed_sources":self.sign_acquisition.ready_sources,
+            "required_sources":calibration_acquisition::REQUIRED_SOURCES,
+            "sustained_support":self.sign_acquisition.sustained_support,
+            "current_source_sign_diagnostics":json_surface_sign_diagnostics(self.surface_gaze.and_then(|s|s.sign_diagnostics)),
+            "target_is_training_data":false})
+    }
+
     fn pause_completed_calibration(&mut self, reason: &'static str) {
         if self.completed_basis_pause.is_none() {
             eprintln!("mouse calibration preserved completed mapping; cursor suspended: {reason}");
@@ -9433,10 +9472,6 @@ impl VirtualMouseMode {
             // including after capture finalization or a long tracking gap.
             if let Some(reason) = self.completed_basis_pause {
                 self.pause_completed_calibration(reason);
-                return;
-            }
-            if observation.is_some_and(|(_, _, epoch)| self.calibration_sign_epoch != Some(epoch)) {
-                self.pause_completed_calibration("GAZE SIGN CHANGED  CALIBRATION PRESERVED");
                 return;
             }
             if observation.is_none() {
@@ -9477,10 +9512,47 @@ impl VirtualMouseMode {
         if self.calibration_failure.is_some() {
             return;
         }
+        if self.display_plane.is_none() {
+            if self.frame_state == CalibrationFrameState::UnresolvedSign && !self.sign_acquisition.active() {
+                self.sign_acquisition.start(now);
+                if self.calibration_sign_epoch.take().is_some() {
+                    self.calibration_sign_restarts = self.calibration_sign_restarts.saturating_add(1);
+                }
+                self.target_index = 0;
+                self.target_source_windows_ns.fill(None);
+                for samples in &mut self.samples { samples.clear(); }
+                self.target_started = now;
+                self.last_timestamp_ns = None;
+                eprintln!("mouse calibration acquiring surface direction before stationary targets; moving stimulus recorded");
+            }
+            if self.sign_acquisition.active() {
+                let qualified = observation.map(|(source_ns, _, epoch)| calibration_acquisition::QualifiedSign {
+                    source_ns, epoch,
+                    sustained_support: self.surface_gaze.and_then(|s|s.sign_diagnostics)
+                        .is_some_and(|d|d.evidence.sustained_acquisition_support()),
+                });
+                match self.sign_acquisition.observe(now, self.acquisition_source_generation, qualified) {
+                    calibration_acquisition::Update::Waiting => {},
+                    calibration_acquisition::Update::TimedOut => {
+                        self.calibration_failure = Some("SURFACE DIRECTION NOT ACQUIRED  CHECK REFLECTIONS AND ROI");
+                    },
+                    calibration_acquisition::Update::Ready => {
+                        self.target_started = now;
+                        self.target_source_started_ns = current_frame_timestamp_ns;
+                        self.last_timestamp_ns = observation.map(|o|o.0);
+                        self.calibration_sign_epoch = observation.map(|o|o.2);
+                        eprintln!("mouse calibration surface direction acquired; starting stationary target 1 with a fresh source-time settle interval");
+                    },
+                }
+                // A moving-target source, including the completion source,
+                // must never enter a stationary target's calibration cluster.
+                return;
+            }
+        }
         if self.target_source_started_ns.is_none() {
             self.target_source_started_ns = current_frame_timestamp_ns;
         }
-        if let Some((_, _, sign_epoch)) = observation {
+        if let Some((_, _, sign_epoch)) = observation.filter(|_| self.display_plane.is_none()) {
             match self.calibration_sign_epoch {
                 None => self.calibration_sign_epoch = Some(sign_epoch),
                 Some(epoch) if epoch != sign_epoch => {
@@ -9496,7 +9568,7 @@ impl VirtualMouseMode {
             }
         }
         let unique_feature = observation.and_then(|(timestamp_ns, feature, _)| {
-            if self.last_timestamp_ns == Some(timestamp_ns) {
+            if self.last_timestamp_ns.is_some_and(|last| timestamp_ns <= last) {
                 None
             } else {
                 self.last_timestamp_ns = Some(timestamp_ns);
@@ -9708,6 +9780,7 @@ struct CalibratedDisplay {
     segmentation_mode: SegmentationMode,
     sam_prompt_generation: Option<u64>,
     gaze_authority_generation: u64,
+    /// Training provenance only; a later sign epoch does not invalidate the fit.
     sign_epoch: u64,
     plane: VirtualDisplayPlane,
     gaze_affine: GazeAffine,
@@ -9743,7 +9816,7 @@ impl CalibratedDisplay {
         let surface = mouse_gaze_surface(frame)?;
         (self.eye == eye && frame.segmentation_mode == self.segmentation_mode
             && frame.gaze_authority_generation == self.gaze_authority_generation
-            && surface.sign_resolved && surface.sign_epoch == self.sign_epoch
+            && surface.sign_resolved
             && (self.segmentation_mode != SegmentationMode::Sam31
                 || frame.gaze_authority_sam_prompt_generation == self.sam_prompt_generation))
             .then_some(self)
@@ -10179,6 +10252,7 @@ impl App {
             "recording_complete": false,
             "completed": false,
             "calibration_failure": calibration_failure,
+            "sign_acquisition": self.virtual_mouse.as_ref().map(|mode|mode.acquisition_json(Instant::now())),
             "sign_epoch": self.virtual_mouse.as_ref().and_then(|mode| mode.calibration_sign_epoch),
             "completed_basis_pause": self.virtual_mouse.as_ref().and_then(|mode| mode.completed_basis_pause),
             "sign_restart_count": self.virtual_mouse.as_ref().map_or(0, |mode| {
@@ -42683,7 +42757,7 @@ fn completed_display_wireframe(mode: &VirtualMouseMode) -> Option<display_pose_w
     if !mode.sequence_started || !mode.sequence_completed { return None; }
     let gaze = mode.surface_gaze.filter(|sample|
         mode.gaze_available && mode.completed_basis_pause.is_none()
-        && sample.sign_resolved && Some(sample.sign_epoch) == mode.calibration_sign_epoch
+        && sample.sign_resolved
     ).map(|sample| sample.relative_gaze);
     display_pose_wireframe::DisplayPoseWireframe::new(mode.display_plane?, gaze)
 }
@@ -42884,9 +42958,13 @@ fn draw_virtual_mouse_at(mode: &VirtualMouseMode, focused_frame: Option<&EyeFram
             );
             return;
         }
-        let elapsed = calibration_elapsed;
-        let sample_count = mode.samples[mode.target_index.min(mode.samples.len() - 1)].len();
-        let status = format!(
+        let (target, elapsed, sample_count) = mode.target_visual(now);
+        let acquiring = mode.sign_acquisition.active();
+        let status = if acquiring {
+            format!("ACQUIRING EYE DIRECTION  FRESH SIGN {}/{}  FOLLOW THE MOVING PLUS",
+                mode.sign_acquisition.ready_sources.min(calibration_acquisition::REQUIRED_SOURCES),
+                calibration_acquisition::REQUIRED_SOURCES)
+        } else { format!(
             "EYE TO SCREEN 3D POSE  TARGET {}/{}  RECENT {}/{}  NEED {} STABLE{}{}",
             mode.target_index + 1,
             mode.samples.len(),
@@ -42903,10 +42981,18 @@ fn draw_virtual_mouse_at(mode: &VirtualMouseMode, focused_frame: Option<&EyeFram
             } else {
                 format!("  SOURCE RELOCKS {}", mode.calibration_authority_restarts)
             },
-        );
+        ) };
         let detail =
             if mode.reacquisition_disabled && mode.frame_state != CalibrationFrameState::Ready {
                 "ROI REACQUIRE IS OFF (R)  KEEP THE IRIS INSIDE THE BOX".to_string()
+            } else if acquiring {
+                if mode.frame_state != CalibrationFrameState::Ready && mode.frame_state != CalibrationFrameState::UnresolvedSign {
+                    mode.frame_state.label().to_string()
+                } else if mode.sign_acquisition.sustained_support {
+                    "DIRECTION SUPPORTED  CONFIRMING FRESH SOURCES".to_string()
+                } else {
+                    "FOLLOW WITH YOUR EYES  WAITING FOR SUSTAINED MOTION OR PUPIL SUPPORT".to_string()
+                }
             } else if elapsed < VIRTUAL_MOUSE_TARGET_SETTLE {
                 format!(
                     "SETTLING {}MS  LOOK AT THE PLUS",
@@ -42939,9 +43025,6 @@ fn draw_virtual_mouse_at(mode: &VirtualMouseMode, focused_frame: Option<&EyeFram
                 VIRTUAL_MOUSE_INK,
             );
         }
-        let target = VIRTUAL_MOUSE_CALIBRATION_TARGETS[mode
-            .target_index
-            .min(VIRTUAL_MOUSE_CALIBRATION_TARGETS.len() - 1)];
         let x = (target.0 * width.saturating_sub(1) as f64).round() as i32;
         let y = (target.1 * height.saturating_sub(1) as f64).round() as i32;
         draw_calibration_eye_thumbnail(
@@ -43147,9 +43230,12 @@ fn calibration_recording_targets_at(mode: &VirtualMouseMode, now: Instant) -> Ve
         return vec![];
     }
     let index = mode.target_index.min(VIRTUAL_MOUSE_CALIBRATION_TARGETS.len() - 1);
-    vec![recording_trace::Target { id: format!("calibration-{index}"), role: "calibration",
-        normalized: VIRTUAL_MOUSE_CALIBRATION_TARGETS[index],
-        appearance: recording_target_appearance("spinner-crosshair", now.saturating_duration_since(mode.target_started), mode.samples[index].len()) }]
+    let (target, elapsed, samples) = mode.target_visual(now);
+    vec![recording_trace::Target {
+        id: if mode.sign_acquisition.active() { format!("sign-acquisition-{}",mode.sign_acquisition.episodes) } else { format!("calibration-{index}") },
+        role: if mode.sign_acquisition.active() { "sign-acquisition" } else { "calibration" },
+        normalized: target,
+        appearance: recording_target_appearance("spinner-crosshair", elapsed, samples) }]
 }
 
 #[cfg(test)]
@@ -43348,6 +43434,7 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
                 }
             }
             mode.reacquisition_disabled = reacquisition_disabled;
+            mode.acquisition_source_generation = active_authority.map_or(0, |a|a.generation);
             mode.observe_frame_state(current_frame_timestamp_ns, frame_state);
             mode.surface_gaze = surface_gaze;
             mode.observe_at_frame(now, current_frame_timestamp_ns, observation);
@@ -43403,7 +43490,10 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
             reference_eye:app.focus_eye, plane, selected_prediction:predicted,
             selected_ray:observation.filter(|_|mode.completed_basis_pause.is_none()).and_then(|(_,p,_)|RelativeGazeVector::from_projected(p.0,p.1)),
             calibration:serde_json::json!({"phase":if !mode.sequence_started {"arming"} else if mode.calibration_failure.is_some() {"failed"}
-                else if mode.display_plane.is_some() {"complete"} else {"collecting"},
+                else if mode.display_plane.is_some() {"complete"} else if mode.sign_acquisition.active() {"sign-acquisition"} else {"collecting"},
+                "sign_acquisition":mode.acquisition_json(calibration_rendered_at),
+                "training_sign_epoch":mode.calibration_sign_epoch.map(|e|e.to_string()),
+                "completed_sign_epoch_policy":"continue-with-current-signed-gaze",
                 "sign_restarts":mode.calibration_sign_restarts,"authority_restarts":mode.calibration_authority_restarts,
                 "failure":mode.calibration_failure,"basis_pause":mode.completed_basis_pause}),
             camera:camera_metadata,
@@ -43590,7 +43680,9 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
             reference_eye:app.focus_eye,plane:calibrated_display.map_or(default_monitor_plane,|c|c.plane),
             selected_ray:selected_virtual_contact.map(|p|p.relative_gaze),selected_prediction:predicted_display_target,
             camera:camera_metadata,calibration:serde_json::json!({"phase":cursor_mapping.status_label(),
-                "stored_calibration":stored_calibration.is_some(),"active_calibration":calibrated_display.is_some()}),
+                "stored_calibration":stored_calibration.is_some(),"active_calibration":calibrated_display.is_some(),
+                "training_sign_epoch":stored_calibration.map(|c|c.sign_epoch.to_string()),
+                "completed_sign_epoch_policy":"continue-with-current-signed-gaze"}),
         }, &app.shared, &recording_trace),
     };
     viewer_ui::render(app, pixels, width, height, &presented_eyes);
@@ -44880,6 +44972,9 @@ fn main() {
         }
         Some("--offline-contact-sign-eval") => {
             offline_segmentation_replay::contact_sign_eval(env::args().skip(2))
+        }
+        Some("--offline-sign-acquisition-trial") => {
+            offline_segmentation_replay::sign_acquisition_trial(env::args().skip(2))
         }
         Some("--offline-sam-outline-export") => {
             offline_segmentation_replay::sam_outline_export(env::args().skip(2))
@@ -50459,6 +50554,7 @@ mod tests {
             relative_gaze: RelativeGazeVector::from_projected(0.0, 0.2).unwrap(),
             frontal_equivalent_disk_area_px2: 1000.0, area_bucket: 0, quantized_frontal_disk_radius_px: 18.0,
             near_surface_point_sensor_px: (3040.0, 2430.0), sign_epoch: 7, kinematic_sign_correction: [false; 2],
+            sign_diagnostics: None,
         };
         let mut frame = control_eye_frame(100);
         frame.segmentation_mode = SegmentationMode::Sam31;
@@ -50470,9 +50566,13 @@ mod tests {
         frame.height = 60;
         frame.sam31_proposal_masks = Some(Arc::new(proposals.clone()));
         assert_eq!(calibration_frame_state(Some(&frame), Some(surface)), CalibrationFrameState::Ready);
+        let unsigned = SurfaceGazeSample {sign_resolved:false,..surface};
+        assert_eq!(calibration_frame_state(Some(&frame), Some(unsigned)), CalibrationFrameState::UnresolvedSign);
         frame.sensor_x = 3024;
         assert!(sam31_presentation_boundary_for_frame(&proposals, frame.timestamp_ns, frame.sensor_x, frame.sensor_y, 80, 60).is_some(), "partial contact remains diagnostic");
         assert_eq!(calibration_frame_state(Some(&frame), Some(surface)), CalibrationFrameState::OutsideSafeFrame);
+        assert_eq!(calibration_frame_state(Some(&frame), Some(unsigned)), CalibrationFrameState::OutsideSafeFrame,
+            "a clipped iris is not diagnosed as merely needing sign acquisition");
         let mut source_clipped = proposals.clone();
         source_clipped.outer_fit.as_mut().unwrap().ellipse.center.0 = 16.0;
         frame.sam31_proposal_masks = Some(Arc::new(source_clipped));
@@ -53070,6 +53170,7 @@ mod tests {
             sign_resolved: true,
             sign_epoch: 0,
             kinematic_sign_correction: [false; 2],
+            sign_diagnostics: None,
         };
         let sam = SurfaceGazeSample {
             relative_gaze: RelativeGazeVector::from_projected(0.25, -0.30).unwrap(),
@@ -61072,6 +61173,109 @@ mod tests {
     }
 
     #[test]
+    fn calibration_acquisition_stimulus_resolves_both_signs_without_training_on_motion() {
+        for sign in [-1.0, 1.0] {
+            let now = Instant::now();
+            let mut mode = VirtualMouseMode::new(now);
+            let mut tracker = SurfaceGazeTracker::default();
+            let (_, area) = quantize_frontal_disk_area(std::f64::consts::PI * 100.0_f64.powi(2)).unwrap();
+            let depth = (area/std::f64::consts::PI).sqrt() * (1.83_f64.powi(2)-1.0).sqrt();
+            let mut completed = None;
+            for i in 0..80u64 {
+                let at = now + Duration::from_millis(i*250);
+                let target = if i == 0 { (0.5,0.5) } else { mode.sign_acquisition.target(at) };
+                // Known synthetic monitor response with ~4deg horizontal and
+                // ~2.5deg vertical excursion. No target coordinates enter the
+                // production sign solver: it sees only conics and RAW motion.
+                let gaze = (sign*(0.1+0.75*(target.0-0.5)), sign*(0.55+0.45*(target.1-0.5)));
+                let origin = if i<8 { (3000,1500) } else { (3020,1480) };
+                let outer = raw_iris_focus::OuterIrisBoundary {
+                    center: (3200.0+2.0*i as f64+depth*gaze.0-origin.0 as f64,
+                        1700.0-1.5*i as f64+depth*gaze.1-origin.1 as f64),
+                    major_radius: 100.0,
+                    minor_radius: 100.0*(1.0-gaze.0*gaze.0-gaze.1*gaze.1).sqrt(),
+                    angle: (-gaze.0).atan2(gaze.1).rem_euclid(std::f64::consts::PI),
+                    points: vec![raw_iris_focus::OuterIrisPoint::default();8], ..Default::default()
+                };
+                let motion = raw_motion_octrees::NativeGlobalSimilarityEvidence {
+                    reliable:true,
+                    motion:raw_motion_octrees::SimilarityMotion {translation:[2.0,-1.5],residual:1.5,support:16,..Default::default()},
+                    motion_center_sensor:[3200.0,1700.0],..Default::default()
+                };
+                let source = 1_000_000_000+i*250_000_000;
+                let surface = tracker.observe_keyed_with_global_similarity(source,at,origin,None,&outer,(i>0).then_some(motion)).unwrap();
+                mode.surface_gaze=Some(surface);
+                mode.frame_state=if surface.sign_resolved {CalibrationFrameState::Ready} else {CalibrationFrameState::UnresolvedSign};
+                let observation=surface.sign_resolved.then_some((source,surface.relative_gaze.projected(),surface.sign_epoch));
+                // Simulate a 400ms asynchronous publication delay.
+                mode.observe_at_frame(at,Some(source+400_000_000),observation);
+                assert!(mode.samples.iter().all(Vec::is_empty));
+                assert!(surface.relative_gaze.is_camera_facing());
+                assert!((surface.frontal_equivalent_disk_area_px2-std::f64::consts::PI*10000.0).abs()<1e-7);
+                if mode.sign_acquisition.episodes>0 && !mode.sign_acquisition.active() {
+                    assert!(surface.relative_gaze.right*gaze.0+surface.relative_gaze.down*gaze.1>0.0);
+                    assert!(mode.sign_acquisition.sustained_support);
+                    completed=Some((at,source,surface)); break;
+                }
+            }
+            let (at,source,surface)=completed.expect("bounded smooth motion should resolve either known synthetic antipode");
+            assert!(at.duration_since(now)<Duration::from_secs(8));
+            assert_eq!(mode.target_index,0);
+            assert_eq!(mode.target_source_started_ns,Some(source+400_000_000));
+            let late=source+700_000_000;
+            mode.observe_at_frame(at+Duration::from_millis(600),Some(source+1_000_000_000),
+                Some((late,surface.relative_gaze.projected(),surface.sign_epoch)));
+            assert!(mode.samples[0].is_empty(),"pre-settle motion must not contaminate stationary target one");
+            mode.observe_at_frame(at+Duration::from_millis(900),Some(source+1_300_000_000),
+                Some((source+1_000_000_000,surface.relative_gaze.projected(),surface.sign_epoch)));
+            assert_eq!(mode.samples[0].len(),1);
+        }
+    }
+
+    #[test]
+    fn calibration_acquisition_records_the_moving_target_and_stops_on_timeout() {
+        let now=Instant::now(); let mut mode=VirtualMouseMode::new(now);
+        mode.frame_state=CalibrationFrameState::UnresolvedSign;
+        mode.arm_for_raw_capture(now);
+        mode.observe_at_frame(now,Some(1),None);
+        assert!(!mode.sign_acquisition.active());
+        assert!(calibration_recording_targets_at(&mode,now).is_empty());
+        mode.begin_sequence(now,Some(1));
+        mode.frame_state=CalibrationFrameState::UnresolvedSign;
+        mode.observe_at_frame(now,Some(1),None);
+        assert!(mode.sign_acquisition.active());
+        let a=calibration_recording_targets_at(&mode,now);
+        let at=now+Duration::from_secs(1);
+        let b=calibration_recording_targets_at(&mode,at);
+        assert_eq!(a[0].id,b[0].id);
+        assert_eq!(b[0].role,"sign-acquisition");
+        assert_ne!(a[0].normalized,b[0].normalized);
+        assert_eq!(b[0].normalized,mode.target_visual(at).0);
+        let (w,h)=(640,400); let mut pixels=vec![VIRTUAL_MOUSE_BACKGROUND;w*h];
+        draw_virtual_mouse_at(&mode,None,&mut pixels,w,h,at);
+        let (u,v)=b[0].normalized;
+        assert_eq!(pixels[(v*(h-1) as f64).round() as usize*w+(u*(w-1) as f64).round() as usize],VIRTUAL_MOUSE_INK);
+        mode.observe_at_frame(now+calibration_acquisition::MAX_DURATION,Some(20_000_000_001),None);
+        assert!(mode.calibration_failure.is_some());
+        assert!(!mode.sequence_completed);
+        assert!(calibration_recording_targets_at(&mode,at).is_empty());
+        assert!(mode.samples.iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    fn calibration_acquisition_does_not_replace_an_existing_good_basis_or_completed_mapping() {
+        let now=Instant::now(); let mut mode=VirtualMouseMode::new(now);
+        mode.frame_state=CalibrationFrameState::Ready;
+        mode.observe_at_frame(now,Some(1),Some((1,(0.1,0.2),9)));
+        assert!(!mode.sign_acquisition.active());
+        mode.display_plane=Some(VirtualDisplayPlane::development_default());
+        mode.frame_state=CalibrationFrameState::UnresolvedSign;
+        mode.observe_at_frame(now+Duration::from_secs(1),Some(1_000_000_001),None);
+        assert!(!mode.sign_acquisition.active());
+        assert!(mode.display_plane.is_some());
+    }
+
+    #[test]
     fn virtual_mouse_calibration_preserves_samples_at_ten_fps() {
         let started = Instant::now();
         let mut mode = VirtualMouseMode::new(started);
@@ -61438,6 +61642,7 @@ mod tests {
             quantized_frontal_disk_radius_px: 10.0, near_surface_point_sensor_px: (0.0,0.0),
             relative_gaze: RelativeGazeVector::from_projected(0.1,0.05).unwrap(),
             sign_resolved: true, sign_epoch: 0, kinematic_sign_correction: [false;2],
+            sign_diagnostics: None,
         });
         let scene = completed_display_wireframe(&mode).unwrap();
         assert!(scene.hit.is_some());
@@ -61455,7 +61660,10 @@ mod tests {
         assert!(completed_display_wireframe(&mode).unwrap().ray_end.is_none());
         mode.gaze_available = true;
         mode.calibration_sign_epoch = Some(1);
+        assert!(completed_display_wireframe(&mode).unwrap().ray_end.is_some());
+        mode.surface_gaze.as_mut().unwrap().sign_resolved = false;
         assert!(completed_display_wireframe(&mode).unwrap().ray_end.is_none());
+        mode.surface_gaze.as_mut().unwrap().sign_resolved = true;
         mode.calibration_sign_epoch = Some(0);
         mode.completed_basis_pause = Some("TEST PAUSE");
         assert!(completed_display_wireframe(&mode).unwrap().ray_end.is_none());
@@ -61464,7 +61672,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_calibration_sign_change_preserves_fit_and_never_restarts_targets() {
+    fn completed_calibration_sign_change_keeps_cursor_and_preserves_training_provenance() {
         let now = Instant::now();
         let mut mode = completed_mouse_calibration_fixture(now);
         let before = (
@@ -61490,16 +61698,33 @@ mod tests {
         assert!(mode.sequence_completed);
         assert_eq!(mode.calibration_sign_epoch, Some(0));
         assert_eq!(mode.calibration_sign_restarts, 0);
-        assert!(mode.completed_basis_pause.is_some());
-        assert!(!mode.gaze_available);
-        assert!(mode.reticle.is_none());
-        // A delayed sample from the old epoch is not proof of revalidation.
+        assert!(mode.completed_basis_pause.is_none());
+        assert!(mode.gaze_available);
+        assert_eq!(mode.reticle, Some((0.7, 0.8)));
+        assert_eq!(mode.reticle_source_timestamp_ns, Some(2));
+        // A genuine direction reversal uses the same map immediately.
         mode.observe_at_frame(
             now + Duration::from_secs(301),
             Some(3),
-            Some((3, (0.2, 0.3), 0)),
+            Some((3, (-0.2, -0.3), 4)),
         );
+        assert_eq!(mode.reticle, Some((0.3, 0.2)));
+        // Epoch changes must not let old or repeated sources move the cursor.
+        for timestamp in [2, 3] {
+            mode.observe_at_frame(now + Duration::from_secs(301), Some(3),
+                Some((timestamp, (0.2, 0.3), 0)));
+            assert_eq!(mode.reticle, Some((0.3, 0.2)));
+        }
+        mode.observe_at_frame(now + Duration::from_secs(302), Some(4), None);
         assert!(mode.reticle.is_none());
+        mode.observe_at_frame(now + Duration::from_secs(303), Some(5),
+            Some((5, (0.2, 0.3), 5)));
+        assert_eq!(mode.reticle, Some((0.7, 0.8)));
+        mode.restart_for_sign_epoch(now, Some(6), 6);
+        assert_eq!(mode.calibration_sign_epoch, Some(0));
+        assert_eq!(mode.calibration_sign_restarts, 0);
+        assert!(mode.completed_basis_pause.is_none());
+        assert_eq!((mode.display_plane, mode.gaze_affine, mode.samples, mode.target_index), before);
         assert!(mode.calibration_failure.is_none());
     }
 
@@ -63555,6 +63780,7 @@ mod tests {
             sign_resolved: true,
             sign_epoch: 0,
             kinematic_sign_correction: [false; 2],
+            sign_diagnostics: None,
         };
         let pose = provisional_surface_pose(Some(surface), &outer_prediction)
             .expect("a camera-normal admitted limbus still defines a surface pose");
@@ -63625,6 +63851,7 @@ mod tests {
             sign_resolved: true,
             sign_epoch: 0,
             kinematic_sign_correction: [false; 2],
+            sign_diagnostics: None,
         };
         frame.surface_gaze = Some(surface);
         frame.virtual_contact_surface_gaze = Some(surface);
@@ -63668,6 +63895,7 @@ mod tests {
             sign_resolved: true,
             sign_epoch: 0,
             kinematic_sign_correction: [false; 2],
+            sign_diagnostics: None,
         });
         frame.projected_rotation_center = Some((31.0, 49.0));
         frame.projected_rotation_center_z = Some(12.0);
@@ -63711,6 +63939,7 @@ mod tests {
             sign_resolved: true,
             sign_epoch: 0,
             kinematic_sign_correction: [false; 2],
+            sign_diagnostics: None,
         });
 
         let pose = virtual_contact_pose(&frame).expect("current RAW perimeter contact");
@@ -63783,6 +64012,7 @@ mod tests {
             sign_resolved: true,
             sign_epoch: 0,
             kinematic_sign_correction: [false; 2],
+            sign_diagnostics: None,
         });
         frame.surface_gaze = frame.virtual_contact_surface_gaze;
         let now = Instant::now();
@@ -63911,6 +64141,7 @@ mod tests {
             sign_resolved: true,
             sign_epoch: 0,
             kinematic_sign_correction: [false; 2],
+            sign_diagnostics: None,
         };
         let pose = provisional_surface_pose(Some(surface), &outer_prediction)
             .expect("de-affined ring should provide a provisional surface pose");
@@ -63978,6 +64209,7 @@ mod tests {
             sign_resolved: true,
             sign_epoch: 0,
             kinematic_sign_correction: [false; 2],
+            sign_diagnostics: None,
         });
         frame.eye_laser_enabled = true;
 
@@ -66796,6 +67028,7 @@ mod tests {
             near_surface_point_sensor_px: (10.0, 20.0),
             relative_gaze: RelativeGazeVector::from_projected(0.1, 0.2).unwrap(),
             sign_resolved: true, sign_epoch: 7, kinematic_sign_correction: [false, false],
+            sign_diagnostics: None,
         };
         let gaze = recording_gaze(Some(&frame), Some(surface), Some((0.25, 1.5)), None,
             recording_mapping("test", VirtualDisplayPlane::development_default(), None), false);

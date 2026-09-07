@@ -18,6 +18,7 @@ pub(crate) mod pupil_center;
 pub(crate) mod pupil_projection;
 pub(crate) mod pupil_size;
 pub(crate) mod sign_motion;
+mod sign_continuity;
 
 /// Unit-safe radius coordinates for the physical pupil-size posterior.
 ///
@@ -209,13 +210,71 @@ pub(crate) struct SurfaceGazeSample {
     /// but it must never train an eye-to-screen calibration.
     pub(crate) sign_resolved: bool,
     /// Changes whenever the persistent sign state is reset or changes branch.
-    /// A calibrated display is valid only for the epoch which trained it.
+    /// Consumers can distinguish training and current sign lineage; completed
+    /// cursor mappings deliberately continue across a sign-only epoch change.
     pub(crate) sign_epoch: u64,
     pub(crate) kinematic_sign_correction: [bool; 2],
+    /// Immutable source-time diagnostics; presentation duplicates do not refresh
+    /// this evidence. None is reserved for old imported/test samples.
+    pub(crate) sign_diagnostics: Option<SurfaceSignDiagnostics>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SurfaceSignEvidence {
+    #[default]
+    Unresolved,
+    MotionInterval,
+    PupilAnchor,
+    MotionWindow,
+    KinematicCorrection,
+}
+
+impl SurfaceSignEvidence {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Unresolved => "unresolved",
+            Self::MotionInterval => "motion-interval",
+            Self::PupilAnchor => "pupil-anchor",
+            Self::MotionWindow => "motion-window",
+            Self::KinematicCorrection => "kinematic-correction",
+        }
+    }
+    pub(crate) fn sustained_acquisition_support(self) -> bool {
+        matches!(self, Self::PupilAnchor | Self::MotionWindow)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SurfaceSignDiagnostics {
+    pub(crate) evidence: SurfaceSignEvidence,
+    pub(crate) selected_branch: usize,
+    pub(crate) branch_residual_ema_px: [f64; 2],
+    pub(crate) source_motion_residual_px: Option<f64>,
+    pub(crate) temporal_margin_px: Option<f64>,
+    pub(crate) pending_anchor_votes: u8,
+    /// Source-time branch correspondence through the frontal degeneracy;
+    /// not an antipodal sign correction or a new training epoch.
+    pub(crate) near_frontal_continuation: bool,
+}
+
+/// The established rule remains an explicit offline baseline. The live fallback
+/// additionally permits the same sustained motion vote to acquire an unknown
+/// sign; it does not lower its support or physical-geometry requirements.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SignAcquisitionPolicy {
+    Established,
+    #[default]
+    MotionWindowFallback,
+    MotionWindowOnly,
+    ReliableMotionSeed,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct SurfaceGazeTracker {
+    pub(crate) acquisition_policy: SignAcquisitionPolicy,
+    pub(crate) reliable_motion_observations: u16,
+    pub(crate) sign_evidence: SurfaceSignEvidence,
+    pub(crate) same_sign_anchor_support: u8,
     pub(crate) floating_center_sensor: Option<(f64, f64)>,
     pub(crate) floating_near_point_sensor: Option<(f64, f64)>,
     pub(crate) area_bucket: Option<i32>,
@@ -496,6 +555,9 @@ pub(crate) fn quantize_frontal_disk_area(frontal_equivalent_disk_area_px2: f64) 
 impl SurfaceGazeTracker {
     pub(crate) fn clear_floating_point(&mut self) {
         self.motion_sign_window.clear();
+        self.sign_evidence = SurfaceSignEvidence::Unresolved;
+        self.same_sign_anchor_support = 0;
+        self.reliable_motion_observations = 0;
         self.floating_center_sensor = None;
         self.floating_near_point_sensor = None;
         self.area_bucket = None;
@@ -519,6 +581,8 @@ impl SurfaceGazeTracker {
     /// full reset above and advances the epoch.
     pub(crate) fn clear_stale_motion_preserving_sign(&mut self) {
         self.motion_sign_window.clear();
+        self.same_sign_anchor_support = 0;
+        self.reliable_motion_observations = 0;
         self.floating_center_sensor = None;
         self.floating_near_point_sensor = None;
         self.pending_area_bucket = None;
@@ -561,10 +625,18 @@ impl SurfaceGazeTracker {
 
     pub(crate) fn consider_sign_hypothesis(&mut self, candidate: usize) {
         if self.sign_resolved && candidate == self.selected_sign_hypothesis {
+            // A later pupil cue can validate a weak motion-only seed without
+            // changing the chosen branch. Four fresh matching anchors are
+            // still required; redraws are rejected by the source-key guard.
+            self.same_sign_anchor_support = self.same_sign_anchor_support.saturating_add(1);
+            if self.same_sign_anchor_support >= CONTACT_SIGN_CONFIRMATION_UPDATES {
+                self.sign_evidence = SurfaceSignEvidence::PupilAnchor;
+            }
             self.pending_sign_hypothesis = None;
             self.pending_sign_frames = 0;
             return;
         }
+        self.same_sign_anchor_support = 0;
         if self.pending_sign_hypothesis == Some(candidate) {
             self.pending_sign_frames = self.pending_sign_frames.saturating_add(1);
         } else {
@@ -579,6 +651,7 @@ impl SurfaceGazeTracker {
             self.pending_sign_hypothesis = None;
             self.pending_sign_frames = 0;
             self.sign_resolved = true;
+            self.sign_evidence = SurfaceSignEvidence::PupilAnchor;
         }
     }
 
@@ -608,6 +681,7 @@ impl SurfaceGazeTracker {
         self.pending_sign_hypothesis = None;
         self.pending_sign_frames = 0;
         self.sign_resolved = true;
+        self.sign_evidence = SurfaceSignEvidence::KinematicCorrection;
         self.sign_epoch = self.sign_epoch.wrapping_add(1);
         self.kinematic_history.clear();
         self.floating_center_sensor = None;
@@ -791,6 +865,7 @@ impl SurfaceGazeTracker {
         );
         let mut motion_window_switch = false;
         let mut motion_window_supported = false;
+        let mut near_frontal_continuation = false;
         if let Some(previous) = self.contact_sign_hypotheses {
             let temporal_motion_reliable = global_similarity.is_some_and(|global| global.reliable);
             let predict = |point: (f64, f64)| {
@@ -854,7 +929,21 @@ impl SurfaceGazeTracker {
                 direction_error(previous[0], candidates[1])
                     + direction_error(previous[1], candidates[0]),
             );
-            let assignment = if direct <= crossed { [0, 1] } else { [1, 0] };
+            let mut assignment = if direct <= crossed { [0, 1] } else { [1, 0] };
+            if self.sign_resolved {
+                if let Some(global) = global_similarity.filter(|g| g.reliable) {
+                    if let Some(continuing) = sign_continuity::near_frontal_assignment(
+                        &self.kinematic_history, source_timestamp_ns, center_sensor,
+                        quantized_frontal_disk_radius_px, candidates,
+                        predicted,
+                        f64::from(global.motion.residual),
+                        self.selected_sign_hypothesis, assignment,
+                    ) {
+                        assignment = continuing;
+                        near_frontal_continuation = true;
+                    }
+                }
+            }
             let updated = std::array::from_fn(|index| {
                 let mut candidate = candidates[assignment[index]];
                 let residual = error(predicted[index], candidate);
@@ -863,7 +952,10 @@ impl SurfaceGazeTracker {
                     // into the pixel residual used to resolve a later frame
                     // with independently measured whole-ROI motion.
                     previous[index].residual_ema
-                } else if previous[index].observations <= 1 {
+                } else if previous[index].observations <= 1
+                    || (self.acquisition_policy == SignAcquisitionPolicy::ReliableMotionSeed
+                        && self.reliable_motion_observations == 0)
+                {
                     residual
                 } else {
                     0.75 * previous[index].residual_ema + 0.25 * residual
@@ -872,6 +964,9 @@ impl SurfaceGazeTracker {
                 candidate
             });
             self.contact_sign_hypotheses = Some(updated);
+            if temporal_motion_reliable {
+                self.reliable_motion_observations = self.reliable_motion_observations.saturating_add(1);
+            }
             // Both histories use their OWN transported pivots. Sustained
             // current-source evidence may challenge a resolved sign without
             // penalizing that retrospective correction as a new saccade.
@@ -881,6 +976,7 @@ impl SurfaceGazeTracker {
                 source_timestamp_ns, now, residuals, quantized_frontal_disk_radius_px,
                 global_similarity.map_or(0.0, |g| f64::from(g.motion.residual)),
             );
+            if sign_anchor.is_none() { self.same_sign_anchor_support = 0; }
             let anchor_candidate = sign_anchor.map(|anchor| {
                 let score = |hypothesis: ContactSignHypothesis| {
                     let offset = (
@@ -891,6 +987,9 @@ impl SurfaceGazeTracker {
                 };
                 usize::from(score(updated[1]) > score(updated[0]))
             });
+            if anchor_candidate != Some(self.selected_sign_hypothesis) {
+                self.same_sign_anchor_support = 0;
+            }
             let temporal_residual_gap = (updated[0].residual_ema - updated[1].residual_ema).abs();
             let temporal_resolution_threshold = global_similarity
                 .filter(|global| global.reliable)
@@ -902,7 +1001,10 @@ impl SurfaceGazeTracker {
                 && updated[0].observations >= 2
                 && temporal_residual_gap >= temporal_resolution_threshold)
                 .then(|| usize::from(updated[1].residual_ema < updated[0].residual_ema));
-            if let Some(decision) = motion_decision.filter(|_| self.sign_resolved) {
+            let window_can_acquire = matches!(self.acquisition_policy,
+                SignAcquisitionPolicy::MotionWindowFallback | SignAcquisitionPolicy::MotionWindowOnly);
+            if let Some(decision) = motion_decision.filter(|_| self.sign_resolved || window_can_acquire) {
+                self.sign_evidence = SurfaceSignEvidence::MotionWindow;
                 motion_window_supported = true;
                 self.pending_sign_hypothesis = None;
                 self.pending_sign_frames = 0;
@@ -916,6 +1018,7 @@ impl SurfaceGazeTracker {
                         decision.candidate, decision.support, decision.mean_costs, self.sign_epoch);
                     self.motion_sign_window.clear();
                 }
+                self.sign_resolved = true;
             } else if let Some(candidate) = anchor_candidate {
                 // A RAW dark component may be an eyelid shadow. It can seed
                 // an unresolved branch, but overturning an established one
@@ -931,7 +1034,9 @@ impl SurfaceGazeTracker {
                     self.pending_sign_hypothesis = None;
                     self.pending_sign_frames = 0;
                 }
-            } else if let Some(candidate) = temporal_candidate.filter(|_| !self.sign_resolved) {
+            } else if let Some(candidate) = temporal_candidate.filter(|_| !self.sign_resolved
+                && self.acquisition_policy != SignAcquisitionPolicy::MotionWindowOnly) {
+                self.sign_evidence = SurfaceSignEvidence::MotionInterval;
                 // Whole-ROI motion can break the initial two-way tie, but the
                 // hypotheses above are persistent physical identities. Once a
                 // sign is resolved, re-ranking their historical residual EMAs
@@ -961,6 +1066,7 @@ impl SurfaceGazeTracker {
             self.pending_sign_hypothesis = None;
             self.pending_sign_frames = 0;
             self.sign_resolved = false;
+            self.sign_evidence = SurfaceSignEvidence::Unresolved;
             if sign_anchor.is_some() {
                 // A single dark component can be a reflection or eyelid
                 // shadow.  Seed, but do not resolve, the selected antipode;
@@ -1102,6 +1208,15 @@ impl SurfaceGazeTracker {
             sign_resolved: self.sign_resolved,
             sign_epoch: self.sign_epoch,
             kinematic_sign_correction: [kinematic_switch_committed || motion_window_switch; 2],
+            sign_diagnostics: Some(SurfaceSignDiagnostics {
+                evidence: self.sign_evidence,
+                selected_branch: self.selected_sign_hypothesis,
+                branch_residual_ema_px: self.contact_sign_hypotheses?.map(|h| h.residual_ema),
+                source_motion_residual_px: global_similarity.filter(|g| g.reliable).map(|g| f64::from(g.motion.residual)),
+                temporal_margin_px: global_similarity.filter(|g| g.reliable).map(|g| (4.0 * f64::from(g.motion.residual)).max(0.35)),
+                pending_anchor_votes: self.pending_sign_frames.max(self.same_sign_anchor_support.min(CONTACT_SIGN_CONFIRMATION_UPDATES)),
+                near_frontal_continuation,
+            }),
         })
     }
 

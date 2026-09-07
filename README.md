@@ -267,3 +267,21 @@ from the selected monitor's EDID when readable, otherwise the labeled nominal
 The reconstruction viewpoint slowly oscillates ±45° horizontally (24-second
 cycle) and ±10° vertically (32-second cycle). This is presentation-only: the
 monitor fit, gaze hit, distances and printed pose angles do not rotate with it.
+
+A completed calibration keeps driving the cursor and wireframe when the
+tracker's sign epoch changes. It uses the current signed gaze with the existing
+map; a real sign reversal can therefore make the cursor jump. Training/current
+epochs remain recorded for diagnosis. Missing or unsigned gaze and incompatible
+eye/provider/prompt sources are still rejected; unfinished calibration still
+restarts its sample collection on a sign change.
+Near-frontal correspondence now distinguishes a continued crossing from a
+turnaround using source-timed motion and bounded pivot support. See the
+[meridian regression tests and native-video review](docs/meridian-sign-continuity.md)
+for the measured results and remaining limits.
+
+If **M** starts with an unresolved surface direction, follow the small moving
+plus first. This recorded acquisition phase stays within the middle 20% of the
+screen and waits for fresh, sustained sign evidence before the usual stationary
+targets. It times out explicitly after 20 seconds; it does not guess a sign or
+train calibration on the moving target. Already usable gaze skips that phase.
+See [the acquisition investigation and live-retest notes](docs/sign-acquisition-trials.md#live-retest-follow-up).
