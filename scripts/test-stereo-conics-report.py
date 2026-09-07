@@ -65,6 +65,13 @@ class MatchingTests(unittest.TestCase):
         with self.assertRaises(ValueError):report.check_shared_target_contract(result)
         result["hypotheses_by_association"]=[8,4,4]
         report.check_shared_target_contract(result)
+        for count,rms in [(0,None),(8,0.2),(16,__import__("math").pi)]:
+            result["support"]=[{"boundary_normal_samples":count,"boundary_normal_rms_radians":rms}]
+            report.check_shared_target_contract(result)
+        for count,rms in [(0,0.0),(8,None),(17,0.2),(1,4.0),(1,float("nan"))]:
+            result["support"]=[{"boundary_normal_samples":count,"boundary_normal_rms_radians":rms}]
+            with self.assertRaises(ValueError):report.check_shared_target_contract(result)
+        result["support"]=[]
         result["eye_gaze_directions"][1]=[0.6,0.0,0.8]
         with self.assertRaises(ValueError):report.check_shared_target_contract(result)
 
@@ -135,6 +142,30 @@ class MatchingTests(unittest.TestCase):
         b["joint"]["withheld_sample_residuals"][0]["groups"][0]["sample_fingerprint"]="coordinates-B"
         with self.assertRaises(ValueError):
             report.matched_algorithm_report(Rows([a]),Rows([b]),[])
+
+    def test_extractor_comparison_skips_changed_eye_but_preserves_unchanged_partner(self):
+        for field,value in [("sample_fingerprint","changed"),("points",7),("kind","PupillaryBoundary")]:
+            a=row();a["inputs"][1]=copy.deepcopy(a["inputs"][0]);a["inputs"][1]["index"]=2
+            a["joint"]["contributing_eyes"]=[True,True]
+            a["joint"]["withheld_sample_residuals"][0]["groups"][0]["sample_fingerprint"]="unchanged"
+            a["joint"]["withheld_sample_residuals"][1]=copy.deepcopy(a["joint"]["withheld_sample_residuals"][0])
+            b=copy.deepcopy(a);b["joint"]["withheld_sample_residuals"][0]["groups"][0][field]=value
+            result=report.matched_algorithm_report(Rows([a]),Rows([b]),[],allow_extractor_changes=True)
+            self.assertEqual(result["comparison_kind"],"extractor_change")
+            self.assertEqual(result["all_withheld_samples"][0]["matched"],0)
+            self.assertEqual(result["all_withheld_samples"][1]["matched"],1)
+            self.assertEqual(result["probe_verification"]["eye0:changed_probe_sets_skipped"],1)
+            self.assertEqual(result["probe_verification"]["coordinate_fingerprints_matched"],1)
+            for eye in range(2):self.assertEqual(result["eye_admission"][eye]["baseline:True,candidate:True"],1)
+
+    def test_extractor_mode_cannot_weaken_source_identity_or_accept_unverified_probes(self):
+        a,b=row(),row()
+        result=report.matched_algorithm_report(Rows([a]),Rows([b]),[],allow_extractor_changes=True)
+        self.assertEqual(result["all_withheld_samples"][0]["matched"],0)
+        self.assertEqual(result["probe_verification"]["eye0:unverified_probe_sets_skipped"],1)
+        b["inputs"][0]["raw_sha256"]="different-bytes"
+        with self.assertRaises(ValueError):
+            report.matched_algorithm_report(Rows([a]),Rows([b]),[],allow_extractor_changes=True)
 
     def test_index_ranges_are_explicit_and_end_exclusive(self):
         rows=[row(i) for i in (1,2,3)]

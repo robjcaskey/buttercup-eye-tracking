@@ -6,7 +6,7 @@
 //! Neither interpolates across rejected/occluded runs to manufacture evidence.
 
 use crate::geometry::Ellipse;
-use crate::roi_evidence::{BoundaryArcObservation,BoundaryKind,ConicObservation,ExposureKey,RoiConicEvidence};
+use crate::roi_evidence::{BoundaryArcObservation,BoundaryKind,BoundaryNormalObservation,ConicObservation,ExposureKey,RoiConicEvidence};
 use super::ContourFitEvidence;
 
 #[derive(Clone,Debug)]
@@ -14,6 +14,7 @@ pub(crate) struct OwnedBoundaryArc {
     pub(crate) evidence_group:u32,
     pub(crate) kind:BoundaryKind,
     pub(crate) points_roi_px:Vec<(f64,f64)>,
+    pub(crate) outward_normals_roi:Option<Vec<Option<BoundaryNormalObservation>>>,
     pub(crate) normal_band_half_width_px:f64,
     pub(crate) detector_score:Option<f64>,
 }
@@ -46,6 +47,7 @@ impl OwnedRoiEvidence {
         PreparedRoiEvidence {source:self,
             arcs:self.arcs.iter().map(|a| BoundaryArcObservation {
                 evidence_group:a.evidence_group,kind:a.kind,points_roi_px:&a.points_roi_px,
+                outward_normals_roi:a.outward_normals_roi.as_deref(),
                 normal_band_half_width_px:Some(a.normal_band_half_width_px),detector_score:a.detector_score,
             }).collect(),
             conics:self.conics.iter().map(|c| ConicObservation {kind:c.kind,ellipse_roi_px:c.ellipse_roi_px,
@@ -72,7 +74,7 @@ pub(crate) fn append_retained_sam_arcs(packet:&mut OwnedRoiEvidence, review:&Con
         let points=(0..count).filter_map(|i| review.retained_points.get(indices[i*(indices.len()-1)/(count-1)]).copied()).collect::<Vec<_>>();
         if points.len()<3 {continue;}
         packet.arcs.push(OwnedBoundaryArc {evidence_group:group_base+run as u32,kind:BoundaryKind::OuterLimbus,
-            points_roi_px:points,normal_band_half_width_px:1.5,detector_score:None});
+            points_roi_px:points,outward_normals_roi:None,normal_band_half_width_px:1.5,detector_score:None});
     }
     packet.conics.push(OwnedConicHint {kind:BoundaryKind::OuterLimbus,ellipse_roi_px:review.ellipse,
         supporting_arc_indices:(start..packet.arcs.len()).collect()});
@@ -164,6 +166,7 @@ pub(crate) fn append_raw_ring_arcs(packet:&mut OwnedRoiEvidence,raw:&[u16],guide
                     detail.push((4.0/mean_width.max(4.0)).clamp(0.0,1.0));
                     arcs.push(OwnedBoundaryArc {evidence_group:group_base+sector as u32,kind,
                         points_roi_px:run.iter().map(|p|p.point).collect(),
+                        outward_normals_roi:None,
                         normal_band_half_width_px:(mean_width*0.25).clamp(0.75,4.0),detector_score:Some(score)});
                 }
                 run.clear();

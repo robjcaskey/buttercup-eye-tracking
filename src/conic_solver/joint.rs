@@ -10,7 +10,7 @@
 //! assumptions, not calibrated gaze probabilities or measured anatomy.
 
 use crate::geometry::{add3, cross3, dot3, norm3, normalized3, scale3, sub3, Ellipse};
-use crate::roi_evidence::{BoundaryKind, ExposureKey, RoiConicEvidence};
+use crate::roi_evidence::{BoundaryKind, BoundaryNormalObservation, ExposureKey, RoiConicEvidence};
 
 #[cfg(test)]
 mod tests;
@@ -28,6 +28,9 @@ const MAXIMUM_GROUP_COST: f64 = 9.0;
 /// Conservative native-image correlation length, not a count of detector
 /// samples. Splitting/resampling a contour must not create more evidence.
 const SUPPORT_CORRELATION_LENGTH_PX: f64 = 32.0;
+/// Correlated contour direction is a compatibility cue, not an independent
+/// precise angle measurement. This support allowance is not a statistical CI.
+const BOUNDARY_DIRECTION_ALLOWANCE_SIGMAS: f64 = 2.0;
 
 /// Bounded engineering support with a soft center. This is not a confidence
 /// interval. All bounds are frozen before the candidate is evaluated.
@@ -210,6 +213,8 @@ pub(crate) struct ArcSupport {
     pub(crate) sigma_px: f64,
     pub(crate) support_length_px: f64,
     pub(crate) evidence_weight: f64,
+    pub(crate) boundary_normal_samples: usize,
+    pub(crate) boundary_normal_rms_radians: Option<f64>,
     pub(crate) used: bool,
 }
 
@@ -393,12 +398,31 @@ fn symmetric_eigen_3x3(mut a:[[f64;3];3])->Option<([f64;3],[[f64;3];3])> {
 struct SparseArc {
     eye: usize, index: usize, kind: BoundaryKind, boundary: usize,
     group: u32, points: Vec<(f64,f64)>, sigma: f64,
+    outward_normals: Vec<Option<BoundaryNormalObservation>>,
     quadrature: Vec<f64>, length_px:f64, weight:f64,
 }
 
 impl SparseArc {
     fn mean_cost(&self,conic:ProjectedCircle)->f64 {
-        self.points.iter().zip(&self.quadrature).map(|(&p,&w)|w*robust_residual(conic.residual_px(p)/self.sigma).powi(2)).sum()
+        self.points.iter().zip(&self.quadrature).enumerate().map(|(i,(&p,&w))|
+            w*(robust_residual(conic.residual_px(p)/self.sigma).powi(2)+self.normal_residual(conic,i).powi(2))).sum()
+    }
+
+    fn normal_angle_error(&self,conic:ProjectedCircle,index:usize)->Option<f64> {
+        let measured=self.outward_normals[index]?;
+        let (x,y)=self.points[index];let [a,b,c,d,e,_]=conic.0;
+        let gradient=[2.0*a*x+b*y+d,b*x+2.0*c*y+e];
+        if gradient[0].hypot(gradient[1])<=1.0e-20 {return Some(std::f64::consts::PI);}
+        let n=measured.unit_outward_roi;
+        Some((gradient[0]*n[1]-gradient[1]*n[0]).atan2(gradient[0]*n[0]+gradient[1]*n[1]))
+    }
+
+    fn normal_residual(&self,conic:ProjectedCircle,index:usize)->f64 {
+        self.normal_angle_error(conic,index).map(|angle| {
+            let sigma=self.outward_normals[index].unwrap().angular_sigma_radians;
+            let excess=(angle.abs()/sigma-BOUNDARY_DIRECTION_ALLOWANCE_SIGMAS).max(0.0);
+            robust_residual(angle.signum()*excess)
+        }).unwrap_or(0.0)
     }
 }
 
@@ -470,8 +494,12 @@ impl<'a> Problem<'a> {
             for (index, arc) in evidence.arcs.iter().take(128).enumerate() {
                 let Some(boundary) = boundary_index(arc.kind) else { continue; };
                 if arc.points_roi_px.len() < 3 { continue; }
+                if arc.outward_normals_roi.is_some_and(|normals|normals.len()!=arc.points_roi_px.len()
+                    || normals.iter().flatten().any(|n|!n.valid())) {return Err(JointConicUnavailable::InvalidRequest);}
                 let count = arc.points_roi_px.len().min(MAX_POINTS_PER_ARC);
                 let points = (0..count).map(|j| arc.points_roi_px[j*(arc.points_roi_px.len()-1)/(count-1)]).collect::<Vec<_>>();
+                let outward_normals=(0..count).map(|j|arc.outward_normals_roi
+                    .and_then(|normals|normals[j*(arc.points_roi_px.len()-1)/(count-1)])).collect();
                 if points.iter().any(|&(x,y)| !x.is_finite() || !y.is_finite()) { continue; }
                 let Some((quadrature,length_px))=polyline_quadrature(&points) else {continue;};
                 let existing = (start..groups.len()).find(|&i| groups[i].alternatives[0].group == arc.evidence_group);
@@ -483,7 +511,7 @@ impl<'a> Problem<'a> {
                 let weight=(length_px/SUPPORT_CORRELATION_LENGTH_PX.max(8.0*sigma)).min(16.0);
                 groups[i].weight=groups[i].weight.max(weight);
                 groups[i].alternatives.push(SparseArc { eye, index, kind: arc.kind, boundary,
-                    group: arc.evidence_group, points, sigma,quadrature,length_px,weight });
+                    group: arc.evidence_group, points, outward_normals,sigma,quadrature,length_px,weight });
                 present[eye] = true;
             }
         }
@@ -680,19 +708,20 @@ impl<'a> Problem<'a> {
 
     fn residuals(&self, p: &Parameters, selected: &[usize]) -> Option<Vec<f64>> {
         let conics = self.conics(p)?;
-        let mut r = Vec::with_capacity(self.groups.len()*MAX_POINTS_PER_ARC + PARAMETERS + 8);
+        let mut r = Vec::with_capacity(self.groups.len()*MAX_POINTS_PER_ARC*2 + PARAMETERS + 8);
         for (group,&choice) in self.groups.iter().zip(selected) {
             let arc = &group.alternatives[choice];
             let conic = conics[arc.eye][arc.boundary]?;
             let outlier=arc.mean_cost(conic)>=MAXIMUM_GROUP_COST;
-            if outlier {
-                // An incompatible arc group is an outlier hypothesis with a
-                // fixed cost, NOT a spring that can keep dragging the other
-                // eye. Bounded multiple starts retain a way back into support.
-                r.extend(arc.quadrature.iter().map(|&w|(MAXIMUM_GROUP_COST*arc.weight*w).sqrt()));
-            } else {
-                r.extend(arc.points.iter().zip(&arc.quadrature).map(|(&point,&w)|
-                    robust_residual(conic.residual_px(point)/arc.sigma)*(arc.weight*w).sqrt()));
+            for (index,(&point,&w)) in arc.points.iter().zip(&arc.quadrature).enumerate() {
+                // Position and measured direction describe ONE correlated
+                // contour, sharing its geometric mass and full outlier cap.
+                // A rejected group has constant cost and zero pulling force.
+                r.push(if outlier {(MAXIMUM_GROUP_COST*arc.weight*w).sqrt()} else {
+                    robust_residual(conic.residual_px(point)/arc.sigma)*(arc.weight*w).sqrt()});
+                if arc.outward_normals[index].is_some() {
+                    r.push(if outlier {0.0} else {arc.normal_residual(conic,index)*(arc.weight*w).sqrt()});
+                }
             }
             // A shorter correlated alternative cannot inherit the longer
             // one's weight, or win merely by omitting most of its coverage.
@@ -878,10 +907,13 @@ impl<'a> Problem<'a> {
             let rms = (a.points.iter().map(|&p| c.residual_px(p).powi(2)).sum::<f64>()/a.points.len() as f64).sqrt();
             let group_cost=a.mean_cost(c);
             let used = group_cost < MAXIMUM_GROUP_COST;
+            let normal_errors=(0..a.points.len()).filter_map(|i|a.normal_angle_error(c,i)).collect::<Vec<_>>();
             result.contributing_eyes[a.eye] |= used;
             result.arcs.push(ArcSupport { exposure: self.request.eyes[a.eye]?.exposure,
                 evidence_group: a.group, arc_index: a.index, kind: a.kind, rms_px: rms, sigma_px: a.sigma,
-                support_length_px:a.length_px,evidence_weight:a.weight,used });
+                support_length_px:a.length_px,evidence_weight:a.weight,used,
+                boundary_normal_samples:normal_errors.len(),boundary_normal_rms_radians:(!normal_errors.is_empty())
+                    .then(||(normal_errors.iter().map(|v|v*v).sum::<f64>()/normal_errors.len() as f64).sqrt()) });
         }
         for eye in 0..2 { if self.present[eye] {
             let (center,normal,_) = self.geometry(p,eye)?;

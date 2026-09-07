@@ -72,7 +72,11 @@ fn prepare(row:Value,partial_outlines:bool)->Result<Frame,String> {
         .or_else(||candidates.iter().find(|c|ellipse(&c["baseline_ellipse"]).is_some()));
     let selected_raw_admitted=selected.is_some_and(|c|c["baseline_raw_admitted"]==true);
     let baseline=selected.and_then(|c|ellipse(&c["baseline_ellipse"]));
-    if let Some((selected,baseline))=selected.zip(baseline) {
+    let try_partial=partial_outlines&&(baseline.is_none()||!selected_raw_admitted);
+    // A rejected complete conic is not stronger evidence than an incomplete
+    // outline. In this explicit experiment, re-extract RAW-supported measured
+    // arcs instead of keeping the rejected fit's unchecked sections as well.
+    if let Some((selected,baseline))=selected.zip(baseline).filter(|_|!try_partial) {
         let retained=points(&selected["baseline_retained"]);
         let segments=selected["baseline_retained_segments"].as_array().map(|segments|segments.iter().filter_map(|run| {
             Some(run.as_array()?.iter().filter_map(|i|i.as_u64().map(|i|i as usize)).collect::<Vec<_>>())
@@ -87,7 +91,6 @@ fn prepare(row:Value,partial_outlines:bool)->Result<Frame,String> {
         }
     }
     let pupil=ellipse(&row["pupil_void"]["ellipse"]);
-    let try_partial=partial_outlines&&baseline.is_none();
     let mut partial_outline=PartialOutlineReport::default();
     if pupil.is_some()||try_partial {
         let mut file=File::open(input["raw_file"].as_str().ok_or("missing RAW file")?).map_err(|e|e.to_string())?;
@@ -105,7 +108,9 @@ fn prepare(row:Value,partial_outlines:bool)->Result<Frame,String> {
             partial_outline=append_unfitted_outline_arcs(&mut packet,&raw,&candidates,(size[0] as f64*0.5,size[1] as f64*0.5),200);
         }
     }
-    let center=baseline.map(|e|[e.center.0+origin[0] as f64,e.center.1+origin[1] as f64])
+    // The replaced rejected ellipse remains diagnostic output, not a hidden
+    // position constraint after its contour evidence has been discarded.
+    let center=baseline.filter(|_|!try_partial).map(|e|[e.center.0+origin[0] as f64,e.center.1+origin[1] as f64])
         .unwrap_or([origin[0] as f64+size[0] as f64*0.5,origin[1] as f64+size[1] as f64*0.5]);
     let scale=&input["scale_hint"];
     let scale=scale["pixels_per_10mm"].as_f64().zip(scale["bounds_px_per_10mm"].as_array()).and_then(|(n,b)|Some([n,b.first()?.as_f64()?,b.get(1)?.as_f64()?]));
@@ -115,6 +120,7 @@ fn prepare(row:Value,partial_outlines:bool)->Result<Frame,String> {
         if arc.points_roi_px.len()>=6 {
             validation.push((index,arc.evidence_group,arc.kind,arc.points_roi_px.iter().skip(1).step_by(2).copied().collect()));
             arc.points_roi_px=arc.points_roi_px.iter().step_by(2).copied().collect();
+            arc.outward_normals_roi=arc.outward_normals_roi.take().map(|normals|normals.into_iter().step_by(2).collect());
         }
     }
     Ok(Frame {input,packet,pose,validation,baseline,selected_raw_admitted,partial_outline})
@@ -158,6 +164,7 @@ fn solution_json(result:Result<JointConicSolution,JointConicUnavailable>,frames:
             "outer_ellipses":solution.ellipses_roi_px.map(|e|ellipse_json(e[0])),
             "support":solution.arcs.iter().map(|a|json!({"roi":a.exposure.roi.0,"kind":format!("{:?}",a.kind),
                 "group":a.evidence_group,"arc":a.arc_index,"rms_px":a.rms_px,"sigma_px":a.sigma_px,"used":a.used,
+                "boundary_normal_samples":a.boundary_normal_samples,"boundary_normal_rms_radians":a.boundary_normal_rms_radians,
                 "support_length_px":a.support_length_px,"evidence_weight":a.evidence_weight})).collect::<Vec<_>>(),
             "withheld_sample_residuals":heldout(&solution,frames),"elapsed_ms":elapsed,
             "sn_feida_mm2":std::array::from_fn::<_,2,_>(|eye| {
@@ -181,13 +188,16 @@ fn evaluate(frames:[Option<Frame>;2],export_sparse:bool)->Value {
         "observed_arc_groups":frames.each_ref().map(|f|f.as_ref().map(|f|f.packet.arcs.len())),
         "partial_outline":frames.each_ref().map(|f|f.as_ref().map(|f|json!({"candidates":f.partial_outline.candidates,
             "censored_samples":f.partial_outline.censored_samples,"unsupported_samples":f.partial_outline.unsupported_samples,
+            "inward_notch_samples":f.partial_outline.inward_notch_samples,
             "emitted_arcs":f.partial_outline.emitted_arcs}))),
         "contract":"shared latent fixation versus separate monocular optimizations of the SAME training arcs; no averaged gaze; held-out points condition on upstream detector segmentation/search. Neither metric pose nor gaze accuracy is ground truth."});
     let mut row=base;
     if export_sparse {
         row["sparse_evidence"]=json!(frames.each_ref().map(|f|f.as_ref().map(|f|json!({
             "arcs":f.packet.arcs.iter().map(|a|json!({"group":a.evidence_group,"kind":format!("{:?}",a.kind),
-                "points":a.points_roi_px,"band_half_width_px":a.normal_band_half_width_px})).collect::<Vec<_>>(),
+                "points":a.points_roi_px,"band_half_width_px":a.normal_band_half_width_px,
+                "outward_normals":a.outward_normals_roi.as_ref().map(|normals|normals.iter().map(|n|n.map(|n|json!({
+                    "unit_outward_roi":n.unit_outward_roi,"angular_sigma_radians":n.angular_sigma_radians}))).collect::<Vec<_>>())})).collect::<Vec<_>>(),
             "seeds":f.packet.conics.iter().map(|c|json!({"kind":format!("{:?}",c.kind),"ellipse":ellipse_json(Some(c.ellipse_roi_px))})).collect::<Vec<_>>()
         }))));
     }
@@ -268,3 +278,84 @@ fn run()->Result<(),String> {
 }
 
 fn main() {if let Err(error)=run() {eprintln!("stereo evaluation error: {error}");std::process::exit(1);}}
+
+#[cfg(test)]
+mod extraction_tests {
+    use super::*;
+
+    // Synthetic RAW stays beneath the checked runtime link and is removed
+    // only by the fixture that successfully created this unique file.
+    struct RawFixture(PathBuf);
+    impl Drop for RawFixture {fn drop(&mut self) {let _=std::fs::remove_file(&self.0);}}
+
+    fn rejected_outline_fixture(raw:&[u16])->(RawFixture,Value) {
+        let path=PathBuf::from("outputs").join(format!("joint-evaluator-test-{}-{}.raw10",std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut file=OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        let fixture=RawFixture(path);
+        assert_eq!(raw.len(),256*192);
+        for p in raw.chunks_exact(4) {
+            let packed=(p[0] as u64)|((p[1] as u64)<<10)|((p[2] as u64)<<20)|((p[3] as u64)<<30);
+            file.write_all(&packed.to_le_bytes()[..5]).unwrap();
+        }
+        let e=geometry::Ellipse {center:(128.0,96.0),major_radius:60.0,minor_radius:46.0,angle:0.0};
+        let points=e.dense_points(128);
+        let row=json!({"input":{"index":0,"clock_lineage":"synthetic","raw_file":fixture.0,
+                "raw_offset":0,"raw_length":256*192*5/4,
+                "frame":{"eye_id":1,"sensor_x":400,"sensor_y":800,"width":256,"height":192,
+                    "stride":320,"timestamp_ns":20,"sequence":10}},
+            "selected_query":null,"pupil_void":null,
+            "candidates":[{"query":0,"semantic_score":1.0,"outline":points,
+                "baseline_raw_admitted":false,"baseline_ellipse":ellipse_json(Some(e)),
+                "baseline_retained":points,"baseline_retained_segments":[(0..128).collect::<Vec<_>>()],
+                "baseline_censored":[]}]});
+        (fixture,row)
+    }
+
+    #[test]
+    fn a_rejected_complete_fit_cannot_bypass_partial_raw_boundary_checks() {
+        let (_fixture,mut row)=rejected_outline_fixture(&vec![0;256*192]);
+        row["candidates"][0]["baseline_ellipse"]["center"]=json!([10.0,20.0]);
+        let ordinary=prepare(row.clone(),false).unwrap();
+        assert!(ordinary.baseline.is_some()&&!ordinary.packet.arcs.is_empty(),"preserve the explicitly selected legacy control");
+        assert_eq!(ordinary.pose.limbus_center_sensor_px,[410.0,820.0]);
+        let partial=prepare(row,true).unwrap();
+        assert_eq!(partial.partial_outline.candidates,1,"a rejected full fit is not an exemption from partial evidence extraction");
+        assert!(partial.packet.arcs.is_empty()&&partial.packet.conics.is_empty(),"flat RAW supplies no observed boundary");
+        assert_eq!(partial.pose.limbus_center_sensor_px,[528.0,896.0],"rejected center cannot remain hidden scene support");
+    }
+
+    #[test]
+    fn accepted_control_extraction_is_unchanged_by_partial_mode() {
+        let (_fixture,mut row)=rejected_outline_fixture(&vec![0;256*192]);
+        row["candidates"][0]["baseline_raw_admitted"]=json!(true);
+        let ordinary=prepare(row.clone(),false).unwrap();
+        let partial=prepare(row,true).unwrap();
+        assert_eq!(partial.partial_outline.candidates,0);
+        assert_eq!(ordinary.packet.arcs.len(),partial.packet.arcs.len());
+        for (a,b) in ordinary.packet.arcs.iter().zip(&partial.packet.arcs) {
+            assert_eq!(a.points_roi_px,b.points_roi_px);assert_eq!(a.evidence_group,b.evidence_group);
+        }
+        assert_eq!(ordinary.pose.limbus_center_sensor_px,partial.pose.limbus_center_sensor_px);
+    }
+
+    #[test]
+    fn partial_boundary_normals_follow_their_points_through_training_decimation() {
+        let raw=(0..192).flat_map(|y|(0..256).map(move|x|
+            if ((x as f64-128.0)/60.0).hypot((y as f64-96.0)/46.0)<=1.0 {150} else {550})).collect::<Vec<_>>();
+        let (_fixture,row)=rejected_outline_fixture(&raw);
+        let prepared=prepare(row,true).unwrap();
+        assert!(prepared.packet.arcs.len()>=4);
+        assert!(!prepared.validation.is_empty(),"exercise actual held-out/training subsampling");
+        for arc in &prepared.packet.arcs {
+            let normals=arc.outward_normals_roi.as_ref().unwrap();
+            assert_eq!(normals.len(),arc.points_roi_px.len());
+            for (&(x,y),normal) in arc.points_roi_px.iter().zip(normals) {
+                let n=normal.unwrap();
+                let gradient=[(x-128.0)/60.0f64.powi(2),(y-96.0)/46.0f64.powi(2)];
+                assert!((gradient[0]*n.unit_outward_roi[0]+gradient[1]*n.unit_outward_roi[1])
+                    /gradient[0].hypot(gradient[1])>0.99,"a normal must retain its original sample identity");
+            }
+        }
+    }
+}

@@ -281,7 +281,7 @@ fn indexed_preview(arguments:&[String])->Result<(),String> {
                 let used=row["joint"]["support"].as_array().is_some_and(|support|support.iter().any(|s|
                     s["roi"].as_u64()==Some(eye as u64+1)&&s["arc"].as_u64()==Some(index as u64)&&s["used"]==true));
                 let Some(points)=arc["points"].as_array() else {continue;};
-                for point in points {
+                for (sample_index,point) in points.iter().enumerate() {
                     let (Some(x),Some(y))=(point[0].as_f64(),point[1].as_f64()) else {continue;};
                     for (panel,color) in [(1,[255,80,220]),(2,if used {[50,230,255]} else {[130,130,130]})] {
                         for dy in -1..=1 {for dx in -1..=1 {
@@ -291,6 +291,24 @@ fn indexed_preview(arguments:&[String])->Result<(),String> {
                                 comparison[at..at+3].copy_from_slice(&color);
                             }
                         }}
+                    }
+                    // Sparse outward IMAGE-boundary direction cues, only
+                    // when actually exported for this measured point. These
+                    // are not reconstructed 3D gaze/surface-normal vectors.
+                    if sample_index%4==0 {
+                        let normal=&arc["outward_normals"][sample_index]["unit_outward_roi"];
+                        if let (Some(nx),Some(ny))=(normal[0].as_f64(),normal[1].as_f64()) {
+                            if nx.is_finite()&&ny.is_finite()&&(nx.hypot(ny)-1.0).abs()<1.0e-6 {
+                                for step in 0..=10 {
+                                    let px=(x+nx*step as f64).round() as isize;
+                                    let py=(y+ny*step as f64).round() as isize;
+                                    if px>=0&&py>=0&&px<width as isize&&py<height as isize {
+                                        let at=(py as usize*width*panels+2*width+px as usize)*3;
+                                        comparison[at..at+3].copy_from_slice(&if used {[50,230,255]} else {[130,130,130]});
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

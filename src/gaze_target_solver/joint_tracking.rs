@@ -33,7 +33,7 @@ mod tests {
                 sequence:time/100_000_000+eye as u64*1000,timestamp_ns:time},
             sensor_origin_px:origin,dimensions_px:[420,280],detail_reliability:Some(1.0),
             arcs:vec![OwnedBoundaryArc {evidence_group:0,kind:BoundaryKind::OuterLimbus,
-                points_roi_px:e.dense_points(32),normal_band_half_width_px:1.0,detector_score:None}],
+                points_roi_px:e.dense_points(32),outward_normals_roi:None,normal_band_half_width_px:1.0,detector_score:None}],
             conics:vec![OwnedConicHint {kind:BoundaryKind::OuterLimbus,ellipse_roi_px:e,supporting_arc_indices:vec![0]}]},
             pose:EyePoseInput {limbus_center_sensor_px:camera().project(center).unwrap(),pixels_per_10mm:Some([4000.0/35.0,100.0,130.0])}}
     }

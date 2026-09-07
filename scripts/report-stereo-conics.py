@@ -52,6 +52,14 @@ def check_shared_target_contract(result):
         if len(work)!=3 or any(type(v) is not int or v<0 for v in work) \
                 or sum(work)!=result["hypotheses"] or sum(work)>24:
             raise ValueError("association searches did not share the declared bounded work budget")
+    for arc in result.get("support",[]):
+        if "boundary_normal_samples" not in arc:
+            continue
+        count=arc["boundary_normal_samples"]
+        rms=arc.get("boundary_normal_rms_radians")
+        if type(count) is not int or not 0<=count<=16 or (count==0 and rms is not None) \
+                or (count>0 and (not isinstance(rms,(int,float)) or not math.isfinite(rms) or not 0<=rms<=math.pi+1e-12)):
+            raise ValueError("invalid image-boundary normal diagnostic; not a 3D surface normal or an unbounded sample vote")
     modeled=result["modeled_eyes"]
     penalties=result["unlocalized_eye_cost"]
     if len(modeled)!=2 or any(type(v) is not bool for v in modeled) or len(penalties)!=2 \
@@ -179,12 +187,13 @@ def summarize_source_replay(evaluation,expected=None):
             "Native ROI reframes are counted, not certified accurate by source-continuity checks."]}
 
 
-def matched_algorithm_report(baseline, candidate, index_ranges):
+def matched_algorithm_report(baseline, candidate, index_ranges, allow_extractor_changes=False):
     """Stream exact source-matched rows; never silently compare different probes.
 
-    This contract is for optimizer-only A/B trials with the same extraction.
-    Arc index/type/count equality is checked; callers must also keep extraction
-    and withheld coordinates unchanged (the old exports predate probe hashes).
+    Default: optimizer-only A/B trials with the same extraction. The explicit
+    extractor-change mode still requires exact RAW/source identity, but skips
+    per-eye residual comparisons unless all probe coordinates are verified
+    unchanged. Admission and source-time area comparisons retain both eyes.
     """
     coverage=[collections.Counter(),collections.Counter()]
     residuals=[[],[]]
@@ -226,12 +235,21 @@ def matched_algorithm_report(baseline, candidate, index_ranges):
                 probes=[fit["withheld_sample_residuals"][eye] for fit in fits]
                 if all(p and p["rms_px"] is not None for p in probes):
                     keys=lambda p:[(g["arc"],g["group"],g["kind"],g["points"]) for g in p["groups"]]
-                    if keys(probes[0])!=keys(probes[1]):
-                        raise ValueError("A/B withheld probe structure changed; optimizer-only comparison is invalid")
+                    changed=keys(probes[0])!=keys(probes[1]) or any(
+                        ga.get("sample_fingerprint") and gb.get("sample_fingerprint")
+                        and ga["sample_fingerprint"]!=gb["sample_fingerprint"]
+                        for ga,gb in zip(probes[0]["groups"],probes[1]["groups"]))
+                    if changed:
+                        if not allow_extractor_changes:
+                            raise ValueError("A/B withheld probe structure or coordinates changed; optimizer-only comparison is invalid")
+                        probe_verification[f"eye{eye}:changed_probe_sets_skipped"]+=1
+                        continue
+                    if allow_extractor_changes and any(not g.get("sample_fingerprint")
+                            for p in probes for g in p["groups"]):
+                        probe_verification[f"eye{eye}:unverified_probe_sets_skipped"]+=1
+                        continue
                     for ga,gb in zip(probes[0]["groups"],probes[1]["groups"]):
                         if ga.get("sample_fingerprint") and gb.get("sample_fingerprint"):
-                            if ga["sample_fingerprint"]!=gb["sample_fingerprint"]:
-                                raise ValueError("A/B withheld coordinates changed despite matching counts")
                             probe_verification["coordinate_fingerprints_matched"]+=1
                         else:
                             probe_verification["legacy_structure_only_checks"]+=1
@@ -243,6 +261,8 @@ def matched_algorithm_report(baseline, candidate, index_ranges):
                         supported[eye].append(tuple(math.sqrt(sum(pair[i]["rms_px"]**2*pair[i]["points"] for pair in common)/count) for i in (0,1)))
                     regressions.append({"eye":eye,"index":source["index"],"baseline_rms_px":probes[0]["rms_px"],
                         "candidate_rms_px":probes[1]["rms_px"],"delta_rms_px":probes[1]["rms_px"]-probes[0]["rms_px"]})
+                elif allow_extractor_changes:
+                    probe_verification[f"eye{eye}:missing_probe_sets_skipped"]+=1
     for eye in range(2):
         area_steps[eye],normalized_steps[eye]=adjacent_area_steps(timeline[eye])
     def comparison(pairs):
@@ -250,6 +270,7 @@ def matched_algorithm_report(baseline, candidate, index_ranges):
             "candidate":distribution([b for a,b in pairs]),"candidate_minus_baseline":distribution([b-a for a,b in pairs]),
             "improved_over_1px":sum(b<a-1 for a,b in pairs),"regressed_over_1px":sum(b>a+1 for a,b in pairs)}
     return {"baseline":str(baseline),"candidate":str(candidate),"matched_reads":rows,"index_ranges":index_ranges,
+        "comparison_kind":"extractor_change" if allow_extractor_changes else "optimizer_only",
         "probe_verification":probe_verification,
         "eye_admission":coverage,"all_withheld_samples":[comparison(p) for p in residuals],
         "common_accepted_arc_samples":[comparison(p) for p in supported],
@@ -258,7 +279,8 @@ def matched_algorithm_report(baseline, candidate, index_ranges):
         "independent_SN_FEIDA_log_steps":[{"matched":len(p),"baseline":distribution([a for a,b in p]),
             "candidate":distribution([b for a,b in p])} for p in normalized_steps],
         "largest_regressions":sorted(regressions,key=lambda r:-r["delta_rms_px"])[:30],
-        "limitations":["Optimizer-only comparison: unchanged extraction/withheld coordinates must be verified separately for old exports lacking probe hashes.",
+        "limitations":[("Extractor-change comparison: changed/missing/unverified per-eye probes are explicitly skipped, never scored against each other; unchanged partner-eye probes remain comparable. Assess changed-eye localization with independent labels, not this selected probe intersection."
+            if allow_extractor_changes else "Optimizer-only comparison: unchanged extraction/withheld coordinates must be verified separately for old exports lacking probe hashes."),
             "Acquisition scale is candidate-independent but held between MediaPipe updates under an assumed 12mm limbus; normalized steps are conditional on that prior, not fresh physical-scale measurements.",
             "Pixel-area steps are unnormalized, include genuine motion, and do not establish physical area stability.",
             "Short adjacent same-clock intervals only; no bridging absent fits or treating held source exposures as new.",
@@ -272,9 +294,13 @@ def main():
     parser.add_argument("--expected-manifest", type=Path)
     parser.add_argument("--baseline-evaluation", type=Path)
     parser.add_argument("--source-order-replay", action="store_true")
+    parser.add_argument("--allow-extractor-changes", action="store_true",
+        help="explicitly skip changed/unverified per-eye probes while retaining source-matched admission and area comparisons")
     parser.add_argument("--index-range", type=int, nargs=2, action="append", default=[], metavar=("START", "END"),
         help="optional source-index intervals for the separate optimizer A/B report; END is exclusive")
     args = parser.parse_args()
+    if args.allow_extractor_changes and not args.baseline_evaluation:
+        parser.error("allow-extractor-changes requires a baseline evaluation")
     if args.source_order_replay:
         if args.baseline_evaluation or args.index_range:
             parser.error("source-order reports do not use stateless row-zipped comparisons")
@@ -391,7 +417,7 @@ def main():
                         "SN-FEIDA is absent when external coarse scale is unavailable; no self-radius normalization.",
                         "Comparison against human native-RAW localization labels and sequence continuity remains separately required."]}
     if args.baseline_evaluation:
-        report["matched_algorithm_comparison"]=matched_algorithm_report(args.baseline_evaluation,args.evaluation,args.index_range)
+        report["matched_algorithm_comparison"]=matched_algorithm_report(args.baseline_evaluation,args.evaluation,args.index_range,args.allow_extractor_changes)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps({"scope": report["scope"], "withheld_sample_comparisons": comparisons}, indent=2))
 

@@ -58,6 +58,25 @@ pub(crate) enum BoundaryKind {
     Unclassified,
 }
 
+/// A measured outward IMAGE-boundary normal, not the eye's 3D surface normal.
+/// It belongs to the same native-ROI sample and source exposure as its point.
+/// RAW polarity establishes outward direction; a fitted ellipse must never
+/// manufacture this observation. Its angular sigma is an engineering model,
+/// not a calibrated posterior or an independent second vote for the contour.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BoundaryNormalObservation {
+    pub(crate) unit_outward_roi: [f64;2],
+    pub(crate) angular_sigma_radians: f64,
+}
+
+impl BoundaryNormalObservation {
+    pub(crate) fn valid(self)->bool {
+        self.unit_outward_roi.into_iter().all(f64::is_finite)
+            && (self.unit_outward_roi[0].hypot(self.unit_outward_roi[1])-1.0).abs()<1.0e-6
+            && self.angular_sigma_radians.is_finite() && self.angular_sigma_radians>0.0
+    }
+}
+
 /// Sparse native-ROI evidence contract for the future joint solvers.
 /// A score is detector-specific ranking evidence, NEVER a posterior
 /// probability. Missing normal localization is unknown, not zero noise.
@@ -68,6 +87,9 @@ pub(crate) struct BoundaryArcObservation<'a> {
     pub(crate) evidence_group: u32,
     pub(crate) kind: BoundaryKind,
     pub(crate) points_roi_px: &'a [(f64, f64)],
+    /// When present, exactly one optional direction per point, before any
+    /// downstream decimation. Missing directions supply no angular constraint.
+    pub(crate) outward_normals_roi: Option<&'a [Option<BoundaryNormalObservation>]>,
     pub(crate) normal_band_half_width_px: Option<f64>,
     pub(crate) detector_score: Option<f64>,
 }

@@ -274,6 +274,7 @@ impl EyeFixture {
                 evidence_group: a.group,
                 kind: a.kind,
                 points_roi_px: &a.points,
+                outward_normals_roi: None,
                 normal_band_half_width_px: None,
                 detector_score: None,
             })

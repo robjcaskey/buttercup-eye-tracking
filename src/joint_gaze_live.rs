@@ -182,6 +182,7 @@ pub(crate) fn json(frame:&EyeFrame)->Value {
         "hypotheses":s.hypotheses_evaluated,"hypotheses_by_association":s.hypotheses_by_association,
         "arcs":s.arcs.iter().map(|a|json!({"roi_id":a.exposure.roi.0,"group":a.evidence_group,"kind":format!("{:?}",a.kind),
             "used":a.used,"rms_px":a.rms_px,"sigma_px":a.sigma_px,
+            "boundary_normal_samples":a.boundary_normal_samples,"boundary_normal_rms_radians":a.boundary_normal_rms_radians,
             "support_length_px":a.support_length_px,"evidence_weight":a.evidence_weight})).collect::<Vec<_>>(),
         "uncertainty":"conditional engineering supports; not calibrated probabilities or measured anatomical pose",
         "transform_to_legacy_monitor_frame":null})
@@ -206,7 +207,7 @@ mod tests {
             let center=std::array::from_fn(|i|center[i]-depth*normal[i]);
             let ellipse=ProjectedCircle::project(camera,center,normal,radius,origin).unwrap().ellipse().unwrap();
             packet.arcs.push(OwnedBoundaryArc {evidence_group:group,kind,points_roi_px:ellipse.dense_points(32),
-                normal_band_half_width_px:0.0,detector_score:None});
+                outward_normals_roi:None,normal_band_half_width_px:0.0,detector_score:None});
             packet.conics.push(OwnedConicHint {kind,ellipse_roi_px:ellipse,supporting_arc_indices:vec![packet.arcs.len()-1]});
         }
         FrameEvidence {packet,pose:EyePoseInput {limbus_center_sensor_px:camera.project(center).unwrap(),

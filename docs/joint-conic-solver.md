@@ -256,14 +256,14 @@ anatomical constancy or ROI-reframe performance. The emitted scale-only bounds
 omit conic uncertainty and are not confidence intervals. Unnormalized area
 tails on the larger subset still regress and cannot be relabeled SN-FEIDA.
 
-The full viewer suite currently has 964 passing tests, the same 41 failures as
+The full viewer suite currently has 967 passing tests, the same 41 failures as
 the pre-change baseline, and 24 ignored tests. Live-adapter tests additionally
 check source deduplication, different ROI sequences on one clock, crop transport,
 missing-eye behavior, provider changes, radius units and shared gaze mapping.
 No live user calibration or desktop-pointer trial has been performed for this
 new path.
-The standalone evaluator has 72 passing tests, including its source-replay
-index and shared live-tracker tests. All 13 independent report tests pass and
+The standalone evaluator has 77 passing tests, including its source-replay,
+shared live-tracker and partial-extraction tests. All 15 independent report tests pass and
 exercise source matching, probe changes, missing-read accounting, chronological
 area transitions, rejected geometry and determinant-based scale normalization.
 
@@ -383,6 +383,21 @@ test also succeeds after discarding every complete-ellipse seed for the
 partial eye. Flat/saturated RAW, reversed contour winding, chord exclusion and
 duplicate-query budgets have independent tests.
 
+The current experimental extractor additionally excludes deep inward-curving
+notches using the convex hull of the same 128 measured samples. The 3 px
+allowance is in 384-wide model coordinates and is an engineering raster/jitter
+tolerance, not calibrated anatomical uncertainty. The hull only censors points:
+neither its closing chords nor its vertices become replacement observations.
+The existing two-sample tangent padding also applies around the excluded bites.
+This catches curved bright occluders that pass outward RAW polarity and the
+old straight-chord test. Rotation, translation, winding, raster jitter and
+exact sampled-point provenance have tests; the bright-bite test failed before
+the change with 44.77 px of false inner-boundary support.
+
+This rule assumes a mask is a subset of a convex projected disk. A convex but
+wrong reflection frontier, an outward semantic extension, or a skin/lid mask
+can still pass. It is not a general boundary-identity solution.
+
 The frozen `eval-partial-v1` trial is deliberately offline-only, selected by
 `--partial-outlines`. Its matched control is `eval-partial-control`. Both ran
 the same 50,000 exposures described above, and 107,868 withheld-coordinate
@@ -422,6 +437,75 @@ small diagnostic replays. The native RAW preview shows all alternatives in
 magenta and selected samples in cyan, separately from reconstructed ellipses.
 These diagnostic coordinates and recordings remain outside the source tree.
 
+### Convex-notch and rejected-conic comparisons
+
+`eval-convex-outline-v5` isolates the notch exclusion against frozen
+`eval-search-bound-v3` with partial extraction enabled in both. The matched
+50,000 exposures are indices 100–25099 and 193759–218758: 30,973 reads,
+19,027 RAW pairs and 61 capture entries. They are **not** the entire available
+387,519-exposure corpus; 337,519 exposures are outside this particular trial.
+
+Changing extraction changes some withheld probes. The report now requires
+explicit `--allow-extractor-changes` for such a comparison. RAW/source identity
+must still match exactly. A per-eye residual comparison is skipped unless
+every probe's structure and coordinate fingerprint match; unchanged probes in
+the other eye remain comparable. Probe equality does not assert equality of
+all training samples. Missing hashes cannot certify an extractor comparison.
+Admission and matched source-time area diagnostics retain changed-extraction
+eyes rather than silently shrinking the entire comparison.
+
+For v5, 3,626 right / 3,217 left changed probe sets are explicitly skipped,
+and 116,223 coordinate fingerprints match. On the 21,520/12,886 fixed-probe
+comparisons, 148/146 improve over one pixel and 95/83 regress. Admissions gain
+168/196 and lose 443/717. There are 27,001 available shared solutions, 14,962
+using both eyes. The 16-start budget is preserved. No candidate-independent
+scale is available on this subset, so its pixel-area changes are not SN-FEIDA.
+
+The separate 76-exposure reviewed-label replay changes target 106191 from
+26.65→20.29 px visible-label RMS and 106217 from 45.23→14.28 px. Both remain
+poor fits; the other eight matching reviewed targets are unchanged. Labels
+are post-fit only; six of 16 reviewed labels still have no matching available
+RAW. All 14 exact-RAW independent-motion links remain comparable, with no ROI
+reframes. Mean absolute SN-FEIDA log change is 0.16235→0.15328, median 0.03976
+unchanged, and maximum 1.66914 unchanged. One modestly improved transition does
+not establish physical constancy. Native regression inspection at 216130,
+5022, 212573 and 201151 shows lid/skin or clipped-eye false geometry; neither
+arm establishes correct limbus localization on those images.
+
+`eval-partial-policy-v6` also tries the partial extractor when a complete
+upstream ellipse exists but fails its RAW admission gate. Previously that
+rejected fit bypassed the RAW partial-boundary checks entirely. In the explicit
+partial experiment, those old sections and their center prior are replaced,
+not double-counted alongside new arcs. The old ellipse remains diagnostic
+output. The accepted control's extraction is unchanged. A flat-RAW fixture
+reproduced the bypass before this policy change.
+
+Against v5 on the same 50k exposures, v6 has 26,771 available solutions and
+14,608 using both eyes. Admission gains are 35/24 and losses 228/415. There
+are 150,238 matched coordinate fingerprints, with 680/438 changed probe sets
+skipped. Fixed-probe improvements over one pixel number 109/68 and regressions
+106/59; corresponding p95 values slightly worsen. This is not a general
+accuracy/coverage win and the experiment remains disabled in the live bridge.
+Native inspection of the largest v6 fixed-probe regressions, 206209 and
+213207, likewise shows clipped-eye/lid or off-target skin geometry rather
+than a labeled true limbus. These remain failures, not interchangeable
+accurate solutions simply because their robust objectives are small.
+
+The reviewed target 105191 loses its erroneous 35.92 px fit rather than being
+recovered: only the other eye contributes. Five measured partial arcs were
+offered, but their penalized unlocalized-eye alternative won. The remaining
+nine reviewed target results are unchanged from v5. No zero error is imputed
+for that dropout. The same 14 independent-motion links remain; their maximum
+absolute SN-FEIDA log step drops from 1.66914 to 0.67411, but native source
+106195 now has a too-small reflection-bounded slice in place of the old
+oversized lid ellipse. Both are wrong. This is an explicit example of a better
+area statistic **not** proving a better anatomical reconstruction. There are
+still no independently validated crop moves in this small motion subset.
+
+The SAM viewer build succeeds, with exactly the same 41 full-suite failure
+names as the pre-change baseline. No viewer restart, live calibration, SAM
+memory change or partial-extractor enablement accompanies these experiments.
+
 The video worker now publishes fresh rejected/empty proposal packets even
 when no complete single-eye ellipse exists, retaining exact source RAW,
 sequence, timestamp, ROI and prompt/stream generations. It does not condition
@@ -456,6 +540,7 @@ score-stereo-labels.py inventory.json frames.jsonl labels.json output.jsonl...
 python3 scripts/report-stereo-motion.py baseline.jsonl candidate.jsonl motion.json SCALE_REPORT.json...
 buttercup_stereo_conic_eval source.jsonl cache.jsonl... --source-order-replay --arrival-delay-ns 2 100000000
 report-stereo-conics.py source.jsonl source-report.json --source-order-replay --expected-manifest manifest.json
+report-stereo-conics.py candidate.jsonl comparison.json --baseline-evaluation baseline.jsonl --allow-extractor-changes
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-stereo-conics-report.py
 buttercup_raw10_preview --source-index frames.jsonl INDEX comparison.png output.jsonl
 ```

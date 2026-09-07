@@ -84,6 +84,7 @@ impl Fixture {
     fn solve(&self, enabled:[bool;2], budget:usize) -> Result<JointConicSolution,JointConicUnavailable> {
         let arcs = self.arcs.each_ref().map(|arcs| arcs.iter().map(|a| BoundaryArcObservation {
             evidence_group:a.group,kind:a.kind,points_roi_px:&a.points,normal_band_half_width_px:Some(a.band),detector_score:None,
+            outward_normals_roi:None,
         }).collect::<Vec<_>>());
         let conics = self.hints.each_ref().map(|hints| hints.iter().map(|&(kind,ellipse_roi_px)| ConicObservation {
             kind,ellipse_roi_px,supporting_arc_indices:&[],residual_px:None,
@@ -368,6 +369,106 @@ fn polyline_information_is_geometric_not_the_number_of_fragments_or_points() {
 }
 
 #[test]
+fn matching_points_do_not_override_opposite_measured_boundary_directions() {
+    let points=[-0.2f64,0.0,0.2].map(|t|(10.0*t.cos(),10.0*t.sin())).to_vec();
+    let (quadrature,length_px)=polyline_quadrature(&points).unwrap();
+    let normals=points.iter().map(|&(x,y)|Some(BoundaryNormalObservation {
+        unit_outward_roi:[x/10.0,y/10.0],angular_sigma_radians:0.2})).collect();
+    let mut arc=SparseArc {eye:0,index:0,kind:BoundaryKind::OuterLimbus,boundary:0,group:0,
+        points,outward_normals:normals,sigma:1.0,quadrature,length_px,weight:1.0};
+    let conic=ProjectedCircle([1.0,0.0,1.0,0.0,0.0,-100.0]);
+    assert!(arc.mean_cost(conic)<1.0e-20);
+    for normal in arc.outward_normals.iter_mut().flatten() {normal.unit_outward_roi=normal.unit_outward_roi.map(|v|-v);}
+    assert!(arc.mean_cost(conic)>MAXIMUM_GROUP_COST,
+        "identical point positions do not make an inward or opposite-polarity boundary a compatible outer rim");
+    for normal in arc.outward_normals.iter_mut().flatten() {normal.angular_sigma_radians=2.0;}
+    assert!(arc.mean_cost(conic)<MAXIMUM_GROUP_COST,"uncertain direction must have weaker influence");
+    arc.outward_normals.fill(None);
+    assert!(arc.mean_cost(conic)<1.0e-20,"missing direction is not fabricated from the candidate conic");
+}
+
+#[test]
+fn uncertain_contour_directions_are_a_compatibility_band_not_a_second_precise_fit() {
+    let points=[-0.2f64,0.0,0.2].map(|t|(10.0*t.cos(),10.0*t.sin())).to_vec();
+    let (quadrature,length_px)=polyline_quadrature(&points).unwrap();
+    let (s,c)=0.3f64.sin_cos();
+    let normals=points.iter().map(|&(x,y)|Some(BoundaryNormalObservation {
+        unit_outward_roi:[(c*x-s*y)/10.0,(s*x+c*y)/10.0],angular_sigma_radians:0.2})).collect();
+    let arc=SparseArc {eye:0,index:0,kind:BoundaryKind::OuterLimbus,boundary:0,group:0,
+        points,outward_normals:normals,sigma:1.0,quadrature,length_px,weight:1.0};
+    assert!(arc.mean_cost(ProjectedCircle([1.0,0.0,1.0,0.0,0.0,-100.0]))<1.0e-20,
+        "contour position and tangent share pixels: do not chase a noisy direction within its two-sigma engineering allowance");
+}
+
+#[test]
+fn joint_selection_uses_measured_direction_not_just_equal_point_alternatives() {
+    use crate::outline_conic_segments::sparse_evidence::{OwnedBoundaryArc,OwnedConicHint,OwnedRoiEvidence};
+    let fixture=Fixture::new([70.0,-130.0,250.0]);
+    let mut packets=std::array::from_fn::<_,2,_>(|eye|OwnedRoiEvidence {
+        exposure:fixture.exposures[eye],sensor_origin_px:fixture.origins[eye],dimensions_px:[420,280],detail_reliability:Some(1.0),
+        arcs:fixture.arcs[eye].iter().map(|a|OwnedBoundaryArc {evidence_group:a.group,kind:a.kind,
+            points_roi_px:a.points.clone(),outward_normals_roi:None,normal_band_half_width_px:0.0,detector_score:None}).collect(),
+        conics:fixture.hints[eye].iter().map(|&(kind,ellipse_roi_px)|OwnedConicHint {kind,ellipse_roi_px,supporting_arc_indices:vec![]}).collect()});
+    let e=fixture.hints[0][0].1;
+    let (s,c)=e.angle.sin_cos();
+    packets[0].arcs[0].outward_normals_roi=Some(packets[0].arcs[0].points_roi_px.iter().map(|&(x,y)| {
+        let u=(c*(x-e.center.0)+s*(y-e.center.1))/e.major_radius.powi(2);
+        let v=(-s*(x-e.center.0)+c*(y-e.center.1))/e.minor_radius.powi(2);
+        let magnitude=u.hypot(v);
+        Some(BoundaryNormalObservation {unit_outward_roi:[(c*u-s*v)/magnitude,(s*u+c*v)/magnitude],angular_sigma_radians:0.2})
+    }).collect());
+    let mut wrong=packets[0].arcs[0].clone();
+    for n in wrong.outward_normals_roi.as_mut().unwrap().iter_mut().flatten() {n.unit_outward_roi=n.unit_outward_roi.map(|v|-v);}
+    packets[0].arcs.insert(0,wrong);
+    let prepared=packets.each_ref().map(OwnedRoiEvidence::prepare);
+    let result=solve_joint_conics(JointConicRequest {eyes:prepared.each_ref().map(|p|Some(p.evidence())),scene:&fixture.scene,
+        maximum_hypotheses:16,maximum_refinements:16,maximum_source_skew_ns:0,
+        exposure_uncertainty_ns:0,motion_bound_px_per_second:0.0}).unwrap();
+    let selected=result.arcs.iter().find(|a|a.exposure.roi==RoiId(1)&&a.evidence_group==0).unwrap();
+    assert_eq!(selected.arc_index,1,"the first alternative has the same coordinates but contradicts measured outward direction");
+    assert!(selected.used);assert_eq!(result.contributing_eyes,[true,true]);
+    for eye in 0..2 {assert!(angular_error(&result,&fixture,eye)<1.0);}
+}
+
+#[test]
+fn malformed_or_misaligned_boundary_directions_cannot_be_silently_ignored() {
+    let fixture=Fixture::new([70.0,-130.0,250.0]);let points=&fixture.arcs[0][0].points;
+    let good=BoundaryNormalObservation {unit_outward_roi:[1.0,0.0],angular_sigma_radians:0.2};
+    for normals in [vec![Some(good);points.len()-1],
+        vec![Some(BoundaryNormalObservation {unit_outward_roi:[0.0,0.0],..good});points.len()],
+        vec![Some(BoundaryNormalObservation {angular_sigma_radians:0.0,..good});points.len()],
+        vec![Some(BoundaryNormalObservation {angular_sigma_radians:f64::NAN,..good});points.len()]] {
+        let arcs=[BoundaryArcObservation {evidence_group:0,kind:BoundaryKind::OuterLimbus,points_roi_px:points,
+            outward_normals_roi:Some(&normals),normal_band_half_width_px:None,detector_score:None}];
+        let eye=RoiConicEvidence {exposure:fixture.exposures[0],sensor_origin_px:fixture.origins[0],
+            dimensions_px:[420,280],arcs:&arcs,conics:&[],detail_reliability:None};
+        assert!(matches!(solve_joint_conics(JointConicRequest {eyes:[Some(eye),None],scene:&fixture.scene,
+            maximum_hypotheses:16,maximum_refinements:16,maximum_source_skew_ns:0,
+            exposure_uncertainty_ns:0,motion_bound_px_per_second:0.0}),Err(JointConicUnavailable::InvalidRequest)));
+    }
+}
+
+#[test]
+fn image_boundary_normals_do_not_fabricate_a_three_dimensional_mirror_sign() {
+    let fixture=Fixture::new([70.0,-130.0,250.0]);let e=fixture.hints[0][0].1;
+    let points=e.dense_points(16);let (s,c)=e.angle.sin_cos();
+    let normals=points.iter().map(|&(x,y)| {
+        let u=(c*(x-e.center.0)+s*(y-e.center.1))/e.major_radius.powi(2);
+        let v=(-s*(x-e.center.0)+c*(y-e.center.1))/e.minor_radius.powi(2);
+        Some(BoundaryNormalObservation {unit_outward_roi:[(c*u-s*v)/u.hypot(v),(s*u+c*v)/u.hypot(v)],angular_sigma_radians:0.2})
+    }).collect();
+    let (quadrature,length_px)=polyline_quadrature(&points).unwrap();
+    let arc=SparseArc {eye:0,index:0,kind:BoundaryKind::OuterLimbus,boundary:0,group:0,
+        points,outward_normals:normals,sigma:1.0,quadrature,length_px,weight:1.0};
+    let poses=circle_pose_hypotheses(fixture.scene.camera,e,fixture.origins[0]).unwrap();
+    assert!(norm3(sub3(poses[0].normal,poses[1].normal))>0.1,"exercise distinct 3D mirror branches");
+    for pose in poses {
+        let conic=ProjectedCircle::project(fixture.scene.camera,scale3(pose.center_per_radius,6.0),pose.normal,6.0,fixture.origins[0]).unwrap();
+        assert!(arc.mean_cost(conic)<1.0e-12,"the identical projected boundary cannot distinguish these 3D branches");
+    }
+}
+
+#[test]
 fn many_short_pupil_fragments_cannot_outvote_a_long_well_supported_limbus() {
     let mut fixture=Fixture::new([70.0,-130.0,250.0]);
     fixture.arcs=[Vec::new(),Vec::new()];fixture.hints=[Vec::new(),Vec::new()];
@@ -518,7 +619,7 @@ fn a_secondary_circle_seed_carries_its_own_center_and_metric_radius() {
     let hints=[wrong,truth].map(|ellipse_roi_px|ConicObservation {kind:BoundaryKind::OuterLimbus,
         ellipse_roi_px,supporting_arc_indices:&[0],residual_px:None});
     let arcs=[BoundaryArcObservation {evidence_group:0,kind:BoundaryKind::OuterLimbus,
-        points_roi_px:&fixture.arcs[0][0].points,normal_band_half_width_px:Some(0.0),detector_score:None}];
+        points_roi_px:&fixture.arcs[0][0].points,outward_normals_roi:None,normal_band_half_width_px:Some(0.0),detector_score:None}];
     let evidence=RoiConicEvidence {exposure:fixture.exposures[0],sensor_origin_px:fixture.origins[0],
         dimensions_px:[420,280],arcs:&arcs,conics:&hints,detail_reliability:Some(1.0)};
     let problem=Problem::new(JointConicRequest {eyes:[Some(evidence),None],scene:&fixture.scene,
