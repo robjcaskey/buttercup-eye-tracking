@@ -6658,6 +6658,7 @@ mod runtime {
         // Keep the strongest geometry-plausible RAW failure for diagnostics,
         // but only a RAW-passing detector candidate may condition memory.
         let mut diagnostic_detector = None::<LiveSelectedMask>;
+        let mut diagnostic_partial_masks = Vec::<ProposalMask>::new();
         let mut raw_valid_detector = None::<LiveSelectedMask>;
         let audit_candidates = std::env::var_os("BUTTERCUP_SAM31_CANDIDATE_AUDIT").is_some();
         let mut raw_candidates_seen = 0;
@@ -6701,6 +6702,15 @@ mod runtime {
                 );
                 let fit = tracker_fit_review(&mask, output.mask_width, output.mask_height);
                 if !live_detector_candidate_is_plausible(score, area, fit.is_some()) {
+                    // Preserve bounded current, identity-qualified outer-mask
+                    // evidence even when no complete single-eye conic exists.
+                    // This does NOT condition memory or claim an iris fit.
+                    if fit.is_none() && score.is_finite() && mask.iter().any(|&p|p!=0)
+                        && diagnostic_partial_masks.len()<4 {
+                        diagnostic_partial_masks.push(ProposalMask {query,score,
+                            boundary_pixels:Arc::new(binary_mask_boundary_indices(&mask,output.mask_width,output.mask_height)),
+                            pixels:Arc::new(mask)});
+                    }
                     if reframe_recovery && enabled_env_flag("BUTTERCUP_SAM31_VIDEO_TRACE", false) {
                         eprintln!("SAM31_REFRAME_QUERY {}", serde_json::json!({
                             "sequence":source.sequence,"query":query,"sensor_iou":reframe_iou,
@@ -6815,11 +6825,15 @@ mod runtime {
             LiveTemporalUpdate::HoldLastConditioning => {
                 let Some(candidate) = diagnostic_detector.take() else {
                     state.record_processed_miss();
-                    return Err(format!(
-                        "SAM31 video tracker held prior memory; propagated area {:?}/fit={} and no RAW-plausible detector geometry was available",
-                        tracker_area,
-                        tracker_fit.is_some(),
-                    ));
+                    // Publish this attempted exposure, including an empty
+                    // packet when there is no evidence. An older proposal
+                    // must not stand in for a fresh missing-ROI observation.
+                    return Ok(LiveTemporalOuterProposal {
+                        semantic:SemanticProposalMasks {prompt_index:OUTER_IRIS_PROMPT,
+                            width:output.mask_width,height:output.mask_height,
+                            selected_query:None,masks:diagnostic_partial_masks},
+                        outer_fit:None,outer_support:RawRingSupport::default(),pupil_fit:None,
+                    });
                 };
                 (candidate, false)
             }
@@ -8046,15 +8060,16 @@ mod runtime {
             pupil_fit,
         } = video_outer
             .ok_or_else(|| "SAM31 video tracker produced no current-frame mask".to_string())?;
-        let outer_fit = outer_fit
-            .ok_or_else(|| "SAM31 video tracker mask had no plausible limbus fit".to_string())?;
-        let outer_fit = model_review_in_source(outer_fit, source.width);
+        if semantic.prompt_index!=OUTER_IRIS_PROMPT {
+            return Err("SAM31 video geometry requires the mandatory outer-iris prompt".into());
+        }
+        let outer_fit = outer_fit.map(|fit|model_review_in_source(fit, source.width));
         let quality = semantic
             .selected_query
             .and_then(|selected| semantic.masks.iter().find(|mask| mask.query == selected))
             .map(|mask| f64::from(mask.score))
             .unwrap_or_default();
-        let outer_ellipse = outer_fit.ellipse;
+        let outer_ellipse = outer_fit.as_ref().map(|fit|fit.ellipse);
         // Always retain the same-exposure RAW pupil void alongside an outer
         // proposal.  Virtual contact needs this private cue to choose between
         // the two antipodal surface normals even when the operator has not
@@ -8073,7 +8088,7 @@ mod runtime {
             source_height: source.height,
             source_raw: Arc::clone(&source.pixels),
             semantic: Some(semantic),
-            outer_fit: Some(outer_fit),
+            outer_fit,
             inner_pupil_fit: proposal_pupil_fit,
             adapters: Vec::new(),
         });
@@ -8081,6 +8096,8 @@ mod runtime {
         // rejects it, so the operator can inspect the rejected proposal.
         let _ = proposal_publisher.try_send(Arc::clone(&proposal_masks));
 
+        let outer_ellipse=outer_ellipse
+            .ok_or_else(|| "SAM31 video tracker mask had no plausible limbus fit; current source proposal published without conditioning memory".to_string())?;
         if current_luma.is_none() {
             return Err("SAM31 video tracker could not construct current RAW luma".to_string());
         }
@@ -8138,6 +8155,45 @@ mod runtime {
             video_tracked: true,
             proposal_masks,
         })
+    }
+
+    #[cfg(test)]
+    mod video_publication_tests {
+        use super::*;
+        fn batch()->Batch {
+            Batch {submitted_at:Instant::now(),target:Target::OuterLimbus,semantic_prompt:OUTER_IRIS_PROMPT,
+                prompt_generation:7,tracking_epoch:9,eye_index:1,
+                frames:vec![Arc::new(RawFrame {eye_index:1,sequence:456,timestamp_ns:123_456_789,
+                    sensor_x:400,sensor_y:800,width:12,height:8,pixels:Arc::new(vec![17;96]),
+                    registration_anchor:None,pupil_component_seed:None})],motion:None,
+                prompt_bundle:PromptBundle {revision:7,path:"unused-test-prompt".into()}}
+        }
+        fn partial(prompt_index:usize,masks:Vec<ProposalMask>)->LiveTemporalOuterProposal {
+            LiveTemporalOuterProposal {semantic:SemanticProposalMasks {prompt_index,width:3,height:2,
+                selected_query:None,masks},outer_fit:None,outer_support:RawRingSupport::default(),pupil_fit:None}
+        }
+        #[test]
+        fn a_current_unfitted_or_empty_mask_is_published_without_admitting_an_ellipse() {
+            for masks in [Vec::new(),vec![ProposalMask {query:3,score:0.2,
+                pixels:Arc::new(vec![0,1,1,0,0,0]),boundary_pixels:Arc::new(vec![1,2])}]] {
+                let source=batch();let expected=masks.len();let (tx,rx)=sync_channel(1);
+                let result=process_video_frame(&source,&tx,None,Some(partial(OUTER_IRIS_PROMPT,masks)));
+                assert!(result.is_err());
+                let published=rx.try_recv().unwrap();
+                assert_eq!((published.tracking_epoch,published.prompt_generation,published.eye_index),(9,7,1));
+                assert_eq!((published.source_sequence,published.source_timestamp_ns),(456,123_456_789));
+                assert_eq!(published.source_sensor_origin,(400,800));
+                assert!(Arc::ptr_eq(&published.source_raw,&source.frames[0].pixels));
+                assert!(published.outer_fit.is_none()&&published.inner_pupil_fit.is_none());
+                assert_eq!(published.semantic.as_ref().unwrap().masks.len(),expected);
+            }
+        }
+        #[test]
+        fn unrelated_semantic_prompt_is_never_published_as_outer_geometry() {
+            let (tx,rx)=sync_channel(1);
+            assert!(process_video_frame(&batch(),&tx,None,Some(partial(OUTER_IRIS_PROMPT+1,Vec::new()))).is_err());
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     fn process_batch(

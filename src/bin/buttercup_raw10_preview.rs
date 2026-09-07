@@ -273,6 +273,28 @@ fn indexed_preview(arguments:&[String])->Result<(),String> {
                 }
             }
         }
+        // Optional evaluator diagnostics: actual training points, never a
+        // synthetic completed perimeter. Panel 1 shows all alternatives;
+        // panel 2 shows selected/used points in cyan, rejected ones in gray.
+        if let Some(arcs)=row["sparse_evidence"][eye]["arcs"].as_array() {
+            for (index,arc) in arcs.iter().enumerate() {
+                let used=row["joint"]["support"].as_array().is_some_and(|support|support.iter().any(|s|
+                    s["roi"].as_u64()==Some(eye as u64+1)&&s["arc"].as_u64()==Some(index as u64)&&s["used"]==true));
+                let Some(points)=arc["points"].as_array() else {continue;};
+                for point in points {
+                    let (Some(x),Some(y))=(point[0].as_f64(),point[1].as_f64()) else {continue;};
+                    for (panel,color) in [(1,[255,80,220]),(2,if used {[50,230,255]} else {[130,130,130]})] {
+                        for dy in -1..=1 {for dx in -1..=1 {
+                            let px=x.round() as isize+dx;let py=y.round() as isize+dy;
+                            if px>=0&&py>=0&&px<width as isize&&py<height as isize {
+                                let at=(py as usize*width*panels+panel*width+px as usize)*3;
+                                comparison[at..at+3].copy_from_slice(&color);
+                            }
+                        }}
+                    }
+                }
+            }
+        }
     }
     let output=Path::new(&arguments[3]);
     if let Some(parent)=output.parent() {fs::create_dir_all(parent).map_err(|e|e.to_string())?;}

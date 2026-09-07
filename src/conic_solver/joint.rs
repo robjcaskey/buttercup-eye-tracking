@@ -225,6 +225,12 @@ pub(crate) struct JointConicSolution {
     pub(crate) ellipses_roi_px: [[Option<Ellipse>; 3]; 2],
     pub(crate) arcs: Vec<ArcSupport>,
     pub(crate) contributing_eyes: [bool; 2],
+    /// Which ROI-to-eye associations this hypothesis models. False means
+    /// unlocalized, not a closed eye, concave surface, or fabricated ellipse.
+    pub(crate) modeled_eyes: [bool; 2],
+    /// Full capped group cost paid for each explicitly unlocalized ROI.
+    /// Model selection remains a heuristic, not a calibrated probability.
+    pub(crate) unlocalized_eye_cost: [f64; 2],
     pub(crate) robust_cost: f64,
     /// Difference to a geometrically distinct optimized hypothesis. None means
     /// no independently explored competing basin, NOT certainty.
@@ -421,6 +427,15 @@ struct Problem<'a> {
 }
 
 impl<'a> Problem<'a> {
+    fn unlocalized_costs(&self,modeled:[bool;2])->[f64;2] {
+        let mut cost=[0.0;2];
+        for group in &self.groups {
+            let eye=group.alternatives[0].eye;
+            if !modeled[eye] {cost[eye]+=group.weight*MAXIMUM_GROUP_COST;}
+        }
+        cost
+    }
+
     fn new(request: JointConicRequest<'a>) -> Result<Self, JointConicUnavailable> {
         let scene = request.scene;
         if request.maximum_hypotheses == 0 || request.maximum_refinements == 0
@@ -717,50 +732,71 @@ impl<'a> Problem<'a> {
     fn seeds(&self) -> Vec<Parameters> {
         let limit = self.request.maximum_hypotheses.min(MAX_HYPOTHESES);
         let mut seeds = Vec::new();
-        let mut push = |target: [f64;3]| {
+        let mut push = |mut p:Parameters,target: [f64;3]| {
             let offset = sub3(target,self.request.scene.target_reference_camera_mm);
             if offset[2] <= 0.0 || seeds.len() >= limit { return; }
-            let mut p = self.initial;
             p[0] = offset[0]/offset[2]; p[1] = offset[1]/offset[2]; p[2] = offset[2].ln();
             for i in 0..PARAMETERS { p[i] = p[i].clamp(self.lower[i],self.upper[i]); }
-            if !seeds.iter().any(|s: &Parameters| (s[0]-p[0]).hypot(s[1]-p[1]) < 0.002 && (s[2]-p[2]).abs() < 0.02) { seeds.push(p); }
+            if !seeds.iter().any(|s: &Parameters| (s[0]-p[0]).hypot(s[1]-p[1]) < 0.002 && (s[2]-p[2]).abs() < 0.02
+                && (TARGET_PARAMETERS..PARAMETERS).all(|i|(s[i]-p[i]).abs()<0.01*self.scales[i])) { seeds.push(p); }
         };
-        if let Some(target) = self.request.scene.target_seed_camera_mm.filter(|p| p.into_iter().all(|v| v.is_finite())) { push(target); }
+        if let Some(target) = self.request.scene.target_seed_camera_mm.filter(|p| p.into_iter().all(|v| v.is_finite())) { push(self.initial,target); }
         // Conic signs supply MULTIPLE starts for the SAME coupled objective.
         // No independent gaze is accepted or averaged here.
         for multiplier in [1.0, 0.5, 2.0] {
+          // Interleave ROIs before considering their second/further hints.
+          // Four low-confidence candidates in eye zero must not consume the
+          // whole paired budget before eye one's first supported conic.
+          for rank in 0..4 {
             for eye in 0..2 {
                 if !self.present[eye] { continue; }
                 let evidence = self.request.eyes[eye].unwrap();
+                let Some(conic)=evidence.conics.get(rank) else {continue;};
                 let k=TARGET_PARAMETERS+eye*EYE_PARAMETERS;
                 let center = [self.initial[k],self.initial[k+1],self.initial[k+2]];
                 let toward = normalized3(scale3(center,-1.0)).unwrap();
                 let u = normalized3(cross3([0.0,1.0,0.0],toward)).unwrap();
                 let v = cross3(toward,u);
-                for conic in evidence.conics.iter().take(4) {
                     let e = conic.ellipse_roi_px;
                     if !e.major_radius.is_finite() || !e.minor_radius.is_finite() || !e.angle.is_finite()
                         || e.minor_radius <= 0.0 || e.minor_radius > e.major_radius { continue; }
                     let cosine = (e.minor_radius/e.major_radius).clamp(0.1,1.0);
                     let sine = (1.0-cosine*cosine).sqrt();
                     let approximate=[-1.0,1.0].map(|sign|add3(scale3(toward,cosine),add3(scale3(u,-e.angle.sin()*sine*sign),scale3(v,e.angle.cos()*sine*sign))));
-                    let normals=circle_normal_hypotheses(self.request.scene.camera,e,evidence.sensor_origin_px).unwrap_or(approximate);
-                    for n in normals {
+                    let poses=circle_pose_hypotheses(self.request.scene.camera,e,evidence.sensor_origin_px);
+                    let normals=poses.map(|p|p.map(|p|p.normal)).unwrap_or(approximate);
+                    for (branch,n) in normals.into_iter().enumerate() {
                         if n[2] <= 0.05 { continue; }
+                        let mut geometry=if conic.kind==BoundaryKind::OuterLimbus {
+                            poses.and_then(|poses|self.seed_circle_geometry(self.initial,eye,poses[branch])).unwrap_or(self.initial)
+                        } else {self.initial};
+                        // Alternative conics must bring their own nuisance
+                        // center/range, not just rotate a target around the
+                        // first candidate's geometry. Keep every hard bound.
+                        if !self.interocular_feasible(&geometry) {
+                            let proposed=geometry;
+                            for fraction in [0.5,0.25,0.125,0.0] {
+                                for i in TARGET_PARAMETERS..PARAMETERS {
+                                    geometry[i]=self.initial[i]+fraction*(proposed[i]-self.initial[i]);
+                                }
+                                if self.interocular_feasible(&geometry) {break;}
+                            }
+                        }
+                        let center=[geometry[k],geometry[k+1],geometry[k+2]];
                         let depth = (self.request.scene.fixation_forward_mm.nominal*multiplier).clamp(self.request.scene.fixation_forward_mm.minimum,self.request.scene.fixation_forward_mm.maximum);
                         let dz = self.request.scene.target_reference_camera_mm[2]+depth-center[2];
-                        push(add3(center,scale3(n,dz/n[2])));
+                        push(geometry,add3(center,scale3(n,dz/n[2])));
                     }
                 }
             }
         }
-        push(self.target(&self.initial));
+        push(self.initial,self.target(&self.initial));
         // Unfitted partial arcs are allowed. Without a complete ellipse hint,
         // non-frontal starts avoid the zero tilt derivative at a perfect circle.
         for (x,y) in [(0.0,-0.35),(0.0,0.35),(-0.35,0.0),(0.35,0.0),
                       (-0.35,-0.35),(-0.35,0.35),(0.35,-0.35),(0.35,0.35)] {
             let d=self.request.scene.fixation_forward_mm.nominal;
-            push(add3(self.request.scene.target_reference_camera_mm,[x*d,y*d,d]));
+            push(self.initial,add3(self.request.scene.target_reference_camera_mm,[x*d,y*d,d]));
         }
         seeds
     }
@@ -830,6 +866,7 @@ impl<'a> Problem<'a> {
             eye_centers_camera_mm: [None;2], eye_normals: [None;2], effective_pivots_camera_mm: [None;2],
             eye_gaze_directions:[None;2],surface_axis_alignment_radians:[None;2],
             ellipses_roi_px: [[None;3];2], arcs: Vec::new(), contributing_eyes: [false;2],
+            modeled_eyes:self.present,unlocalized_eye_cost:[0.0;2],
             robust_cost: cost, alternative_cost_margin: None, alternative_target_camera_mm: None,
             hypotheses_evaluated: 0, refinement_steps: 0 };
         for (g,selection) in self.groups.iter().zip(self.select(&conics)) {
@@ -908,19 +945,40 @@ fn solve_dense(mut a: [[f64;PARAMETERS];PARAMETERS], mut b: Parameters) -> Optio
 }
 
 pub(crate) fn solve_joint_conics(request: JointConicRequest<'_>) -> Result<JointConicSolution, JointConicUnavailable> {
+    // Validate the FULL request first. Omitting an unlocalized ROI must never
+    // be a way around invalid source clocks, timing bounds or scene inputs.
     let problem = Problem::new(request)?;
-    let seeds = problem.seeds();
-    let hypotheses = seeds.len();
-    let mut fits = seeds.into_iter().filter_map(|p| problem.refine(p)).collect::<Vec<_>>();
-    fits.sort_by(|a,b| a.1.total_cmp(&b.1));
-    let (p,cost,_) = fits.first().ok_or(JointConicUnavailable::NoFeasibleInitialization)?;
-    let mut solution = problem.solution(p,*cost).ok_or(JointConicUnavailable::NoFeasibleHypothesis)?;
-    solution.hypotheses_evaluated = hypotheses;
-    solution.refinement_steps = fits.iter().map(|f| f.2).sum();
-    if let Some((alternate,alternate_cost,_)) = fits.iter().skip(1)
-        .find(|(q,_,_)| (q[0]-p[0]).hypot(q[1]-p[1]) > 0.035) {
-        solution.alternative_cost_margin = Some((alternate_cost-cost).max(0.0));
-        solution.alternative_target_camera_mm = Some(problem.target(alternate));
+    let budget=request.maximum_hypotheses.min(MAX_HYPOTHESES);
+    let reserve=if problem.present==[true,true]&&budget>=8 {(budget/4).min(4)} else {0};
+    let mut models=vec![(problem.present,budget-2*reserve)];
+    if reserve>0 {models.extend([([true,false],reserve),([false,true],reserve)]);}
+    let mut fits=Vec::<([f64;2],JointConicSolution)>::new();
+    let mut hypotheses=0;let mut steps=0;let mut feasible=false;
+    for (modeled,limit) in models {
+        let subrequest=JointConicRequest {eyes:std::array::from_fn(|i|if modeled[i] {request.eyes[i]} else {None}),
+            maximum_hypotheses:limit,..request};
+        let model=Problem::new(subrequest)?;
+        let omitted=problem.unlocalized_costs(modeled);
+        for seed in model.seeds() {
+            hypotheses+=1;
+            let Some((p,cost,refinements))=model.refine(seed) else {continue;};
+            feasible=true;steps+=refinements;
+            let Some(mut solution)=model.solution(&p,cost+omitted.iter().sum::<f64>()) else {continue;};
+            solution.unlocalized_eye_cost=omitted;
+            fits.push(([p[0],p[1]],solution));
+        }
+    }
+    // These are alternative ASSOCIATIONS in one robust boundary objective.
+    // A one-ROI hypothesis pays the complete other ROI's capped evidence cost;
+    // it does not obtain a free win by omitting pixels or average two targets.
+    fits.sort_by(|a,b|a.1.robust_cost.total_cmp(&b.1.robust_cost));
+    if fits.is_empty() {return Err(if feasible {JointConicUnavailable::NoFeasibleHypothesis}
+        else {JointConicUnavailable::NoFeasibleInitialization});}
+    let (slope,mut solution)=fits.remove(0);
+    solution.hypotheses_evaluated=hypotheses;solution.refinement_steps=steps;
+    if let Some((_,alternate))=fits.iter().find(|(q,_)|(q[0]-slope[0]).hypot(q[1]-slope[1])>0.035) {
+        solution.alternative_cost_margin=Some((alternate.robust_cost-solution.robust_cost).max(0.0));
+        solution.alternative_target_camera_mm=Some(alternate.target_camera_mm);
     }
     Ok(solution)
 }

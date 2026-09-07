@@ -16,6 +16,7 @@ use std::sync::Arc;
 /// deliberately does not call this module.
 pub(crate) mod recent_exclusion;
 pub(crate) mod sparse_evidence;
+pub(crate) mod partial_outline;
 
 /// Geometric evidence extracted from an ordered semantic-mask contour.
 /// Points and ellipse share the caller's pixel frame (model space during
@@ -494,17 +495,23 @@ pub(crate) fn deflattened_mask_fit_with_context(
     deflattened_mask_fit_with_noise(contour, reference, scale_context, 1.0, true)
 }
 
-pub(crate) fn deflattened_mask_fit_with_noise(
-    contour: Vec<(f64, f64)>,
-    reference: Ellipse,
-    scale_context: Option<OuterContourScaleContext>,
-    pixel_scale: f64,
-    constrain_arcs: bool,
-) -> Option<ContourFitEvidence> {
+/// The observation-only part of flat-tire exclusion. It must remain available
+/// when there is too little support for a complete single-eye ellipse.
+pub(crate) struct ChordCensoredContour {
+    pub(crate) samples: Vec<(f64, f64)>,
+    pub(crate) smoothed: Vec<(f64, f64)>,
+    pub(crate) flat_tire: Vec<bool>,
+    pub(crate) upper_flat_tire: bool,
+    pub(crate) lower_flat_tire: bool,
+}
+
+pub(crate) fn censor_occluding_chords(
+    contour: &[(f64, f64)], reference: Ellipse,
+) -> Option<ChordCensoredContour> {
     // Preserve boundary order: polar sorting can jump between the true limbus
     // and an occluding lid chord and manufacture exactly the flattened conic
     // this stage is intended to reject.
-    let samples = sample_closed_contour(&contour, 128);
+    let samples = sample_closed_contour(contour, 128);
     if samples.len() < 24 {
         return None;
     }
@@ -532,6 +539,20 @@ pub(crate) fn deflattened_mask_fit_with_noise(
             flat_tire[(run.start + offset) % samples.len()] = true;
         }
     }
+    Some(ChordCensoredContour {samples,smoothed,flat_tire,
+        upper_flat_tire:upper.is_some_and(|run|run.side==FlatTireSide::Upper),
+        lower_flat_tire:lower.is_some_and(|run|run.side==FlatTireSide::Lower)})
+}
+
+pub(crate) fn deflattened_mask_fit_with_noise(
+    contour: Vec<(f64, f64)>,
+    reference: Ellipse,
+    scale_context: Option<OuterContourScaleContext>,
+    pixel_scale: f64,
+    constrain_arcs: bool,
+) -> Option<ContourFitEvidence> {
+    let ChordCensoredContour {samples,smoothed,flat_tire,upper_flat_tire,lower_flat_tire}=
+        censor_occluding_chords(&contour,reference)?;
     let retained_indices = (0..samples.len())
         .filter(|&i| !flat_tire[i])
         .collect::<Vec<_>>();
@@ -650,8 +671,8 @@ pub(crate) fn deflattened_mask_fit_with_noise(
         retained_points: Arc::new(retained_points),
         conic_segments: Arc::new(supported_conic_runs(&final_kept)),
         flat_tire_points: Arc::new(flat_tire_points),
-        upper_flat_tire: upper.is_some_and(|run| run.side == FlatTireSide::Upper),
-        lower_flat_tire: lower.is_some_and(|run| run.side == FlatTireSide::Lower),
+        upper_flat_tire,
+        lower_flat_tire,
     })
 }
 

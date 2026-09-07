@@ -17,6 +17,7 @@ use native::{binocular_coordinator,eye_scene_model};
 use native::eye_scene_model::binocular_pose::{approximate_scene,EyePoseInput};
 use conic_solver::joint::*;
 use outline_conic_segments::sparse_evidence::*;
+use outline_conic_segments::partial_outline::{append_unfitted_outline_arcs,OutlineCandidate,PartialOutlineReport};
 use roi_evidence::{BoundaryKind,ExposureKey,RoiId,SourceClock};
 use serde_json::{json,Value};
 use std::collections::HashMap;
@@ -51,9 +52,10 @@ struct Frame {
     validation:Vec<(usize,u32,BoundaryKind,Vec<(f64,f64)>)>,
     baseline:Option<geometry::Ellipse>,
     selected_raw_admitted:bool,
+    partial_outline:PartialOutlineReport,
 }
 
-fn prepare(row:Value)->Result<Frame,String> {
+fn prepare(row:Value,partial_outlines:bool)->Result<Frame,String> {
     let input=row["input"].clone();
     let meta=&input["frame"];
     let eye=integer(meta,"eye_id")?;
@@ -83,12 +85,24 @@ fn prepare(row:Value)->Result<Frame,String> {
             for arc in &mut packet.arcs {arc.normal_band_half_width_px=5.0;}
         }
     }
-    if let Some(pupil)=ellipse(&row["pupil_void"]["ellipse"]) {
+    let pupil=ellipse(&row["pupil_void"]["ellipse"]);
+    let try_partial=partial_outlines&&baseline.is_none();
+    let mut partial_outline=PartialOutlineReport::default();
+    if pupil.is_some()||try_partial {
         let mut file=File::open(input["raw_file"].as_str().ok_or("missing RAW file")?).map_err(|e|e.to_string())?;
         file.seek(SeekFrom::Start(integer(&input,"raw_offset")?)).map_err(|e|e.to_string())?;
         let mut bytes=vec![0;integer(&input,"raw_length")? as usize];file.read_exact(&mut bytes).map_err(|e|e.to_string())?;
         let raw=raw10::try_unpack_raw10(&bytes,size[0] as usize,size[1] as usize,integer(meta,"stride")? as usize)?;
-        append_raw_ring_arcs(&mut packet,&raw,pupil,BoundaryKind::PupillaryBoundary,100,RawArcConfig::default());
+        if let Some(pupil)=pupil {
+            append_raw_ring_arcs(&mut packet,&raw,pupil,BoundaryKind::PupillaryBoundary,100,RawArcConfig::default());
+        }
+        if try_partial {
+            let mut ranked=candidates.iter().filter(|c|c["semantic_score"].as_f64().is_some_and(f64::is_finite)).collect::<Vec<_>>();
+            ranked.sort_by(|a,b|b["semantic_score"].as_f64().unwrap().total_cmp(&a["semantic_score"].as_f64().unwrap()));
+            let outlines=ranked.iter().take(4).map(|c|(points(&c["outline"]),c["semantic_score"].as_f64())).collect::<Vec<_>>();
+            let candidates=outlines.iter().map(|(points,score)|OutlineCandidate {points_roi_px:points,detector_score:*score}).collect::<Vec<_>>();
+            partial_outline=append_unfitted_outline_arcs(&mut packet,&raw,&candidates,(size[0] as f64*0.5,size[1] as f64*0.5),200);
+        }
     }
     let center=baseline.map(|e|[e.center.0+origin[0] as f64,e.center.1+origin[1] as f64])
         .unwrap_or([origin[0] as f64+size[0] as f64*0.5,origin[1] as f64+size[1] as f64*0.5]);
@@ -102,7 +116,7 @@ fn prepare(row:Value)->Result<Frame,String> {
             arc.points_roi_px=arc.points_roi_px.iter().step_by(2).copied().collect();
         }
     }
-    Ok(Frame {input,packet,pose,validation,baseline,selected_raw_admitted})
+    Ok(Frame {input,packet,pose,validation,baseline,selected_raw_admitted,partial_outline})
 }
 
 fn heldout(solution:&JointConicSolution,frames:&[Option<Frame>;2])->[Value;2] {
@@ -135,6 +149,7 @@ fn solution_json(result:Result<JointConicSolution,JointConicUnavailable>,frames:
             "eye_centers_camera_mm":solution.eye_centers_camera_mm,"eye_normals":solution.eye_normals,
             "eye_gaze_directions":solution.eye_gaze_directions,"surface_axis_alignment_radians":solution.surface_axis_alignment_radians,
             "contributing_eyes":solution.contributing_eyes,"cost":solution.robust_cost,
+            "modeled_eyes":solution.modeled_eyes,"unlocalized_eye_cost":solution.unlocalized_eye_cost,
             "alternative_cost_margin":solution.alternative_cost_margin,
             "alternative_target_camera_mm":solution.alternative_target_camera_mm,
             "hypotheses":solution.hypotheses_evaluated,"refinement_steps":solution.refinement_steps,
@@ -153,7 +168,7 @@ fn solution_json(result:Result<JointConicSolution,JointConicUnavailable>,frames:
     }
 }
 
-fn evaluate(frames:[Option<Frame>;2])->Value {
+fn evaluate(frames:[Option<Frame>;2],export_sparse:bool)->Value {
     let poses=frames.each_ref().map(|f|f.as_ref().map(|f|f.pose));
     let prepared=frames.each_ref().map(|f|f.as_ref().map(|f|f.packet.prepare()));
     let evidence=prepared.each_ref().map(|e|e.as_ref().map(|p|p.evidence()));
@@ -162,8 +177,18 @@ fn evaluate(frames:[Option<Frame>;2])->Value {
         "baseline_sam_outer":frames.each_ref().map(|f|ellipse_json(f.as_ref().and_then(|f|f.baseline))),
         "raw_admitted":frames.each_ref().map(|f|f.as_ref().map(|f|f.selected_raw_admitted)),
         "observed_arc_groups":frames.each_ref().map(|f|f.as_ref().map(|f|f.packet.arcs.len())),
+        "partial_outline":frames.each_ref().map(|f|f.as_ref().map(|f|json!({"candidates":f.partial_outline.candidates,
+            "censored_samples":f.partial_outline.censored_samples,"unsupported_samples":f.partial_outline.unsupported_samples,
+            "emitted_arcs":f.partial_outline.emitted_arcs}))),
         "contract":"shared latent fixation versus separate monocular optimizations of the SAME training arcs; no averaged gaze; held-out points condition on upstream detector segmentation/search. Neither metric pose nor gaze accuracy is ground truth."});
     let mut row=base;
+    if export_sparse {
+        row["sparse_evidence"]=json!(frames.each_ref().map(|f|f.as_ref().map(|f|json!({
+            "arcs":f.packet.arcs.iter().map(|a|json!({"group":a.evidence_group,"kind":format!("{:?}",a.kind),
+                "points":a.points_roi_px,"band_half_width_px":a.normal_band_half_width_px})).collect::<Vec<_>>(),
+            "seeds":f.packet.conics.iter().map(|c|json!({"kind":format!("{:?}",c.kind),"ellipse":ellipse_json(Some(c.ellipse_roi_px))})).collect::<Vec<_>>()
+        }))));
+    }
     let Some(scene)=approximate_scene(camera,poses) else {row["error"]=json!("no coarse scene support");return row;};
     row["scale_provenance"]=json!(scene.scale_provenance.map(|p|p.map(|p|format!("{p:?}"))));
     row["independent_pixels_per_mm"]=json!(scene.independent_pixels_per_mm);
@@ -184,11 +209,15 @@ fn run()->Result<(),String> {
     let output=PathBuf::from(args.next().ok_or("usage: buttercup_stereo_conic_eval OUTPUT.jsonl SAM_CACHE.jsonl...")?);
     let mut files=Vec::new();
     let mut maximum_frames_per_cache=usize::MAX;
+    let mut partial_outlines=false;
+    let mut export_sparse=false;
     while let Some(arg)=args.next() {
         if arg=="--max-frames-per-cache" {
             maximum_frames_per_cache=args.next().ok_or("missing frame limit")?.parse::<usize>().map_err(|e|e.to_string())?;
             if maximum_frames_per_cache==0 {return Err("frame limit must be positive".into());}
-        } else {files.push(arg);}
+        } else if arg=="--partial-outlines" {partial_outlines=true;}
+        else if arg=="--export-sparse-evidence" {export_sparse=true;}
+        else {files.push(arg);}
     }
     if files.is_empty() {return Err("at least one SAM evidence cache is required".into());}
     let allowed=std::fs::canonicalize("outputs").map_err(|e|e.to_string())?;
@@ -197,7 +226,7 @@ fn run()->Result<(),String> {
     let mut pending:HashMap<(String,u64),[Option<Frame>;2]>=HashMap::new();
     let mut count=0usize;
     let mut write=|frames|->Result<(),String> {
-        let row=evaluate(frames);serde_json::to_writer(&mut writer,&row).map_err(|e|e.to_string())?;
+        let row=evaluate(frames,export_sparse);serde_json::to_writer(&mut writer,&row).map_err(|e|e.to_string())?;
         writer.write_all(b"\n").map_err(|e|e.to_string())?;count+=1;
         if count%500==0 {writer.flush().map_err(|e|e.to_string())?;eprintln!("stereo evaluation reads={count}");}
         Ok(())
@@ -205,7 +234,7 @@ fn run()->Result<(),String> {
     for path in files {
         for (line_number,line) in BufReader::new(File::open(&path).map_err(|e|e.to_string())?).lines().take(maximum_frames_per_cache).enumerate() {
             let row=serde_json::from_str(&line.map_err(|e|e.to_string())?).map_err(|e|format!("{path}:{}: {e}",line_number+1))?;
-            let frame=prepare(row)?;
+            let frame=prepare(row,partial_outlines)?;
             let eye=frame.packet.exposure.roi.0.checked_sub(1).filter(|e|*e<2).ok_or("invalid ROI")? as usize;
             let key=(frame.input["clock_lineage"].as_str().ok_or("missing lineage")?.to_owned(),frame.packet.exposure.timestamp_ns);
             let slot=pending.entry(key.clone()).or_insert_with(||[None,None]);

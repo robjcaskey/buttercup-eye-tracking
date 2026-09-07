@@ -225,17 +225,77 @@ anatomical constancy or ROI-reframe performance. The emitted scale-only bounds
 omit conic uncertainty and are not confidence intervals. Unnormalized area
 tails on the larger subset still regress and cannot be relabeled SN-FEIDA.
 
-The full viewer suite currently has 949 passing tests, the same 41 failures as
+The full viewer suite currently has 957 passing tests, the same 41 failures as
 the pre-change baseline, and 24 ignored tests. Live-adapter tests additionally
 check source deduplication, different ROI sequences on one clock, crop transport,
 missing-eye behavior, provider changes, radius units and shared gaze mapping.
 No live user calibration or desktop-pointer trial has been performed for this
 new path.
-The standalone solver has 57 passing tests. The independent report tests also
+The standalone solver has 62 passing tests. The independent report tests also
 exercise source matching, probe changes, missing-read accounting, chronological
 area transitions, rejected geometry and determinant-based scale normalization.
 
 ## Known failures and remaining work
+
+### Partial-outline experiment (not enabled in the live solver)
+
+`outline_conic_segments/partial_outline.rs` now shares the observation-only
+flat-tire chord censor with the legacy complete-ellipse fitter. It accepts up
+to four ranked mandatory-outer-iris mask contours, checks outward native RAW
+contrast, preserves gaps, and emits at most eight correlated sector groups
+with four alternatives and 16 points per arc. Different SAM queries share a
+fixed sector budget. Optional conic fits are starts only; a synthetic mixed-eye
+test also succeeds after discarding every complete-ellipse seed for the
+partial eye. Flat/saturated RAW, reversed contour winding, chord exclusion and
+duplicate-query budgets have independent tests.
+
+The frozen `eval-partial-v1` trial is deliberately offline-only, selected by
+`--partial-outlines`. Its matched control is `eval-partial-control`. Both ran
+the same 50,000 exposures described above, and 107,868 withheld-coordinate
+fingerprints matched for the existing admitted outputs. Admissions increase
+by 5,859 right / 4,775 left, but 13 / 15 existing admissions are lost. Among
+unchanged probes, 191 / 162 regress by more than one pixel versus 44 / 36
+improvements. More accepted ellipses are **not** proven better localizations.
+
+The two formerly absent reviewed targets, 106191 and 106217, now fit with
+26.65 and 45.23 px visible-label RMS, respectively: still unacceptable. The
+other eight reviewed target results are unchanged. Native overlays show
+contamination by lid/reflection boundaries. Source 212420 reveals a second
+problem: even when every new arc from its partner is rejected, that partner's
+initialized geometry and pair constraints can damage the previously supported
+fit. Native inspection of 212419/212420 and 15631 shows off-target or heavily
+clipped ROIs, not established ground-truth irises; those large mask-residual
+regressions must not be described as measured gaze/localization errors.
+Thus widening localization bands is not a complete treatment of uncertain
+boundary identity or a genuinely unlocalized second eye. The next solver
+change must address that failure without averaging independent gaze points.
+In particular, test a penalized unlocalized-eye hypothesis within the shared
+objective, and ensure alternative conic starts carry their own center/range
+geometry rather than only rotating a target around the first candidate's
+geometry. Both need matched corpus checks, not just added initialization code.
+No independent absolute scale exists on this 50k subset, so the area summaries
+cannot establish an SN-FEIDA improvement.
+
+The separate byte-matched RAW motion audit has 13 usable local-reference
+SN-FEIDA transitions for this newer control/candidate pair, with no ROI
+reframes. Both arms are identical on those links: absolute log-step median
+0.03572, maximum 1.66914. The additional link, 106193→106195, was absent from
+the earlier 12-link comparison because its older baseline lacked accepted
+support. Its large area jump is a remaining failure of the current baseline,
+not an improvement or regression attributable to partial-outline extraction.
+Changing a comparison's admission intersection must not conceal that tail.
+
+`--export-sparse-evidence` adds exact training samples and optional seeds to
+small diagnostic replays. The native RAW preview shows all alternatives in
+magenta and selected samples in cyan, separately from reconstructed ellipses.
+These diagnostic coordinates and recordings remain outside the source tree.
+
+The video worker now publishes fresh rejected/empty proposal packets even
+when no complete single-eye ellipse exists, retaining exact source RAW,
+sequence, timestamp, ROI and prompt/stream generations. It does not condition
+SAM memory or admit an ellipse from that failure, and unrelated prompts are
+rejected. This prevents an older proposal from concealing a new missing-eye
+observation; it does **not** enable the unvalidated partial-outline fallback.
 
 Native RAW inspection of pair [7358,7359] exposes a serious failure: a few
 compatible upper-eyelid arcs can leave a fitted ellipse above the iris, despite

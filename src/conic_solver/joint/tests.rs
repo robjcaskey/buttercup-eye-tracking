@@ -403,3 +403,118 @@ fn independently_scaled_seed_radii_do_not_make_every_joint_start_infeasible() {
     let support=fixture.scene.interocular_distance_mm.unwrap();
     assert!(distance>=support.minimum&&distance<=support.maximum);
 }
+
+#[test]
+fn raw_verified_partial_outline_without_a_fitted_ellipse_contributes_to_one_shared_target() {
+    use crate::outline_conic_segments::partial_outline::{append_unfitted_outline_arcs,OutlineCandidate};
+    use crate::outline_conic_segments::sparse_evidence::OwnedRoiEvidence;
+    let mut fixture=Fixture::new([70.0,-130.0,250.0]);
+    let ellipse=fixture.hints[0][0].1;
+    let raw=(0..280).flat_map(|y|(0..420).map(move|x| {
+        let (s,c)=ellipse.angle.sin_cos();
+        let dx=x as f64-ellipse.center.0;let dy=y as f64-ellipse.center.1;
+        if ((c*dx+s*dy)/ellipse.major_radius).hypot((-s*dx+c*dy)/ellipse.minor_radius)<=1.0 {150} else {550}
+    })).collect::<Vec<_>>();
+    let contour=fixture.arcs[0][0].points.clone();
+    let dense=ring_points(fixture.scene.camera,fixture.scene.eyes[0].unwrap().limbus_center.camera_mm,
+        normalized3(sub3(fixture.target,fixture.scene.eyes[0].unwrap().limbus_center.camera_mm)).unwrap(),6.0,
+        fixture.origins[0],0.0,TAU,128);
+    let clipped=dense.iter().map(|&(x,y)|(x.max(ellipse.center.0),y)).collect::<Vec<_>>();
+    let mut packet=OwnedRoiEvidence {exposure:fixture.exposures[0],sensor_origin_px:fixture.origins[0],
+        dimensions_px:[420,280],arcs:Vec::new(),conics:Vec::new(),detail_reliability:None};
+    append_unfitted_outline_arcs(&mut packet,&raw,&[OutlineCandidate {points_roi_px:&clipped,detector_score:None}],ellipse.center,20);
+    assert!(packet.arcs.len()>=2);
+    // Deliberately discard every fitted-conic seed for this eye. Its only
+    // contribution is the current RAW-supported incomplete boundary.
+    fixture.hints[0].clear();
+    fixture.arcs[0]=packet.arcs.iter().map(|a|OwnedArc {group:a.evidence_group,kind:a.kind,
+        points:a.points_roi_px.clone(),band:a.normal_band_half_width_px}).collect();
+    let joint=fixture.solve([true,true],24).unwrap();
+    assert_eq!(joint.contributing_eyes,[true,true]);
+    assert!(angular_error(&joint,&fixture,1)<2.0);
+    let recovered=joint.ellipses_roi_px[0][0].unwrap();
+    let error=contour.iter().map(|&p|crate::conic_solver::ellipse_residual(p,recovered).powi(2)).sum::<f64>();
+    assert!((error/contour.len() as f64).sqrt()<3.0);
+    for eye in 0..2 {
+        let ray=normalized3(sub3(joint.target_camera_mm,joint.eye_centers_camera_mm[eye].unwrap())).unwrap();
+        assert!(norm3(sub3(ray,joint.eye_gaze_directions[eye].unwrap()))<1.0e-10);
+    }
+}
+
+#[test]
+fn an_unlocalized_roi_cannot_force_a_good_eye_into_its_false_interocular_geometry() {
+    let mut fixture=Fixture::new([70.0,-130.0,250.0]);
+    // A skin/foreground detection is not the second eye. Its tight but wrong
+    // ROI association would make every coupled initialization violate IPD.
+    let prior=fixture.scene.eyes[1].as_mut().unwrap();
+    prior.limbus_center.camera_mm[0]=160.0;
+    prior.limbus_center.maximum_displacement_mm=[0.1;3];
+    fixture.hints[1].clear();
+    fixture.arcs[1]=vec![OwnedArc {group:40,kind:BoundaryKind::OuterLimbus,
+        points:vec![(10.0,10.0),(12.0,10.2),(14.0,10.3)],band:8.0}];
+    let result=fixture.solve([true,true],16).unwrap();
+    assert_eq!(result.modeled_eyes,[true,false]);
+    assert_eq!(result.contributing_eyes,[true,false]);
+    assert!(result.eye_centers_camera_mm[1].is_none()&&result.ellipses_roi_px[1][0].is_none());
+    assert!(result.unlocalized_eye_cost[1]>0.0);
+    assert!(angular_error(&result,&fixture,0)<1.0);
+    assert!(result.hypotheses_evaluated<=16);
+    assert!(result.refinement_steps<=16*16*4);
+    // Correlated detector alternatives cannot multiply the rejection penalty.
+    for _ in 0..8 {fixture.arcs[1].push(OwnedArc {group:40,kind:BoundaryKind::OuterLimbus,
+        points:vec![(10.0,10.0),(12.0,10.2),(14.0,10.3)],band:8.0});}
+    let repeated=fixture.solve([true,true],16).unwrap();
+    assert_eq!(repeated.unlocalized_eye_cost,result.unlocalized_eye_cost);
+    assert!(norm3(sub3(repeated.target_camera_mm,result.target_camera_mm))<1.0e-8);
+}
+
+#[test]
+fn useful_two_eye_evidence_is_not_replaced_by_a_free_single_eye_hypothesis() {
+    let fixture=Fixture::new([70.0,-130.0,250.0]);
+    for budget in [8,16,24] {
+        let result=fixture.solve([true,true],budget).unwrap();
+        assert_eq!(result.modeled_eyes,[true,true]);
+        assert_eq!(result.contributing_eyes,[true,true]);
+        assert_eq!(result.unlocalized_eye_cost,[0.0;2]);
+        assert!(result.hypotheses_evaluated<=budget);
+    }
+}
+
+#[test]
+fn misleading_first_conic_does_not_replace_strong_two_eye_boundary_support() {
+    for eye in 0..2 {
+        let mut fixture=Fixture::new([70.0,-130.0,250.0]);
+        let truth=fixture.hints[eye][0].1;
+        let prior=fixture.scene.eyes[eye].as_mut().unwrap();
+        prior.limbus_center.sigma_mm=[6.0,6.0,90.0];
+        prior.limbus_center.maximum_displacement_mm=[16.0,16.0,200.0];
+        let mut bad=truth;
+        bad.center.0+=80.0;bad.center.1+=30.0;
+        bad.major_radius*=0.6;bad.minor_radius*=0.6;
+        fixture.hints[eye].insert(0,(BoundaryKind::OuterLimbus,bad));
+        let result=fixture.solve([true,true],24).unwrap();
+        assert_eq!(result.contributing_eyes,[true,true],"a bad first seed must not erase directly observed good arcs");
+        let fit=result.ellipses_roi_px[eye][0].unwrap();
+        let rms=(truth.dense_points(64).iter().map(|&p|crate::conic_solver::ellipse_residual(p,fit).powi(2)).sum::<f64>()/64.0).sqrt();
+        assert!(rms<1.0,"eye={eye} actual boundary error={rms} result={fit:?}");
+    }
+}
+
+#[test]
+fn a_secondary_circle_seed_carries_its_own_center_and_metric_radius() {
+    let fixture=Fixture::new([70.0,-130.0,250.0]);
+    let truth=fixture.hints[0][0].1;
+    let mut wrong=truth;wrong.major_radius*=1.2;wrong.minor_radius*=1.2;wrong.center.0+=15.0;
+    let hints=[wrong,truth].map(|ellipse_roi_px|ConicObservation {kind:BoundaryKind::OuterLimbus,
+        ellipse_roi_px,supporting_arc_indices:&[0],residual_px:None});
+    let arcs=[BoundaryArcObservation {evidence_group:0,kind:BoundaryKind::OuterLimbus,
+        points_roi_px:&fixture.arcs[0][0].points,normal_band_half_width_px:Some(0.0),detector_score:None}];
+    let evidence=RoiConicEvidence {exposure:fixture.exposures[0],sensor_origin_px:fixture.origins[0],
+        dimensions_px:[420,280],arcs:&arcs,conics:&hints,detail_reliability:Some(1.0)};
+    let problem=Problem::new(JointConicRequest {eyes:[Some(evidence),None],scene:&fixture.scene,
+        maximum_hypotheses:24,maximum_refinements:16,maximum_source_skew_ns:0,
+        exposure_uncertainty_ns:0,motion_bound_px_per_second:0.0}).unwrap();
+    let k=TARGET_PARAMETERS;
+    assert!(problem.seeds().iter().any(|p|(p[k+2]+350.0).abs()<1.0e-5&&(p[k+3]-6.0).abs()<1.0e-5),
+        "normal-only starts remain stuck in the first conic's center/range geometry");
+}

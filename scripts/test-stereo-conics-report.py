@@ -33,6 +33,26 @@ def row(index=1):
 
 
 class MatchingTests(unittest.TestCase):
+    def test_unlocalized_roi_exports_no_geometry_but_keeps_its_rejection_cost(self):
+        result={"available":True,"modeled_eyes":[True,False],"unlocalized_eye_cost":[0.0,3.0],
+            "target_camera_mm":[0.0,0.0,100.0],"eye_centers_camera_mm":[[0.0,0.0,-100.0],None],
+            "eye_gaze_directions":[[0.0,0.0,1.0],None],"outer_ellipses":[{"major_radius":20.0},None],
+            "contributing_eyes":[True,False]}
+        report.check_shared_target_contract(result)
+        for field,value in [("eye_centers_camera_mm",[0.0,0.0,-100.0]),("eye_gaze_directions",[0.0,0.0,1.0]),
+                            ("outer_ellipses",{"major_radius":20.0}),("contributing_eyes",True)]:
+            invalid=copy.deepcopy(result);invalid[field][1]=value
+            with self.assertRaises(ValueError):report.check_shared_target_contract(invalid)
+
+    def test_exported_eye_rays_really_share_the_declared_fixation(self):
+        result={"available":True,"modeled_eyes":[True,True],"unlocalized_eye_cost":[0.0,0.0],
+            "target_camera_mm":[0.0,0.0,100.0],"eye_centers_camera_mm":[[-3.0,0.0,96.0],[3.0,0.0,96.0]],
+            "eye_gaze_directions":[[0.6,0.0,0.8],[-0.6,0.0,0.8]],"outer_ellipses":[{},{}],
+            "contributing_eyes":[True,True]}
+        report.check_shared_target_contract(result)
+        result["eye_gaze_directions"][1]=[0.6,0.0,0.8]
+        with self.assertRaises(ValueError):report.check_shared_target_contract(result)
+
     def test_scale_uses_determinant_and_never_the_candidate_radius(self):
         a={"width":420,"height":280,"timestamp_ns":10,"sequence":1}
         b=dict(a,timestamp_ns=20,sequence=2,shared_global_scale={"reliable":True,"motion_support":16,

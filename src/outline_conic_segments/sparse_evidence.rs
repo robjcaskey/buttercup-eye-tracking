@@ -91,7 +91,7 @@ impl Default for RawArcConfig {
 /// Average a CFA-aligned 4×4 cell (one complete quad-Bayer color cell).
 /// Bilinear sampling these cell means avoids treating mosaic phase as an edge.
 /// This is custom native RAW decoding/photometry, not a rendered RGB thumbnail.
-fn luma(raw:&[u16],width:usize,height:usize,x:f64,y:f64) -> Option<f64> {
+pub(super) fn luma(raw:&[u16],width:usize,height:usize,x:f64,y:f64) -> Option<f64> {
     if !x.is_finite() || !y.is_finite() || x<1.5 || y<1.5 || x>width as f64-6.5 || y>height as f64-6.5 {return None;}
     let gx=(x-1.5)/4.0; let gy=(y-1.5)/4.0;
     let ix=gx.floor() as usize; let iy=gy.floor() as usize;

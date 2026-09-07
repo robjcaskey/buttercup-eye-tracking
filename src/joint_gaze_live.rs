@@ -178,6 +178,7 @@ pub(crate) fn json(frame:&EyeFrame)->Value {
             "clock_epoch":e.clock.epoch.to_string(),"sequence":e.sequence.to_string(),"sensor_timestamp_ns":e.timestamp_ns.to_string()}))),
         "eye_centers":s.eye_centers_camera_mm,"surface_normals":s.eye_normals,"gaze_directions":s.eye_gaze_directions,
         "contributing_eyes":s.contributing_eyes,"cost":s.robust_cost,"alternative_cost_margin":s.alternative_cost_margin,
+        "modeled_eyes":s.modeled_eyes,"unlocalized_eye_cost":s.unlocalized_eye_cost,
         "arcs":s.arcs.iter().map(|a|json!({"roi_id":a.exposure.roi.0,"group":a.evidence_group,"kind":format!("{:?}",a.kind),
             "used":a.used,"rms_px":a.rms_px,"sigma_px":a.sigma_px,
             "support_length_px":a.support_length_px,"evidence_weight":a.evidence_weight})).collect::<Vec<_>>(),
@@ -209,6 +210,30 @@ mod tests {
         }
         FrameEvidence {packet,pose:EyePoseInput {limbus_center_sensor_px:camera.project(center).unwrap(),
             pixels_per_10mm:Some([4000.0/35.0,100.0,130.0])}}
+    }
+
+    #[test]
+    fn fresh_empty_roi_clears_old_geometry_and_pairs_as_missing_not_as_a_held_eye() {
+        let camera=PinholeCamera {focal_px:[4000.0;2],principal_px:[4000.0,3000.0]};
+        let time=1_000_000_000;
+        let mut tracker=JointTracker::default();tracker.begin(clock("test:1"),7);
+        tracker.observe(evidence(0,time),camera).unwrap();
+        tracker.observe(evidence(1,time),camera).unwrap();
+        let now=time+100_000_000;
+        let mut missing=evidence(0,now);missing.packet.exposure.sequence+=1;
+        missing.packet.arcs.clear();missing.packet.conics.clear();
+        assert!(tracker.observe(missing,camera).is_err());
+        assert!(tracker.latest(0,clock("test:1"),now,500_000_000).is_none());
+        let mut other=evidence(1,now);other.packet.exposure.sequence+=1;
+        let current=tracker.observe(other,camera).unwrap().unwrap();
+        assert_eq!(current.solution.contributing_eyes,[false,true]);
+        assert!(current.solution.ellipses_roi_px[0][0].is_none());
+        assert!(current.exposures.into_iter().flatten().all(|e|e.timestamp_ns==now));
+        // Replayed old output cannot replace the fresh missing-eye state.
+        assert!(tracker.observe(evidence(0,time),camera).unwrap().is_none());
+        let latest=tracker.latest(0,clock("test:1"),now,500_000_000).unwrap();
+        assert_eq!(latest.exposures[0].unwrap().timestamp_ns,now);
+        assert!(!latest.solution.contributing_eyes[0]);
     }
 
     #[test]

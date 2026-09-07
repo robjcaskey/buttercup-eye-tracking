@@ -39,6 +39,39 @@ def adjacent_area_steps(timeline):
     return pixel_steps,normalized_steps
 
 
+def check_shared_target_contract(result):
+    """Check emitted geometry consistency, not anatomical/gaze accuracy.
+
+    Older exports did not declare modeled ROIs; do not infer that declaration
+    from contribution flags (an outlier-only modeled ROI is different).
+    """
+    if not result.get("available") or "modeled_eyes" not in result:
+        return
+    modeled=result["modeled_eyes"]
+    penalties=result["unlocalized_eye_cost"]
+    if len(modeled)!=2 or any(type(v) is not bool for v in modeled) or len(penalties)!=2 \
+            or any(not math.isfinite(v) or v<0 for v in penalties):
+        raise ValueError("invalid modeled-ROI declaration or unlocalized evidence cost")
+    target=result["target_camera_mm"]
+    if len(target)!=3 or not all(math.isfinite(v) for v in target):
+        raise ValueError("shared target is not a finite 3D point")
+    for eye in range(2):
+        center=result["eye_centers_camera_mm"][eye]
+        ray=result["eye_gaze_directions"][eye]
+        ellipse=result["outer_ellipses"][eye]
+        if not modeled[eye]:
+            if center is not None or ray is not None or ellipse is not None or result["contributing_eyes"][eye]:
+                raise ValueError("unlocalized ROI exported fabricated geometry or an admitted observation")
+            continue
+        if penalties[eye]!=0 or center is None or ray is None or len(center)!=3 or len(ray)!=3:
+            raise ValueError("modeled ROI has missing geometry or an unlocalized penalty")
+        delta=[t-c for t,c in zip(target,center)]
+        distance=math.sqrt(sum(v*v for v in delta))
+        if not math.isfinite(distance) or distance<=0 or not all(math.isfinite(v) for v in ray) \
+                or max(abs(v/distance-r) for v,r in zip(delta,ray))>1e-7:
+            raise ValueError("exported gaze ray does not point to the single shared target")
+
+
 def matched_algorithm_report(baseline, candidate, index_ranges):
     """Stream exact source-matched rows; never silently compare different probes.
 
@@ -136,6 +169,7 @@ def main():
     methods = ("joint", "monocular_right", "monocular_left")
     summary = {m: {"available": 0, "unavailable": collections.Counter(),
                    "contributing_eyes": collections.Counter(), "costs": [],
+                   "modeled_eyes": collections.Counter(), "unlocalized_eye_costs": [], "hypotheses": [],
                    "elapsed_ms": [], "alternative_margins": []} for m in methods}
     heldout = [[], []]
     matched_supported = [[], []]
@@ -169,7 +203,11 @@ def main():
                     aggregate["unavailable"][result.get("reason", row.get("error", "absent-result"))] += 1
                     continue
                 aggregate["available"] += 1
+                check_shared_target_contract(result)
                 aggregate["contributing_eyes"][str(result["contributing_eyes"])] += 1
+                aggregate["modeled_eyes"][str(result.get("modeled_eyes","legacy-unspecified"))] += 1
+                aggregate["unlocalized_eye_costs"].append(sum(result["unlocalized_eye_cost"]) if "unlocalized_eye_cost" in result else None)
+                aggregate["hypotheses"].append(result.get("hypotheses"))
                 aggregate["costs"].append(result["cost"])
                 aggregate["alternative_margins"].append(result["alternative_cost_margin"])
             joint = row.get("joint", {})
@@ -200,7 +238,7 @@ def main():
                               "joint_rms_px": pair[0], "monocular_rms_px": pair[1],
                               "indices": [v["index"] if v else None for v in inputs]})
     for aggregate in summary.values():
-        for key in ("costs", "elapsed_ms", "alternative_margins"):
+        for key in ("costs", "elapsed_ms", "alternative_margins", "unlocalized_eye_costs", "hypotheses"):
             aggregate[key] = distribution(aggregate[key])
     def comparisons_for(samples):
         return [{"eye": eye, "matched_reads": len(pairs),
