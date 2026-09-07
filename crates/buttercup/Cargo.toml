@@ -5,6 +5,6 @@ edition = "2021"
 description = "Portable Buttercup RAW10 decoding shared by native and browser viewers"
 
 [lib]
-path = "../../src/raw10.rs"
+path = "../../src/portable.rs"
 
 [workspace]

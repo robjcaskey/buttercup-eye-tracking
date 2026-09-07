@@ -67,6 +67,8 @@ mapfile -t unexpected_files < <(
       ./src/pupil_clock_supervision.rs \
       ./src/pivot_region_scheduler.rs \
       ./src/raw10.rs \
+      ./src/raw_preview.rs \
+      ./src/portable.rs \
       ./src/raw_eye_model_protocol.rs \
       ./src/raw_iris_focus.rs \
       ./src/raw_motion_octrees.rs \
