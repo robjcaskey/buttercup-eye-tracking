@@ -66,6 +66,15 @@ impl<D: Pointer> Controller<D> {
         self.device.as_ref().map(|_| self.generation)
     }
 
+    pub(crate) fn invalidate_global_settings(&mut self) {
+        self.last_target = None;
+        if self.device.is_some() {
+            self.pause = "paused: global gaze settings changed";
+        }
+        // Preserve last_source: a new display setting or repeated RAW source
+        // is not a fresh observation, nor a reason to reopen the uinput device.
+    }
+
     fn disable(&mut self) {
         self.device = None;
         self.generation = self.generation.wrapping_add(1);
@@ -328,6 +337,29 @@ mod tests {
         assert_eq!(c.emitted, 0);
         c.update(generation, now, sample(4, Duration::ZERO, (0.5, 0.5)));
         assert_eq!(c.emitted, 1);
+    }
+
+    #[test]
+    fn global_gaze_switch_pause_keeps_device_on_and_resumes_absolute_output() {
+        let now = Instant::now();
+        let mut c = Controller::<Fake>::default();
+        let fake = Fake::default();
+        let points = fake.points.clone();
+        c.set_enabled_with(true, now, || Ok(fake)).unwrap();
+        let generation = c.enabled_generation().unwrap();
+        c.update(generation, now, sample(10, Duration::ZERO, (0.0, 0.0)));
+        c.invalidate_global_settings();
+        assert_eq!(c.enabled_generation(), Some(generation));
+        assert!(c.snapshot()["last_unclamped_target"].is_null());
+        assert_eq!(*points.lock().unwrap(), [[0, 0]]);
+        let mut next = sample(11, Duration::ZERO, (1.0, 1.0)).unwrap();
+        next.source.authority += 1;
+        c.update(generation, now, Ok(next));
+        // The new detector's first admissible point is not eased toward the
+        // previous detector's point, and no re-enable/uinput reopen is needed.
+        assert_eq!(*points.lock().unwrap(), [[0, 0], [AXIS_MAX, AXIS_MAX]]);
+        c.update(generation, now, Ok(next));
+        assert_eq!(points.lock().unwrap().len(), 2);
     }
 
     #[test]

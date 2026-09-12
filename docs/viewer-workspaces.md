@@ -2,16 +2,19 @@
 
 The main screen answers three different questions without mixing their controls:
 
-1. **ROI**: what is happening in this region? Each eye remembers its pixel view
-   and overlay independently; selecting another region must not erase them.
-2. **Linked ROIs**: how do the observations compare? Compare, timing, and contact
+1. **ROI**: what is happening in this preview? Both previews inherit global
+   presentation defaults unless a pixel-view or overlay override is explicitly
+   set. Selecting another preview does not change camera or gaze settings.
+2. **Linked Views**: how do the observations compare? Compare, timing, and contact
    views keep separate source times and explicitly report missing regions. Two
-   visible eyes do not imply that the unimplemented stereo solver ran.
-3. **Global**: what does the camera see, and where are the regions? Sensor overview
+   visible eyes alone do not prove an admitted joint stereo solution.
+3. **Overview**: what does the camera see, and where are the regions? Sensor overview
    and prompted object inspection belong here, not in an iris overlay cycle.
 
 Tab changes workspace. F changes the view within that workspace. V changes image
-appearance where applicable. Object search is an explicit start/stop action,
+appearance where applicable. Shift+Tab switches between editing global preview
+defaults and overriding the selected preview. Backspace clears the selected
+preview's overrides so it inherits again. Object search is an explicit start/stop action,
 not a side effect of browsing. The selected eye's presentation is separate from
 the physical lens/exposure controls, which necessarily affect the whole camera.
 
@@ -64,6 +67,73 @@ solver and acceptance gates are unchanged. Main-screen lightbox/cursor
 compositing and source-aligned eye-overlay helpers are reused. The new view
 layer does not claim a stereo solve, fresh observations from held data, or an
 improvement to SN-FEIDA/localization accuracy.
+
+## Global gaze settings versus preview settings
+
+There is one global gaze configuration. **G** selects its detector and **Y**
+selects its compatible rough-center source; analysis bounds and other solver
+settings are global too. Focus follows eyes, absolute desktop mouse output,
+the J cursor, calibration and accuracy measurement use this configuration.
+They do not choose a detector from the preview being inspected. Camera focus
+reference is also separate from preview selection; **F2** explicitly changes
+the reference used by autofocus and gaze/calibration.
+
+Cursor projection and the main/thumbnail laser axes use the same signed,
+source-clock-bound gaze vector that calibration consumes, including Native,
+Driving and Clusters. The contact mesh can retain its geometric surface normal;
+that normal is not a fallback cursor direction when signed gaze is unavailable.
+
+**F** and **V** are presentation controls, not alternate gaze providers. A clean
+image, a mask, an ellipse, a contact or a diagnostic display can all inspect the
+same analysis. In particular, the experimental SAM tweaked-contact visualization
+is still preview-only; selecting it does not silently recalibrate or alter
+desktop gaze. The Overview tab means sensor context, not global settings.
+
+| Control | Scope |
+| --- | --- |
+| G / Y / solver bounds | Global analysis, regardless of preview edit scope |
+| Shift+Tab | Edit global preview defaults or selected-preview overrides |
+| F in ROI workspace | Overlay at the chosen edit scope |
+| V | Pixel appearance at the chosen edit scope |
+| Backspace | Remove selected-preview overrides; inherit defaults again |
+| 1 / 2 | Select left/right preview without changing analysis or autofocus |
+
+The default edit scope is global preview defaults. Overrides are per setting:
+overriding F does not freeze inherited V, or vice versa. Changing defaults leaves
+explicit overrides alone. Linked F changes the linked layout, and Overview F
+changes the overview page; neither creates a new eye-analysis method. Prompt
+editing and calibration retain their modal keyboard handling.
+
+Every published eye frame carries its analysis-settings revision. Before gaze
+is consumed, a common policy check compares the selected detector, settings,
+prompt and enabled-eye state. During a switch, old frames may remain available
+for inspection, but cannot drive outputs or calibration. This is a source
+validity gate, not a new anatomical confidence threshold or a reset of sign
+history for presentation changes. Completed calibration's existing behavior
+across legitimate sign-epoch changes is preserved.
+
+### Verification (September 12)
+
+The SAM-enabled live binary builds, and the no-default-features portable build
+checks successfully. The targeted Rust suite passes 91 tests; two real
+Sway/uinput integration tests remain explicitly ignored. The shortcut helper's
+10 Python tests pass. Source-tree and whitespace audits pass; existing compiler
+warnings remain.
+
+Coverage includes per-setting preview inheritance, Student single/linked F
+cycles, default mask/outline/ellipse/pupil/contact layer isolation, source-crop
+movement and resizing, stale global policy rejection, canceled in-flight focus
+decisions, shared calibration/cursor/laser directions and completed-calibration
+continuity. Rendered desktop, compact and tall layouts and isolated Student
+layers were inspected. A clockless-contact legacy laser fixture was updated to
+supply an explicit published gaze source, with a negative assertion that the
+clockless contact cannot drive output.
+
+Artifacts: `outputs/gaze-preview-scope.KnG3CF/verified-tests.log` and adjacent
+build logs/PPM renders. Renderer evidence is synthetic, not a new corpus accuracy
+or SN-FEIDA result. Model weights, inference, fitting and anatomical confidence
+thresholds were not changed. Live user calibration and desktop focus accuracy
+have not been remeasured by this change.
 
 ## Desktop gaze mouse (uinput)
 

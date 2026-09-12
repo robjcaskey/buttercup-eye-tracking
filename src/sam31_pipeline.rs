@@ -16,6 +16,31 @@ pub(super) fn channel<T>() -> (Sender<T>, Receiver<T>) {
 }
 
 impl<T> Sender<T> {
+    /// Replace a stereo waiting group atomically. Callers mark a group's
+    /// first claim inside `recv_with`, under these same mailbox locks.
+    pub(super) fn try_send_pair(&self, other:&Self, values:[T;2],
+        replace:impl Fn(&T,&T)->bool)->Result<[bool;2],TrySendError<[T;2]>> {
+        if Arc::ptr_eq(&self.0,&other.0) {return Err(TrySendError::Disconnected(values));}
+        // Stable lock order also makes reverse caller order deadlock-free.
+        let (low,high,forward)=if Arc::as_ptr(&self.0)<Arc::as_ptr(&other.0) {
+            (&self.0,&other.0,true)
+        } else {(&other.0,&self.0,false)};
+        let Ok(low_guard)=low.state.lock() else {return Err(TrySendError::Disconnected(values));};
+        let Ok(high_guard)=high.state.lock() else {return Err(TrySendError::Disconnected(values));};
+        let (mut first,mut second)=if forward {(low_guard,high_guard)} else {(high_guard,low_guard)};
+        if first.closed||second.closed {return Err(TrySendError::Disconnected(values));}
+        if first.pending.as_ref().is_some_and(|old|!replace(&values[0],old))
+            ||second.pending.as_ref().is_some_and(|old|!replace(&values[1],old)) {
+            return Err(TrySendError::Full(values));
+        }
+        let [a,b]=values;
+        let old=[first.pending.replace(a),second.pending.replace(b)];
+        let replaced=[old[0].is_some(),old[1].is_some()];
+        drop(first);drop(second);drop(old);
+        self.0.ready.notify_one();other.0.ready.notify_one();
+        Ok(replaced)
+    }
+
     /// True means a waiting item was superseded, before expensive processing.
     pub(super) fn try_send(&self, value: T, replace: impl FnOnce(&T, &T) -> bool)
         -> Result<bool, TrySendError<T>> {
@@ -36,10 +61,14 @@ impl<T> Sender<T> {
 }
 impl<T> Receiver<T> {
     pub(super) fn recv(&self) -> Result<T, RecvError> {
+        self.recv_with(|_|{})
+    }
+
+    pub(super) fn recv_with(&self, claimed:impl FnOnce(&T)) -> Result<T, RecvError> {
         let mut state = self.0.state.lock().map_err(|_| RecvError)?;
         loop {
             if state.closed { return Err(RecvError); }
-            if let Some(value) = state.pending.take() { return Ok(value); }
+            if let Some(value) = state.pending.take() {claimed(&value);return Ok(value);}
             state = self.0.ready.wait(state).map_err(|_| RecvError)?;
         }
     }

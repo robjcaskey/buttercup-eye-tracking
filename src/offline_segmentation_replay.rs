@@ -16,6 +16,7 @@ mod sign_acquisition;
 pub(super) use sign_acquisition::run as sign_acquisition_trial;
 mod stereo;
 pub(super) use stereo::export as stereo_sam_export;
+pub(super) use stereo::export_motion as stereo_motion_export;
 
 #[derive(Default)]
 struct ModelAggregate {

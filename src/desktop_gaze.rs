@@ -1,7 +1,7 @@
 //! Shared gaze input for the independent pointer and window-focus outputs.
 //! Hidden windows still get event-loop ticks. Preparation/mapping matches draw.
 use crate::mouse_output::{Sample, Source};
-use crate::{App, EyeFrame, SegmentationMode, VirtualContactAuthority};
+use crate::{App, EyeFrame, GlobalGazePolicy, SegmentationMode, SharedState, VirtualContactAuthority, VirtualDisplayPlane};
 use std::time::{Duration, Instant};
 
 pub(crate) fn tick(app: &mut App) {
@@ -31,6 +31,14 @@ pub(crate) fn tick(app: &mut App) {
     };
     let error = app.shared.lock().ok().and_then(|mut shared| {
         let now = Instant::now();
+        // Projection happens outside this lock. A concurrent G/settings,
+        // reference-eye or monitor change must not republish the old target
+        // after the mutation synchronously canceled pending desktop work.
+        let sample = sample.and_then(|(sample, selection)| {
+            (selection == Selection::from_shared(&shared))
+                .then_some(sample)
+                .ok_or("paused: global gaze selection changed during projection")
+        });
         if let Some(generation) = focus_generation {
             shared.gaze_focus.publish(generation, now, sample);
         }
@@ -55,6 +63,7 @@ pub(crate) fn tick(app: &mut App) {
 }
 
 fn source(frame: &EyeFrame, prompt_generation: u64) -> Result<Source, &'static str> {
+    if let Some(reason) = frame.gaze_policy_error { return Err(reason); }
     if !frame.eye_identity_present {
         return Err("paused: eye not present");
     }
@@ -65,7 +74,7 @@ fn source(frame: &EyeFrame, prompt_generation: u64) -> Result<Source, &'static s
     let timestamp_ns = surface
         .source_timestamp_ns
         .ok_or("paused: no gaze source clock")?;
-    if frame.segmentation_mode == SegmentationMode::Sam31
+    if frame.segmentation_mode.uses_mask_geometry()
         && !frame.sam31_proposal_masks.as_ref().is_some_and(|p| {
             p.source_timestamp_ns == timestamp_ns
                 && p.prompt_generation == prompt_generation
@@ -82,7 +91,25 @@ fn source(frame: &EyeFrame, prompt_generation: u64) -> Result<Source, &'static s
     })
 }
 
-fn current_sample(app: &App) -> Result<Sample, &'static str> {
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Selection {
+    policy: GlobalGazePolicy,
+    eye: usize,
+    plane: VirtualDisplayPlane,
+    object_search: bool,
+}
+impl Selection {
+    fn from_shared(s: &SharedState) -> Self {
+        Self {
+            policy: GlobalGazePolicy::from_shared(s),
+            eye: s.focus_eye,
+            plane: s.monitor_location.effective_plane(),
+            object_search: s.sam31_object_inspection,
+        }
+    }
+}
+
+fn current_sample(app: &App) -> Result<(Sample, Selection), &'static str> {
     // No desktop pointer movement while collecting targets, editing a prompt,
     // or doing non-eye object search. Neither pause toggles J or stops analysis.
     if app.virtual_mouse.is_some() || app.accuracy_requested || app.accuracy_check.is_some() {
@@ -91,7 +118,7 @@ fn current_sample(app: &App) -> Result<Sample, &'static str> {
     if app.sam31_prompt_editor.is_some() {
         return Err("paused: prompt editor");
     }
-    let (prompt_generation, plane, trace) = {
+    let (selection, trace) = {
         let s = app
             .shared
             .lock()
@@ -100,19 +127,18 @@ fn current_sample(app: &App) -> Result<Sample, &'static str> {
             return Err("paused: object search");
         }
         (
-            s.sam31_prompt_bundle_generation,
-            s.monitor_location.effective_plane(),
+            Selection::from_shared(&s),
             s.recording_trace.clone(),
         )
     };
-    let mut frame = app.eyes[app.focus_eye]
+    let mut frame = app.eyes[selection.eye]
         .clone()
         .ok_or("paused: no eye frame")?;
-    let source = source(&frame, prompt_generation)?;
+    crate::prepare_current_contact_frame(app, selection.eye, &mut frame, selection.policy);
+    let source = source(&frame, selection.policy.prompt_generation)?;
     let age = trace
         .source_arrival_age(frame.eye_id, source.timestamp_ns)
         .ok_or("paused: unknown or ambiguous source clock")?;
-    crate::prepare_current_contact_frame(app, app.focus_eye, &mut frame, prompt_generation);
     let pose = crate::virtual_contact_pose(&frame).ok_or("paused: no current virtual contact")?;
     if pose.authority == VirtualContactAuthority::MotionHeld {
         return Err("paused: held contact is not a fresh observation");
@@ -120,14 +146,14 @@ fn current_sample(app: &App) -> Result<Sample, &'static str> {
     let pose=crate::pose_for_cursor(&frame,pose).ok_or("paused: no current joint gaze ray")?;
     let calibration = app
         .calibrated_display
-        .and_then(|c| c.for_frame(app.focus_eye, Some(&frame)));
-    let target = crate::display_gaze_target(pose, calibration, plane)
+        .and_then(|c| c.for_frame(selection.eye, Some(&frame)));
+    let target = crate::display_gaze_target(pose, calibration, selection.plane)
         .ok_or("paused: no forward monitor intersection")?;
-    Ok(Sample {
+    Ok((Sample {
         source,
         age,
         target,
-    })
+    }, selection))
 }
 
 #[cfg(test)]
@@ -146,6 +172,180 @@ mod tests {
             sign_epoch: 7,
             kinematic_sign_correction: [false; 2],
             sign_diagnostics: None,
+        }
+    }
+
+    #[test]
+    fn every_gaze_consumer_rejects_previous_global_method_or_settings() {
+        let mut state = SharedState::default();
+        state.segmentation_mode = SegmentationMode::Sam31;
+        state.segmentation_generation = 8;
+        state.sam31_prompt_bundle_generation = 3;
+        let mut frame = crate::tests::control_eye_frame(1);
+        frame.eye_identity_present = true;
+        frame.segmentation_mode = SegmentationMode::Sam31;
+        frame.gaze_settings_generation = 8;
+        frame.gaze_authority_sam_prompt_generation = Some(3);
+        frame.virtual_contact_surface_gaze = Some(surface());
+        frame.sam31_proposal_masks = Some(std::sync::Arc::new(crate::sam31_outer::ProposalMasks {
+            source_timestamp_ns: 100,
+            prompt_generation: 3,
+            ..Default::default()
+        }));
+        assert_eq!(GlobalGazePolicy::from_shared(&state).frame_error(&frame), None);
+        assert!(source(&frame, 3).is_ok());
+
+        for (method, revision, reason) in [
+            (SegmentationMode::EyeStudent, 9, "paused: waiting for global gaze method"),
+            // Same enum after a round-trip must not resurrect old settings.
+            (SegmentationMode::Sam31, 10, "paused: waiting for global gaze settings"),
+        ] {
+            state.segmentation_mode = method;
+            state.segmentation_generation = revision;
+            frame.gaze_policy_error = GlobalGazePolicy::from_shared(&state).frame_error(&frame);
+            assert_eq!(frame.gaze_policy_error, Some(reason));
+            assert_eq!(source(&frame, 3).unwrap_err(), reason);
+            assert!(crate::mouse_gaze_surface(&frame).is_none());
+            assert!(crate::gaze_feature(&frame).is_none());
+            assert!(crate::virtual_contact_pose(&frame).is_none());
+        }
+        // Invalidation is a freshness fence, not destructive tracker editing.
+        assert_eq!(frame.virtual_contact_surface_gaze.unwrap().sign_epoch, 7);
+        assert!(frame.virtual_contact_surface_gaze.unwrap().sign_resolved);
+    }
+
+    #[test]
+    fn global_prompt_stereo_and_enabled_eye_are_part_of_the_source_contract() {
+        let mut state = SharedState::default();
+        state.segmentation_mode = SegmentationMode::Sam31;
+        let mut frame = crate::tests::control_eye_frame(1);
+        frame.segmentation_mode = SegmentationMode::Sam31;
+        frame.gaze_authority_sam_prompt_generation = Some(0);
+        assert_eq!(GlobalGazePolicy::from_shared(&state).frame_error(&frame), None);
+        state.sam31_prompt_bundle_generation = 1;
+        assert_eq!(GlobalGazePolicy::from_shared(&state).frame_error(&frame),
+            Some("paused: waiting for global gaze prompt"));
+        frame.gaze_authority_sam_prompt_generation = Some(1);
+        state.second_roi_enabled = true;
+        assert_eq!(GlobalGazePolicy::from_shared(&state).frame_error(&frame),
+            Some("paused: waiting for global stereo setting"));
+        frame.joint_gaze_active = true;
+        frame.eye_id = 2;
+        assert_eq!(GlobalGazePolicy::from_shared(&state).frame_error(&frame), None);
+        state.second_roi_enabled = false;
+        assert_eq!(GlobalGazePolicy::from_shared(&state).frame_error(&frame),
+            Some("paused: reference eye analysis disabled"));
+    }
+
+    #[test]
+    fn sizing_freshness_does_not_reset_sign_or_completed_calibration() {
+        let mut state = SharedState::default();
+        let mut frame = crate::tests::control_eye_frame(1);
+        frame.surface_gaze = Some(surface());
+        let calibration = crate::CalibratedDisplay {
+            eye: 0,
+            segmentation_mode: frame.segmentation_mode,
+            sam_prompt_generation: None,
+            gaze_authority_generation: frame.gaze_authority_generation,
+            sign_epoch: 7,
+            plane: VirtualDisplayPlane::development_default(),
+            gaze_affine: crate::GazeAffine { x: [1.0, 0.0, 0.0], y: [0.0, 1.0, 0.0] },
+        };
+        crate::bump_pupil_sizing_generation(&mut state);
+        assert_eq!(state.gaze_input_generation, 0);
+        frame.gaze_policy_error = GlobalGazePolicy::from_shared(&state).frame_error(&frame);
+        assert!(calibration.for_frame(0, Some(&frame)).is_none());
+        // Next RAW analysis uses the new sizing policy with the same sign/basis.
+        frame.gaze_settings_generation = state.segmentation_generation;
+        frame.gaze_policy_error = GlobalGazePolicy::from_shared(&state).frame_error(&frame);
+        assert!(calibration.for_frame(0, Some(&frame)).is_some());
+        assert_eq!(frame.surface_gaze.unwrap().sign_epoch, 7);
+        crate::bump_iris_runtime_policy_generation(&mut state);
+        assert_eq!(state.gaze_input_generation, 0);
+        assert_eq!(GlobalGazePolicy::from_shared(&state).frame_error(&frame),
+            Some("paused: waiting for global gaze settings"));
+    }
+
+    #[test]
+    fn in_flight_desktop_projection_is_bound_to_global_selection_not_preview() {
+        let mut state = SharedState::default();
+        let captured = Selection::from_shared(&state);
+        let mut preview = crate::viewer_ui::Workspace::default();
+        preview.cycle_view(SegmentationMode::Sam31);
+        preview.selected = 1;
+        preview.scope = crate::viewer_ui::Scope::Linked;
+        assert_eq!(captured, Selection::from_shared(&state));
+        state.focus_eye = 1;
+        assert_ne!(captured, Selection::from_shared(&state));
+        state.focus_eye = 0;
+        state.sam31_object_inspection = true;
+        assert_ne!(captured, Selection::from_shared(&state));
+        state.sam31_object_inspection = false;
+        let mut plane = state.monitor_location.effective_plane();
+        plane.center_inches[0] += 1.0;
+        state.monitor_location.offer(plane);
+        assert_ne!(captured, Selection::from_shared(&state));
+    }
+
+    #[test]
+    fn cursor_and_laser_use_calibrations_signed_surface_not_a_divergent_contact_normal() {
+        for method in [SegmentationMode::Native, SegmentationMode::Driving, SegmentationMode::Clusters] {
+            let mut frame = crate::tests::control_eye_frame(1);
+            frame.segmentation_mode = method;
+            frame.surface_gaze = Some(surface());
+            let contact_normal = crate::RelativeGazeVector::from_projected(-0.4, 0.5).unwrap();
+            frame.virtual_contact_surface_gaze = Some(crate::SurfaceGazeSample {
+                relative_gaze: contact_normal, ..surface()
+            });
+            let contact = crate::VirtualContactPose {
+                rotation_center: (20.0, 30.0),
+                rotation_center_z: Some(-40.0),
+                relative_gaze: contact_normal,
+                sphere_radius: Some(50.0),
+                authority: VirtualContactAuthority::MotionLocked,
+            };
+            let cursor = crate::pose_for_cursor(&frame, contact).unwrap();
+            assert_eq!(cursor.relative_gaze, surface().relative_gaze, "{method:?}");
+            assert_eq!(crate::gaze_feature(&frame), Some(cursor.relative_gaze.projected()));
+            assert_eq!(crate::gaze_output_direction(&frame), Some(cursor.relative_gaze));
+            assert_eq!(cursor.rotation_center, contact.rotation_center);
+            assert_eq!(cursor.sphere_radius, contact.sphere_radius);
+            assert_eq!(contact.relative_gaze, contact_normal, "globe normal remains presentation geometry");
+
+            frame.surface_gaze.as_mut().unwrap().sign_resolved = false;
+            assert!(crate::pose_for_cursor(&frame, contact).is_none());
+            frame.surface_gaze = Some(crate::SurfaceGazeSample { source_timestamp_ns: None, ..surface() });
+            assert!(crate::pose_for_cursor(&frame, contact).is_none());
+            frame.surface_gaze = Some(crate::SurfaceGazeSample {
+                source_timestamp_ns: Some(frame.timestamp_ns + 1), ..surface()
+            });
+            assert!(crate::pose_for_cursor(&frame, contact).is_none());
+            frame.surface_gaze = Some(surface());
+            frame.gaze_policy_error = Some("paused: waiting for global gaze settings");
+            assert!(crate::pose_for_cursor(&frame, contact).is_none());
+        }
+    }
+
+    #[test]
+    fn sam_output_direction_requires_exact_source_and_never_uses_native_fallback() {
+        for method in [SegmentationMode::Sam31, SegmentationMode::EyeStudent] {
+            let mut frame = crate::tests::control_eye_frame(1);
+            frame.segmentation_mode = method;
+            frame.surface_gaze = Some(surface());
+            frame.virtual_contact_surface_gaze = Some(surface());
+            frame.gaze_authority_sam_prompt_generation = Some(3);
+            assert!(crate::gaze_output_direction(&frame).is_none());
+            frame.sam31_proposal_masks = Some(std::sync::Arc::new(crate::sam31_outer::ProposalMasks {
+                source_timestamp_ns: 101, prompt_generation: 3, ..Default::default()
+            }));
+            assert!(crate::gaze_output_direction(&frame).is_none());
+            std::sync::Arc::make_mut(frame.sam31_proposal_masks.as_mut().unwrap()).source_timestamp_ns = 100;
+            assert_eq!(crate::gaze_output_direction(&frame), Some(surface().relative_gaze));
+            frame.gaze_authority_sam_prompt_generation = Some(4);
+            assert!(crate::gaze_output_direction(&frame).is_none());
+            frame.gaze_authority_sam_prompt_generation = Some(3);
+            frame.virtual_contact_surface_gaze.as_mut().unwrap().sign_resolved = false;
+            assert!(crate::gaze_output_direction(&frame).is_none());
         }
     }
 

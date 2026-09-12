@@ -17,12 +17,17 @@ ordered video-memory tracking and RAW/conic fitting of exposure N. The image
 stage owns its model, prompts, pinned staging and photometric state. The tracking
 stage alone owns the video memory, pupil history and geometry decisions. Each
 stage has its own CUDA stream. The second eye loads tensors only when used;
-second-ROI analysis still starts **off** (3 toggles it). Disabled/missing eyes do
-not make their sibling wait for a pair.
+second-ROI analysis still starts **off** (3 toggles it). An actually evicted eye
+does not make its sibling wait for a pair. In joint SAM mode with both ROIs
+resident, input is submitted as one attested same-read group; an incomplete
+nominal stereo read is dropped instead of borrowing the other eye's old RAW.
 
 There is one replaceable waiting RAW exposure per eye, one image-stage exposure,
 and one tracking-stage exposure. A rendezvous between stages prevents a FIFO of
-encoded frames. As load increases, newer RAW replaces older waiting RAW before
+encoded frames. Joint-mode waiting pairs are replaced atomically; after one
+lane claims its half, the other half is protected until claimed too. Outside
+joint mode each lane retains its independent latest-frame policy. As load
+increases, newer RAW replaces older waiting RAW before
 expensive processing starts; as load falls, fewer or no frames are replaced.
 No manually chosen inference FPS is required. Already-processing work is not
 repeatedly discarded just because another camera exposure arrived (which could
@@ -35,6 +40,16 @@ per eye, with the existing duplicate/source-gap/session guards unchanged. The
 optional pupil prompt reuses the current image features when supported; its
 mask is selected/fitted only in the ordered tracking stage. Optional inference
 failure cannot authorize a different cold RAW pupil acquisition.
+
+Host-side admission matters before these GPU lanes: beginning a nearly stale
+first ROI can otherwise spend the second ROI's remaining 200 ms queue budget.
+The host now anticipates that paired work using bounded measured CPU timings;
+it can shed an aging read early but cannot grant stale-packet exceptions.
+Active recording preserves native ingress before analysis shedding, and
+`source_dropped` metadata distinguishes saved-but-unanalyzed RAW from discarded
+payloads. The dark recent calibration contained 191 incomplete archived reads,
+all with exact host partner-drop receipts. See the measured limits and
+recovery tradeoffs in [the host-queue audit](joint-conic-solver.md#the-host-queue-was-selectively-discarding-the-second-eye).
 
 Prompt reloads update one revision under a mutex; each submitted batch retains
 its immutable prompt reference and generation. Both lanes load the new revision

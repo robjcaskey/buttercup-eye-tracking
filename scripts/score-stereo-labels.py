@@ -67,6 +67,23 @@ def metrics(label, ellipse):
                   "bands_intersected": sum(bands[key])} for key, values in strata.items()}
 
 
+def prediction_metrics(label,row,eye):
+    """Missing exports are not failed detectors or invented monocular results."""
+    score={}
+    if ("raw_admitted" in row)!=("baseline_sam_outer" in row):
+        raise ValueError("incomplete SAM reference export")
+    if "baseline_sam_outer" in row:
+        score["SAM"]={"accepted":row["raw_admitted"][eye],
+            "metrics":metrics(label,row["baseline_sam_outer"][eye])}
+    for name in ("joint","monocular_right" if eye==0 else "monocular_left"):
+        if name not in row:continue
+        fit=row[name]
+        ellipse=fit.get("outer_ellipses",[None,None])[eye]
+        score[name]={"accepted":bool(fit.get("available",False) and fit.get("contributing_eyes",[False,False])[eye]),
+            "metrics":metrics(label,ellipse)}
+    return score
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("inventory", type=Path)
@@ -112,13 +129,7 @@ def main():
                 for eye, receipt in enumerate(row.get("inputs", [])):
                     for item in by_index.get(receipt["index"] if receipt else None, []):
                         score = {"evaluation": str(evaluation), "index": receipt["index"]}
-                        score["SAM"] = {"accepted": row["raw_admitted"][eye],
-                            "metrics": metrics(item["document"], row["baseline_sam_outer"][eye])}
-                        for name in ("joint", "monocular_right" if eye == 0 else "monocular_left"):
-                            fit = row.get(name, {})
-                            ellipse = fit.get("outer_ellipses", [None, None])[eye]
-                            score[name] = {"accepted": fit.get("contributing_eyes", [False, False])[eye],
-                                "metrics": metrics(item["document"], ellipse)}
+                        score.update(prediction_metrics(item["document"],row,eye))
                         item["scores"].append(score)
     for item in labels:
         del item["document"]

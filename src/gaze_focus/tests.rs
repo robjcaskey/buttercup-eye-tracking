@@ -134,6 +134,33 @@ fn repeat_and_out_of_order_sources_do_not_advance_dwell() {
 }
 
 #[test]
+fn global_gaze_authority_switch_requires_a_new_complete_focus_dwell() {
+    // Changing the global detector/basis cannot finish a fixation collected
+    // with the previous detector, even when both point at the same window.
+    let now = Instant::now();
+    let mut dwell = Dwell::default();
+    assert!(dwell.observe(now, source(1), hit(2)).is_none());
+    assert!(dwell
+        .observe(now + Duration::from_millis(200), source(2), hit(2))
+        .is_none());
+    let next = |t| Source {
+        authority: 2,
+        ..source(t)
+    };
+    assert!(source_advanced(Some(source(2)), next(3)));
+    assert!(dwell
+        .observe(now + Duration::from_millis(400), next(3), hit(2))
+        .is_none());
+    assert!(dwell
+        .observe(now + Duration::from_millis(600), next(4), hit(2))
+        .is_none());
+    assert_eq!(
+        dwell.observe(now + Duration::from_millis(800), next(5), hit(2)),
+        Some(target(2))
+    );
+}
+
+#[test]
 fn delayed_short_source_sequence_is_not_a_long_fixation() {
     let now = Instant::now();
     let mut d = Dwell::default();
@@ -200,6 +227,84 @@ fn worker_starts_off_and_off_invalidates_old_publications() {
     c.publish(generation, Instant::now(), Ok(sample(20)));
     assert!(c.channel.state.lock().unwrap().input.is_none());
     c.disable();
+}
+
+#[test]
+fn global_settings_invalidation_discards_pending_input_without_disabling_focus() {
+    let c = Controller::default();
+    {
+        // Exercise the same channel state as an enabled worker without
+        // spawning a compositor client or changing actual window focus.
+        let mut s = c.channel.state.lock().unwrap();
+        s.enabled_at = Some(Instant::now());
+        s.generation = 7;
+        s.input = Some(Input { at: Instant::now(), sample: Ok(sample(1)) });
+        s.pending = Some(2);
+        s.revision = 10;
+        s.policy_revision = 3;
+    }
+    c.invalidate_global_settings();
+    assert_eq!(c.enabled_generation(), Some(7));
+    {
+        let s = c.channel.state.lock().unwrap();
+        assert!(s.input.is_none());
+        assert!(s.pending.is_none());
+        assert_eq!(s.revision, 11);
+        assert_eq!(s.policy_revision, 4);
+    }
+    // A new publication may replace the empty input before the worker wakes.
+    // The independent policy revision must still mark the previous dwell and
+    // in-flight layout query as obsolete.
+    c.publish(7, Instant::now(), Ok(sample(2)));
+    let s = c.channel.state.lock().unwrap();
+    assert_eq!(s.policy_revision, 4);
+    assert_eq!(s.input.unwrap().sample.unwrap().source, source(2));
+}
+
+#[test]
+fn global_settings_change_cancels_a_focus_decision_in_flight() {
+    use std::sync::mpsc;
+    struct BlockingHit {
+        hits: u32,
+        entered: mpsc::Sender<u32>,
+        resume: mpsc::Receiver<()>,
+        focused: Arc<Mutex<Vec<u64>>>,
+    }
+    impl Backend for BlockingHit {
+        fn hit(&mut self, _: (f64, f64)) -> Result<Hit, String> {
+            self.hits += 1;
+            self.entered.send(self.hits).unwrap();
+            if self.hits == 3 {
+                self.resume.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+            Ok(hit(2))
+        }
+        fn focus(&mut self, target: Target) -> Result<(), String> {
+            self.focused.lock().unwrap().push(target.id);
+            Ok(())
+        }
+    }
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let focused = Arc::new(Mutex::new(Vec::new()));
+    let mut controller = Controller::default();
+    controller.start(BlockingHit {
+        hits: 0, entered: entered_tx, resume: resume_rx, focused: focused.clone(),
+    }, "TEST".into()).unwrap();
+    let generation = controller.enabled_generation().unwrap();
+    for timestamp in 1..=3 {
+        if timestamp > 1 { std::thread::sleep(Duration::from_millis(210)); }
+        controller.publish(generation, Instant::now(), Ok(sample(timestamp)));
+        assert_eq!(entered_rx.recv_timeout(Duration::from_secs(1)).unwrap(), timestamp as u32);
+    }
+    // The third query would complete the old dwell. Invalidate while it is
+    // blocked in IPC, then replace the input immediately with a fresh sample.
+    controller.invalidate_global_settings();
+    controller.publish(generation, Instant::now(), Ok(sample(4)));
+    resume_tx.send(()).unwrap();
+    assert_eq!(entered_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 4);
+    controller.disable();
+    assert!(focused.lock().unwrap().is_empty());
 }
 
 #[test]

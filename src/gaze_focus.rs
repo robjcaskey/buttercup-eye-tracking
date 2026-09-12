@@ -121,6 +121,9 @@ struct State {
     enabled_at: Option<Instant>,
     generation: u64,
     revision: u64,
+    /// Global input-policy changes do not turn the output off, but do discard
+    /// dwell accumulated with a different analysis configuration.
+    policy_revision: u64,
     input: Option<Input>,
     status: String,
     error: Option<String>,
@@ -179,6 +182,18 @@ impl Controller {
         }
         s.input = Some(Input { at: now, sample });
         s.revision = s.revision.wrapping_add(1);
+        self.channel.wake.notify_one();
+    }
+
+    pub(crate) fn invalidate_global_settings(&self) {
+        let mut s = self.channel.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.policy_revision = s.policy_revision.wrapping_add(1);
+        s.revision = s.revision.wrapping_add(1);
+        s.input = None;
+        s.pending = None;
+        if s.enabled_at.is_some() {
+            s.status = "paused: global gaze settings changed".into();
+        }
         self.channel.wake.notify_one();
     }
 
@@ -269,6 +284,7 @@ fn source_advanced(last: Option<Source>, current: Source) -> bool {
 
 fn run_worker(channel: Arc<Channel>, generation: u64, mut backend: impl Backend) {
     let mut last_revision = 0;
+    let mut last_policy_revision = None;
     let mut last_source = None;
     let mut dwell = Dwell::default();
     loop {
@@ -290,6 +306,11 @@ fn run_worker(channel: Arc<Channel>, generation: u64, mut backend: impl Backend)
         let Some(enabled_at) = s.enabled_at.filter(|_| s.generation == generation) else {
             return;
         };
+        let policy_revision = s.policy_revision;
+        if last_policy_revision != Some(policy_revision) {
+            dwell = Dwell::default();
+            last_policy_revision = Some(policy_revision);
+        }
         last_revision = s.revision;
         let Some(input) = s.input else {
             continue;
@@ -312,6 +333,9 @@ fn run_worker(channel: Arc<Channel>, generation: u64, mut backend: impl Backend)
         let mut s = channel.state.lock().unwrap_or_else(|e| e.into_inner());
         if s.enabled_at.is_none() || s.generation != generation {
             return;
+        }
+        if s.policy_revision != policy_revision {
+            continue;
         }
         // A newer observation/missing-eye update arriving during IPC cancels
         // this result; never send a queued decision for the preceding gaze.

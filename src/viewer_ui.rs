@@ -19,9 +19,9 @@ impl Scope {
     }
     pub fn label(self) -> &'static str {
         match self {
-            Self::Roi => "ROI",
-            Self::Linked => "LINKED ROIS",
-            Self::Global => "GLOBAL",
+            Self::Roi => "PREVIEW",
+            Self::Linked => "LINKED VIEWS",
+            Self::Global => "OVERVIEW",
         }
     }
 }
@@ -31,20 +31,38 @@ pub(super) enum LinkedView {
     Compare,
     Timing,
     Contacts,
+    TweakedContacts,
+    StudentMaskOutline,
+    StudentEllipseOnly,
+    StudentPupilOnly,
 }
 impl LinkedView {
-    fn next(self) -> Self {
-        match self {
-            Self::Compare => Self::Timing,
-            Self::Timing => Self::Contacts,
-            Self::Contacts => Self::Compare,
+    fn available(method: SegmentationMode) -> &'static [Self] {
+        match method {
+            SegmentationMode::Sam31 => &[Self::Compare, Self::Timing, Self::Contacts, Self::TweakedContacts],
+            SegmentationMode::EyeStudent => &[Self::Compare, Self::StudentEllipseOnly,
+                Self::StudentMaskOutline, Self::StudentPupilOnly, Self::Contacts, Self::Timing],
+            _ => &[Self::Compare, Self::Timing, Self::Contacts],
         }
+    }
+    fn next(self, method: SegmentationMode) -> Self {
+        let views = Self::available(method);
+        let index = views.iter().position(|view| *view == self).unwrap_or(0);
+        views[(index + 1) % views.len()]
+    }
+    fn position_for(self, method: SegmentationMode) -> (usize, usize) {
+        let views = Self::available(method);
+        (views.iter().position(|view| *view == self).unwrap_or(0) + 1, views.len())
     }
     fn label(self) -> &'static str {
         match self {
             Self::Compare => "COMPARE",
             Self::Timing => "SOURCE TIMING",
             Self::Contacts => "CONTACT GEOMETRY",
+            Self::TweakedContacts => "TWEAKED CONTACT GEOMETRY / EXPERIMENTAL",
+            Self::StudentMaskOutline => "STUDENT MASK OUTLINES",
+            Self::StudentEllipseOnly => "STUDENT FITTED LIMBUS ONLY",
+            Self::StudentPupilOnly => "STUDENT PUPIL ONLY",
         }
     }
 }
@@ -80,7 +98,7 @@ impl Panel {
         }
     }
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct RoiView {
     pub pixels: ViewMode,
     pub overlay: RoiOverlayMode,
@@ -93,10 +111,54 @@ impl Default for RoiView {
         }
     }
 }
+/// This controls presentation edits, never the detector or camera settings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum PreviewEditScope {
+    #[default]
+    GlobalDefaults,
+    SelectedPreview,
+}
+impl PreviewEditScope {
+    fn next(self) -> Self {
+        match self {
+            Self::GlobalDefaults => Self::SelectedPreview,
+            Self::SelectedPreview => Self::GlobalDefaults,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::GlobalDefaults => "GLOBAL PREVIEW DEFAULTS",
+            Self::SelectedPreview => "SELECTED PREVIEW OVERRIDE",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default)]
+struct PreviewOverrides {
+    pixels: Option<ViewMode>,
+    overlay: Option<RoiOverlayMode>,
+}
+impl PreviewOverrides {
+    fn resolve(self, defaults: RoiView) -> RoiView {
+        RoiView {
+            pixels: self.pixels.unwrap_or(defaults.pixels),
+            overlay: self.overlay.unwrap_or(defaults.overlay),
+        }
+    }
+    fn label(self) -> &'static str {
+        match (self.overlay.is_some(), self.pixels.is_some()) {
+            (false, false) => "INHERITS GLOBAL PREVIEW DEFAULTS",
+            (true, false) => "F OVERRIDE / V INHERITED",
+            (false, true) => "F INHERITED / V OVERRIDE",
+            (true, true) => "F + V OVERRIDDEN",
+        }
+    }
+}
 pub(super) struct Workspace {
     pub scope: Scope,
     pub selected: usize,
-    pub rois: [RoiView; 2],
+    pub preview_defaults: RoiView,
+    pub preview_edit_scope: PreviewEditScope,
+    preview_overrides: [PreviewOverrides; 2],
     pub linked: LinkedView,
     pub global: GlobalView,
     pub panel: Panel,
@@ -109,7 +171,9 @@ impl Default for Workspace {
         Self {
             scope: Scope::Roi,
             selected: 0,
-            rois: [RoiView::default(); 2],
+            preview_defaults: RoiView::default(),
+            preview_edit_scope: PreviewEditScope::default(),
+            preview_overrides: [PreviewOverrides::default(); 2],
             linked: LinkedView::default(),
             global: GlobalView::default(),
             panel: Panel::default(),
@@ -120,13 +184,36 @@ impl Default for Workspace {
     }
 }
 impl Workspace {
+    pub fn roi_view(&self, eye: usize) -> RoiView {
+        self.preview_overrides[eye.min(1)].resolve(self.preview_defaults)
+    }
+    fn edit_view(&self) -> RoiView {
+        match self.preview_edit_scope {
+            PreviewEditScope::GlobalDefaults => self.preview_defaults,
+            PreviewEditScope::SelectedPreview => self.roi_view(self.selected),
+        }
+    }
+    fn set_overlay(&mut self, overlay: RoiOverlayMode) {
+        match self.preview_edit_scope {
+            PreviewEditScope::GlobalDefaults => self.preview_defaults.overlay = overlay,
+            PreviewEditScope::SelectedPreview => self.preview_overrides[self.selected].overlay = Some(overlay),
+        }
+    }
+    fn set_pixels(&mut self, pixels: ViewMode) {
+        match self.preview_edit_scope {
+            PreviewEditScope::GlobalDefaults => self.preview_defaults.pixels = pixels,
+            PreviewEditScope::SelectedPreview => self.preview_overrides[self.selected].pixels = Some(pixels),
+        }
+    }
+    fn reset_selected_preview(&mut self) {
+        self.preview_overrides[self.selected] = PreviewOverrides::default();
+    }
     pub fn cycle_view(&mut self, method: SegmentationMode) {
         match self.scope {
             Scope::Roi => {
-                self.rois[self.selected].overlay =
-                    self.rois[self.selected].overlay.cycled_for(method)
+                self.set_overlay(self.edit_view().overlay.cycled_for(method));
             }
-            Scope::Linked => self.linked = self.linked.next(),
+            Scope::Linked => self.linked = self.linked.next(method),
             Scope::Global => {
                 self.global = if self.global == GlobalView::Sensor {
                     GlobalView::Objects
@@ -142,10 +229,10 @@ impl Workspace {
             Scope::Roi => format!(
                 "{} / {}",
                 eye_name(self.selected),
-                self.rois[self.selected]
+                self.roi_view(self.selected)
                     .overlay
                     .normalized_for(method)
-                    .label()
+                    .label_for(method)
             ),
             Scope::Linked => self.linked.label().into(),
             Scope::Global => match self.global {
@@ -190,6 +277,7 @@ impl Rect {
 }
 pub(super) struct Layout {
     pub nav: Rect,
+    pub detector: Rect,
     pub toolbar: Rect,
     pub canvas: Rect,
     pub inspector: Rect,
@@ -197,10 +285,11 @@ pub(super) struct Layout {
 }
 impl Layout {
     pub fn new(w: usize, h: usize) -> Self {
-        let nav_h = 40.min(h / 5);
-        let toolbar_h = 38.min(h / 5);
+        let nav_h = 40.min(h / 6);
+        let detector_h = (if w >= 900 { 64 } else { 44 }).min(h / 4);
+        let toolbar_h = 38.min(h / 6);
         let footer_h = 24.min(h / 8);
-        let y = nav_h + toolbar_h;
+        let y = nav_h + detector_h + toolbar_h;
         let body_h = h.saturating_sub(y + footer_h);
         let body = Rect {
             x: 0,
@@ -242,9 +331,15 @@ impl Layout {
                 w,
                 h: nav_h,
             },
-            toolbar: Rect {
+            detector: Rect {
                 x: 0,
                 y: nav_h,
+                w,
+                h: detector_h,
+            },
+            toolbar: Rect {
+                x: 0,
+                y: nav_h + detector_h,
                 w,
                 h: toolbar_h,
             },
@@ -265,17 +360,18 @@ pub(super) enum Action {
     Select(usize),
     Panel(Panel),
     NextView,
+    NextMethod,
     Search,
     FocusReference,
     SaveMonitor,
     AccuracyCheck,
+    TogglePreviewEditScope,
+    ResetPreviewOverrides,
 }
 pub(super) fn apply(app: &mut App, action: Action) {
-    app.ui.rois[app.ui.selected] = RoiView {
-        pixels: app.mode,
-        overlay: app.roi_overlay_mode,
-    };
     match action {
+        Action::TogglePreviewEditScope => app.ui.preview_edit_scope = app.ui.preview_edit_scope.next(),
+        Action::ResetPreviewOverrides => app.ui.reset_selected_preview(),
         Action::SaveMonitor => {
             if let Ok(mut s)=app.shared.lock() {
                 if let Err(e)=s.monitor_location.save(){s.monitor_location.status=format!("MONITOR SAVE FAILED: {e}");}
@@ -303,9 +399,18 @@ pub(super) fn apply(app: &mut App, action: Action) {
                 .unwrap_or_default();
             app.ui.cycle_view(method);
         }
+        Action::NextMethod => {
+            if let Ok(mut state) = app.shared.lock() {
+                cycle_segmentation_mode(&mut state, "detector selector");
+            }
+        }
         Action::Search => {
             if let Ok(mut s) = app.shared.lock() {
-                if s.segmentation_mode == SegmentationMode::Sam31 && app.virtual_mouse.is_none() {
+                if s.segmentation_mode==SegmentationMode::EyeStudent {
+                    s.sam31_scene_prompt_status="STUDENT HAS FIXED EYE LABELS; SELECT SAM FOR OBJECT SEARCH".into();
+                    return;
+                }
+                if s.segmentation_mode.uses_mask_geometry() && app.virtual_mouse.is_none() {
                     if !app.ui.object_view() && !s.sam31_object_inspection {
                         return;
                     }
@@ -319,6 +424,7 @@ pub(super) fn apply(app: &mut App, action: Action) {
                             "ENTER AND APPLY AN OBJECT PROMPT FIRST".into();
                         return;
                     }
+                    invalidate_desktop_gaze_settings(&mut s);
                     s.sam31_object_inspection = !s.sam31_object_inspection;
                     s.sam31_scene_candidate = None;
                 }
@@ -326,27 +432,20 @@ pub(super) fn apply(app: &mut App, action: Action) {
         }
     }
     app.ui.scroll = 0;
-    app.mode = app.ui.rois[app.ui.selected].pixels;
-    app.roi_overlay_mode = app.ui.rois[app.ui.selected].overlay;
+    remember_roi(app);
     if let Ok(mut s) = app.shared.lock() {
-        s.sam31_semantic_prompt = (s.segmentation_mode == SegmentationMode::Sam31).then_some(0);
+        s.sam31_semantic_prompt = (s.segmentation_mode.uses_mask_geometry()).then_some(0);
     }
 }
 pub(super) fn cycle_pixels(app: &mut App) {
-    match app.ui.scope {
-        Scope::Roi => {
-            app.mode = app.mode.cycled();
-            app.ui.rois[app.ui.selected].pixels = app.mode;
-        }
-        Scope::Linked => {
-            let next = app.ui.rois[app.ui.selected].pixels.cycled();
-            for view in &mut app.ui.rois {
-                view.pixels = next;
-            }
-            app.mode = next;
-        }
-        Scope::Global => {}
+    if app.ui.scope != Scope::Global {
+        app.ui.set_pixels(app.ui.edit_view().pixels.cycled());
+        remember_roi(app);
     }
+}
+pub(super) fn select_pixels(app: &mut App, pixels: ViewMode) {
+    app.ui.set_pixels(pixels);
+    remember_roi(app);
 }
 pub(super) fn click(app: &mut App) {
     if let Some(action) = app
@@ -363,10 +462,9 @@ pub(super) fn next_panel(app: &mut App) {
     apply(app, Action::Panel(app.ui.panel.next()));
 }
 pub(super) fn remember_roi(app: &mut App) {
-    app.ui.rois[app.ui.selected] = RoiView {
-        pixels: app.mode,
-        overlay: app.roi_overlay_mode,
-    };
+    let view = app.ui.roi_view(app.ui.selected);
+    app.mode = view.pixels;
+    app.roi_overlay_mode = view.overlay;
 }
 pub(super) fn eye_name(i: usize) -> &'static str {
     if i == 0 {
@@ -420,6 +518,18 @@ impl Canvas<'_> {
                 .copy_from_slice(&p[y * r.w..y * r.w + len]);
         }
     }
+    fn large_text(&mut self, r: Rect, s: &str, color: u32) {
+        // Integer glyph scaling keeps the detector readable on large displays.
+        let (w,h)=(r.w/2,r.h/2);
+        if w==0 || h==0 {return;}
+        let mut pixels=vec![BG;w*h];
+        Canvas {pixels:&mut pixels,w,h}.text(Rect {x:0,y:0,w,h},s,color);
+        for y in 0..r.h.min(self.h.saturating_sub(r.y)) {
+            for x in 0..r.w.min(self.w.saturating_sub(r.x)) {
+                self.pixels[(r.y+y)*self.w+r.x+x]=pixels[(y/2).min(h-1)*w+(x/2).min(w-1)];
+            }
+        }
+    }
     fn image(&mut self, r: Rect, p: &[u32], w: usize, h: usize) -> Rect {
         if r.w == 0 || r.h == 0 || w == 0 || h == 0 {
             return r;
@@ -459,6 +569,77 @@ fn button(c: &mut Canvas, ui: &mut Workspace, r: Rect, label: &str, active: bool
         if active { ACCENT } else { MUTED },
     );
     ui.hits.push((r, action));
+}
+
+fn selection_controls(c: &mut Canvas, ui: &mut Workspace, mut area: Rect, monitor_unsaved: bool) -> Rect {
+    // A bottom inspector is short but wide. Use one row for its actions so
+    // the controls cannot consume the entire scrollable status area.
+    let compact = area.w >= 520 && area.h < 180;
+    let overriding = ui.preview_edit_scope == PreviewEditScope::SelectedPreview;
+    let edit_label = match (compact, overriding) {
+        (true, false) => "S-TAB GLOBAL",
+        (true, true) => "S-TAB OVERRIDE",
+        (false, false) => "S-TAB: GLOBAL DEFAULTS",
+        (false, true) => "S-TAB: PREVIEW OVERRIDE",
+    };
+    for (index, (label, action, active)) in [
+        (edit_label, Action::TogglePreviewEditScope, overriding),
+        (if compact { "SAVE MONITOR" } else { "SAVE MONITOR LOCATION" }, Action::SaveMonitor, monitor_unsaved),
+        (if compact { "\\ ACCURACY" } else { "\\ ACCURACY CHECK - 20 TARGETS" }, Action::AccuracyCheck, false),
+    ].into_iter().enumerate() {
+        let rect = if compact {
+            let column = area.w / 3;
+            Rect { x: area.x + index * column, w: column.saturating_sub(4), h: 28.min(area.h), ..area }
+        } else {
+            Rect { h: 28.min(area.h), ..area }
+        };
+        if rect.h > 0 { button(c, ui, rect, label, active, action); }
+        if !compact {
+            area.y += 32.min(area.h);
+            area.h = area.h.saturating_sub(32);
+        }
+    }
+    if compact {
+        area.y += 32.min(area.h);
+        area.h = area.h.saturating_sub(32);
+    }
+    area
+}
+
+fn detector_label(method: SegmentationMode) -> String {
+    format!("G {}/{} {}",method.ordinal(),SegmentationMode::COUNT,method.label().to_ascii_uppercase())
+}
+
+fn detector_scope(second: bool) -> &'static str {
+    if second {"GLOBAL GAZE / BOTH ROIS"} else {"GLOBAL GAZE / RIGHT ROI"}
+}
+
+fn detector_bar(c: &mut Canvas, ui: &mut Workspace, r: Rect, method: SegmentationMode, second: bool) {
+    let control=Rect {w:if r.w>=900 {540.min(r.w)} else {r.w},..r}.inset(4);
+    c.fill(control,0x0025_4c55);
+    let label=detector_label(method);
+    let large=r.w>=900 && control.h>=48;
+    let label_rect=Rect {x:control.x+6.min(control.w),y:control.y+3.min(control.h),
+        w:control.w.saturating_sub(12),h:(if large {28}else{14}).min(control.h)};
+    if large {c.large_text(label_rect,&label,ACCENT);} else {c.text(label_rect,&label,ACCENT);}
+    c.text(Rect {x:label_rect.x,y:control.y+control.h.saturating_sub(16),
+        w:label_rect.w,h:14.min(control.h)},detector_scope(second),INK);
+    ui.hits.push((control,Action::NextMethod));
+    if r.w>=900 {
+        let hint=Rect {x:r.x+550,y:r.y+8,w:r.w.saturating_sub(562),h:18.min(r.h)};
+        c.text(hint,"G: GLOBAL GAZE DETECTOR",INK);
+        c.text(Rect {y:hint.y+24,..hint},"FOCUS + MOUSE + J + CALIBRATION",MUTED);
+    }
+}
+
+fn roi_method_lines(method: SegmentationMode, frame_method: Option<SegmentationMode>, enabled: bool) -> [String;2] {
+    [format!("G {}",method.label().to_ascii_uppercase()),
+        if !enabled {"ANALYSIS OFF / 3 TO ENABLE".into()}
+        else {match frame_method {
+            Some(frame) if frame!=method=>format!("FRAME: {} / SWITCHING",frame.label().to_ascii_uppercase()),
+            Some(frame)=>format!("FRAME: {}",frame.label().to_ascii_uppercase()),
+            None=>"WAITING FOR FIRST FRAME".into(),
+        }}]
 }
 
 fn overview(c: &mut Canvas, r: Rect, backdrop: Option<&Backdrop>, eyes: &[Option<EyeFrame>; 2]) {
@@ -528,6 +709,7 @@ fn roi_card(
     eye: Option<&EyeFrame>,
     i: usize,
     view: RoiView,
+    method: SegmentationMode,
     enabled: bool,
     present: bool,
     checkerboard: &checkerboard_calibration::StatusSnapshot,
@@ -543,7 +725,12 @@ fn roi_card(
             "ID HELD"
         }
     );
-    let body = c.label(r, &heading);
+    let mut body = c.label(r, &heading);
+    let method_lines=roi_method_lines(method,eye.map(|f|f.segmentation_mode),enabled);
+    for (line,color) in method_lines.iter().zip([ACCENT,MUTED]) {
+        c.text(Rect {h:16.min(body.h),..body},line,color);
+        let used=20.min(body.h);body.y+=used;body.h-=used;
+    }
     if !enabled {
         c.text(body, "3 ENABLE SECOND ROI ANALYSIS", MUTED);
         return;
@@ -554,8 +741,9 @@ fn roi_card(
     };
     // Render native geometry once then fit the result into a bounded card.
     // No scaling decision may change the inference frame or source clock.
-    let w = frame.width + 16;
-    let h = frame.height + 36;
+    let (source_width,source_height)=roi_card_source_size(frame,view.overlay);
+    let w = source_width + 16;
+    let h = source_height + 36;
     let mut pixels = vec![BG; w * h];
     let checkerboard = checkerboard.overlay.as_ref().filter(|overlay| {
         overlay.eye_index == i
@@ -581,11 +769,11 @@ fn roi_card(
         h: body.h.saturating_sub(20),
         ..body
     };
-    let mut image_pixels = Vec::with_capacity(frame.width * frame.height);
-    for y in 28..28 + frame.height {
-        image_pixels.extend_from_slice(&pixels[y * w + 8..y * w + 8 + frame.width]);
+    let mut image_pixels = Vec::with_capacity(source_width * source_height);
+    for y in 28..28 + source_height {
+        image_pixels.extend_from_slice(&pixels[y * w + 8..y * w + 8 + source_width]);
     }
-    c.image(image, &image_pixels, frame.width, frame.height);
+    c.image(image, &image_pixels, source_width, source_height);
     let source = frame
         .sam31_proposal_masks
         .as_ref()
@@ -604,6 +792,18 @@ fn roi_card(
         ),
         MUTED,
     );
+}
+
+fn roi_card_source_size(frame:&EyeFrame,overlay:RoiOverlayMode)->(usize,usize) {
+    if frame.segmentation_mode==SegmentationMode::EyeStudent && overlay.normalized_for(frame.segmentation_mode).uses_student_source() {
+        return student_preview::source_dimensions(frame).unwrap_or((frame.width, frame.height));
+    }
+    if frame.segmentation_mode==SegmentationMode::Sam31 && overlay==RoiOverlayMode::SamTweakedContactGeometry {
+        if let Some(p)=frame.sam31_proposal_masks.as_ref().filter(|p|p.source_width>0 && p.source_height>0) {
+            return (p.source_width,p.source_height);
+        }
+    }
+    (frame.width,frame.height)
 }
 
 fn split_pair(r: Rect) -> [Rect; 2] {
@@ -636,6 +836,7 @@ struct Snapshot {
     monitor_status:String,
     mouse_output_status: String,
     gaze_focus_status: String,
+    gaze_settings_status: String,
     monitor_unsaved:bool,
     method: SegmentationMode,
     second: bool,
@@ -679,6 +880,11 @@ pub(super) fn render(
             monitor_status:s.monitor_location.status.clone(),
             mouse_output_status: s.mouse_output.label(),
             gaze_focus_status: s.gaze_focus.label(),
+            gaze_settings_status: presented_eyes[app.focus_eye].as_ref().map_or_else(
+                || "GLOBAL GAZE: WAITING FOR REFERENCE EYE".into(),
+                |frame| frame.gaze_policy_error.map_or_else(
+                    || format!("GLOBAL GAZE: {} / {}",s.segmentation_mode.label(),eye_name(app.focus_eye)),
+                    |reason| reason.to_ascii_uppercase())),
             monitor_unsaved:s.monitor_location.unsaved_candidate(),
             method: s.segmentation_mode,
             second: s.second_roi_enabled,
@@ -716,7 +922,14 @@ pub(super) fn render(
             "object_prompt":s.sam31_scene_prompt_text,"prompt_editor":app.sam31_prompt_editor.is_some(),
             "iris_prompt_generation":s.sam31_prompt_bundle_generation,"object_prompt_generation":s.sam31_scene_prompt_generation,
             "object_prompt_status":s.sam31_scene_prompt_status,"recovery_status":s.reacquire_status,
-            "roi_views":app.ui.rois.map(|r|r.overlay.label()),"roi_pixels":app.ui.rois.map(|r|annotated_view_mode_name(r.pixels)),
+            "roi_views":[app.ui.roi_view(0).overlay.label(),app.ui.roi_view(1).overlay.label()],
+            "roi_pixels":[annotated_view_mode_name(app.ui.roi_view(0).pixels),annotated_view_mode_name(app.ui.roi_view(1).pixels)],
+            "preview_edit_scope":app.ui.preview_edit_scope.label(),
+            "preview_defaults":{"overlay":app.ui.preview_defaults.overlay.label(),"pixels":annotated_view_mode_name(app.ui.preview_defaults.pixels)},
+            "preview_overrides":app.ui.preview_overrides.map(|r|serde_json::json!({
+                "overlay":r.overlay.map(|o|o.label()),"pixels":r.pixels.map(annotated_view_mode_name)})),
+            "global_gaze":{"detector":s.segmentation_mode.label(),"settings_generation":s.segmentation_generation,
+                "reference_eye":eye_name(app.focus_eye),"outputs":"focus / uinput / J cursor / calibration / accuracy"},
             "monitor":s.monitor_location.snapshot(),
             "mouse_output":s.mouse_output.snapshot(),
             "gaze_focus":s.gaze_focus.snapshot(),
@@ -739,7 +952,19 @@ pub(super) fn configure_hotkeys(
             continue;
         }
         match binding.key {
-            "V" => binding.enabled = ui.scope != Scope::Global,
+            "V" => {
+                binding.enabled = ui.scope != Scope::Global;
+                binding.label = if ui.preview_edit_scope == PreviewEditScope::GlobalDefaults {
+                    "Global preview pixels"
+                } else { "Override preview pixels" };
+            }
+            "F" => binding.label = if ui.scope == Scope::Roi {
+                if ui.preview_edit_scope == PreviewEditScope::GlobalDefaults { "Global preview overlay" }
+                else { "Override preview overlay" }
+            } else { "Workspace view only" },
+            "G" => binding.label = "Global gaze detector",
+            "Y" => binding.label = "Global pupil source",
+            "Tab" => binding.label = "Preview / linked / overview",
             "Space" => {
                 binding.enabled = ui.object_view() || search_running;
                 binding.label = if search_running {
@@ -749,11 +974,26 @@ pub(super) fn configure_hotkeys(
                 };
             }
             "M" => binding.enabled = !search_running,
-            "1" => binding.label = "Select left ROI",
-            "2" => binding.label = "Select right ROI",
+            "1" => binding.label = "Select left preview",
+            "2" => binding.label = "Select right preview",
             _ => {}
         }
     }
+    map.bindings.push(keyboard_peeper::Binding {
+        // KPP/1 uses bit 1 for Shift (independent of winit's bit layout).
+        modifiers: 1 << 1,
+        enabled: !editing,
+        key: "Tab",
+        label: if ui.preview_edit_scope == PreviewEditScope::GlobalDefaults {
+            "Edit selected preview"
+        } else { "Edit global defaults" },
+    });
+    map.bindings.push(keyboard_peeper::Binding {
+        modifiers: 0,
+        enabled: !editing,
+        key: "Backspace",
+        label: "Preview: inherit defaults",
+    });
     map.bindings.push(keyboard_peeper::Binding {
         modifiers: 0,
         enabled: editing || ui.object_view() || ui.scope == Scope::Roi,
@@ -777,6 +1017,7 @@ fn render_snapshot(
         monitor_status,
         mouse_output_status,
         gaze_focus_status,
+        gaze_settings_status,
         monitor_unsaved,
         method,
         second,
@@ -805,6 +1046,9 @@ fn render_snapshot(
     let mut c = Canvas { pixels, w, h };
     c.pixels.fill(BG);
     ui.hits.clear();
+    if !LinkedView::available(method).contains(&ui.linked) {
+        ui.linked=LinkedView::Contacts;
+    }
     let tab_w = (layout.nav.w / 3).min(180);
     for (i, scope) in [Scope::Roi, Scope::Linked, Scope::Global]
         .into_iter()
@@ -855,7 +1099,13 @@ fn render_snapshot(
             0x00ff_897d,
         );
     }
-    let title = ui.title(method);
+    detector_bar(&mut c,ui,layout.detector,method,second);
+    let (position,count)=match ui.scope {
+        Scope::Roi=>ui.roi_view(ui.selected).overlay.position_for(method),
+        Scope::Linked=>ui.linked.position_for(method),
+        Scope::Global=>(if ui.global==GlobalView::Sensor {1}else{2},2),
+    };
+    let title = format!("F VIEW {position}/{count} / {}",ui.title(method));
     c.text(
         Rect {
             x: 10,
@@ -907,7 +1157,8 @@ fn render_snapshot(
                 primary,
                 eyes[i].as_ref(),
                 i,
-                ui.rois[i],
+                ui.roi_view(i),
+                method,
                 i == 0 || second,
                 present[i],
                 &checkerboard,
@@ -921,12 +1172,21 @@ fn render_snapshot(
                 ..area
             });
             for i in 0..2 {
-                let mut view = ui.rois[i];
+                let mut view = ui.roi_view(i);
                 if ui.linked == LinkedView::Contacts {
                     view.overlay = RoiOverlayMode::SamDeflattenedVirtualContact;
                 }
+                if ui.linked == LinkedView::TweakedContacts {
+                    view.overlay = RoiOverlayMode::SamTweakedContactGeometry;
+                }
                 if ui.linked == LinkedView::Timing {
                     view.overlay = RoiOverlayMode::Clean;
+                }
+                match ui.linked {
+                    LinkedView::StudentMaskOutline => view.overlay = RoiOverlayMode::StudentMaskOutline,
+                    LinkedView::StudentEllipseOnly => view.overlay = RoiOverlayMode::StudentEllipseOnly,
+                    LinkedView::StudentPupilOnly => view.overlay = RoiOverlayMode::StudentPupilOnly,
+                    _ => {}
                 }
                 roi_card(
                     &mut c,
@@ -934,6 +1194,7 @@ fn render_snapshot(
                     eyes[i].as_ref(),
                     i,
                     view,
+                    method,
                     i == 0 || second,
                     present[i],
                     &checkerboard,
@@ -944,7 +1205,7 @@ fn render_snapshot(
                 h: info_h,
                 ..area
             };
-            let mut rows = vec!["LINKED PRESENTATION / JOINT STEREO SOLVER NOT IMPLEMENTED".into()];
+            let mut rows = vec![format!("SHARED DETECTOR: {} / ENABLED ROIS",method.label().to_ascii_uppercase())];
             match (&eyes[0], &eyes[1]) {
                 (Some(a), Some(b)) if second => {
                     let delta = a.timestamp_ns.abs_diff(b.timestamp_ns);
@@ -1100,13 +1361,8 @@ fn render_snapshot(
     }
     let mut rows = vec![];
     if ui.panel==Panel::Selection && !ui.object_view() {
-        for (label,action,active) in [
-            ("SAVE MONITOR LOCATION",Action::SaveMonitor,monitor_unsaved),
-            ("\\ ACCURACY CHECK - 20 TARGETS",Action::AccuracyCheck,false),
-        ] {
-            button(&mut c,ui,Rect {h:28.min(text_area.h),..text_area},label,active,action);
-            text_area.y+=32.min(text_area.h);text_area.h=text_area.h.saturating_sub(32);
-        }
+        text_area = selection_controls(&mut c, ui, text_area, monitor_unsaved);
+        rows.push(gaze_settings_status.clone());
         rows.push(monitor_status);
         rows.push(mouse_output_status);
         rows.push(gaze_focus_status);
@@ -1118,37 +1374,58 @@ fn render_snapshot(
     match ui.panel {
         Panel::Selection => {
             if ui.scope != Scope::Global {
-                rows.push(format!("SELECTED: {}", eye_name(ui.selected)));
-                rows.push("1 left / 2 right".into());
+                rows.push(format!("PREVIEW: {}", eye_name(ui.selected)));
+                rows.push("1 left / 2 right (view only)".into());
+                rows.push(ui.preview_overrides[ui.selected].label().into());
+                rows.push(format!("SHIFT+TAB EDIT {}",ui.preview_edit_scope.label()));
+                rows.push("BACKSPACE: INHERIT BOTH DEFAULTS".into());
+                rows.push("F overlays / V pixels; no gaze changes".into());
+                if ui.preview_edit_scope==PreviewEditScope::GlobalDefaults {
+                    rows.push(format!("GLOBAL F: {}",ui.preview_defaults.overlay.normalized_for(method).label_for(method)));
+                    rows.push(format!("GLOBAL V: {}",annotated_view_mode_name(ui.preview_defaults.pixels)));
+                }
                 rows.push(format!(
                     "V {}",
-                    annotated_view_mode_name(ui.rois[ui.selected].pixels)
+                    annotated_view_mode_name(ui.roi_view(ui.selected).pixels)
                 ));
                 rows.push(format!(
                     "J gaze overlays {}",
                     if laser { "ON" } else { "OFF" }
                 ));
                 rows.push(format!("M CALIBRATE {}",eye_name(focus_eye)));
-                if ui.selected!=focus_eye {rows.push("F2 USE SELECTED ROI FOR AF + CALIBRATION".into());}
+                if ui.selected!=focus_eye {rows.push("F2 USE SELECTED EYE FOR AF + ALL GAZE OUTPUT".into());}
             }
             if ui.object_view() {
+                if method==SegmentationMode::EyeStudent {
+                    rows.push("OBJECT SEARCH REQUIRES SAM; G TO SWITCH".into());
+                }
                 rows.push(format!("PROMPT: {}", editor.as_deref().unwrap_or(&prompt)));
                 rows.push(prompt_status);
                 rows.push("Enter edit object prompt".into());
                 rows.push("Object crops are not eye evidence.".into());
                 rows.push("Global-image crop, not native ROI.".into());
-            } else if method == SegmentationMode::Sam31 && ui.scope==Scope::Roi {
-                rows.push(format!("IRIS PROMPT: {prompt}"));
-                rows.push("Enter edit / Esc cancel".into());
+            } else if method.uses_mask_geometry() && ui.scope==Scope::Roi {
+                if method==SegmentationMode::EyeStudent {
+                    rows.push("CUDA EYE STUDENT: FIXED EYE LABELS".into());
+                    rows.push("SAM-trained masks; shared RAW + 3D solver".into());
+                    rows.push("Experimental; G switches back to SAM".into());
+                } else {
+                    rows.push(format!("IRIS PROMPT: {prompt}"));
+                    rows.push("Enter edit / Esc cancel".into());
+                }
             }
             if let Some(status) = recovery {
                 rows.push(status);
             }
         }
         Panel::Analysis => {
-            rows.push("SHARED ANALYSIS / BOTH EYES".into());
+            rows.push("GLOBAL GAZE / ALL ENABLED EYES".into());
+            rows.push(gaze_settings_status);
             rows.push(method.method_control_label());
-            rows.push("Y rough-center source".into());
+            rows.push("Y global rough-center source".into());
+            rows.push("Same source for focus, mouse, J, M and accuracy.".into());
+            rows.push("F/V are previews only, never gaze input.".into());
+            rows.push("No per-region analysis overrides.".into());
             rows.push(format!(
                 "3 second ROI {}",
                 if second { "ON" } else { "OFF" }
@@ -1225,7 +1502,15 @@ fn render_snapshot(
     text_rows(&mut c, text_area, &rows, ui.scroll);
     c.text(
         layout.footer.inset(4),
-        "TAB SCOPE   F VIEW   , INSPECTOR   PGUP/PGDN SCROLL   ESC CANCEL EDIT / Q QUIT",
+        if w >= 1180 {
+            "G GLOBAL GAZE   F/V PREVIEW   SHIFT+TAB EDIT SCOPE   BACKSPACE INHERIT   TAB WORKSPACE   , PANEL"
+        } else if w >= 700 {
+            "G GAZE  F/V VIEW  SHIFT+TAB SCOPE  BKSP INHERIT  TAB NAV"
+        } else if w >= 520 {
+            "G GAZE  F/V VIEW  S-TAB SCOPE  BKSP INHERIT"
+        } else {
+            "F/V VIEW  S-TAB SCOPE"
+        },
         MUTED,
     );
     if let Some(editor) = editor {
@@ -1391,6 +1676,7 @@ mod tests {
             method: SegmentationMode::Sam31,
             mouse_output_status: "MOUSE OFF / Super+Shift+M".into(),
             gaze_focus_status: "GAZE FOCUS OFF / Super+Shift+F".into(),
+            gaze_settings_status: "GLOBAL GAZE: SAM31 / SUBJECT RIGHT".into(),
             second: true,
             object_running: false,
             prompt: "iris".into(),
@@ -1484,6 +1770,158 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn detector_banner_is_visible_and_clickable_in_every_scope() {
+        // The requested detector changes immediately, even while both frames
+        // still belong to SAM. A heading must not quietly report the old mode.
+        let mut snapshot = example_snapshot();
+        snapshot.method = SegmentationMode::EyeStudent;
+        for (w, h) in [(320, 240), (640, 480), (1200, 850), (904, 2048)] {
+            let mut pixels = vec![0; w * h];
+            let mut reference = vec![BG; w * h];
+            let banner = Layout::new(w, h).detector;
+            detector_bar(
+                &mut Canvas { pixels: &mut reference, w, h },
+                &mut Workspace::default(),
+                banner,
+                snapshot.method,
+                snapshot.second,
+            );
+            for scope in [Scope::Roi, Scope::Linked, Scope::Global] {
+                let mut ui = Workspace { scope, ..Workspace::default() };
+                render_snapshot(&mut ui, &mut pixels, w, h, &snapshot);
+                let controls: Vec<_> = ui.hits.iter()
+                    .filter(|(_, action)| matches!(action, Action::NextMethod))
+                    .collect();
+                assert_eq!(controls.len(), 1);
+                let (control, _) = controls[0];
+                assert!(banner.contains((control.x as f64, control.y as f64)));
+                assert!(control.y + control.h <= banner.y + banner.h);
+                for y in banner.y..banner.y + banner.h {
+                    assert_eq!(&pixels[y*w..(y+1)*w], &reference[y*w..(y+1)*w]);
+                }
+                if scope == Scope::Linked {
+                    if let Some(dir) = std::env::var_os("BUTTERCUP_UI_TEST_EXPORT") {
+                        export_eye_ppm(
+                            &PathBuf::from(dir).join(format!("detector-switch-{w}x{h}.ppm")),
+                            &pixels, w, h,
+                        ).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn detector_names_fit_and_identify_the_shared_scope() {
+        assert_eq!(detector_label(SegmentationMode::EyeStudent), "G 3/6 EYE-STUDENT");
+        assert_eq!(detector_scope(true), "GLOBAL GAZE / BOTH ROIS");
+        assert_eq!(detector_scope(false), "GLOBAL GAZE / RIGHT ROI");
+        let mut method = SegmentationMode::Native;
+        for _ in 0..SegmentationMode::COUNT {
+            // 520px at double-size and 300px at normal size: no ellipsis,
+            // including the longest detector name, VESSEL-FEATURES.
+            let glyphs = detector_label(method).chars().count();
+            assert!(glyphs * 24 <= 520);
+            assert!(glyphs * 12 <= 300);
+            method = method.cycled();
+        }
+    }
+
+    #[test]
+    fn roi_detector_labels_distinguish_requested_frame_and_disabled_states() {
+        let student = SegmentationMode::EyeStudent;
+        assert_eq!(roi_method_lines(student, Some(SegmentationMode::Sam31), true),
+            ["G EYE-STUDENT", "FRAME: SAM31 / SWITCHING"]);
+        // An enum match is not proof of an accepted pupil/contact solution.
+        assert_eq!(roi_method_lines(student, Some(student), true),
+            ["G EYE-STUDENT", "FRAME: EYE-STUDENT"]);
+        assert_eq!(roi_method_lines(student, None, true),
+            ["G EYE-STUDENT", "WAITING FOR FIRST FRAME"]);
+        assert_eq!(roi_method_lines(student, Some(SegmentationMode::Sam31), false),
+            ["G EYE-STUDENT", "ANALYSIS OFF / 3 TO ENABLE"]);
+    }
+
+    #[test]
+    fn detector_selector_and_keyboard_share_the_complete_cycle() {
+        for source in ["G hotkey", "detector selector"] {
+            let mut state = SharedState {
+                segmentation_mode: SegmentationMode::Native,
+                rough_pupil_center_mode: RoughPupilCenterMode::IrisGuided,
+                ..SharedState::default()
+            };
+            for (index, expected) in [
+                SegmentationMode::Sam31,
+                SegmentationMode::EyeStudent,
+                SegmentationMode::Clusters,
+                SegmentationMode::Driving,
+                SegmentationMode::ScleraRedCanny,
+                SegmentationMode::Native,
+            ].into_iter().enumerate() {
+                cycle_segmentation_mode(&mut state, source);
+                assert_eq!(state.segmentation_mode, expected);
+                assert_eq!(state.iris_segmentation_generation, index as u64 + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn eye_student_renders_every_sam_roi_view_and_linked_contact_view() {
+        let mut snapshot=example_snapshot();
+        snapshot.method=SegmentationMode::EyeStudent;
+        snapshot.prompt_status="FIXED EYE LABELS / CUDA STUDENT".into();
+        for frame in snapshot.eyes.iter_mut().flatten() {
+            frame.segmentation_mode=SegmentationMode::EyeStudent;
+        }
+        let mut ui=Workspace::default();
+        let mut pixels=vec![0;1200*850];
+        for &overlay in RoiOverlayMode::available(SegmentationMode::EyeStudent) {
+            ui.preview_defaults.overlay=overlay;
+            render_snapshot(&mut ui,&mut pixels,1200,850,&snapshot);
+            assert!(pixels.iter().any(|p|*p==INK));
+            assert!(ui.hits.len()>=7);
+        }
+        ui.scope=Scope::Linked;
+        ui.linked=LinkedView::Contacts;
+        render_snapshot(&mut ui,&mut pixels,1200,850,&snapshot);
+        assert!(pixels.iter().any(|p|*p==INK));
+        if let Some(dir)=std::env::var_os("BUTTERCUP_UI_TEST_EXPORT") {
+            export_eye_ppm(&PathBuf::from(dir).join("eye-student-contacts-1200x850.ppm"),
+                &pixels,1200,850).unwrap();
+        }
+    }
+    #[test]
+    fn tweaked_contact_is_a_sam_only_linked_view() {
+        assert_eq!(LinkedView::Contacts.next(SegmentationMode::Sam31),LinkedView::TweakedContacts);
+        assert_eq!(LinkedView::TweakedContacts.next(SegmentationMode::Sam31),LinkedView::Compare);
+        assert_eq!(LinkedView::Contacts.next(SegmentationMode::EyeStudent),LinkedView::Timing);
+        let mut snapshot=example_snapshot();
+        snapshot.method=SegmentationMode::Sam31;
+        let mut ui=Workspace::default();
+        ui.scope=Scope::Linked;
+        ui.linked=LinkedView::TweakedContacts;
+        let mut pixels=vec![0;1200*850];
+        render_snapshot(&mut ui,&mut pixels,1200,850,&snapshot);
+        assert_eq!(ui.linked,LinkedView::TweakedContacts);
+        snapshot.method=SegmentationMode::EyeStudent;
+        render_snapshot(&mut ui,&mut pixels,1200,850,&snapshot);
+        assert_eq!(ui.linked,LinkedView::Contacts);
+    }
+
+    #[test]
+    fn tweaked_roi_card_preserves_source_size_across_a_newer_crop_resize() {
+        let mut frame=crate::tests::control_eye_frame(12);
+        frame.segmentation_mode=SegmentationMode::Sam31;
+        frame.width=420;frame.height=280;
+        frame.sam31_proposal_masks=Some(Arc::new(sam31_outer::ProposalMasks {
+            source_width:384,source_height:256,..Default::default()}));
+        assert_eq!(roi_card_source_size(&frame,RoiOverlayMode::SamTweakedContactGeometry),(384,256));
+        assert_eq!(roi_card_source_size(&frame,RoiOverlayMode::Clean),(420,280));
+        frame.segmentation_mode=SegmentationMode::EyeStudent;
+        assert_eq!(roi_card_source_size(&frame,RoiOverlayMode::SamTweakedContactGeometry),(420,280));
+    }
+
     #[test]
     fn absent_disabled_and_object_views_render_without_eye_evidence() {
         let mut snapshot = example_snapshot();
@@ -1519,7 +1957,7 @@ mod tests {
             (800, 1200),
         ] {
             let l = Layout::new(w, h);
-            let rs = [l.nav, l.toolbar, l.canvas, l.inspector, l.footer];
+            let rs = [l.nav, l.detector, l.toolbar, l.canvas, l.inspector, l.footer];
             for r in rs {
                 assert!(r.x + r.w <= w && r.y + r.h <= h, "{w}x{h} {r:?}");
             }
@@ -1576,15 +2014,108 @@ mod tests {
     #[test]
     fn roi_views_are_independent_and_scopes_remember_selection() {
         let mut ui = Workspace::default();
-        let other = ui.rois[1].overlay;
+        ui.preview_edit_scope = PreviewEditScope::SelectedPreview;
+        let other = ui.roi_view(1).overlay;
         ui.cycle_view(SegmentationMode::Sam31);
-        assert_eq!(ui.rois[1].overlay, other);
-        let selected = ui.rois[0].overlay;
+        assert_eq!(ui.roi_view(1).overlay, other);
+        let selected = ui.roi_view(0).overlay;
         ui.scope = Scope::Linked;
         ui.cycle_view(SegmentationMode::Sam31);
         ui.scope = Scope::Global;
         ui.cycle_view(SegmentationMode::Sam31);
         assert!(ui.object_view());
-        assert_eq!(ui.rois[0].overlay, selected);
+        assert_eq!(ui.roi_view(0).overlay, selected);
+    }
+
+    #[test]
+    fn global_preview_defaults_inherit_per_setting_and_reset_is_local() {
+        let mut ui = Workspace::default();
+        assert_eq!(ui.preview_edit_scope, PreviewEditScope::GlobalDefaults);
+        ui.cycle_view(SegmentationMode::Sam31);
+        assert_eq!(ui.roi_view(0), ui.roi_view(1));
+        let global_overlay = ui.preview_defaults.overlay;
+        ui.preview_edit_scope = PreviewEditScope::SelectedPreview;
+        ui.cycle_view(SegmentationMode::Sam31);
+        let overridden_overlay = ui.roi_view(0).overlay;
+        assert_ne!(overridden_overlay, global_overlay);
+        assert!(ui.preview_overrides[0].pixels.is_none());
+        ui.preview_edit_scope = PreviewEditScope::GlobalDefaults;
+        ui.set_pixels(ViewMode::BlueFilter);
+        assert_eq!(ui.roi_view(0).pixels, ViewMode::BlueFilter);
+        assert_eq!(ui.roi_view(1).pixels, ViewMode::BlueFilter);
+        assert_eq!(ui.roi_view(0).overlay, overridden_overlay);
+
+        ui.selected = 1;
+        ui.preview_edit_scope = PreviewEditScope::SelectedPreview;
+        ui.set_pixels(ViewMode::RawColor);
+        assert!(ui.preview_overrides[1].overlay.is_none());
+        ui.preview_edit_scope = PreviewEditScope::GlobalDefaults;
+        ui.set_overlay(RoiOverlayMode::Clean);
+        assert_eq!(ui.roi_view(1).overlay, RoiOverlayMode::Clean);
+        assert_eq!(ui.roi_view(1).pixels, ViewMode::RawColor);
+        ui.selected = 0;
+        ui.reset_selected_preview();
+        assert_eq!(ui.roi_view(0), ui.preview_defaults);
+        assert_eq!(ui.roi_view(1).pixels, ViewMode::RawColor);
+    }
+
+    #[test]
+    fn linked_student_views_offer_sparse_layers_without_changing_preview_defaults() {
+        let mut snapshot = example_snapshot();
+        snapshot.method = SegmentationMode::EyeStudent;
+        for frame in snapshot.eyes.iter_mut().flatten() {
+            frame.segmentation_mode = SegmentationMode::EyeStudent;
+        }
+        let mut ui = Workspace { scope: Scope::Linked, ..Default::default() };
+        let original = ui.preview_defaults;
+        let mut pixels = vec![0; 1200 * 850];
+        let views = LinkedView::available(snapshot.method);
+        assert!(views.contains(&LinkedView::StudentEllipseOnly));
+        assert!(views.contains(&LinkedView::StudentMaskOutline));
+        assert!(views.contains(&LinkedView::StudentPupilOnly));
+        for index in 0..views.len() {
+            assert_eq!(ui.linked.position_for(snapshot.method), (index + 1, views.len()));
+            render_snapshot(&mut ui, &mut pixels, 1200, 850, &snapshot);
+            ui.cycle_view(snapshot.method);
+        }
+        assert_eq!(ui.linked, LinkedView::Compare);
+        assert_eq!(ui.preview_defaults, original);
+        assert_eq!(LinkedView::available(SegmentationMode::Sam31),
+            &[LinkedView::Compare, LinkedView::Timing, LinkedView::Contacts, LinkedView::TweakedContacts]);
+    }
+
+    #[test]
+    fn preview_scope_hotkeys_are_explicit_and_do_not_require_function_keys() {
+        let mut ui = Workspace::default();
+        let mut map = keyboard_peeper::buttercup_map(false, false);
+        configure_hotkeys(&mut map, &ui, false, false);
+        assert!(map.bindings.iter().any(|b| b.key == "Tab" && b.modifiers == 2 && b.enabled
+            && b.label == "Edit selected preview"));
+        assert!(map.bindings.iter().any(|b| b.key == "Backspace" && b.modifiers == 0 && b.enabled));
+        assert_eq!(map.bindings.iter().find(|b| b.key == "G").unwrap().label, "Global gaze detector");
+        ui.preview_edit_scope = PreviewEditScope::SelectedPreview;
+        let mut map = keyboard_peeper::buttercup_map(false, false);
+        configure_hotkeys(&mut map, &ui, false, false);
+        assert_eq!(map.bindings.iter().find(|b| b.key == "F").unwrap().label, "Override preview overlay");
+        let mut map = keyboard_peeper::buttercup_map(false, false);
+        configure_hotkeys(&mut map, &ui, true, false);
+        assert!(map.bindings.iter().filter(|b| b.enabled).all(|b| matches!(b.key, "Enter" | "Esc")));
+    }
+
+    #[test]
+    fn compact_selection_actions_leave_room_for_scrollable_status() {
+        let (w, h) = (640, 480);
+        let panel = Layout::new(w, h).inspector.inset(8);
+        let area = Rect { y: panel.y + 36, h: panel.h.saturating_sub(36), ..panel };
+        let mut pixels = vec![0; w * h];
+        let mut ui = Workspace::default();
+        let remaining = selection_controls(&mut Canvas { pixels: &mut pixels, w, h }, &mut ui, area, false);
+        assert!(remaining.h >= 20, "at least one status row must remain");
+        assert_eq!(ui.hits.len(), 3);
+        for (rect, _) in &ui.hits {
+            assert_eq!(rect.y, area.y);
+            assert!(rect.y + rect.h <= remaining.y);
+            assert!(rect.x >= area.x && rect.x + rect.w <= area.x + area.w);
+        }
     }
 }

@@ -7,6 +7,7 @@ initial conic hypotheses. External label scoring is a separate, post-fit step.
 """
 import argparse
 import collections
+import contextlib
 import json
 import math
 import itertools
@@ -68,6 +69,27 @@ def check_shared_target_contract(result):
     target=result["target_camera_mm"]
     if len(target)!=3 or not all(math.isfinite(v) for v in target):
         raise ValueError("shared target is not a finite 3D point")
+    chart=result.get("target_search_chart") or {}
+    if any(k in chart for k in ("reference_camera_mm","axial_distance_mm","distance_axis")):
+        origin=chart.get("reference_camera_mm")
+        axial=chart.get("axial_distance_mm")
+        slopes=chart.get("slopes")
+        limit=chart.get("slope_limit")
+        if chart.get("distance_axis")!="reference-to-camera" \
+                or not isinstance(origin,list) or len(origin)!=3 or not all(math.isfinite(v) for v in origin) or origin[2]>=0 \
+                or not isinstance(axial,(int,float)) or not math.isfinite(axial) or axial<=0 \
+                or not isinstance(slopes,list) or len(slopes)!=2 or not all(math.isfinite(v) for v in slopes) \
+                or not isinstance(limit,(int,float)) or not math.isfinite(limit) or limit<=0 \
+                or any(abs(v)>limit+1e-7 for v in slopes):
+            raise ValueError("invalid viewpoint axial-distance chart")
+        length=math.sqrt(sum(v*v for v in origin))
+        forward=[-v/length for v in origin]
+        transverse=math.hypot(forward[0],forward[2])
+        right=[forward[2]/transverse,0.0,-forward[0]/transverse]
+        down=[forward[1]*right[2],forward[2]*right[0]-forward[0]*right[2],-forward[1]*right[0]]
+        expected=[o+axial*(f+slopes[0]*r+slopes[1]*d) for o,f,r,d in zip(origin,forward,right,down)]
+        if max(abs(a-b) for a,b in zip(target,expected))>1e-6*max(1.0,axial):
+            raise ValueError("viewpoint slopes and axial distance do not reconstruct the bounded shared target")
     for eye in range(2):
         center=result["eye_centers_camera_mm"][eye]
         ray=result["eye_gaze_directions"][eye]
@@ -187,7 +209,115 @@ def summarize_source_replay(evaluation,expected=None):
             "Native ROI reframes are counted, not certified accurate by source-continuity checks."]}
 
 
-def matched_algorithm_report(baseline, candidate, index_ranges, allow_extractor_changes=False):
+def evaluation_rows(evaluation):
+    with evaluation.open() as stream:
+        for line in stream:
+            yield json.loads(line)
+
+
+def source_read_rows(evaluation):
+    """One final result per physical read, including failed pairs and singletons.
+
+    With the replay's constant per-eye delay, second arrivals have a common
+    source-time ordering. First publications are not additional observations.
+    Pending genuine singletons are emitted last in deterministic source order;
+    the area diagnostic independently sorts source time, preserving dropouts.
+    This offline join is not memory retained by the real-time solver.
+    """
+    pending={}
+    complete=set()
+    indices=set()
+    delays=None
+    previous_pair=None
+    with contextlib.closing(evaluation_rows(evaluation)) as rows:
+        for row in rows:
+            if row.get("schema")!="buttercup-joint-source-replay-v1":
+                raise ValueError("geometry comparison requires native source-replay rows")
+            source=row["input"];frame=source["frame"]
+            key=(source["clock_lineage"],int(frame["timestamp_ns"]))
+            eye=int(frame["eye_id"])-1
+            current_delays=tuple(int(v) for v in row["arrival_delay_ns"])
+            if delays is None:delays=current_delays
+            if delays!=current_delays:
+                raise ValueError("source-read joining requires constant per-eye arrival delays")
+            if eye not in (0,1) or source["index"] in indices or key in complete:
+                raise ValueError("duplicate/conflicting source in final-read geometry comparison")
+            indices.add(source["index"])
+            result=pending.setdefault(key,{"inputs":[None,None]})
+            if result["inputs"][eye] is not None:
+                raise ValueError("duplicate ROI in one physical source read")
+            result["inputs"][eye]=source
+            result["joint"]=row["joint"]
+            result["publication_input_indices"]=None
+            if row["joint"].get("available"):
+                publication=row["publication_inputs"]
+                if len(publication)!=2 or not any(publication):
+                    raise ValueError("available final-read geometry has no source evidence")
+                for slot,p in enumerate(publication):
+                    if p is not None and p!=result["inputs"][slot]:
+                        raise ValueError("final-read publication changed RAW identity or used an unseen partner")
+                result["publication_input_indices"]=[p["index"] if p else None for p in publication]
+            if all(result["inputs"]):
+                order=(source_clock_epoch(key[0]),key[1])
+                if previous_pair is not None and order<=previous_pair:
+                    raise ValueError("paired completions are not source ordered under a constant arrival delay")
+                previous_pair=order
+                complete.add(key)
+                yield pending.pop(key)
+    for key in sorted(pending,key=lambda k:(source_clock_epoch(k[0]),k[1])):
+        yield pending[key]
+
+
+class JointGeometryComparison:
+    """Compare each eye with itself across runs, never average two gaze points."""
+    def __init__(self):
+        self.counts=collections.Counter()
+        self.target_changes=[]
+        self.ray_angles=[[],[]]
+        self.largest=[]
+
+    def observe(self,a,b):
+        self.counts["same_RAW_reads"]+=1
+        fits=[r["joint"] for r in (a,b)]
+        available=[bool(f.get("available")) for f in fits]
+        self.counts[f"available_baseline:{available[0]},candidate:{available[1]}"]+=1
+        for fit in fits:check_shared_target_contract(fit)
+        if not all(available):return
+        if a["publication_input_indices"]!=b["publication_input_indices"]:
+            self.counts["different_publication_evidence_geometry_skipped"]+=1
+            return
+        self.counts["both_available_same_publication_evidence"]+=1
+        self.counts["contributing_eyes_changed"]+=fits[0]["contributing_eyes"]!=fits[1]["contributing_eyes"]
+        target_delta=math.dist(*(f["target_camera_mm"] for f in fits))
+        self.target_changes.append(target_delta)
+        self.counts["target_changed_over_1e-6_mm"]+=target_delta>1e-6
+        angles=[]
+        for eye in range(2):
+            if not all(f["contributing_eyes"][eye] for f in fits):continue
+            u,v=(f["eye_gaze_directions"][eye] for f in fits)
+            cross=[u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]]
+            angle=math.degrees(math.atan2(math.sqrt(sum(x*x for x in cross)),sum(x*y for x,y in zip(u,v))))
+            self.ray_angles[eye].append(angle);angles.append(angle)
+            self.counts["eye_rays_changed_over_1_degree"]+=angle>1.0
+            self.counts["eye_rays_changed_over_5_degrees"]+=angle>5.0
+        maximum=max(angles,default=0.0)
+        if maximum>1e-7 or target_delta>1e-6:
+            self.largest.append({"indices":[s["index"] if s else None for s in a["inputs"]],
+                "maximum_common_eye_angle_degrees":maximum,"target_delta_mm":target_delta,
+                "baseline_contributing":fits[0]["contributing_eyes"],"candidate_contributing":fits[1]["contributing_eyes"],
+                "baseline_cost":fits[0]["cost"],"candidate_cost":fits[1]["cost"],
+                "baseline_margin":fits[0]["alternative_cost_margin"],"candidate_margin":fits[1]["alternative_cost_margin"]})
+
+    def report(self):
+        return {"counts":self.counts,"target_change_mm":distribution(self.target_changes),
+            "same_eye_ray_change_degrees":[distribution(v) for v in self.ray_angles],
+            "largest_ray_changes":sorted(self.largest,key=lambda r:(-r["maximum_common_eye_angle_degrees"],-r["target_delta_mm"]))[:30],
+            "limitations":["Same native RAW/extraction is necessary but not anatomical gaze ground truth.",
+                "Changing the arrival order can legitimately change which past observations are available. Paired initialization must not depend on presentation slots when the same prior joint evidence is available.",
+                "A competing-hypothesis cost margin is heuristic separation, not calibrated sign confidence."]}
+
+
+def matched_algorithm_report(baseline, candidate, index_ranges, allow_extractor_changes=False, source_order=False):
     """Stream exact source-matched rows; never silently compare different probes.
 
     Default: optimizer-only A/B trials with the same extraction. The explicit
@@ -198,25 +328,29 @@ def matched_algorithm_report(baseline, candidate, index_ranges, allow_extractor_
     coverage=[collections.Counter(),collections.Counter()]
     residuals=[[],[]]
     supported=[[],[]]
+    unchanged_outer=[[],[]]
+    unchanged_supported_outer=[[],[]]
     area_steps=[[],[]]
     normalized_steps=[[],[]]
     timeline=[[],[]]
     regressions=[]
     probe_verification=collections.Counter()
+    geometry={kind:JointGeometryComparison() for kind in ("paired","singleton")} if source_order else {}
     rows=0
     def in_scope(row):
         return not index_ranges or all(any(lo<=item["index"]<hi for lo,hi in index_ranges)
             for item in row["inputs"] if item)
-    with baseline.open() as first,candidate.open() as second:
-        for line_a,line_b in itertools.zip_longest(first,second):
-            if line_a is None or line_b is None:
+    read_rows=source_read_rows if source_order else evaluation_rows
+    with contextlib.closing(read_rows(baseline)) as first,contextlib.closing(read_rows(candidate)) as second:
+        for a,b in itertools.zip_longest(first,second):
+            if a is None or b is None:
                 raise ValueError("baseline/candidate source-read counts differ")
-            a,b=json.loads(line_a),json.loads(line_b)
             if a["inputs"]!=b["inputs"]:
                 raise ValueError("baseline/candidate source identity or row order differs")
             if not in_scope(b):
                 continue
             rows+=1
+            if source_order:geometry["paired" if all(a["inputs"]) else "singleton"].observe(a,b)
             for eye,source in enumerate(b["inputs"]):
                 if source is None:
                     continue
@@ -233,6 +367,20 @@ def matched_algorithm_report(baseline, candidate, index_ranges, allow_extractor_
                 if not all(admitted):
                     continue
                 probes=[fit["withheld_sample_residuals"][eye] for fit in fits]
+                if all(probes):
+                    # Pupil photometry can change while the independent SAM
+                    # limbus samples remain byte-identical. Keep this explicit
+                    # fixed outer-probe metric instead of either comparing new
+                    # pupil probes with old ones or discarding the whole eye.
+                    outer_sets=[{(g["group"],g["points"],g["sample_fingerprint"]):g for g in p["groups"]
+                        if g["kind"]=="OuterLimbus" and g.get("sample_fingerprint")} for p in probes]
+                    common_outer=[(g,outer_sets[1][key]) for key,g in outer_sets[0].items() if key in outer_sets[1]]
+                    for pairs,destination in [(common_outer,unchanged_outer[eye]),
+                            ([pair for pair in common_outer if all(g["used"] for g in pair)],unchanged_supported_outer[eye])]:
+                        if pairs:
+                            count=sum(pair[0]["points"] for pair in pairs)
+                            destination.append(tuple(math.sqrt(sum(pair[i]["rms_px"]**2*pair[i]["points"]
+                                for pair in pairs)/count) for i in (0,1)))
                 if all(p and p["rms_px"] is not None for p in probes):
                     keys=lambda p:[(g["arc"],g["group"],g["kind"],g["points"]) for g in p["groups"]]
                     changed=keys(probes[0])!=keys(probes[1]) or any(
@@ -270,10 +418,13 @@ def matched_algorithm_report(baseline, candidate, index_ranges, allow_extractor_
             "candidate":distribution([b for a,b in pairs]),"candidate_minus_baseline":distribution([b-a for a,b in pairs]),
             "improved_over_1px":sum(b<a-1 for a,b in pairs),"regressed_over_1px":sum(b>a+1 for a,b in pairs)}
     return {"baseline":str(baseline),"candidate":str(candidate),"matched_reads":rows,"index_ranges":index_ranges,
+        **({"source_geometry":{key:value.report() for key,value in geometry.items()}} if source_order else {}),
         "comparison_kind":"extractor_change" if allow_extractor_changes else "optimizer_only",
         "probe_verification":probe_verification,
         "eye_admission":coverage,"all_withheld_samples":[comparison(p) for p in residuals],
         "common_accepted_arc_samples":[comparison(p) for p in supported],
+        "unchanged_outer_limbus_probe_samples":[comparison(p) for p in unchanged_outer],
+        "unchanged_common_accepted_outer_limbus_probe_samples":[comparison(p) for p in unchanged_supported_outer],
         "frontal_equivalent_pixel_area_log_steps":[{"matched":len(p),"baseline":distribution([a for a,b in p]),
             "candidate":distribution([b for a,b in p])} for p in area_steps],
         "independent_SN_FEIDA_log_steps":[{"matched":len(p),"baseline":distribution([a for a,b in p]),
@@ -302,10 +453,14 @@ def main():
     if args.allow_extractor_changes and not args.baseline_evaluation:
         parser.error("allow-extractor-changes requires a baseline evaluation")
     if args.source_order_replay:
-        if args.baseline_evaluation or args.index_range:
-            parser.error("source-order reports do not use stateless row-zipped comparisons")
+        if args.index_range:
+            parser.error("source-order reports require the full matched replay scope")
         expected=json.loads(args.expected_manifest.read_text())["summary"]["unique_raw_frames"] if args.expected_manifest else None
         report=summarize_source_replay(args.evaluation,expected)
+        if args.baseline_evaluation:
+            report["baseline_source_audit"]=summarize_source_replay(args.baseline_evaluation,expected)
+            report["matched_algorithm"]=matched_algorithm_report(args.baseline_evaluation,args.evaluation,[],
+                allow_extractor_changes=args.allow_extractor_changes,source_order=True)
         args.output.write_text(json.dumps(report,indent=2)+"\n")
         return
     methods = ("joint", "monocular_right", "monocular_left")

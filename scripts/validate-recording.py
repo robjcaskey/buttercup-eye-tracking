@@ -65,6 +65,7 @@ def validate(path):
         start_ns = int(start["host_monotonic_ns"])
         config, scenes, refs, dropped = {}, {}, {}, set()
         events, states, intersections, reference_classes = Counter(), Counter(), Counter(), Counter()
+        drop_archive_classes = Counter()
         target_positions, predictions, eye_ids = set(), set(), set()
         held = 0
         ray_comparisons = 0
@@ -94,7 +95,18 @@ def validate(path):
             elif event == "source_dropped":
                 key = row["data"]["clock"]
                 if key:
-                    dropped.add(canonical(key["source_key"]))
+                    source_key = canonical(key["source_key"])
+                    dropped.add(source_key)
+                    if row["data"].get("archived") is True:
+                        assert source_key in frame_keys, "saved-but-unanalyzed ROI lacks its exact native payload"
+                        assert row["data"].get("drop_scope") == "analysis"
+                        drop_archive_classes["saved-native-roi-analysis-skipped"] += 1
+                    elif source_key in frame_keys:
+                        drop_archive_classes["native-roi-present-resolved-by-index"] += 1
+                    else:
+                        drop_archive_classes["native-roi-not-archived"] += 1
+                else:
+                    drop_archive_classes["non-roi-resolve-thumbnail-index"] += 1
             elif event == "presentation":
                 presentations.append(row)
                 cfg = config[(session, row["configuration_revision"])]
@@ -171,6 +183,7 @@ def validate(path):
             "events": dict(events), "target_positions": len(target_positions),
             "distinct_predicted_uv": len(predictions), "held_presentations": held,
             "source_references": dict(reference_classes), "metadata_sequence_gaps": source_gaps,
+            "source_drop_archive_classes": dict(drop_archive_classes),
             "roi_states": {f"{roi}:{state}":n for (roi,state),n in states.items()},
             "intersections": dict(intersections), "plane_only_screen_ray_comparisons": ray_comparisons,
             "interrupted": rows[-1]["interrupted"],

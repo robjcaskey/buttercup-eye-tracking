@@ -825,6 +825,24 @@ pub(crate) fn fit_virtual_display_plane_with_dimensions(
             }
         }
     }
+    // Huber's tail still exerts a finite force. Once a spatially distributed
+    // consensus has identified an antipodal/wandering fixation as an outlier,
+    // that rejected target must not keep rotating/translating the monitor.
+    // Polish only the accepted consensus, then re-score against ALL original
+    // targets. This changes the estimate, not coverage or acceptance limits.
+    if let Some((mut plane,mut score))=best {
+        for _ in 0..3 {
+            let inliers=observations.iter().copied().filter(|observation|
+                display_plane_residual(plane,observation).is_some_and(|r|
+                    r[0].hypot(r[1])<=VIRTUAL_MOUSE_PLANE_INLIER_RESIDUAL)).collect::<Vec<_>>();
+            if !calibration_targets_have_required_coverage(inliers.iter().map(|v|v.1)) {break;}
+            let candidate=refine_virtual_display_plane(plane,&inliers);
+            let Some(next)=score_virtual_display_plane(candidate,observations) else {break;};
+            if next.inliers<score.inliers || (next.inliers==score.inliers && next.rms>=score.rms) {break;}
+            plane=candidate;score=next;
+        }
+        best=Some((plane,score));
+    }
     if let Some((_, score)) = best.as_ref() {
         eprintln!(
             "mouse calibration best 3D candidate: {} inliers rms={:.4} limit={:.4}",

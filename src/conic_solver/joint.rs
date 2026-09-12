@@ -170,10 +170,21 @@ pub(crate) struct JointScenePrior {
     pub(crate) eyes: [Option<EyeScenePrior>; 2],
     /// Reference point only parameterizes the target; no observation vote.
     pub(crate) target_reference_camera_mm: [f64; 3],
-    /// Forward Z separation from that reference, NOT Euclidean ray length.
-    pub(crate) fixation_forward_mm: ScalarSupport,
+    /// Positive axial distance from the reference along its reference-to-
+    /// camera direction, NOT optical-axis Z separation or Euclidean range.
+    /// Together with the viewpoint slope envelope this bounds target range.
+    pub(crate) fixation_axial_distance_mm: ScalarSupport,
     /// Optional previous joint result used as a seed only, never as new pixels.
     pub(crate) target_seed_camera_mm: Option<[f64; 3]>,
+    /// A distinct previous read may provide a better start than the newest
+    /// weak/occluded one. This competes within the SAME bounded search; its
+    /// target is never averaged with another target or added as a residual.
+    pub(crate) secondary_target_seed_camera_mm: Option<[f64; 3]>,
+    /// Tangent-plane ray slopes around the reference-to-camera direction,
+    /// NOT slopes around the camera's optical +Z axis. A visible off-axis eye
+    /// can have a large camera-axis slope with only modest foreshortening.
+    /// This is an engineering search envelope, not a measured head-relative
+    /// biological rotation limit (the head frame is not supplied here).
     pub(crate) maximum_gaze_slope: f64,
     /// Optional independently supported eye-center separation. A coarse IPD
     /// is a model prior, not a measurement of the current iris radii.
@@ -221,6 +232,12 @@ pub(crate) struct ArcSupport {
 #[derive(Clone, Debug)]
 pub(crate) struct JointConicSolution {
     pub(crate) target_camera_mm: [f64; 3],
+    /// Viewpoint-chart diagnostics, not a gaze covariance or a quality vote.
+    pub(crate) target_reference_camera_mm: [f64; 3],
+    pub(crate) target_viewpoint_axial_distance_mm: f64,
+    pub(crate) target_viewpoint_slopes: [f64; 2],
+    pub(crate) target_viewpoint_slope_limit: f64,
+    pub(crate) target_viewpoint_bounds_active: [bool; 2],
     pub(crate) eye_centers_camera_mm: [Option<[f64; 3]>; 2],
     pub(crate) eye_normals: [Option<[f64; 3]>; 2],
     pub(crate) eye_gaze_directions: [Option<[f64;3]>;2],
@@ -443,8 +460,47 @@ fn polyline_quadrature(points:&[(f64,f64)])->Option<(Vec<f64>,f64)> {
 }
 type Parameters = [f64; PARAMETERS];
 
+/// A viewpoint-relative ray chart: two tangent slopes and log axial distance
+/// along the SAME reference-to-camera axis. Mixing viewpoint slopes with
+/// optical-Z depth divides by a near-zero optical-Z ray component and admits
+/// unbounded target ranges even though both configured bounds are finite.
+/// Camera-facing surface checks still apply separately to each eye.
+#[derive(Clone, Copy, Debug)]
+struct ViewpointRayChart {
+    origin_camera_mm: [f64;3],
+    right: [f64;3],
+    down: [f64;3],
+    toward_camera: [f64;3],
+}
+
+impl ViewpointRayChart {
+    fn new(origin_camera_mm:[f64;3])->Option<Self> {
+        if !origin_camera_mm.into_iter().all(f64::is_finite) || origin_camera_mm[2]>=-1.0e-6 {return None;}
+        let toward_camera=normalized3(scale3(origin_camera_mm,-1.0))?;
+        let right=normalized3(cross3([0.0,1.0,0.0],toward_camera))?;
+        let down=cross3(toward_camera,right);
+        Some(Self {origin_camera_mm,right,down,toward_camera})
+    }
+
+    fn coordinates(self,target:[f64;3])->Option<[f64;3]> {
+        let delta=sub3(target,self.origin_camera_mm);
+        let forward=dot3(delta,self.toward_camera);
+        if !delta.into_iter().all(f64::is_finite) || delta[2]<=0.0 || forward<=1.0e-9 {return None;}
+        Some([dot3(delta,self.right)/forward,dot3(delta,self.down)/forward,forward.ln()])
+    }
+
+    fn target(self,coordinates:[f64;3])->Option<[f64;3]> {
+        let ray=add3(self.toward_camera,add3(scale3(self.right,coordinates[0]),scale3(self.down,coordinates[1])));
+        let axial_distance=coordinates[2].exp();
+        if !ray.into_iter().all(f64::is_finite) || ray[2]<=1.0e-6 || !axial_distance.is_finite() || axial_distance<=0.0 {return None;}
+        let target=add3(self.origin_camera_mm,scale3(ray,axial_distance));
+        target.into_iter().all(f64::is_finite).then_some(target)
+    }
+}
+
 struct Problem<'a> {
     request: JointConicRequest<'a>,
+    target_chart: ViewpointRayChart,
     groups: Vec<Group>,
     present: [bool; 2],
     initial: Parameters,
@@ -466,8 +522,8 @@ impl<'a> Problem<'a> {
     fn new(request: JointConicRequest<'a>) -> Result<Self, JointConicUnavailable> {
         let scene = request.scene;
         if request.maximum_hypotheses == 0 || request.maximum_refinements == 0
-            || !scene.camera.valid() || !scene.fixation_forward_mm.valid()
-            || scene.fixation_forward_mm.minimum <= 0.0
+            || !scene.camera.valid() || !scene.fixation_axial_distance_mm.valid()
+            || scene.fixation_axial_distance_mm.minimum <= 0.0
             || !scene.maximum_gaze_slope.is_finite() || scene.maximum_gaze_slope <= 0.0
             || !scene.target_reference_camera_mm.into_iter().all(f64::is_finite)
             || !request.motion_bound_px_per_second.is_finite() || request.motion_bound_px_per_second < 0.0
@@ -516,11 +572,13 @@ impl<'a> Problem<'a> {
             }
         }
         if !present.into_iter().any(|x| x) { return Err(JointConicUnavailable::NoBoundaryEvidence); }
-        let mut p = Self { request, groups, present, initial: [0.0;PARAMETERS],
+        let target_chart=ViewpointRayChart::new(scene.target_reference_camera_mm)
+            .ok_or(JointConicUnavailable::InvalidRequest)?;
+        let mut p = Self { request, target_chart, groups, present, initial: [0.0;PARAMETERS],
             lower: [0.0;PARAMETERS], upper: [0.0;PARAMETERS], scales: [1.0;PARAMETERS] };
         for i in 0..2 { p.lower[i] = -scene.maximum_gaze_slope; p.upper[i] = scene.maximum_gaze_slope; p.scales[i] = 0.1; }
-        p.initial[2] = scene.fixation_forward_mm.nominal.ln();
-        p.lower[2] = scene.fixation_forward_mm.minimum.ln(); p.upper[2] = scene.fixation_forward_mm.maximum.ln(); p.scales[2] = 0.25;
+        p.initial[2] = scene.fixation_axial_distance_mm.nominal.ln();
+        p.lower[2] = scene.fixation_axial_distance_mm.minimum.ln(); p.upper[2] = scene.fixation_axial_distance_mm.maximum.ln(); p.scales[2] = 0.25;
         for eye in 0..2 {
             if !present[eye] { continue; }
             let prior = scene.eyes[eye].unwrap();
@@ -644,9 +702,8 @@ impl<'a> Problem<'a> {
         Some(p)
     }
 
-    fn target(&self, p: &Parameters) -> [f64; 3] {
-        let depth = p[2].exp();
-        add3(self.request.scene.target_reference_camera_mm, [p[0]*depth,p[1]*depth,depth])
+    fn target(&self, p: &Parameters) -> Option<[f64; 3]> {
+        self.target_chart.target([p[0],p[1],p[2]])
     }
 
     fn project_step(&self, mut p:Parameters) -> Option<Parameters> {
@@ -666,7 +723,7 @@ impl<'a> Problem<'a> {
         let c = [p[k], p[k+1], p[k+2]];
         let position=self.request.scene.eyes[eye]?.limbus_center;
         if position.displacement(c).into_iter().zip(position.maximum_displacement_mm).any(|(d,bound)|d.abs()>bound+1.0e-9) {return None;}
-        let gaze = normalized3(sub3(self.target(p),c))?;
+        let gaze = normalized3(sub3(self.target(p)?,c))?;
         if gaze[2]<=0.0 {return None;}
         let tangent_u=normalized3(cross3([0.0,1.0,0.0],gaze))?;
         let tangent_v=cross3(gaze,tangent_u);
@@ -747,7 +804,7 @@ impl<'a> Problem<'a> {
         let scene = self.request.scene;
         // Scale/position priors are separate from arc residuals. A radius does
         // not calibrate its own SN-FEIDA normalization.
-        r.push((p[2].exp()-scene.fixation_forward_mm.nominal)/scene.fixation_forward_mm.sigma);
+        r.push((p[2].exp()-scene.fixation_axial_distance_mm.nominal)/scene.fixation_axial_distance_mm.sigma);
         for eye in 0..2 { if self.present[eye] {
             let prior = scene.eyes[eye]?;
             let k = TARGET_PARAMETERS + eye*EYE_PARAMETERS;
@@ -782,14 +839,15 @@ impl<'a> Problem<'a> {
         let limit = self.request.maximum_hypotheses.min(MAX_HYPOTHESES);
         let mut seeds = Vec::new();
         let mut push = |mut p:Parameters,target: [f64;3]| {
-            let offset = sub3(target,self.request.scene.target_reference_camera_mm);
-            if offset[2] <= 0.0 || seeds.len() >= limit { return; }
-            p[0] = offset[0]/offset[2]; p[1] = offset[1]/offset[2]; p[2] = offset[2].ln();
+            if seeds.len() >= limit { return; }
+            let Some(coordinates)=self.target_chart.coordinates(target) else {return;};
+            p[..TARGET_PARAMETERS].copy_from_slice(&coordinates);
             for i in 0..PARAMETERS { p[i] = p[i].clamp(self.lower[i],self.upper[i]); }
             if !seeds.iter().any(|s: &Parameters| (s[0]-p[0]).hypot(s[1]-p[1]) < 0.002 && (s[2]-p[2]).abs() < 0.02
                 && (TARGET_PARAMETERS..PARAMETERS).all(|i|(s[i]-p[i]).abs()<0.01*self.scales[i])) { seeds.push(p); }
         };
         if let Some(target) = self.request.scene.target_seed_camera_mm.filter(|p| p.into_iter().all(|v| v.is_finite())) { push(self.initial,target); }
+        if let Some(target) = self.request.scene.secondary_target_seed_camera_mm.filter(|p| p.into_iter().all(|v| v.is_finite())) { push(self.initial,target); }
         // Conic signs supply MULTIPLE starts for the SAME coupled objective.
         // No independent gaze is accepted or averaged here.
         for multiplier in [1.0, 0.5, 2.0] {
@@ -832,20 +890,23 @@ impl<'a> Problem<'a> {
                             }
                         }
                         let center=[geometry[k],geometry[k+1],geometry[k+2]];
-                        let depth = (self.request.scene.fixation_forward_mm.nominal*multiplier).clamp(self.request.scene.fixation_forward_mm.minimum,self.request.scene.fixation_forward_mm.maximum);
-                        let dz = self.request.scene.target_reference_camera_mm[2]+depth-center[2];
-                        push(geometry,add3(center,scale3(n,dz/n[2])));
+                        let axial = self.request.scene.fixation_axial_distance_mm;
+                        let distance = (axial.nominal*multiplier).clamp(axial.minimum,axial.maximum);
+                        let center_offset=dot3(sub3(center,self.target_chart.origin_camera_mm),self.target_chart.toward_camera);
+                        let ray_forward=dot3(n,self.target_chart.toward_camera);
+                        if ray_forward<=1.0e-6 || distance<=center_offset {continue;}
+                        push(geometry,add3(center,scale3(n,(distance-center_offset)/ray_forward)));
                     }
                 }
             }
         }
-        push(self.initial,self.target(&self.initial));
+        if let Some(target)=self.target(&self.initial) {push(self.initial,target);}
         // Unfitted partial arcs are allowed. Without a complete ellipse hint,
         // non-frontal starts avoid the zero tilt derivative at a perfect circle.
         for (x,y) in [(0.0,-0.35),(0.0,0.35),(-0.35,0.0),(0.35,0.0),
                       (-0.35,-0.35),(-0.35,0.35),(0.35,-0.35),(0.35,0.35)] {
-            let d=self.request.scene.fixation_forward_mm.nominal;
-            push(self.initial,add3(self.request.scene.target_reference_camera_mm,[x*d,y*d,d]));
+            let mut candidate=self.initial;candidate[0]=x;candidate[1]=y;
+            if let Some(target)=self.target(&candidate) {push(self.initial,target);}
         }
         seeds
     }
@@ -912,7 +973,12 @@ impl<'a> Problem<'a> {
 
     fn solution(&self, p: &Parameters, cost: f64) -> Option<JointConicSolution> {
         let conics = self.conics(p)?;
-        let mut result = JointConicSolution { target_camera_mm: self.target(p),
+        let mut result = JointConicSolution { target_camera_mm: self.target(p)?,
+            target_reference_camera_mm:self.target_chart.origin_camera_mm,
+            target_viewpoint_axial_distance_mm:p[2].exp(),
+            target_viewpoint_slopes:[p[0],p[1]],
+            target_viewpoint_slope_limit:self.request.scene.maximum_gaze_slope,
+            target_viewpoint_bounds_active:[0,1].map(|i|(p[i].abs()-self.request.scene.maximum_gaze_slope).abs()<=1.0e-5),
             eye_centers_camera_mm: [None;2], eye_normals: [None;2], effective_pivots_camera_mm: [None;2],
             eye_gaze_directions:[None;2],surface_axis_alignment_radians:[None;2],
             ellipses_roi_px: [[None;3];2], arcs: Vec::new(), contributing_eyes: [false;2],
@@ -998,6 +1064,16 @@ fn solve_dense(mut a: [[f64;PARAMETERS];PARAMETERS], mut b: Parameters) -> Optio
 }
 
 pub(crate) fn solve_joint_conics(request: JointConicRequest<'_>) -> Result<JointConicSolution, JointConicUnavailable> {
+    solve_joint_conic_hypotheses(request, 1).map(|mut hypotheses| hypotheses.remove(0))
+}
+
+/// Retain a bounded set of CURRENT, jointly optimized alternatives for
+/// temporal diagnosis. Returning more hypotheses does not add optimizer work,
+/// independent gaze averages, or evidence. The first is exactly the ordinary
+/// single-frame winner. A missing alternative is not proof of observability.
+pub(crate) fn solve_joint_conic_hypotheses(request: JointConicRequest<'_>, maximum_returned: usize)
+    -> Result<Vec<JointConicSolution>, JointConicUnavailable> {
+    if maximum_returned == 0 { return Err(JointConicUnavailable::InvalidRequest); }
     // Validate the FULL request first. Omitting an unlocalized ROI must never
     // be a way around invalid source clocks, timing bounds or scene inputs.
     let problem = Problem::new(request)?;
@@ -1049,12 +1125,18 @@ pub(crate) fn solve_joint_conics(request: JointConicRequest<'_>) -> Result<Joint
     fits.sort_by(|a,b|a.1.robust_cost.total_cmp(&b.1.robust_cost));
     if fits.is_empty() {return Err(if feasible {JointConicUnavailable::NoFeasibleHypothesis}
         else {JointConicUnavailable::NoFeasibleInitialization});}
-    let (slope,mut solution)=fits.remove(0);
-    solution.hypotheses_evaluated=hypotheses;solution.refinement_steps=steps;
-    solution.hypotheses_by_association=associations;
-    if let Some((_,alternate))=fits.iter().find(|(q,_)|(q[0]-slope[0]).hypot(q[1]-slope[1])>0.035) {
-        solution.alternative_cost_margin=Some((alternate.robust_cost-solution.robust_cost).max(0.0));
-        solution.alternative_target_camera_mm=Some(alternate.target_camera_mm);
+    let mut retained = Vec::<([f64; 2], JointConicSolution)>::new();
+    for (slope, candidate) in &fits {
+        if retained.iter().any(|(q, _)| (q[0]-slope[0]).hypot(q[1]-slope[1]) <= 0.035) { continue; }
+        let mut solution = candidate.clone();
+        solution.hypotheses_evaluated=hypotheses;solution.refinement_steps=steps;
+        solution.hypotheses_by_association=associations;
+        if let Some((_,alternate))=fits.iter().find(|(q,_)|(q[0]-slope[0]).hypot(q[1]-slope[1])>0.035) {
+            solution.alternative_cost_margin=Some((alternate.robust_cost-solution.robust_cost).max(0.0));
+            solution.alternative_target_camera_mm=Some(alternate.target_camera_mm);
+        }
+        retained.push((*slope, solution));
+        if retained.len() >= maximum_returned.min(4) { break; }
     }
-    Ok(solution)
+    Ok(retained.into_iter().map(|(_, solution)| solution).collect())
 }

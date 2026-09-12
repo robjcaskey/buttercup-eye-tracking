@@ -28,9 +28,17 @@ mapfile -t unexpected_files < <(
       ./docs/roi-reframe-continuity.md \
       ./docs/viewer-workspaces.md \
       ./docs/sam-concurrency-and-gaze-latency.md \
+      ./docs/eye-student.md \
+      ./docs/limbus-refiner.md \
       ./docs/raw-recording-evidence.md \
       ./docs/physics-naming-audit.md \
       ./scripts/audit-tree.sh \
+      ./scripts/prepare-eye-student.py \
+      ./scripts/prepare-limbus-refiner.py \
+      ./scripts/test-limbus-refiner.py \
+      ./scripts/report-limbus-refiner.py \
+      ./scripts/report-eye-student.py \
+      ./scripts/test-eye-student.py \
       ./scripts/run-viewer.sh \
       ./scripts/audit-readmission-corpus.py \
       ./scripts/inventory-stereo-corpus.py \
@@ -49,6 +57,9 @@ mapfile -t unexpected_files < <(
       ./src/checkerboard_calibration.rs \
       ./src/calibration_acquisition.rs \
       ./src/geometry.rs \
+      ./src/limbus_refiner.rs \
+      ./src/limbus_refiner_train.rs \
+      ./src/limbus_refiner_view.rs \
       ./src/display_pose_wireframe.rs \
       ./src/monitor_location.rs \
       ./src/mouse_output.rs \
@@ -93,6 +104,8 @@ mapfile -t unexpected_files < <(
       ./src/bin/buttercup_sam31_video_graph.rs \
       ./src/bin/buttercup_sam31_tracker_bundle.rs \
       ./src/bin/buttercup_raw10_preview.rs \
+      ./src/bin/buttercup_eye_student.rs \
+      ./src/bin/buttercup_limbus_refiner.rs \
       ./src/coupled_eye_kinematics.rs \
       ./src/keyboard_peeper.rs \
       ./src/main.rs \
@@ -117,7 +130,10 @@ mapfile -t unexpected_files < <(
       ./src/raw_sclera_vein_graph.rs \
       ./src/raw_sclera_red_canny.rs \
       ./src/sam31_outer.rs \
+      ./src/sam31_student.rs \
       ./src/sam31_pipeline.rs \
+      ./src/source_queue_budget.rs \
+      ./src/student_preview.rs \
       ./src/sam31_cuda_stream.cpp \
       ./src/sam31_photometric.rs \
       ./src/sam31_text.rs \

@@ -68,8 +68,8 @@ fn source_json(source:ExposureKey)->Value {
         "timestamp_ns":source.timestamp_ns.to_string()})
 }
 
-pub(super) fn run(files:&[String],limit:usize,partial_outlines:bool,delay:[u64;2],
-    writer:&mut impl Write)->Result<(),String> {
+pub(super) fn run(files:&[String],limit:usize,partial_outlines:bool,delay:[u64;2],export_hypotheses:bool,
+    outline_directions:bool,writer:&mut impl Write)->Result<(),String> {
     let mut readers=files.iter().map(|path|File::open(path).map(BufReader::new).map_err(|e|e.to_string()))
         .collect::<Result<Vec<_>,_>>()?;
     let mut clocks=HashMap::new();
@@ -84,6 +84,7 @@ pub(super) fn run(files:&[String],limit:usize,partial_outlines:bool,delay:[u64;2
     let mut retained:[VecDeque<Arc<Frame>>;2]=std::array::from_fn(|_|VecDeque::new());
     let mut previous:[Option<(u64,[u32;2],[u32;2])>;2]=[None;2];
     let mut tracker=JointTracker::default();
+    tracker.retain_diagnostic_hypotheses(export_hypotheses);
     let mut clock=None;
     let mut generation=0;
     let mut newest=0u64;
@@ -93,7 +94,7 @@ pub(super) fn run(files:&[String],limit:usize,partial_outlines:bool,delay:[u64;2
         let reader=&mut readers[position.file];
         reader.seek(SeekFrom::Start(position.offset)).map_err(|e|e.to_string())?;
         line.clear();reader.read_line(&mut line).map_err(|e|e.to_string())?;
-        let frame=Arc::new(prepare(serde_json::from_str(&line).map_err(|e|e.to_string())?,partial_outlines)?);
+        let frame=Arc::new(prepare_with_directions(serde_json::from_str(&line).map_err(|e|e.to_string())?,partial_outlines,outline_directions)?);
         let source=frame.packet.exposure;
         if source!=position.source || integer(&frame.input,"index")?!=position.index {
             return Err("cached source changed between indexing and replay".into());
@@ -119,6 +120,7 @@ pub(super) fn run(files:&[String],limit:usize,partial_outlines:bool,delay:[u64;2
         let result=tracker.observe(packet(),camera);
         let elapsed=started.elapsed().as_secs_f64()*1000.0;
         let mut output=json!({"schema":"buttercup-joint-source-replay-v1","event":event,"input":frame.input,
+            "retained_outline_direction_experiment":outline_directions,
             "generation":generation,"arrival_delay_ns":delay.map(|v|v.to_string()),
             "logical_arrival_timestamp_ns":(source.timestamp_ns+delay[eye]).to_string(),
             "source_now_ns":newest.to_string(),"native_roi_reframe":reframe,
@@ -136,6 +138,10 @@ pub(super) fn run(files:&[String],limit:usize,partial_outlines:bool,delay:[u64;2
                 }
                 output["publication_inputs"]=json!(frames.map(|f|f.map(|f|&f.input)));
                 output["joint"]=solution_json(Ok(publication.solution.clone()),frames,elapsed);
+                if export_hypotheses {
+                    output["current_source_hypotheses"]=json!(publication.diagnostic_hypotheses.iter()
+                        .map(|solution|solution_json(Ok(solution.clone()),frames,elapsed)).collect::<Vec<_>>());
+                }
             },
             Ok(None)=>return Err("unique source silently treated as duplicate".into()),
             Err(error)=>output["joint"]=json!({"available":false,"reason":format!("{error:?}"),"elapsed_ms":elapsed}),

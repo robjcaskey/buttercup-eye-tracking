@@ -79,8 +79,8 @@ pub(crate) fn approximate_scene(camera:PinholeCamera,eyes:[Option<EyePoseInput>;
     // gaze direction or solved gaze point exists at this stage.
     Some(CoarseBinocularScene {prior:JointScenePrior {camera,eyes:priors,
         target_reference_camera_mm:reference,
-        fixation_forward_mm:ScalarSupport {nominal:609.6,minimum:150.0,maximum:2000.0,sigma:800.0},
-        target_seed_camera_mm:None,maximum_gaze_slope:1.5,
+        fixation_axial_distance_mm:ScalarSupport {nominal:609.6,minimum:150.0,maximum:2000.0,sigma:800.0},
+        target_seed_camera_mm:None,secondary_target_seed_camera_mm:None,maximum_gaze_slope:1.5,
         interocular_distance_mm:Some(ScalarSupport {nominal:64.0,minimum:30.0,maximum:100.0,sigma:18.0}),
     },scale_provenance,independent_pixels_per_mm:independent})
 }

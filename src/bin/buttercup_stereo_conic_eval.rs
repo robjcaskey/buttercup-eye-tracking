@@ -57,6 +57,10 @@ struct Frame {
 }
 
 fn prepare(row:Value,partial_outlines:bool)->Result<Frame,String> {
+    prepare_with_directions(row,partial_outlines,false)
+}
+
+fn prepare_with_directions(row:Value,partial_outlines:bool,outline_directions:bool)->Result<Frame,String> {
     let input=row["input"].clone();
     let meta=&input["frame"];
     let eye=integer(meta,"eye_id")?;
@@ -73,6 +77,13 @@ fn prepare(row:Value,partial_outlines:bool)->Result<Frame,String> {
     let selected_raw_admitted=selected.is_some_and(|c|c["baseline_raw_admitted"]==true);
     let baseline=selected.and_then(|c|ellipse(&c["baseline_ellipse"]));
     let try_partial=partial_outlines&&(baseline.is_none()||!selected_raw_admitted);
+    let pupil=ellipse(&row["pupil_void"]["ellipse"]);
+    let raw=if outline_directions || pupil.is_some() || try_partial {
+        let mut file=File::open(input["raw_file"].as_str().ok_or("missing RAW file")?).map_err(|e|e.to_string())?;
+        file.seek(SeekFrom::Start(integer(&input,"raw_offset")?)).map_err(|e|e.to_string())?;
+        let mut bytes=vec![0;integer(&input,"raw_length")? as usize];file.read_exact(&mut bytes).map_err(|e|e.to_string())?;
+        Some(raw10::try_unpack_raw10(&bytes,size[0] as usize,size[1] as usize,integer(meta,"stride")? as usize)?)
+    } else {None};
     // A rejected complete conic is not stronger evidence than an incomplete
     // outline. In this explicit experiment, re-extract RAW-supported measured
     // arcs instead of keeping the rejected fit's unchecked sections as well.
@@ -85,20 +96,17 @@ fn prepare(row:Value,partial_outlines:bool)->Result<Frame,String> {
         let review=outline_conic_segments::ContourFitEvidence {ellipse:baseline,source_component_area_px:0.0,
             retained_points:Arc::new(retained),conic_segments:Arc::new(segments),
             flat_tire_points:Arc::new(points(&selected["baseline_censored"])),upper_flat_tire:false,lower_flat_tire:false};
-        append_retained_sam_arcs(&mut packet,&review,0);
+        append_retained_sam_arcs_with_direction_policy(&mut packet,&review,0,
+            raw.as_deref().filter(|_|outline_directions));
         if !selected_raw_admitted {
             for arc in &mut packet.arcs {arc.normal_band_half_width_px=5.0;}
         }
     }
-    let pupil=ellipse(&row["pupil_void"]["ellipse"]);
     let mut partial_outline=PartialOutlineReport::default();
-    if pupil.is_some()||try_partial {
-        let mut file=File::open(input["raw_file"].as_str().ok_or("missing RAW file")?).map_err(|e|e.to_string())?;
-        file.seek(SeekFrom::Start(integer(&input,"raw_offset")?)).map_err(|e|e.to_string())?;
-        let mut bytes=vec![0;integer(&input,"raw_length")? as usize];file.read_exact(&mut bytes).map_err(|e|e.to_string())?;
-        let raw=raw10::try_unpack_raw10(&bytes,size[0] as usize,size[1] as usize,integer(meta,"stride")? as usize)?;
-        if let Some(pupil)=pupil {
-            append_raw_ring_arcs(&mut packet,&raw,pupil,BoundaryKind::PupillaryBoundary,100,RawArcConfig::default());
+    if let Some(raw)=raw.as_ref() {
+        if let Some((pupil,config))=pupil.zip(baseline.and_then(|outer|
+            RawArcConfig::for_pupil(&raw,size[0] as usize,size[1] as usize,outer))) {
+            append_raw_ring_arcs(&mut packet,&raw,pupil,BoundaryKind::PupillaryBoundary,100,config);
         }
         if try_partial {
             let mut ranked=candidates.iter().filter(|c|c["semantic_score"].as_f64().is_some_and(f64::is_finite)).collect::<Vec<_>>();
@@ -153,6 +161,10 @@ fn solution_json(result:Result<JointConicSolution,JointConicUnavailable>,frames:
     match result {
         Err(reason)=>json!({"available":false,"reason":format!("{reason:?}"),"elapsed_ms":elapsed}),
         Ok(solution)=>json!({"available":true,"target_camera_mm":solution.target_camera_mm,
+            "target_search_chart":{"frame":"reference-to-camera-tangent-plane","slopes":solution.target_viewpoint_slopes,
+                "reference_camera_mm":solution.target_reference_camera_mm,
+                "axial_distance_mm":solution.target_viewpoint_axial_distance_mm,"distance_axis":"reference-to-camera",
+                "slope_limit":solution.target_viewpoint_slope_limit,"active_bounds":solution.target_viewpoint_bounds_active},
             "eye_centers_camera_mm":solution.eye_centers_camera_mm,"eye_normals":solution.eye_normals,
             "eye_gaze_directions":solution.eye_gaze_directions,"surface_axis_alignment_radians":solution.surface_axis_alignment_radians,
             "contributing_eyes":solution.contributing_eyes,"cost":solution.robust_cost,
@@ -224,6 +236,8 @@ fn run()->Result<(),String> {
     let mut partial_outlines=false;
     let mut export_sparse=false;
     let mut source_order_replay=false;
+    let mut export_hypotheses=false;
+    let mut outline_directions=false;
     let mut arrival_delay_ns=[0u64;2];
     while let Some(arg)=args.next() {
         if arg=="--max-frames-per-cache" {
@@ -232,6 +246,8 @@ fn run()->Result<(),String> {
         } else if arg=="--partial-outlines" {partial_outlines=true;}
         else if arg=="--export-sparse-evidence" {export_sparse=true;}
         else if arg=="--source-order-replay" {source_order_replay=true;}
+        else if arg=="--export-hypotheses" {export_hypotheses=true;}
+        else if arg=="--retained-outline-directions" {outline_directions=true;}
         else if arg=="--arrival-delay-ns" {
             let eye=args.next().ok_or("missing delayed ROI id (1 or 2)")?.parse::<usize>().map_err(|e|e.to_string())?;
             if !(1..=2).contains(&eye) {return Err("delayed ROI id must be 1 or 2".into());}
@@ -244,8 +260,9 @@ fn run()->Result<(),String> {
     if !std::fs::canonicalize(output.parent().ok_or("missing output directory")?).map_err(|e|e.to_string())?.starts_with(allowed) {return Err("output must be under outputs".into());}
     let mut writer=BufWriter::new(OpenOptions::new().create_new(true).write(true).open(output).map_err(|e|e.to_string())?);
     if source_order_replay {
-        return source_order::run(&files,maximum_frames_per_cache,partial_outlines,arrival_delay_ns,&mut writer);
+        return source_order::run(&files,maximum_frames_per_cache,partial_outlines,arrival_delay_ns,export_hypotheses,outline_directions,&mut writer);
     }
+    if export_hypotheses { return Err("export-hypotheses requires source-order-replay".into()); }
     if arrival_delay_ns!=[0;2] {return Err("arrival-delay-ns requires source-order-replay".into());}
     let mut pending:HashMap<(String,u64),[Option<Frame>;2]>=HashMap::new();
     let mut count=0usize;
@@ -258,7 +275,7 @@ fn run()->Result<(),String> {
     for path in files {
         for (line_number,line) in BufReader::new(File::open(&path).map_err(|e|e.to_string())?).lines().take(maximum_frames_per_cache).enumerate() {
             let row=serde_json::from_str(&line.map_err(|e|e.to_string())?).map_err(|e|format!("{path}:{}: {e}",line_number+1))?;
-            let frame=prepare(row,partial_outlines)?;
+            let frame=prepare_with_directions(row,partial_outlines,outline_directions)?;
             let eye=frame.packet.exposure.roi.0.checked_sub(1).filter(|e|*e<2).ok_or("invalid ROI")? as usize;
             let key=(frame.input["clock_lineage"].as_str().ok_or("missing lineage")?.to_owned(),frame.packet.exposure.timestamp_ns);
             let slot=pending.entry(key.clone()).or_insert_with(||[None,None]);

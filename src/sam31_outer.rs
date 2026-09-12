@@ -20,6 +20,9 @@ use std::time::Instant;
 #[path = "sam31_pipeline.rs"]
 mod pipeline;
 
+#[path = "sam31_student.rs"]
+pub mod student;
+
 pub use crate::geometry::Ellipse;
 pub use crate::conic_solver::OuterContourScaleContext;
 // Compatibility entry point for the existing offline tools.
@@ -393,6 +396,9 @@ pub enum PreprocessRegime {
     /// transforms.
     #[default]
     MildBlur,
+    /// Offline trial: local-variance shrinkage with a robust, image-derived
+    /// noise proxy. Not a calibrated sensor-noise model or a live default.
+    AdaptiveDenoise,
     /// Diagnostic-only center exclusion: use the normal mild-blur adapter,
     /// locate the darkest compact central region, then cover it with a
     /// saturated pink box before SAM inference. The retained RAW frame is
@@ -422,11 +428,12 @@ impl PreprocessRegime {
         }
     }
 
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::BalancedQuadRgb,
         Self::ShadowBoost,
         Self::GentleShadowLift,
         Self::MildBlur,
+        Self::AdaptiveDenoise,
         Self::PinkCenterMask,
         Self::Unsharp,
         Self::GentleUnsharp,
@@ -448,6 +455,7 @@ impl PreprocessRegime {
             Self::ShadowBoost => "shadow-boost",
             Self::GentleShadowLift => "gentle-shadow-lift",
             Self::MildBlur => "mild-blur",
+            Self::AdaptiveDenoise => "adaptive-denoise",
             Self::PinkCenterMask => "pink-center-mask",
             Self::Unsharp => "unsharp",
             Self::GentleUnsharp => "gentle-unsharp",
@@ -514,6 +522,10 @@ pub struct ProposalMasks {
     pub eye_index: usize,
     pub source_sequence: u64,
     pub source_timestamp_ns: u64,
+    /// Number of ROIs atomically submitted for this sensor exposure: one
+    /// single-eye request or two paired requests. Zero denotes unavailable
+    /// legacy metadata. This is not the number of temporal history frames.
+    pub source_group_roi_count: u8,
     pub source_sensor_origin: (u32, u32),
     pub source_width: usize,
     pub source_height: usize,
@@ -1108,7 +1120,6 @@ fn live_detector_candidate_is_plausible(
         && has_plausible_fit
 }
 
-#[cfg(any(feature = "sam31", test))]
 fn live_detector_raw_gate_passes(support: RawRingSupport) -> bool {
     support.score.is_finite() && support.score >= MIN_RAW_RING_SUPPORT_SCORE
 }
@@ -1299,6 +1310,7 @@ struct Batch {
     frames: Vec<Arc<RawFrame>>,
     motion: Option<SourceMotionSnapshot>,
     prompt_bundle: PromptBundle,
+    source_group_claimed: Option<Arc<AtomicBool>>,
 }
 
 enum WorkerRequest {
@@ -1307,6 +1319,14 @@ enum WorkerRequest {
 }
 
 fn replace_waiting_request(new: &WorkerRequest, old: &WorkerRequest) -> bool {
+    // A single-eye/scene submission must not split a previously queued pair.
+    if matches!(old,WorkerRequest::Batch(batch) if batch.source_group_claimed.is_some()) {return false;}
+    replace_waiting_group_member(new,old)
+}
+
+fn replace_waiting_group_member(new: &WorkerRequest, old: &WorkerRequest) -> bool {
+    if matches!(old,WorkerRequest::Batch(batch) if batch.source_group_claimed.as_ref()
+        .is_some_and(|claimed|claimed.load(std::sync::atomic::Ordering::Acquire))) {return false;}
     match (new, old) {
         (WorkerRequest::Batch(new), WorkerRequest::Batch(old)) => {
             if new.eye_index != old.eye_index { return false; }
@@ -1346,7 +1366,11 @@ impl RequestSender {
 }
 impl RequestReceiver {
     fn recv(&self) -> Result<WorkerRequest, std::sync::mpsc::RecvError> {
-        match self { Self::Direct(rx) => rx.recv(), Self::Latest(rx) => rx.recv() }
+        match self { Self::Direct(rx) => rx.recv(), Self::Latest(rx) => rx.recv_with(|request| {
+            if let WorkerRequest::Batch(batch)=request {
+                if let Some(claimed)=&batch.source_group_claimed {claimed.store(true,std::sync::atomic::Ordering::Release);}
+            }
+        }) }
     }
 }
 
@@ -1400,6 +1424,7 @@ fn scene_candidate(masks: &[u8], scores: &[f32], width: usize, height: usize) ->
 pub struct Client {
     lanes: Vec<WorkerLane>,
     prompt_bundle: Mutex<PromptBundle>,
+    student_backend: bool,
 }
 
 struct WorkerLane {
@@ -1412,6 +1437,12 @@ struct WorkerLane {
 }
 
 impl Client {
+    pub fn is_student(&self)->bool {self.student_backend}
+
+    pub fn start_student(model:impl AsRef<Path>)->Result<Self,String> {
+        student::validate_model(model.as_ref())?;
+        Self::start_with_backend(model,None::<&Path>,2,true,true)
+    }
     /// Global searches use the primary lane, without touching eye memory.
     pub fn submit_scene(&self, pixels: Arc<Vec<u32>>, width: usize, height: usize,
         prompt_bundle: Option<PathBuf>) -> Result<Receiver<Result<Option<SceneCandidate>, String>>, String> {
@@ -1457,6 +1488,11 @@ impl Client {
         count: usize,
         pipelined: bool,
     ) -> Result<Self, String> {
+        Self::start_with_backend(model,prompt_bundle_override,count,pipelined,false)
+    }
+
+    fn start_with_backend(model:impl AsRef<Path>,prompt_bundle_override:Option<impl AsRef<Path>>,
+        count:usize,pipelined:bool,student_backend:bool)->Result<Self,String> {
         if !(1..=2).contains(&count) { return Err("SAM requires one or two worker lanes".into()); }
         PreprocessRegime::configured_live()?;
         let model = model.as_ref().to_path_buf();
@@ -1469,7 +1505,7 @@ impl Client {
         let prompt_bundle = prompt_bundle_override
             .map(|path| path.as_ref().to_path_buf())
             .unwrap_or_else(|| prompt_bundle_path(&model));
-        if !prompt_bundle.is_file() {
+        if !student_backend && !prompt_bundle.is_file() {
             return Err(format!(
                 "SAM31 semantic prompt bundle not found: {}",
                 prompt_bundle.display()
@@ -1490,14 +1526,14 @@ impl Client {
             let stop = Arc::new(AtomicBool::new(false));
             let worker = start_worker(
                 lane, model.clone(), prompt_bundle.clone(), request_rx, result_tx,
-                proposal_tx, Arc::clone(&status), Arc::clone(&stop),
+                proposal_tx, Arc::clone(&status), Arc::clone(&stop), student_backend,
             )?;
             lanes.push(WorkerLane {
                 request: Some(request_tx), results: result_rx, proposal_masks: proposal_rx,
                 status, stop, worker: Some(worker),
             });
         }
-        Ok(Self { lanes, prompt_bundle: Mutex::new(PromptBundle { revision: 0, path: prompt_bundle }) })
+        Ok(Self { lanes, prompt_bundle: Mutex::new(PromptBundle { revision: 0, path: prompt_bundle }), student_backend })
     }
 
     pub fn submit_history(
@@ -1570,6 +1606,7 @@ impl Client {
             frames,
             motion,
             prompt_bundle: prompt_bundle.clone(),
+            source_group_claimed: None,
         })) {
             Ok(replaced) => {
                 if let Ok(mut status) = lane.status.lock() {
@@ -1601,10 +1638,50 @@ impl Client {
         }
     }
 
+    pub(crate) fn supports_source_groups(&self)->bool {
+        self.lanes.len()==2 && self.lanes.iter().all(|lane|matches!(lane.request,Some(RequestSender::Latest(_))))
+    }
+
+    /// Both native ROIs from an attested common source read are accepted or
+    /// dropped together. One already claimed half protects its partner until
+    /// that lane claims it too; newer waiting groups replace both halves.
+    pub(crate) fn submit_source_group(&self, frames:[Arc<RawFrame>;2], target:Target,
+        semantic_prompt:usize,prompt_generation:u64,tracking_epochs:[u64;2],
+        motion:[Option<SourceMotionSnapshot>;2])->SubmitOutcome {
+        if !self.supports_source_groups() || frames[0].timestamp_ns!=frames[1].timestamp_ns
+            || frames.iter().enumerate().any(|(eye,frame)|frame.eye_index!=eye || frame.width<4 || frame.height<4
+                || frame.width*FRAME_HEIGHT!=frame.height*FRAME_WIDTH
+                || frame.width.checked_mul(frame.height)!=Some(frame.pixels.len())) {return SubmitOutcome::Invalid;}
+        let Ok(bundle)=self.prompt_bundle.lock() else {return SubmitOutcome::Invalid;};
+        let claimed=Arc::new(AtomicBool::new(false));let submitted_at=Instant::now();
+        let mut motion=motion.into_iter();
+        let requests=frames.into_iter().enumerate().map(|(eye_index,frame)|WorkerRequest::Batch(Batch {
+            submitted_at,target,semantic_prompt:semantic_prompt.min(SEMANTIC_PROMPT_COUNT-1),
+            prompt_generation,tracking_epoch:tracking_epochs[eye_index],eye_index,
+            frames:vec![frame],motion:motion.next().unwrap(),prompt_bundle:bundle.clone(),
+            source_group_claimed:Some(Arc::clone(&claimed)),
+        })).collect::<Vec<_>>();
+        let [first,second]:[WorkerRequest;2]=requests.try_into().ok().unwrap();
+        let (Some(RequestSender::Latest(first_tx)),Some(RequestSender::Latest(second_tx)))=
+            (&self.lanes[0].request,&self.lanes[1].request) else {return SubmitOutcome::Invalid;};
+        let result=first_tx.try_send_pair(second_tx,[first,second],replace_waiting_group_member);
+        for (eye,lane) in self.lanes.iter().enumerate() {
+            if let Ok(mut status)=lane.status.lock() {
+                match &result {
+                    Ok(replaced)=>{status.accepted_batches+=1;if replaced[eye] {status.replaced_batches+=1;status.dropped_batches+=1;}},
+                    Err(_)=>status.dropped_batches+=1,
+                }
+            }
+        }
+        match result {Ok(_)=>SubmitOutcome::Accepted,Err(TrySendError::Full(_))=>SubmitOutcome::DroppedBusy,
+            Err(TrySendError::Disconnected(_))=>SubmitOutcome::Invalid}
+    }
+
     /// Atomically bind subsequent submissions on *both* lanes to one revision.
     /// In-flight requests retain their own prompt/generation. Idle lanes load
     /// the newest revision on their next frame; no partial broadcast/retry.
     pub fn reload_prompt_bundle(&self, path: impl AsRef<Path>) -> SubmitOutcome {
+        if self.student_backend {return SubmitOutcome::Invalid;}
         if !path.as_ref().is_file() { return SubmitOutcome::Invalid; }
         let Ok(mut bundle) = self.prompt_bundle.lock() else { return SubmitOutcome::Invalid; };
         bundle.revision = bundle.revision.wrapping_add(1);
@@ -1691,6 +1768,7 @@ fn start_worker(
     _proposal_masks: SyncSender<Arc<ProposalMasks>>,
     _status: Arc<Mutex<StatusSnapshot>>,
     _stop: Arc<AtomicBool>,
+    _student_backend: bool,
 ) -> Result<std::thread::JoinHandle<()>, String> {
     Err("SAM31 support is not compiled in; rebuild with --features sam31".to_string())
 }
@@ -1705,10 +1783,20 @@ fn start_worker(
     proposal_masks: SyncSender<Arc<ProposalMasks>>,
     status: Arc<Mutex<StatusSnapshot>>,
     stop: Arc<AtomicBool>,
+    student_backend: bool,
 ) -> Result<std::thread::JoinHandle<()>, String> {
     thread::Builder::new()
         .name(format!("sam31-eye-{lane}"))
         .spawn(move || {
+            if student_backend {
+                let error_status=Arc::clone(&status);
+                let run=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+                    runtime::student_worker(lane,model,request,results,proposal_masks,status,stop)));
+                if run.is_err() {if let Ok(mut state)=error_status.lock() {
+                    state.state="error";state.detail="CUDA eye student worker panicked; select SAM or restart".into();
+                }}
+                return;
+            }
             runtime::worker(
                 lane,
                 model,
@@ -1787,22 +1875,9 @@ fn raw_ring_support(image: &FloatImage, ellipse: Ellipse) -> RawRingSupport {
 /// Use the surrounding iris to bound reflectance in the *original* RAW luma;
 /// the center can be almost entirely covered by a specular highlight.
 fn pupil_iris_luma_ceiling(image: &FloatImage, outer: Ellipse) -> f64 {
-    let mut annulus = Vec::new();
-    for y in (0..image.height).step_by(2) {
-        for x in (0..image.width).step_by(2) {
-            let radius = ellipse_coordinate((x as f64, y as f64), outer);
-            let value = image.data[y * image.width + x][0] as f64;
-            if (0.55..=0.85).contains(&radius) && value.is_finite() {
-                annulus.push(value);
-            }
-        }
-    }
-    if annulus.len() < 64 {
-        return 0.0;
-    }
-    let center = median(annulus.clone());
-    let deviation = median(annulus.into_iter().map(|value| (value - center).abs()).collect());
-    center + (4.0 * deviation).max(0.4 * center).max(12.0)
+    crate::outline_conic_segments::sparse_evidence::iris_tissue_luma_ceiling(
+        image.width,image.height,outer,|x,y|Some(image.data[y*image.width+x][0] as f64))
+        .unwrap_or(0.0)
 }
 
 fn pupil_raw_support_is_sufficient(support: RawRingSupport) -> bool {
@@ -2692,6 +2767,97 @@ fn mildly_blurred(balanced: &[FloatImage]) -> Vec<FloatImage> {
         .collect()
 }
 
+/// Single-exposure local-variance shrinkage. The mixed spatial difference
+/// cancels a linear brightness ramp; a robust scale downweights sparse edges.
+/// Demosaic correlation and iris texture violate independent Gaussian noise,
+/// so this is an engineering proxy, NOT a measured noise variance/confidence.
+/// Only model input is filtered: retained RAW and boundary evidence are intact.
+fn adaptive_denoise(source: &FloatImage) -> FloatImage {
+    if source.width < 12
+        || source.height < 12
+        || source.data.iter().flatten().any(|v| !v.is_finite())
+    {
+        return source.clone();
+    }
+    let mut differences: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::new());
+    // Four native image pixels span a complete Quad-Bayer period. This is
+    // spatial decorrelation support, not a new resampling or sensor origin.
+    for y in (0..source.height - 4).step_by(4) {
+        for x in (0..source.width - 4).step_by(4) {
+            for channel in 0..3 {
+                let value = source.data[y * source.width + x][channel] as f64
+                    - source.data[y * source.width + x + 4][channel] as f64
+                    - source.data[(y + 4) * source.width + x][channel] as f64
+                    + source.data[(y + 4) * source.width + x + 4][channel] as f64;
+                differences[channel].push(value.abs());
+            }
+        }
+    }
+    let noise_variance = differences.map(|mut values| {
+        values.sort_by(f64::total_cmp);
+        // Under independent Gaussian sites the four-term difference has
+        // twice the site's standard deviation; the MAD conversion is fixed.
+        (values[values.len() / 2] * (1.4826022 / 2.0)).powi(2)
+    });
+    if noise_variance.iter().all(|v| *v <= f64::EPSILON) {
+        return source.clone();
+    }
+    // Use f64 for both moments, not f32 E[x²] - E[x]²: subtracting two
+    // brightness-sized values otherwise loses the small variance and makes
+    // the filtering decision depend on an additive exposure offset. The
+    // separable fixed-radius filter has bounded O(pixels * radius) work.
+    let sigma = 2.4_f64;
+    let radius = (sigma * 3.0).ceil() as isize;
+    let mut kernel = (-radius..=radius)
+        .map(|offset| (-0.5 * (offset as f64 / sigma).powi(2)).exp())
+        .collect::<Vec<_>>();
+    let sum = kernel.iter().sum::<f64>();
+    for weight in &mut kernel {
+        *weight /= sum;
+    }
+    let mut horizontal = vec![[0.0_f64; 6]; source.data.len()];
+    for y in 0..source.height {
+        for x in 0..source.width {
+            let moments = &mut horizontal[y * source.width + x];
+            for (index, &weight) in kernel.iter().enumerate() {
+                let sample = source.sample_reflect101(
+                    x as isize + index as isize - radius, y as isize,
+                );
+                for channel in 0..3 {
+                    let value = sample[channel] as f64;
+                    moments[channel] += weight * value;
+                    moments[channel + 3] += weight * value * value;
+                }
+            }
+        }
+    }
+    let mut output = source.clone();
+    for y in 0..source.height {
+        for x in 0..source.width {
+            let mut moments = [0.0_f64; 6];
+            for (index, &weight) in kernel.iter().enumerate() {
+                let sy = reflect101(y as isize + index as isize - radius, source.height);
+                for channel in 0..6 {
+                    moments[channel] += weight * horizontal[sy * source.width + x][channel];
+                }
+            }
+            for channel in 0..3 {
+                let mean = moments[channel];
+                let variance = (moments[channel + 3] - mean * mean).max(0.0);
+                let gain = if variance > f64::EPSILON {
+                    (1.0 - noise_variance[channel] / variance).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                // A convex combination cannot invent a sharpening overshoot.
+                output.data[y * source.width + x][channel] =
+                    (mean + gain * (source.data[y * source.width + x][channel] as f64 - mean)) as f32;
+            }
+        }
+    }
+    output
+}
+
 fn unsharp(balanced: &[FloatImage], strength: f32) -> Vec<FloatImage> {
     balanced
         .iter()
@@ -2968,6 +3134,10 @@ fn write_preprocessed_filmstrip(
             let images = mildly_blurred(&balanced);
             write_quantized_filmstrip(&images, 0.35, 99.65, 0.82, destination)
         }
+        PreprocessRegime::AdaptiveDenoise => {
+            let images=balanced.iter().map(adaptive_denoise).collect::<Vec<_>>();
+            write_quantized_filmstrip(&images,0.35,99.65,0.82,destination)
+        }
         PreprocessRegime::PinkCenterMask => {
             let images = mildly_blurred(&balanced);
             write_quantized_filmstrip(&images, 0.35, 99.65, 0.82, destination)?;
@@ -3223,6 +3393,49 @@ fn write_live_preprocessed_frame_with_policy(
 #[cfg(test)]
 mod photometric_adapter_tests {
     use super::*;
+
+    #[test]
+    fn adaptive_denoise_preserves_constant_images_and_keeps_mild_blur_as_default() {
+        assert_eq!(PreprocessRegime::default(),PreprocessRegime::MildBlur);
+        for value in [0.0,150.0,1023.0] {
+            let mut image=FloatImage::new(32,24);image.data.fill([value;3]);
+            assert_eq!(adaptive_denoise(&image).data,image.data);
+        }
+    }
+
+    #[test]
+    fn adaptive_denoise_reduces_flat_noise_without_erasing_a_step_or_changing_exposure_scale() {
+        let mut random=7u64;
+        let mut image=FloatImage::new(96,64);
+        for (index,pixel) in image.data.iter_mut().enumerate() {
+            for value in pixel {
+                let mut noise=0.0;
+                for _ in 0..12 {
+                    random=random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    noise+=(random>>32) as f32/u32::MAX as f32-0.5;
+                }
+                *value=(if index%96<48 {200.0} else {600.0})+12.0*noise;
+            }
+        }
+        let result=adaptive_denoise(&image);
+        let mut before=0.0;let mut after=0.0;
+        for y in 8..56 {for x in (8..40).chain(56..88) {
+            let truth=if x<48 {200.0} else {600.0};
+            for channel in 0..3 {
+                before+=(image.data[y*96+x][channel]-truth).powi(2);
+                after+=(result.data[y*96+x][channel]-truth).powi(2);
+            }
+        }}
+        assert!(after<before*0.6,"reduce flat-region squared error; before={before}, after={after}");
+        let contrast=(8..56).map(|y|result.data[y*96+48][0]-result.data[y*96+47][0]).sum::<f32>()/48.0;
+        assert!(contrast>380.0,"strong current edges retain their contrast: {contrast}");
+        let mut exposed=image.clone();for pixel in &mut exposed.data {for value in pixel {*value=*value*2.0+30.0;}}
+        let exposed=adaptive_denoise(&exposed);
+        for (original,scaled) in result.data.iter().flatten().zip(exposed.data.iter().flatten()) {
+            assert!((scaled-(original*2.0+30.0)).abs()<0.05,"linear exposure must not change the denoising decision: original={original} scaled={scaled} expected={}",original*2.0+30.0);
+            assert!(original.is_finite()&&(100.0..700.0).contains(original));
+        }
+    }
 
     fn raw_crop(sequence: u64, origin: (u32, u32), size: (usize, usize), bright_border: bool) -> Arc<RawFrame> {
         let (width, height) = size;
@@ -6963,6 +7176,34 @@ mod runtime {
                 matched_query.map(|matched| matched.1),
             );
         }
+        let pupil_selection = select_pupil_observation_from_masks(pupil_inference.as_ref(), semantic_requested,
+            current_luma, source, outer, pupil_prior, &mut None);
+        let pupil_fit = pupil_selection.map(|(fit, _)| fit);
+        if live_detector_raw_gate_passes(selected.outer_support) {
+            // A guided RAW recovery may support this exposure, but cannot
+            // teach its own size/offset back into the prior. Only independent
+            // current SAM masks or RAW components refresh contour history.
+            if let Some((pupil, true)) = pupil_selection {
+                state.pupil_history.observe(source.timestamp_ns, pupil.ellipse, outer);
+            }
+        }
+        Ok(LiveTemporalOuterProposal {
+            pupil_fit,
+            semantic: SemanticProposalMasks {
+                prompt_index: OUTER_IRIS_PROMPT,
+                width: mask_width,
+                height: mask_height,
+                selected_query: Some(0),
+                masks: vec![proposal],
+            },
+            outer_fit: Some(selected.fit),
+            outer_support: selected.outer_support,
+        })
+    }
+
+    fn select_pupil_observation_from_masks(pupil_inference: Option<&InferenceOutput>, semantic_requested: bool,
+        current_luma: &FloatImage, source: &RawFrame, outer: Ellipse, pupil_prior: Option<PupilFitPrior>, selected_query:&mut Option<usize>)
+        -> Option<(PupilVoidFitReview, bool)> {
         let semantic_pupil = if let Some(pupil_output) = pupil_inference {
             let glare_ceiling = pupil_iris_luma_ceiling(current_luma, outer);
             let mut best = None::<PupilVoidFitReview>;
@@ -6996,6 +7237,7 @@ mod runtime {
                 if !pupil_raw_support_is_sufficient(support) {continue;}
                 if best.is_none_or(|b|support.score>b.raw_support.score) {
                     best=Some(PupilVoidFitReview {ellipse,raw_support:support});
+                    *selected_query=Some(query);
                 }
                 // First-qualified semantic ranking is useful for latency
                 // experiments, but the corpus retained more stable pupils
@@ -7017,31 +7259,11 @@ mod runtime {
         let recovered = if semantic_pupil.is_some() { None } else {
             pupil_prior.and_then(|prior|refit_pupil_from_prior(current_luma,outer,prior))
         };
-        let pupil_selection = choose_pupil_observation(
+        choose_pupil_observation(
             semantic_requested, semantic_pupil, component, recovered, outer, pupil_prior,
-        );
-        let pupil_fit = pupil_selection.map(|(fit, _)| fit);
-        if live_detector_raw_gate_passes(selected.outer_support) {
-            // A guided RAW recovery may support this exposure, but cannot
-            // teach its own size/offset back into the prior. Only independent
-            // current SAM masks or RAW components refresh contour history.
-            if let Some((pupil, true)) = pupil_selection {
-                state.pupil_history.observe(source.timestamp_ns, pupil.ellipse, outer);
-            }
-        }
-        Ok(LiveTemporalOuterProposal {
-            pupil_fit,
-            semantic: SemanticProposalMasks {
-                prompt_index: OUTER_IRIS_PROMPT,
-                width: mask_width,
-                height: mask_height,
-                selected_query: Some(0),
-                masks: vec![proposal],
-            },
-            outer_fit: Some(selected.fit),
-            outer_support: selected.outer_support,
-        })
+        )
     }
+
 
     fn prepare_pupil(
         module: &CModule, staging: &Tensor, device: Device, prompts: &RuntimePrompts,
@@ -7442,6 +7664,227 @@ mod runtime {
             status.state = state;
             status.detail.clear();
             status.detail.push_str(detail);
+        }
+    }
+
+    pub(super) fn student_cuda_init()->Result<(),String> {
+        load_cuda_dispatch_library()?;
+        if !tch::Cuda::is_available() {return Err("eye student requires an available CUDA device".into());}
+        Ok(())
+    }
+
+    fn student_head(logits:&Tensor,prompt:usize)->Result<InferenceOutput,String> {
+        student_head_with_levelsets(logits,prompt,
+            enabled_env_flag("BUTTERCUP_EYE_STUDENT_PUPIL_LEVELSETS",true))
+    }
+
+    fn student_head_with_levelsets(logits:&Tensor,prompt:usize,alternatives:bool)->Result<InferenceOutput,String> {
+        if logits.size()!=[1,SEMANTIC_PROMPT_COUNT as i64,FRAME_HEIGHT as i64,FRAME_WIDTH as i64]
+            || prompt>=SEMANTIC_PROMPT_COUNT || logits.isfinite().all().int64_value(&[])==0 {
+            return Err("invalid student output shape or nonfinite logits".into());
+        }
+        let central=logits.narrow(1,prompt as i64,1).contiguous();
+        // Alternative level sets of one observation, not independent votes.
+        // A single pupil edge may lie within the student's uncertainty band.
+        // The unchanged RAW selector chooses at most one admitted alternative.
+        let offsets: &[f64] = if prompt==PUPIL_DISK_PROMPT && alternatives {
+            &[0.0,-1.0,1.0]
+        } else {&[0.0]};
+        let confidence=central.sigmoid();
+        let mut alternatives=Vec::new();
+        let mut scores=Vec::new();
+        for &offset in offsets {
+            let shifted=&central-offset;
+            let foreground=shifted.gt(0.0).to_kind(Kind::Float);
+            let support=foreground.sum(Kind::Float).double_value(&[]);
+            // Descriptive foreground activation, not SAM's object score or
+            // a calibrated probability; no fit is admitted without RAW.
+            scores.push(if support>0.0 {(&confidence*&foreground).sum(Kind::Float)
+                .double_value(&[])/support} else {0.0} as f32);
+            alternatives.push(shifted);
+        }
+        let logits=Tensor::cat(&alternatives,1).contiguous();
+        Ok(InferenceOutput {masks:binary_mask_bytes(&logits),logits,scores,
+            query_count:offsets.len(),mask_width:FRAME_WIDTH,mask_height:FRAME_HEIGHT,video_features:None})
+    }
+
+    #[cfg(test)]
+    mod student_levelset_tests {
+        use super::*;
+
+        #[test]
+        fn pupil_levelsets_are_three_nested_alternatives_of_one_observation() {
+            let width=FRAME_WIDTH as i64;
+            let logits=Tensor::linspace(-3.0,3.0,width,(Kind::Float,Device::Cpu))
+                .reshape([1,1,1,width]).expand([1,SEMANTIC_PROMPT_COUNT as i64,FRAME_HEIGHT as i64,width],true);
+            let output=student_head_with_levelsets(&logits,PUPIL_DISK_PROMPT,true).unwrap();
+            let plane=FRAME_WIDTH*FRAME_HEIGHT;
+            assert_eq!(output.query_count,3);
+            assert_eq!(output.masks.len(),plane*3);
+            assert!(output.scores.iter().all(|s|s.is_finite() && (0.0..=1.0).contains(s)));
+            for i in 0..plane {
+                assert!(output.masks[plane+i]>=output.masks[i]);
+                assert!(output.masks[i]>=output.masks[2*plane+i]);
+            }
+            let counts=output.masks.chunks(plane).map(|m|m.iter().filter(|&&v|v!=0).count()).collect::<Vec<_>>();
+            assert!(counts[1]>counts[0] && counts[0]>counts[2]);
+            assert_eq!(student_head_with_levelsets(&logits,OUTER_IRIS_PROMPT,true).unwrap().query_count,1);
+            assert_eq!(student_head_with_levelsets(&logits,PUPIL_DISK_PROMPT,false).unwrap().query_count,1);
+        }
+    }
+
+    fn student_outer_proposal(source:&RawFrame,logits:&Tensor,target:Target,
+        current_luma:&FloatImage,history:&mut PupilContourHistory)->Result<LiveTemporalOuterProposal,String> {
+        let output=student_head(logits,OUTER_IRIS_PROMPT)?;
+        let mask=&output.masks;
+        let area=mask.iter().filter(|&&v|v!=0).count() as f64/mask.len().max(1) as f64;
+        let fit=tracker_fit_review(mask,output.mask_width,output.mask_height)
+            .filter(|_|live_detector_candidate_is_plausible(output.scores[0],Some(area),true));
+        let support=fit.as_ref().map(|f|raw_ring_support(current_luma,model_ellipse_in_source(f.ellipse,source.width)))
+            .unwrap_or_default();
+        let semantic_requested=matches!(target,Target::InnerPupilVoid|Target::OuterLimbusAndInnerPupilVoid)
+            && enabled_env_flag("BUTTERCUP_SAM31_SEMANTIC_PUPIL",true);
+        let pupil_output=semantic_requested.then(||student_head(logits,PUPIL_DISK_PROMPT)).transpose()?;
+        let pupil_fit=fit.as_ref().and_then(|fit| {
+            let outer=model_ellipse_in_source(fit.ellipse,source.width);
+            let selection=select_pupil_observation_from_masks(pupil_output.as_ref(),semantic_requested,
+                current_luma,source,outer,history.prior(source.timestamp_ns),&mut None);
+            if live_detector_raw_gate_passes(support) {
+                if let Some((pupil,true))=selection {history.observe(source.timestamp_ns,pupil.ellipse,outer);}
+            }
+            selection.map(|(pupil,_)|pupil)
+        });
+        Ok(LiveTemporalOuterProposal {semantic:SemanticProposalMasks {prompt_index:OUTER_IRIS_PROMPT,
+            width:output.mask_width,height:output.mask_height,selected_query:(!mask.iter().all(|&v|v==0)).then_some(0),
+            masks:vec![ProposalMask {query:0,score:output.scores[0],pixels:Arc::new(mask.clone()),
+                boundary_pixels:Arc::new(binary_mask_boundary_indices(mask,output.mask_width,output.mask_height))}]},
+            outer_fit:fit,outer_support:support,pupil_fit})
+    }
+
+    fn ellipse_diagnostic(ellipse:Option<Ellipse>)->serde_json::Value {
+        ellipse.map(|e|serde_json::json!({"center":e.center,"major_radius":e.major_radius,
+            "minor_radius":e.minor_radius,"angle":e.angle})).unwrap_or(serde_json::Value::Null)
+    }
+
+    pub(super) fn student_evaluation(source:&RawFrame,logits:&Tensor)->Result<serde_json::Value,String> {
+        let luma=raw_luma(&[Arc::new(source.clone())]).into_iter().next().ok_or("missing RAW luma")?;
+        let proposal=student_outer_proposal(source,logits,Target::OuterLimbusAndInnerPupilVoid,&luma,&mut PupilContourHistory::default())?;
+        Ok(serde_json::json!({"outer_ellipse":ellipse_diagnostic(proposal.outer_fit.as_ref().map(|r|model_ellipse_in_source(r.ellipse,source.width))),
+            "raw_admitted":live_detector_raw_gate_passes(proposal.outer_support),"raw_score":proposal.outer_support.score,
+            "pupil_ellipse":ellipse_diagnostic(proposal.pupil_fit.map(|r|r.ellipse)),
+            "retained":proposal.outer_fit.as_ref().map(|r|r.retained_points.len()),
+            "censored":proposal.outer_fit.as_ref().map(|r|r.flat_tire_points.len())}))
+    }
+
+    pub(super) fn export_student_teacher<I,F>(model:&Path,frames:I,mut visitor:F)->Result<usize,String>
+    where I:Iterator<Item=Result<(serde_json::Value,Arc<RawFrame>),String>>,
+          F:FnMut(serde_json::Value,student::TeacherSample)->Result<(),String> {
+        student_cuda_init()?;configure_cuda_bfloat16_autocast();let _guard=tch::no_grad_guard();
+        tch::autocast(true,|| {
+            let device=Device::Cuda(0);let mut module=CModule::load_on_device(model,device).map_err(|e|e.to_string())?;module.set_eval();
+            let prompts=load_runtime_prompts(&prompt_bundle_path(model),device,SEMANTIC_PROMPT_COUNT)?;
+            let regime=PreprocessRegime::configured_live()?;
+            let staging=Tensor::zeros([1,3,FRAME_HEIGHT as i64,FRAME_WIDTH as i64],(Kind::Uint8,Device::Cpu)).pin_memory(device);
+            let plane=FRAME_HEIGHT*FRAME_WIDTH;let mut count=0;
+            for item in frames {
+                let (row,source)=item?;let started=Instant::now();
+                write_preprocessed_filmstrip(std::slice::from_ref(&source),regime,staging_bytes_len(&staging,plane*3))?;
+                let image=staging_bytes_len(&staging,plane*3).to_vec();
+                let outer=infer(&module,&staging,device,&prompts,OUTER_IRIS_PROMPT)?;
+                let luma=raw_luma(std::slice::from_ref(&source)).into_iter().next().ok_or("teacher RAW luma unavailable")?;
+                let mut selected_outer=None;
+                for query in ranked_finite_query_indices(&outer.scores).into_iter().take(12) {
+                    let p=outer.mask_width*outer.mask_height;
+                    if let Some(fit)=tracker_fit_review(&outer.masks[query*p..(query+1)*p],outer.mask_width,outer.mask_height) {
+                        let native=model_ellipse_in_source(fit.ellipse,source.width);
+                        let support=raw_ring_support(&luma,native);
+                        if live_detector_raw_gate_passes(support) {selected_outer=Some((query,native,support));break;}
+                    }
+                }
+                let mut masks=Vec::with_capacity(plane*SEMANTIC_PROMPT_COUNT);
+                let mut weights=Vec::new();let mut reports=Vec::new();let mut pupil=None;
+                for prompt in 0..SEMANTIC_PROMPT_COUNT {
+                    let extra=if prompt==OUTER_IRIS_PROMPT {None} else {
+                        Some(if let Some(features)=&outer.video_features {
+                            infer_from_features(&module,features,&prompts,prompt).or_else(|_|infer(&module,&staging,device,&prompts,prompt))?
+                        } else {infer(&module,&staging,device,&prompts,prompt)?})
+                    };
+                    let output=extra.as_ref().unwrap_or(&outer);
+                    let mut pupil_query=None;
+                    if prompt==PUPIL_DISK_PROMPT {
+                        if let Some((_,outer,_))=selected_outer {
+                            pupil=select_pupil_observation_from_masks(Some(output),true,&luma,&source,outer,None,&mut pupil_query).map(|(fit,_)|fit.ellipse);
+                        }
+                    }
+                    let query=if prompt==OUTER_IRIS_PROMPT {selected_outer.map(|s|s.0)}else {pupil_query}
+                        .or_else(||ranked_finite_query_indices(&output.scores).first().copied());
+                    let score=query.map(|q|output.scores[q]).unwrap_or(0.0);
+                    // A low-scoring, nonempty teacher result is unknown, not
+                    // a fabricated empty eye. Exclude it from supervision.
+                    let weight=match prompt {
+                        OUTER_IRIS_PROMPT=>if selected_outer.is_some() {1.0}else {0.0},
+                        PUPIL_DISK_PROMPT=>if pupil.is_some() && pupil_query.is_some() {1.0}else {0.0},
+                        _=>if score>=0.5 {score.clamp(0.0,1.0)}else {0.0},
+                    };
+                    let start=masks.len();masks.resize(start+plane,0);
+                    if let Some(query)=query {
+                        let p=output.mask_width*output.mask_height;let mask=&output.masks[query*p..(query+1)*p];
+                        for y in 0..FRAME_HEIGHT {for x in 0..FRAME_WIDTH {
+                            masks[start+y*FRAME_WIDTH+x]=mask[y*output.mask_height/FRAME_HEIGHT*output.mask_width+x*output.mask_width/FRAME_WIDTH];
+                        }}
+                    }
+                    weights.push(weight);reports.push(serde_json::json!({"prompt":prompt,"query":query,"score":score,"weight":weight}));
+                }
+                visitor(row,student::TeacherSample {image,masks,weights,report:serde_json::json!({"heads":reports,
+                    "outer_ellipse":ellipse_diagnostic(selected_outer.map(|s|s.1)),"raw_admitted":selected_outer.is_some(),
+                    "raw_score":selected_outer.map(|s|s.2.score),"pupil_ellipse":ellipse_diagnostic(pupil),
+                    "teacher_ms":started.elapsed().as_secs_f64()*1000.0})})?;
+                count+=1;if count%10==0 {eprintln!("STUDENT_TEACHER frames={count}");}
+            }Ok(count)
+        })
+    }
+
+    pub(super) fn student_worker(lane:usize,model_path:PathBuf,request:RequestReceiver,
+        results:SyncSender<OuterResult>,proposals:SyncSender<Arc<ProposalMasks>>,
+        status:Arc<Mutex<StatusSnapshot>>,stop:Arc<AtomicBool>) {
+        if let Err(error)=student_cuda_init() {update_status(&status,"error",&error);return;}
+        let mut stream=None;let mut model=None;let mut state=LiveTrackerState::default();
+        while let Ok(request)=request.recv() {
+            if stop.load(AtomicOrdering::Acquire) {break;}
+            let batch=match request {WorkerRequest::Batch(batch)=>batch,WorkerRequest::Scene(scene)=> {
+                let _=scene.reply.try_send(Err("eye student has fixed eye labels; arbitrary object search requires SAM".into()));continue;
+            }};
+            let started=Instant::now();let mut encode_ms=0;
+            let run:Result<OuterResult,String>=(|| {
+                if stream.is_none() {stream=Some(WorkerStream::enter()?);}
+                if model.is_none() {update_status(&status,"loading","loading compact CUDA eye student");model=Some(student::Model::load(&model_path)?);}
+                let source=batch.frames.last().ok_or("student received no source")?;
+                let input=LiveTrackerInput {tracking_epoch:batch.tracking_epoch,prompt_generation:batch.prompt_generation,
+                    sequence:source.sequence,timestamp_ns:source.timestamp_ns,sensor_origin:(source.sensor_x,source.sensor_y),width:source.width,height:source.height};
+                if !live_source_is_fresh(state.last_input,input) {return Err("SAM31 video stale student source ignored".into());}
+                state.prepare(input);
+                let mut image=vec![0;FRAME_WIDTH*FRAME_HEIGHT*3];
+                write_preprocessed_filmstrip(std::slice::from_ref(source),PreprocessRegime::configured_live()?,&mut image)?;
+                let logits=model.as_ref().unwrap().infer(&image)?;
+                // Materialize on the worker's own stream before reusing input.
+                let _=logits.sum(Kind::Float).double_value(&[]);
+                encode_ms=started.elapsed().as_millis() as u64;
+                let luma=raw_luma(std::slice::from_ref(source)).into_iter().next().ok_or("student missing RAW luma")?;
+                let proposal=student_outer_proposal(source,&logits,batch.target,&luma,&mut state.pupil_history)?;
+                let mut result=process_video_frame(&batch,&proposals,Some(&luma),Some(proposal))?;
+                result.video_tracked=false;Ok(result)
+            })();
+            let elapsed_ms=batch.submitted_at.elapsed().as_millis() as u64;
+            match run {
+                Ok(mut result)=> {result.elapsed_ms=elapsed_ms;let _=results.try_send(result);
+                    update_status(&status,"ready","EYE STUDENT CUDA masks + shared RAW/conic gates; fixed vocabulary");}
+                Err(error)=> {let state=if error.starts_with("SAM31 ") {"rejected"}else {"error"};update_status(&status,state,&error);}
+            }
+            if let Ok(mut s)=status.lock() {s.completed_batches+=1;s.last_elapsed_ms=Some(elapsed_ms);s.last_encode_ms=Some(encode_ms);
+                s.last_track_ms=Some((started.elapsed().as_millis() as u64).saturating_sub(encode_ms));
+                s.last_queue_ms=Some(elapsed_ms.saturating_sub(started.elapsed().as_millis() as u64));
+                s.last_source_sequence=batch.frames.last().map(|f|f.sequence);s.last_source_ns=batch.frames.last().map(|f|f.timestamp_ns);}
+            if enabled_env_flag("BUTTERCUP_SAM31_VIDEO_TRACE",false) {eprintln!("EYE_STUDENT_QUERY lane={lane} elapsed_ms={elapsed_ms} encode_ms={encode_ms}");}
         }
     }
 
@@ -8083,6 +8526,7 @@ mod runtime {
             eye_index: batch.eye_index,
             source_sequence: source.sequence,
             source_timestamp_ns: source.timestamp_ns,
+            source_group_roi_count: if batch.source_group_claimed.is_some() { 2 } else { 1 },
             source_sensor_origin: (source.sensor_x, source.sensor_y),
             source_width: source.width,
             source_height: source.height,
@@ -8166,7 +8610,7 @@ mod runtime {
                 frames:vec![Arc::new(RawFrame {eye_index:1,sequence:456,timestamp_ns:123_456_789,
                     sensor_x:400,sensor_y:800,width:12,height:8,pixels:Arc::new(vec![17;96]),
                     registration_anchor:None,pupil_component_seed:None})],motion:None,
-                prompt_bundle:PromptBundle {revision:7,path:"unused-test-prompt".into()}}
+                prompt_bundle:PromptBundle {revision:7,path:"unused-test-prompt".into()},source_group_claimed:None}
         }
         fn partial(prompt_index:usize,masks:Vec<ProposalMask>)->LiveTemporalOuterProposal {
             LiveTemporalOuterProposal {semantic:SemanticProposalMasks {prompt_index,width:3,height:2,
@@ -8193,6 +8637,21 @@ mod runtime {
             let (tx,rx)=sync_channel(1);
             assert!(process_video_frame(&batch(),&tx,None,Some(partial(OUTER_IRIS_PROMPT+1,Vec::new()))).is_err());
             assert!(rx.try_recv().is_err());
+        }
+
+        #[test]
+        fn source_group_metadata_survives_raw_rejection_and_is_not_history_length() {
+            for paired in [false,true] {
+                for history_frames in [1,3] {
+                    let mut source=batch();
+                    source.frames=vec![Arc::clone(&source.frames[0]);history_frames];
+                    source.source_group_claimed=paired.then(||Arc::new(AtomicBool::new(true)));
+                    let (tx,rx)=sync_channel(1);
+                    assert!(process_video_frame(&source,&tx,None,
+                        Some(partial(OUTER_IRIS_PROMPT,Vec::new()))).is_err());
+                    assert_eq!(rx.try_recv().unwrap().source_group_roi_count,if paired {2}else{1});
+                }
+            }
         }
     }
 
@@ -8306,6 +8765,7 @@ mod runtime {
             source_height: source.height,
             source_raw: Arc::clone(&source.pixels),
             semantic,
+            source_group_roi_count: if batch.source_group_claimed.is_some() { 2 } else { 1 },
             outer_fit,
             inner_pupil_fit: proposal_pupil_fit,
             adapters: proposal_adapters,
@@ -8911,6 +9371,7 @@ mod tests {
                 sensor_x: 100, sensor_y: 200, width: 12, height: 8, pixels: Arc::new(vec![0;96]),
                 registration_anchor: None, pupil_component_seed: None })], motion: None,
             prompt_bundle: PromptBundle { revision, path: format!("prompt-{revision}").into() },
+            source_group_claimed: None,
         });
         let (tx, rx) = pipeline::channel();
         assert!(!tx.try_send(batch(10,1,0), replace_waiting_request).unwrap());
@@ -8935,6 +9396,40 @@ mod tests {
     // Real rendezvous admission without CUDA: a busy eye must never block
     // another eye, nor accumulate work to execute after a prompt change.
     #[test]
+    fn paired_mailboxes_never_replace_only_the_unclaimed_eye_of_a_source_read() {
+        let mut lanes=Vec::new();let mut receivers=Vec::new();
+        for _ in 0..2 {
+            let (tx,rx)=pipeline::channel();
+            let (_,results)=sync_channel(4);let (_,proposal_masks)=sync_channel(1);
+            lanes.push(WorkerLane {request:Some(RequestSender::Latest(tx)),results,proposal_masks,
+                status:Arc::new(Mutex::new(StatusSnapshot::default())),
+                stop:Arc::new(AtomicBool::new(false)),worker:None});
+            receivers.push(RequestReceiver::Latest(rx));
+        }
+        let client=Client {lanes,prompt_bundle:Mutex::new(PromptBundle {revision:0,path:"test".into()}),student_backend:false};
+        let frames=|time| std::array::from_fn(|eye|Arc::new(RawFrame {
+            eye_index:eye,sequence:time+eye as u64*900,timestamp_ns:time*100,
+            sensor_x:100+eye as u32*200,sensor_y:100,width:12,height:8,
+            pixels:Arc::new(vec![100;96]),registration_anchor:None,pupil_component_seed:None,
+        }));
+        let submit=|time|client.submit_source_group(frames(time),Target::OuterLimbus,0,1,[1;2],[None,None]);
+        for time in 1..1000 {assert_eq!(submit(time),SubmitOutcome::Accepted);}
+        let WorkerRequest::Batch(first)=receivers[0].recv().unwrap() else {panic!()};
+        assert_eq!(first.frames[0].timestamp_ns,99900);
+        for time in 1000..2000 {assert_eq!(submit(time),SubmitOutcome::DroppedBusy);}
+        let WorkerRequest::Batch(second)=receivers[1].recv().unwrap() else {panic!()};
+        assert_eq!(second.frames[0].timestamp_ns,first.frames[0].timestamp_ns);
+        assert_ne!(second.frames[0].sequence,first.frames[0].sequence,"ROI sequences need not match");
+        assert_eq!(submit(2000),SubmitOutcome::Accepted);
+        let mut wrong=frames(2001);Arc::make_mut(&mut wrong[1]).timestamp_ns+=1;
+        assert_eq!(client.submit_source_group(wrong,Target::OuterLimbus,0,1,[1;2],[None,None]),SubmitOutcome::Invalid);
+        for rx in &receivers {
+            let WorkerRequest::Batch(batch)=rx.recv().unwrap() else {panic!()};
+            assert_eq!(batch.frames[0].timestamp_ns,200000);
+        }
+    }
+
+    #[test]
     fn independent_lanes_admit_both_eyes_without_queueing_or_mixing_prompts() {
         let mut lanes = Vec::new();
         let mut requests = Vec::new();
@@ -8949,7 +9444,7 @@ mod tests {
             });
             requests.push(rx);
         }
-        let client = Client { lanes, prompt_bundle: Mutex::new(PromptBundle {
+        let client = Client { lanes, student_backend:false, prompt_bundle: Mutex::new(PromptBundle {
             revision: 0, path: "old-prompts".into(),
         }) };
         let histories: [VecDeque<_>; 2] = std::array::from_fn(|eye| VecDeque::from([

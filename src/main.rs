@@ -15,6 +15,8 @@ mod eye_scene_model;
 mod gaze_target_solver;
 mod joint_gaze_live;
 mod geometry;
+mod limbus_refiner;
+mod limbus_refiner_view;
 mod keyboard_peeper;
 mod native_mediapipe;
 mod offline_segmentation_replay;
@@ -34,6 +36,8 @@ mod roi_continuity;
 mod roi_evidence;
 mod roi_visibility;
 mod sam31_outer;
+mod source_queue_budget;
+mod student_preview;
 mod screen_reflection_clock;
 mod screen_reflection_code;
 mod screen_reflection_live;
@@ -133,7 +137,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::raw_window_handle::{DisplayHandle, HasDisplayHandle};
 use winit::window::{Fullscreen, Window, WindowId};
 
@@ -551,6 +555,25 @@ fn tracking_queue_action(
         TrackingQueueAction::Fatal
     }
 }
+
+/// Additional paired-read scheduling may shed work, never authorize a packet
+/// rejected by the existing freshness, warmup or hard-failure policy.
+fn apply_paired_queue_budget(
+    budget: &mut source_queue_budget::SourceQueueBudget,
+    header: &PacketHeader,
+    now: Instant,
+    queue_age: Duration,
+    nominal: TrackingQueueAction,
+) -> (TrackingQueueAction, bool) {
+    let shed = budget.should_shed(
+        header.source_queue_part(), now, queue_age, nominal == TrackingQueueAction::Consume,
+    );
+    if shed && nominal == TrackingQueueAction::Consume {
+        (TrackingQueueAction::DropBacklog, true)
+    } else {
+        (nominal, false)
+    }
+}
 // Key repeat may arrive much faster than a bounded camera-control round trip.
 // Coalesce those events and issue at most one physical VCM/exposure write per
 // interval so manual tuning cannot starve the lossless RAW packet consumer.
@@ -651,6 +674,12 @@ fn subject_eye_analysis_enabled(index: usize, second_roi_enabled: bool) -> bool 
 }
 
 fn set_second_roi_analysis(state: &mut SharedState, enabled: bool) {
+    if state.second_roi_enabled != enabled {
+        invalidate_desktop_gaze_settings(state);
+        // Freshness only. The joint bridge owns its separate gaze basis;
+        // toggling ROI membership must not reset single-eye sign tracking.
+        state.segmentation_generation = state.segmentation_generation.wrapping_add(1);
+    }
     state.second_roi_enabled = enabled;
     if !enabled {
         state.eyes[1] = None;
@@ -676,7 +705,7 @@ fn active_segmentation_owns_eye_presence(
     semantic_seeded
         && match mode {
             SegmentationMode::Native => native_present,
-            SegmentationMode::Sam31 => sam_present,
+            SegmentationMode::Sam31 | SegmentationMode::EyeStudent => sam_present,
             SegmentationMode::Clusters => clusters_present,
             SegmentationMode::Driving => driving_present,
             SegmentationMode::ScleraRedCanny => sclera_present,
@@ -1051,6 +1080,7 @@ enum SegmentationMode {
     #[default]
     Native,
     Sam31,
+    EyeStudent,
     Clusters,
     Driving,
     /// Track red-opponent line structure on bright sclera without fitting or
@@ -1336,7 +1366,11 @@ impl SegmentationModeProfile {
 }
 
 impl SegmentationMode {
-    const COUNT: usize = 5;
+    const COUNT: usize = 6;
+
+    /// Detector-independent contract: identical observed-contour, RAW,
+    /// contact, gaze, stereo and calibration handling for either mask source.
+    fn uses_mask_geometry(self)->bool {matches!(self,Self::Sam31|Self::EyeStudent)}
 
     fn method_control_label(self) -> String {
         format!(
@@ -1349,9 +1383,10 @@ impl SegmentationMode {
         match self {
             Self::Native => 1,
             Self::Sam31 => 2,
-            Self::Clusters => 3,
-            Self::Driving => 4,
-            Self::ScleraRedCanny => 5,
+            Self::EyeStudent => 3,
+            Self::Clusters => 4,
+            Self::Driving => 5,
+            Self::ScleraRedCanny => 6,
         }
     }
 
@@ -1359,6 +1394,7 @@ impl SegmentationMode {
         match value.to_ascii_lowercase().replace(['_', '-'], "").as_str() {
             "native" => Some(Self::Native),
             "sam31" | "sam3.1" | "sam" => Some(Self::Sam31),
+            "eyestudent" | "student" | "samstudent" => Some(Self::EyeStudent),
             // Legacy spelling remains an outer-SAM alias. Config/control
             // parsing also selects the independent SAM pupil-center mode.
             "sam31pupil" | "sam3.1pupil" | "sampupil" | "pupilvoid" => Some(Self::Sam31),
@@ -1374,6 +1410,7 @@ impl SegmentationMode {
         match self {
             Self::Native => "native",
             Self::Sam31 => "sam31",
+            Self::EyeStudent => "eye-student",
             Self::Clusters => "clusters",
             Self::Driving => "driving",
             Self::ScleraRedCanny => "vessel-features",
@@ -1388,7 +1425,7 @@ impl SegmentationMode {
             // These modes own multi-frame RAW evidence or fine sensor-ROI
             // steering. They may consume one global acquisition, then retain
             // uninterrupted fine control until the lock is explicitly lost.
-            Self::Sam31 | Self::Clusters | Self::Driving | Self::ScleraRedCanny => {
+            Self::Sam31 | Self::EyeStudent | Self::Clusters | Self::Driving | Self::ScleraRedCanny => {
                 MediaPipeCadence::GlobalAcquireOnly
             }
         }
@@ -1397,7 +1434,8 @@ impl SegmentationMode {
     fn cycled(self) -> Self {
         match self {
             Self::Native => Self::Sam31,
-            Self::Sam31 => Self::Clusters,
+            Self::Sam31 => Self::EyeStudent,
+            Self::EyeStudent => Self::Clusters,
             Self::Clusters => Self::Driving,
             Self::Driving => Self::ScleraRedCanny,
             Self::ScleraRedCanny => Self::Native,
@@ -1426,7 +1464,7 @@ impl SegmentationMode {
                 show_rotation_meridians: true,
                 eyelid_overlay: SegmentationEyelidOverlay::NativeMargins,
             },
-            Self::Sam31 => SegmentationModeProfile {
+            Self::Sam31 | Self::EyeStudent => SegmentationModeProfile {
                 motion_work: SegmentationMotionWork::None,
                 show_native_diagnostics: false,
                 show_censored_limbus: false,
@@ -1486,7 +1524,7 @@ fn sam31_target_for_modes(
         return None;
     }
     match (
-        segmentation == SegmentationMode::Sam31,
+        segmentation.uses_mask_geometry(),
         rough_center == RoughPupilCenterMode::Sam31,
     ) {
         // The pupil prompt reuses the iris image features where supported,
@@ -1497,6 +1535,34 @@ fn sam31_target_for_modes(
         (false, true) => Some(sam31_outer::Target::InnerPupilVoid),
         (false, false) => None,
     }
+}
+
+fn sam31_target_for_joint_modes(
+    segmentation: SegmentationMode,
+    rough_center: RoughPupilCenterMode,
+    second_roi_enabled: bool,
+) -> Option<sam31_outer::Target> {
+    // The joint conic solver needs independent pupil-depth evidence even
+    // when Y selects a different rough-center provider. Requesting evidence
+    // does not change ownership of that center product.
+    if second_roi_enabled && segmentation.uses_mask_geometry() {
+        Some(sam31_outer::Target::OuterLimbusAndInnerPupilVoid)
+    } else {
+        sam31_target_for_modes(segmentation, rough_center)
+    }
+}
+
+fn sam31_source_group_for_read(histories:&[VecDeque<Arc<sam31_outer::RawFrame>>;2],
+    hub:&recording_trace::Hub,stream_epoch:&str,timestamp_ns:u64)
+    ->Option<[Arc<sam31_outer::RawFrame>;2]> {
+    let frames=[Arc::clone(histories[0].back()?),Arc::clone(histories[1].back()?)];
+    for (eye,frame) in frames.iter().enumerate() {
+        if frame.eye_index!=eye || frame.timestamp_ns!=timestamp_ns {return None;}
+        let source=hub.source_reference(eye as u32+1,Some(timestamp_ns));
+        if source["status"]!="exact-source-key" || source["key"]["stream_epoch"].as_str()!=Some(stream_epoch)
+            || source["key"]["sequence"].as_str()?.parse::<u64>().ok()?!=frame.sequence {return None;}
+    }
+    Some(frames)
 }
 
 #[derive(Clone)]
@@ -2822,6 +2888,7 @@ struct PresentationLaserLease {
     eye: usize,
     segmentation_mode: SegmentationMode,
     gaze_authority_generation: u64,
+    gaze_settings_generation: u64,
     sam_prompt_generation: Option<u64>,
     surface_gaze: Option<SurfaceGazeSample>,
     rotation_center_sensor: (f64, f64),
@@ -4756,6 +4823,11 @@ struct EyeFrame {
     recording_clock: serde_json::Value,
     recording_ready: serde_json::Value,
     segmentation_mode: SegmentationMode,
+    /// Exact global analysis settings used for this frame. This is a source
+    /// freshness fence, not a reason to reset temporal signs or calibration.
+    gaze_settings_generation: u64,
+    /// Set only on a consumer's prepared snapshot; RAW analysis remains intact.
+    gaze_policy_error: Option<&'static str>,
     /// Monotonic receiver-owned lineage for every input which can alter the
     /// physical gaze surface. It also advances across camera reconnects, so a
     /// numerically repeated sign epoch can never revive an older calibration.
@@ -5578,6 +5650,64 @@ struct SharedState {
     checkerboard_status: checkerboard_calibration::StatusSnapshot,
 }
 
+/// One global source contract for gaze focus, desktop pointer, calibration,
+/// accuracy checks and the visible cursor. Preview selections are absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GlobalGazePolicy {
+    method: SegmentationMode,
+    settings_generation: u64,
+    prompt_generation: u64,
+    second_roi_enabled: bool,
+    object_search: bool,
+}
+
+impl GlobalGazePolicy {
+    fn from_shared(state: &SharedState) -> Self {
+        Self {
+            method: state.segmentation_mode,
+            settings_generation: state.segmentation_generation,
+            prompt_generation: state.sam31_prompt_bundle_generation,
+            second_roi_enabled: state.second_roi_enabled,
+            object_search: state.sam31_object_inspection,
+        }
+    }
+
+    fn frame_error(self, frame: &EyeFrame) -> Option<&'static str> {
+        if self.object_search { return Some("paused: object search"); }
+        if frame.segmentation_mode != self.method {
+            return Some("paused: waiting for global gaze method");
+        }
+        if frame.gaze_settings_generation != self.settings_generation {
+            return Some("paused: waiting for global gaze settings");
+        }
+        if !subject_eye_analysis_enabled(frame.eye_id.saturating_sub(1) as usize, self.second_roi_enabled) {
+            return Some("paused: reference eye analysis disabled");
+        }
+        if self.method.uses_mask_geometry() {
+            if frame.joint_gaze_active != self.second_roi_enabled {
+                return Some("paused: waiting for global stereo setting");
+            }
+            if frame.gaze_authority_sam_prompt_generation != Some(self.prompt_generation)
+                || frame.sam31_proposal_masks.as_ref().is_some_and(|p| p.prompt_generation != self.prompt_generation)
+            {
+                return Some("paused: waiting for global gaze prompt");
+            }
+        }
+        None
+    }
+}
+
+fn invalidate_desktop_gaze_settings(state: &mut SharedState) {
+    state.gaze_focus.invalidate_global_settings();
+    state.mouse_output.invalidate_global_settings();
+}
+
+fn set_gaze_reference_eye(state: &mut SharedState, eye: usize) {
+    let eye = eye.min(1);
+    if state.focus_eye != eye { invalidate_desktop_gaze_settings(state); }
+    state.focus_eye = eye;
+}
+
 fn manual_exposure_step_target(current: u16, delta: i32) -> Option<u16> {
     let requested = i32::from(current).saturating_add(delta).clamp(
         i32::from(AUTO_EXPOSURE_MIN_LINES),
@@ -5680,23 +5810,27 @@ fn apply_manual_focus_step(
 }
 
 fn bump_iris_segmentation_generation(state: &mut SharedState) {
+    invalidate_desktop_gaze_settings(state);
     state.segmentation_generation = state.segmentation_generation.wrapping_add(1);
     state.iris_segmentation_generation = state.iris_segmentation_generation.wrapping_add(1);
     state.gaze_input_generation = state.gaze_input_generation.wrapping_add(1);
 }
 
 fn bump_rough_pupil_center_generation(state: &mut SharedState) {
+    invalidate_desktop_gaze_settings(state);
     state.segmentation_generation = state.segmentation_generation.wrapping_add(1);
     state.rough_pupil_center_generation = state.rough_pupil_center_generation.wrapping_add(1);
     state.gaze_input_generation = state.gaze_input_generation.wrapping_add(1);
 }
 
 fn bump_pupil_sizing_generation(state: &mut SharedState) {
+    invalidate_desktop_gaze_settings(state);
     state.segmentation_generation = state.segmentation_generation.wrapping_add(1);
     state.pupil_sizing_generation = state.pupil_sizing_generation.wrapping_add(1);
 }
 
 fn bump_iris_runtime_policy_generation(state: &mut SharedState) {
+    invalidate_desktop_gaze_settings(state);
     state.segmentation_generation = state.segmentation_generation.wrapping_add(1);
     state.iris_segmentation_generation = state.iris_segmentation_generation.wrapping_add(1);
 }
@@ -5715,8 +5849,10 @@ fn set_segmentation_mode(
         bump_iris_segmentation_generation(state);
     }
     state.segmentation_mode = mode;
-    if mode != SegmentationMode::Sam31 {
+    if !mode.uses_mask_geometry() {
         state.sam31_semantic_prompt = None;
+    }
+    if mode != SegmentationMode::Sam31 {
         state.sam31_object_inspection = false;
         state.sam31_scene_candidate = None;
     }
@@ -5725,8 +5861,8 @@ fn set_segmentation_mode(
             "IRIS NATIVE + CENTER {} ({source})",
             state.rough_pupil_center_mode.short_label(),
         ),
-        SegmentationMode::Sam31 => format!(
-            "IRIS SAM31 + CENTER {} WARMING ({source})",
+        SegmentationMode::Sam31 | SegmentationMode::EyeStudent => format!(
+            "IRIS {} + CENTER {} WARMING ({source})",mode.label().to_ascii_uppercase(),
             state.rough_pupil_center_mode.short_label(),
         ),
         SegmentationMode::Clusters => format!(
@@ -5743,6 +5879,23 @@ fn set_segmentation_mode(
         }
     };
     Ok(())
+}
+
+/// The keyboard and the always-visible detector selector share one transition.
+fn cycle_segmentation_mode(state: &mut SharedState, source: &str) {
+    let previous=state.segmentation_mode;
+    let mode=previous.cycled_compatible(state.rough_pupil_center_mode);
+    if mode==previous {
+        eprintln!("segmentation method held at {}; rough-center={} permits no other method (Y changes center)",
+            mode.label(),state.rough_pupil_center_mode.label());
+    } else {
+        match set_segmentation_mode(state,mode,source) {
+            Ok(())=>eprintln!("segmentation method cycled to {} by {source} with rough-center={}",
+                mode.label(),state.rough_pupil_center_mode.label()),
+            Err(error)=>eprintln!("segmentation method cycle refused for rough-center={}: {error}",
+                state.rough_pupil_center_mode.label()),
+        }
+    }
 }
 
 fn set_rough_pupil_center_mode(
@@ -6038,7 +6191,7 @@ fn selected_limbus_focus_geometry_verified(
 ) -> bool {
     match mode {
         SegmentationMode::Native => raw_eye_anatomy_confirmed && native_boundary_ready,
-        SegmentationMode::Sam31 => {
+        SegmentationMode::Sam31 | SegmentationMode::EyeStudent => {
             sam_boundary_selected || (raw_eye_anatomy_confirmed && native_boundary_ready)
         }
         SegmentationMode::Clusters => {
@@ -8005,7 +8158,7 @@ fn handle_control_command(command: &str, shared: &Arc<Mutex<SharedState>>) -> St
                 "left" => 1,
                 _ => return control_error("FOCUS EYE must be RIGHT or LEFT"),
             };
-            state.focus_eye = selected;
+            set_gaze_reference_eye(&mut state, selected);
             state.focus_action = Some(FocusAction::SelectEye(selected));
             format!(
                 "{{\"ok\":true,\"queued\":\"focus-eye\",\"focus_eye\":{}}}",
@@ -8371,24 +8524,45 @@ enum RoiOverlayMode {
     SamOuterIrisFit,
     SamConicSegments,
     SamDeflattenedVirtualContact,
+    SamTweakedContactGeometry,
+    StudentMaskOutline,
+    StudentEllipseOnly,
+    StudentPupilOnly,
+    StudentSourceRaw,
     Clean,
 }
 
 impl RoiOverlayMode {
-    const SAM31_MODES: [Self; 7] = [
+    const SAM31_MODES: [Self; 8] = [
         Self::SamOuterIrisMasks,
         Self::SamSegmentationOnly,
         Self::SamOuterIrisFit,
         Self::SamConicSegments,
         Self::SamDeflattenedVirtualContact,
+        Self::SamTweakedContactGeometry,
+        Self::Clean,
+        Self::FullDiagnostics,
+    ];
+    const STUDENT_MODES: [Self; 11] = [
+        Self::SamOuterIrisMasks,
+        Self::SamSegmentationOnly,
+        Self::StudentMaskOutline,
+        Self::SamOuterIrisFit,
+        Self::SamConicSegments,
+        Self::StudentEllipseOnly,
+        Self::StudentPupilOnly,
+        Self::SamDeflattenedVirtualContact,
+        Self::StudentSourceRaw,
         Self::Clean,
         Self::FullDiagnostics,
     ];
     const GENERAL_MODES: [Self; 2] = [Self::Clean, Self::FullDiagnostics];
 
     fn available(segmentation: SegmentationMode) -> &'static [Self] {
-        if segmentation == SegmentationMode::Sam31 {
+        if segmentation==SegmentationMode::Sam31 {
             &Self::SAM31_MODES
+        } else if segmentation==SegmentationMode::EyeStudent {
+            &Self::STUDENT_MODES
         } else {
             &Self::GENERAL_MODES
         }
@@ -8432,8 +8606,37 @@ impl RoiOverlayMode {
             Self::SamOuterIrisFit => "SAM OUTER IRIS: DE-FLAT-TIRE FIT",
             Self::SamConicSegments => "CONIC SEGMENTS",
             Self::SamDeflattenedVirtualContact => "VIRTUAL CONTACT: DE-FLAT-TIRE FIT",
+            Self::SamTweakedContactGeometry => "TWEAKED CONTACT GEOMETRY / EXPERIMENTAL",
+            Self::StudentMaskOutline => "STUDENT MASK OUTLINES ONLY",
+            Self::StudentEllipseOnly => "STUDENT LIMBUS ELLIPSE ONLY",
+            Self::StudentPupilOnly => "STUDENT PUPIL VOID ELLIPSE ONLY",
+            Self::StudentSourceRaw => "STUDENT INFERENCE SOURCE / NO OVERLAYS",
             Self::Clean => "CLEAN ROI",
         }
+    }
+
+    fn label_for(self,method:SegmentationMode)->String {
+        if method==SegmentationMode::EyeStudent {
+            match self {
+                Self::SamOuterIrisMasks => "STUDENT SELECTED MASK ONLY / FIXED LABELS",
+                Self::SamSegmentationOnly => "STUDENT ALL CANDIDATE MASKS ONLY / FIXED LABELS",
+                Self::SamOuterIrisFit => "STUDENT DE-FLAT-TIRE FIT + KEEP / REJECT",
+                Self::SamConicSegments => "STUDENT SUPPORTED CONIC ARCS ONLY",
+                Self::SamDeflattenedVirtualContact => "STUDENT VIRTUAL CONTACT ONLY",
+                Self::Clean => "CLEAN LIVE ROI / NO OVERLAYS",
+                _ => self.label(),
+            }.to_owned()
+        } else {self.label().to_owned()}
+    }
+
+    /// Student inspection layers use the immutable inference source, not a
+    /// later ROI crop. Clean and full diagnostics deliberately remain live.
+    fn uses_student_source(self) -> bool {
+        matches!(self,
+            Self::SamOuterIrisMasks | Self::SamSegmentationOnly
+            | Self::SamOuterIrisFit | Self::SamConicSegments
+            | Self::SamDeflattenedVirtualContact | Self::StudentMaskOutline
+            | Self::StudentEllipseOnly | Self::StudentPupilOnly | Self::StudentSourceRaw)
     }
 
     fn sam31_prompt_index(self) -> Option<usize> {
@@ -8442,7 +8645,8 @@ impl RoiOverlayMode {
             | Self::SamSegmentationOnly
             | Self::SamOuterIrisFit
             | Self::SamConicSegments
-            | Self::SamDeflattenedVirtualContact => Some(0),
+            | Self::SamDeflattenedVirtualContact
+            | Self::SamTweakedContactGeometry => Some(0),
             _ => None,
         }
     }
@@ -9062,10 +9266,11 @@ enum CalibrationFrameState {
     OutsideSafeFrame,
     UnresolvedSign,
     Ready,
+    WaitingForSourcePartner,
 }
 
 impl CalibrationFrameState {
-    const COUNT: usize = 6;
+    const COUNT: usize = 7;
 
     fn index(self) -> usize {
         match self {
@@ -9075,6 +9280,7 @@ impl CalibrationFrameState {
             Self::OutsideSafeFrame => 3,
             Self::UnresolvedSign => 4,
             Self::Ready => 5,
+            Self::WaitingForSourcePartner => 6,
         }
     }
 
@@ -9086,13 +9292,14 @@ impl CalibrationFrameState {
             Self::OutsideSafeFrame => "MOVE EYE INSIDE THE GREEN BOX",
             Self::UnresolvedSign => "RESOLVING SURFACE DIRECTION",
             Self::Ready => "CURRENT SAM IRIS READY",
+            Self::WaitingForSourcePartner => "WAITING FOR PAIRED SAM RESULT",
         }
     }
 
     fn guide_color(self) -> u32 {
         match self {
             Self::Ready => 0x0038_ff70,
-            Self::SamSourceMismatch | Self::UnresolvedSign => 0x00ff_b020,
+            Self::SamSourceMismatch | Self::UnresolvedSign | Self::WaitingForSourcePartner => 0x00ff_b020,
             Self::MissingFrame | Self::NoSurface | Self::OutsideSafeFrame => 0x00ff_4050,
         }
     }
@@ -9105,6 +9312,7 @@ impl CalibrationFrameState {
             Self::OutsideSafeFrame => "IRIS DID NOT STAY INSIDE ROI SAFE FRAME",
             Self::UnresolvedSign => "IRIS SURFACE SIGN DID NOT STABILIZE",
             Self::Ready => "SAM GAZE UPDATES WERE TOO SPARSE",
+            Self::WaitingForSourcePartner => "PAIRED SAM RESULTS DID NOT COMPLETE TOGETHER",
         }
     }
 }
@@ -9119,13 +9327,29 @@ fn calibration_frame_state(
     frame: Option<&EyeFrame>,
     surface: Option<SurfaceGazeSample>,
 ) -> CalibrationFrameState {
+    let state = gaze_frame_state(frame, surface);
+    if state == CalibrationFrameState::Ready
+        && frame.is_some_and(|frame| !joint_gaze_live::calibration_source_group_complete(frame))
+    {
+        CalibrationFrameState::WaitingForSourcePartner
+    } else {
+        state
+    }
+}
+
+/// Source/geometry validity shared by collection and the completed plotter.
+/// Only collection additionally waits for final paired-request evidence.
+fn gaze_frame_state(
+    frame: Option<&EyeFrame>,
+    surface: Option<SurfaceGazeSample>,
+) -> CalibrationFrameState {
     let Some(frame) = frame else {
         return CalibrationFrameState::MissingFrame;
     };
     let Some(surface) = surface else {
         return CalibrationFrameState::NoSurface;
     };
-    if frame.segmentation_mode != SegmentationMode::Sam31 {
+    if !frame.segmentation_mode.uses_mask_geometry() {
         return if surface.sign_resolved { CalibrationFrameState::Ready } else { CalibrationFrameState::UnresolvedSign };
     }
     let Some(source_timestamp_ns) = surface.source_timestamp_ns else {
@@ -9137,25 +9361,32 @@ fn calibration_frame_state(
     }) else {
         return CalibrationFrameState::SamSourceMismatch;
     };
-    let Some(ellipse) = sam31_presentation_ellipse_for_frame(
-        proposals, frame.timestamp_ns, frame.sensor_x, frame.sensor_y, frame.width, frame.height,
-    ) else {
+    let geometry = if frame.joint_gaze_active {
+        joint_gaze_live::source_ellipse(frame).zip(joint_gaze_live::ellipse(frame))
+    } else {
+        proposals.outer_fit.as_ref().map(|fit| fit.ellipse).zip(
+            sam31_presentation_ellipse_for_frame(proposals, frame.timestamp_ns,
+                frame.sensor_x, frame.sensor_y, frame.width, frame.height))
+    };
+    let Some((source_ellipse, ellipse)) = geometry else {
         return CalibrationFrameState::SamSourceMismatch;
     };
-    let margin = (frame.width.min(frame.height) as f64 * 0.04).max(4.0);
-    let source_ellipse = proposals.outer_fit.as_ref().expect("transport requires a review fit").ellipse;
     // Moving a clipped historical fit into a larger visible margin cannot
     // create the RAW support that was absent in its actual source exposure.
     // The fitted limbus must be safe in both source and presentation windows.
-    let safely_contained = [source_ellipse, ellipse].into_iter().all(|ellipse| {
+    let safely_contained = [
+        (source_ellipse, proposals.source_width, proposals.source_height),
+        (ellipse, frame.width, frame.height),
+    ].into_iter().all(|(ellipse, width, height)| {
+        let margin = (width.min(height) as f64 * 0.04).max(4.0);
         let (axis_sine, axis_cosine) = ellipse.angle.sin_cos();
         let extent_x = (ellipse.major_radius * axis_cosine).hypot(ellipse.minor_radius * axis_sine);
         let extent_y = (ellipse.major_radius * axis_sine).hypot(ellipse.minor_radius * axis_cosine);
         [
             ellipse.center.0 - extent_x - margin,
             ellipse.center.1 - extent_y - margin,
-            frame.width as f64 - margin - ellipse.center.0 - extent_x,
-            frame.height as f64 - margin - ellipse.center.1 - extent_y,
+            width as f64 - margin - ellipse.center.0 - extent_x,
+            height as f64 - margin - ellipse.center.1 - extent_y,
         ]
         .into_iter()
         .all(|clearance| clearance.is_finite() && clearance >= 0.0)
@@ -9218,6 +9449,11 @@ struct VirtualMouseMode {
     reticle: Option<(f64, f64)>,
     /// Evidence key for a displayed reticle that can survive a redraw.
     reticle_source_timestamp_ns: Option<u64>,
+    /// Current request completion state and the last displayed source's
+    /// (sign epoch, completion state). Only a provisional -> complete paired
+    /// revision may replace a same-time absolute placement.
+    source_group_complete: bool,
+    reticle_source_revision: Option<(u64, bool)>,
     last_timestamp_ns: Option<u64>,
     gaze_available: bool,
     frame_state: CalibrationFrameState,
@@ -9255,6 +9491,8 @@ impl VirtualMouseMode {
             gaze_affine: None,
             reticle: None,
             reticle_source_timestamp_ns: None,
+            source_group_complete: true,
+            reticle_source_revision: None,
             last_timestamp_ns: None,
             gaze_available: false,
             frame_state: CalibrationFrameState::MissingFrame,
@@ -9297,6 +9535,14 @@ impl VirtualMouseMode {
         self.unique_surface_updates = 0;
     }
 
+    /// Automatic ROI admission/focus selection is a presentation decision,
+    /// not permission to substitute another eye's calibration coordinates.
+    /// Before the first admitted sample we may follow the selected live eye;
+    /// thereafter a missing bound eye pauses collection, without fallback.
+    fn eye_index(&self, viewer_eye: usize) -> usize {
+        self.calibration_authority.map_or(viewer_eye.min(1), |authority| authority.eye)
+    }
+
     fn observe_frame_state(
         &mut self,
         current_frame_timestamp_ns: Option<u64>,
@@ -9324,6 +9570,7 @@ impl VirtualMouseMode {
                 CalibrationFrameState::SamSourceMismatch,
                 CalibrationFrameState::OutsideSafeFrame,
                 CalibrationFrameState::UnresolvedSign,
+                CalibrationFrameState::WaitingForSourcePartner,
             ]
             .into_iter()
             .max_by_key(|state| self.frame_state_counts[state.index()])
@@ -9344,6 +9591,11 @@ impl VirtualMouseMode {
         current_frame_timestamp_ns: Option<u64>,
         authority: CalibrationGazeAuthority,
     ) {
+        // A finalized failed recording must not silently restart its in-memory
+        // targets on a subsequent tracking reconnect.
+        if self.calibration_failure.is_some() {
+            return;
+        }
         if self.display_plane.is_some() {
             if self.calibration_authority != Some(authority) {
                 self.pause_completed_calibration("GAZE SOURCE CHANGED  CALIBRATION PRESERVED");
@@ -9386,7 +9638,10 @@ impl VirtualMouseMode {
                     self.calibration_authority_restarts,
                 );
             }
-            Some(_) => self.calibration_failure = Some("GAZE PROVIDER CHANGED DURING CALIBRATION"),
+            Some(expected) => {
+                eprintln!("mouse calibration provider changed: expected={expected:?} observed={authority:?}");
+                self.calibration_failure = Some("GAZE PROVIDER CHANGED DURING CALIBRATION");
+            }
         }
     }
 
@@ -9518,11 +9773,13 @@ impl VirtualMouseMode {
             return;
         }
         if self.display_plane.is_none() {
-            if self.frame_state == CalibrationFrameState::UnresolvedSign && !self.sign_acquisition.active() {
+            // An unsigned/provisional SAM result pauses sample collection;
+            // it does not invalidate an already acquired stationary-target
+            // basis. Only an actual provider/generation or signed-epoch
+            // transition may discard that sequence (handled separately).
+            if self.frame_state == CalibrationFrameState::UnresolvedSign
+                && self.calibration_sign_epoch.is_none() && !self.sign_acquisition.active() {
                 self.sign_acquisition.start(now);
-                if self.calibration_sign_epoch.take().is_some() {
-                    self.calibration_sign_restarts = self.calibration_sign_restarts.saturating_add(1);
-                }
                 self.target_index = 0;
                 self.target_source_windows_ns.fill(None);
                 for samples in &mut self.samples { samples.clear(); }
@@ -9582,7 +9839,18 @@ impl VirtualMouseMode {
             }
         });
         if let Some(display_plane) = self.display_plane {
-            if let Some(feature) = unique_feature {
+            // A later same-exposure partner may refine this source's gaze.
+            // Calibration must not cast another vote, but an absolute cursor
+            // can replace its provisional placement without interpolation or
+            // pretending that another sensor exposure arrived. Older sources
+            // remain unable to rewind the cursor.
+            let feature = unique_feature.or_else(|| observation
+                .filter(|(timestamp, _, epoch)| Some(*timestamp) == self.last_timestamp_ns
+                    && self.source_group_complete
+                    && self.reticle_source_revision.is_some_and(|(previous_epoch,complete)|
+                        previous_epoch == *epoch && !complete))
+                .map(|(_, feature, _)| feature));
+            if let Some(feature) = feature {
                 let mapped = self
                     .gaze_affine
                     .map(|affine| affine.map(feature))
@@ -9595,6 +9863,8 @@ impl VirtualMouseMode {
                     // toward its destination over subsequent observations.
                     self.reticle = Some(mapped);
                     self.reticle_source_timestamp_ns = self.last_timestamp_ns;
+                    self.reticle_source_revision = observation.map(|(_, _, epoch)|
+                        (epoch, self.source_group_complete));
                 }
             }
             return;
@@ -9694,6 +9964,10 @@ impl VirtualMouseMode {
                         calibration_models_have_shared_support(plane, affine, measured.as_slice())
                     });
             if !plane_ready || !affine_ready || !models_agree {
+                eprintln!(
+                    "mouse calibration fit diagnostics: targets={} coverage={} plane={} affine={} shared={}",
+                    measured.len(), coverage_ready, plane_ready, affine_ready, models_agree,
+                );
                 self.display_plane = None;
                 self.gaze_affine = None;
                 self.target_index = self.samples.len() - 1;
@@ -9770,6 +10044,7 @@ struct App {
     checkerboard_status: checkerboard_calibration::StatusSnapshot,
     keyboard_peeper: keyboard_peeper::Registration,
     window_focused: bool,
+    keyboard_modifiers: ModifiersState,
     /// Presentation-only ROI label layer. The temporal learners continue to
     /// run unchanged while F selects full diagnostics, spatial geometry,
     /// direct feature points, Canny evidence, or a clean image.
@@ -9822,7 +10097,7 @@ impl CalibratedDisplay {
         (self.eye == eye && frame.segmentation_mode == self.segmentation_mode
             && frame.gaze_authority_generation == self.gaze_authority_generation
             && surface.sign_resolved
-            && (self.segmentation_mode != SegmentationMode::Sam31
+            && (!self.segmentation_mode.uses_mask_geometry()
                 || frame.gaze_authority_sam_prompt_generation == self.sam_prompt_generation))
             .then_some(self)
     }
@@ -9915,6 +10190,7 @@ fn install_compiled_prompt(state: &mut SharedState, object: bool, output: PathBu
         state.sam31_scene_prompt_text = prompt;
         state.sam31_scene_candidate = None;
     } else {
+        invalidate_desktop_gaze_settings(state);
         state.sam31_prompt_bundle_override = Some(output);
         state.sam31_prompt_bundle_generation = state.sam31_prompt_bundle_generation.wrapping_add(1);
         state.sam31_prompt_text = prompt;
@@ -10071,7 +10347,8 @@ impl App {
                 if let Some(capture) = self.calibration_capture.as_mut() {
                     capture.started_unix_ns = Some(started_unix_ns);
                 }
-                let current_frame_timestamp_ns = self.eyes[self.focus_eye]
+                let eye = self.virtual_mouse.as_ref().map_or(self.focus_eye, |mode| mode.eye_index(self.focus_eye));
+                let current_frame_timestamp_ns = self.eyes[eye]
                     .as_ref()
                     .map(|frame| frame.timestamp_ns);
                 if let Some(mode) = self.virtual_mouse.as_mut() {
@@ -10290,6 +10567,7 @@ impl App {
                     "outside_safe_frame": mode.frame_state_counts[CalibrationFrameState::OutsideSafeFrame.index()],
                     "unresolved_sign": mode.frame_state_counts[CalibrationFrameState::UnresolvedSign.index()],
                     "ready": mode.frame_state_counts[CalibrationFrameState::Ready.index()],
+                    "waiting_for_source_partner": mode.frame_state_counts[CalibrationFrameState::WaitingForSourcePartner.index()],
                 })
             }),
             "targets": VIRTUAL_MOUSE_CALIBRATION_TARGETS,
@@ -10300,6 +10578,7 @@ impl App {
             "display_pose": display_pose,
             "gaze_affine": gaze_affine,
             "focus_eye": capture.focus_eye,
+            "calibration_eye": self.virtual_mouse.as_ref().map(|mode| mode.eye_index(capture.focus_eye)),
             "segmentation_mode": capture.segmentation_mode.label(),
             "sam_prompt_generation": capture.sam_prompt_generation,
             "reacquisition_disabled_at_start": capture.reacquisition_disabled_at_start,
@@ -25524,9 +25803,10 @@ fn gaze_feature(frame: &EyeFrame) -> Option<(f64, f64)> {
 }
 
 fn mouse_gaze_surface(frame: &EyeFrame) -> Option<SurfaceGazeSample> {
+    if frame.gaze_policy_error.is_some() { return None; }
     if frame.joint_gaze_active {return joint_gaze_live::surface(frame,true);}
     match frame.segmentation_mode {
-        SegmentationMode::Sam31 => frame.virtual_contact_surface_gaze,
+        SegmentationMode::Sam31 | SegmentationMode::EyeStudent => frame.virtual_contact_surface_gaze,
         _ => frame.surface_gaze,
     }
     .filter(|surface| surface.relative_gaze.is_camera_facing())
@@ -25597,6 +25877,21 @@ struct PacketHeader {
     stride: usize,
     payload_bytes: usize,
     region: Option<RegionMetadata>,
+}
+
+impl PacketHeader {
+    fn source_queue_part(&self) -> source_queue_budget::SourcePart {
+        use source_queue_budget::{ReadKey, SourcePart};
+        match (self.kind, self.region) {
+            (PacketKind::Eye(eye @ (1 | 2)), Some(region)) if region.active_mask == 3 => {
+                let key = ReadKey { sequence: self.sequence, timestamp_ns: self.timestamp_ns,
+                    region_session: region.session, region_generation: region.generation };
+                if eye == 1 { SourcePart::First(key) } else { SourcePart::Last(key) }
+            }
+            (PacketKind::Eye(_), _) => SourcePart::Independent,
+            _ => SourcePart::Auxiliary,
+        }
+    }
 }
 
 struct ReceivedPacket {
@@ -30965,10 +31260,13 @@ fn receive(
     // pupil choices. Do not construct its client unless one of those two
     // independent selectors requests it. Driving remains self-contained
     // Rust/RAW10 unless SAM31 pupil-center mode is explicitly mixed with it.
+    let mut parked_mask_client: Option<sam31_outer::Client> = None;
     let mut sam31_client =
         if sam31_target_for_modes(config.segmentation, config.rough_pupil_center).is_some() {
             Some(
-                sam31_outer::Client::start(&config.sam31_model)
+                (if config.segmentation == SegmentationMode::EyeStudent {
+                    sam31_outer::Client::start_student(sam31_outer::student::default_model_path())
+                } else {sam31_outer::Client::start(&config.sam31_model)})
                     .map_err(|error| format!("requested SAM31 segmentation: {error}"))?,
             )
         } else {
@@ -31431,6 +31729,7 @@ fn receive(
             let mut last_raw_set_arrival = None;
             let mut stale_queue_drops = 0u64;
             let mut stale_queue_peak_age = Duration::ZERO;
+            let mut source_queue_budget = source_queue_budget::SourceQueueBudget::new(MAX_TRACKING_QUEUE_AGE);
             host_telemetry.last_packet_arrival = None;
             loop {
                 let follow_paused = shared.lock().map(|state| state.region_follow_paused).unwrap_or(true);
@@ -31826,13 +32125,292 @@ fn receive(
                         selected_context_missing_frames = 0;
                         if config.focus_eye_auto {
                             config.focus_eye = if applied_region_mask & 1 != 0 { 0 } else { 1 };
-                            if let Ok(mut state) = shared.lock() { state.focus_eye = config.focus_eye; }
+                            if let Ok(mut state) = shared.lock() { set_gaze_reference_eye(&mut state, config.focus_eye); }
                         }
                     }
                     continue;
                 }
-                let queue_age = Instant::now().saturating_duration_since(packet_arrived);
-                match tracking_queue_action(started.elapsed(), queue_age, autofocus_active) {
+                // Keep native evidence before deciding whether there is
+                // enough time left to analyze it. Recording is not admission:
+                // skipped packets never update SAM, tracking or calibration.
+                let payload = Arc::new(payload);
+                let mut raw_archived = false;
+                if let PacketKind::Eye(eye_id) = header.kind {
+                    if roi_tracker.live_region_transactions && header.region.is_none() {
+                        return Err("negotiated region stream omitted source metadata".to_string());
+                    }
+                    let active_mask = header.region.map_or(3, |metadata| metadata.active_mask);
+                    let (first_in_set, last_in_set) = region_set_boundary(active_mask, eye_id);
+                    if let Some(recorder) = recorder.as_mut() {
+                        recorder.record(&header, &payload, Some(&recording_clock))?;
+                        raw_archived = true;
+                        recorder.record_recovery(&header, &roi_tracker)?;
+                    }
+                    if first_in_set {
+                        let request = shared
+                            .lock()
+                            .ok()
+                            .and_then(|mut state| state.hotkey_record_request.take());
+                        if let Some(request) = request {
+                            match request {
+                                HotkeyRecordRequest::Start(path) => {
+                                    if recorder.is_some() || timed_recording.is_some() {
+                                        if let Ok(mut state) = shared.lock() {
+                                            state.hotkey_record_result = Some(HotkeyRecordResult {
+                                                state: "failed",
+                                                path,
+                                                elapsed_ms: 0,
+                                                complete_sets: 0,
+                                                frames: 0,
+                                                error: Some(
+                                                    "another RAW bundle writer already owns the eye stream"
+                                                        .to_string(),
+                                                ),
+                                            });
+                                        }
+                                    } else {
+                                        match Recorder::new(&path, &config, &recording_trace) {
+                                            Ok(dynamic_recorder) => {
+                                                eprintln!(
+                                                    "S/H started two-ROI RAW recording with frame predictions {}",
+                                                    path.display(),
+                                                );
+                                                hotkey_recording = Some(HotkeyRecording {
+                                                    path: path.clone(),
+                                                    recorder: dynamic_recorder,
+                                                    started_at: Instant::now(),
+                                                    frames: 0,
+                                                    complete_sets: 0,
+                                                });
+                                                if let Ok(mut state) = shared.lock() {
+                                                    state.hotkey_record_result =
+                                                        Some(HotkeyRecordResult {
+                                                            state: "recording",
+                                                            path,
+                                                            elapsed_ms: 0,
+                                                            complete_sets: 0,
+                                                            frames: 0,
+                                                            error: None,
+                                                        });
+                                                }
+                                            }
+                                            Err(error) => {
+                                                if let Ok(mut state) = shared.lock() {
+                                                    state.hotkey_record_result =
+                                                        Some(HotkeyRecordResult {
+                                                            state: "failed",
+                                                            path,
+                                                            elapsed_ms: 0,
+                                                            complete_sets: 0,
+                                                            frames: 0,
+                                                            error: Some(error),
+                                                        });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                HotkeyRecordRequest::Stop => {
+                                    if let Some(mut active) = hotkey_recording.take() {
+                                        let finalize_error = active.recorder.finalize().err();
+                                        let state_name = if finalize_error.is_some() {
+                                            "failed"
+                                        } else {
+                                            "complete"
+                                        };
+                                        eprintln!(
+                                            "S/H stopped two-ROI RAW recording {} ({} complete sets)",
+                                            active.path.display(),
+                                            active.complete_sets,
+                                        );
+                                        if let Ok(mut state) = shared.lock() {
+                                            state.hotkey_record_result = Some(HotkeyRecordResult {
+                                                state: state_name,
+                                                path: active.path,
+                                                elapsed_ms: active
+                                                    .started_at
+                                                    .elapsed()
+                                                    .as_millis()
+                                                    .min(u64::MAX as u128)
+                                                    as u64,
+                                                complete_sets: active.complete_sets,
+                                                frames: active.frames,
+                                                error: finalize_error,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if first_in_set && timed_recording.is_none() {
+                        let request = shared
+                            .lock()
+                            .ok()
+                            .and_then(|mut state| state.timed_record_request.take());
+                        if let Some(request) = request {
+                            if recorder.is_some() || hotkey_recording.is_some() {
+                                if let Ok(mut state) = shared.lock() {
+                                    state.timed_record_result = Some(TimedRecordResult {
+                                        id: request.id,
+                                        state: "failed",
+                                        path: request.path,
+                                        duration_ms: request.duration.as_millis().min(u64::MAX as u128)
+                                            as u64,
+                                        complete_sets: 0,
+                                        frames: 0,
+                                        error: Some(
+                                            "another RAW bundle writer already owns the eye stream"
+                                                .to_string(),
+                                        ),
+                                    });
+                                }
+                            } else {
+                                match Recorder::new(&request.path, &config, &recording_trace) {
+                                    Ok(dynamic_recorder) => {
+                                        if let Ok(mut state) = shared.lock() {
+                                            if let Some(result) = state.timed_record_result.as_mut() {
+                                                if result.id == request.id {
+                                                    result.state = "recording";
+                                                }
+                                            }
+                                        }
+                                        timed_recording = Some(TimedRecording {
+                                            request,
+                                            recorder: dynamic_recorder,
+                                            started_at: Instant::now(),
+                                            frames: 0,
+                                            complete_sets: 0,
+                                        });
+                                    }
+                                    Err(error) => {
+                                        if let Ok(mut state) = shared.lock() {
+                                            state.timed_record_result = Some(TimedRecordResult {
+                                                id: request.id,
+                                                state: "failed",
+                                                path: request.path,
+                                                duration_ms: request
+                                                    .duration
+                                                    .as_millis()
+                                                    .min(u64::MAX as u128)
+                                                    as u64,
+                                                complete_sets: 0,
+                                                frames: 0,
+                                                error: Some(error),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let mut timed_completion = None;
+                    if let Some(active) = timed_recording.as_mut() {
+                        match active.recorder.record(&header, &payload, Some(&recording_clock)).and_then(|()|active.recorder.record_recovery(&header,&roi_tracker)) {
+                            Ok(()) => {
+                                raw_archived = true;
+                                active.frames = active.frames.saturating_add(1);
+                                if last_in_set {
+                                    active.complete_sets = active.complete_sets.saturating_add(1);
+                                    if timed_region_recording_complete(active_mask, eye_id, active.started_at.elapsed(), active.request.duration) {
+                                        timed_completion = Some(None);
+                                    }
+                                }
+                            }
+                            Err(error) => timed_completion = Some(Some(error)),
+                        }
+                    }
+                    if let Some(record_error) = timed_completion {
+                        let mut active = timed_recording
+                            .take()
+                            .expect("timed RAW completion lost its recorder");
+                        let finalize_error = active.recorder.finalize().err();
+                        let error = record_error.or(finalize_error);
+                        let state_name = if error.is_some() {
+                            "failed"
+                        } else {
+                            "complete"
+                        };
+                        if error.is_none() {
+                            pupil_center_health = PupilCenterHealth::default();
+                            pupil_center_health_warning_logged = false;
+                        }
+                        if let Ok(mut state) = shared.lock() {
+                            state.timed_record_result = Some(TimedRecordResult {
+                                id: active.request.id,
+                                state: state_name,
+                                path: active.request.path,
+                                duration_ms: active
+                                    .started_at
+                                    .elapsed()
+                                    .as_millis()
+                                    .min(u64::MAX as u128)
+                                    as u64,
+                                complete_sets: active.complete_sets,
+                                frames: active.frames,
+                                error,
+                            });
+                        }
+                    }
+                    let mut hotkey_error = None;
+                    if let Some(active) = hotkey_recording.as_mut() {
+                        match active.recorder.record(&header, &payload, Some(&recording_clock)).and_then(|()|active.recorder.record_recovery(&header,&roi_tracker)) {
+                            Ok(()) => {
+                                raw_archived = true;
+                                active.frames = active.frames.saturating_add(1);
+                                if last_in_set {
+                                    active.complete_sets = active.complete_sets.saturating_add(1);
+                                }
+                            }
+                            Err(error) => hotkey_error = Some(error),
+                        }
+                    }
+                    if let Some(record_error) = hotkey_error {
+                        let mut active = hotkey_recording
+                            .take()
+                            .expect("hotkey RAW failure lost its recorder");
+                        let finalize_error = active.recorder.finalize().err();
+                        if let Ok(mut state) = shared.lock() {
+                            state.hotkey_record_result = Some(HotkeyRecordResult {
+                                state: "failed",
+                                path: active.path,
+                                elapsed_ms: active
+                                    .started_at
+                                    .elapsed()
+                                    .as_millis()
+                                    .min(u64::MAX as u128)
+                                    as u64,
+                                complete_sets: active.complete_sets,
+                                frames: active.frames,
+                                error: Some(finalize_error.unwrap_or(record_error)),
+                            });
+                        }
+                    }
+                }
+                if header.kind == PacketKind::Context {
+                    let native = Arc::new(CameraThumbnailFrame {
+                        kind: ThumbnailKind::SensorBand,
+                        sensor_size_px: [SENSOR_WIDTH, SENSOR_HEIGHT],
+                        sensor_rect_px: [header.sensor_x, header.sensor_y, config.window_size.0, config.window_size.1],
+                        host_received_unix_ns: host_arrival_unix_ns,
+                        region_session: header.region.map(|r| r.session),
+                        region_generation: header.region.map(|r| r.generation),
+                        camera_header, payload: Arc::clone(&payload),
+                    });
+                    native.validate()?;
+                    recording_trace.thumbnail(Arc::clone(&native));
+                    for publisher in model_publishers.iter() { publisher.submit_thumbnail(Arc::clone(&native)); }
+                }
+                let queue_now = Instant::now();
+                let queue_age = queue_now.saturating_duration_since(packet_arrived);
+                let nominal_queue_action = tracking_queue_action(started.elapsed(), queue_age, autofocus_active);
+                // Reserve time for the mate before beginning expensive eye
+                // analysis. This only sheds additional old work; it cannot
+                // turn an age rejection or hard failure into permission.
+                let (queue_action, paired_queue_shed) = apply_paired_queue_budget(
+                    &mut source_queue_budget, &header, queue_now, queue_age, nominal_queue_action,
+                );
+                match queue_action {
                     TrackingQueueAction::Consume => {
                         if stale_queue_drops > 0 {
                             eprintln!(
@@ -31844,15 +32422,17 @@ fn receive(
                         }
                     }
                     TrackingQueueAction::DropWarmup | TrackingQueueAction::DropBacklog => {
-                        recording_trace.dropped_source(recording_clock.clone(), "tracking-warmup-or-backlog");
+                        recording_trace.skipped_source_analysis(recording_clock.clone(),
+                            if paired_queue_shed {"tracking-paired-source-headroom"} else {"tracking-warmup-or-backlog"},
+                            queue_age, matches!(header.kind, PacketKind::Eye(_)).then_some(raw_archived));
                         stale_queue_drops = stale_queue_drops.saturating_add(1);
                         stale_queue_peak_age = stale_queue_peak_age.max(queue_age);
                         continue;
                     }
                     TrackingQueueAction::Fatal => {
-                        if !recording_clock.is_null() {
-                            recording_trace.dropped_source(recording_clock.clone(), "tracking-queue-hard-limit");
-                        }
+                        recording_trace.skipped_source_analysis(recording_clock.clone(),
+                            "tracking-queue-hard-limit", queue_age,
+                            matches!(header.kind, PacketKind::Eye(_)).then_some(raw_archived));
                         if std::env::var_os("BUTTERCUP_CALIBRATION_CAPTURE")
                             .is_some_and(|value| value != "0")
                         {
@@ -31860,7 +32440,7 @@ fn receive(
                             stale_queue_peak_age = stale_queue_peak_age.max(queue_age);
                             if stale_queue_drops % 64 == 1 {
                                 eprintln!(
-                                    "screen-reflection capture shed a {}ms-old tracking packet; lossless RAW recording remains authoritative",
+                                    "screen-reflection capture skipped analysis of a {}ms-old packet; native archive membership and queue age are recorded separately",
                                     queue_age.as_millis(),
                                 );
                             }
@@ -31875,7 +32455,6 @@ fn receive(
                 }
                 host_telemetry.observe_packet_arrival(packet_arrived);
                 host_telemetry.record(HOST_STAGE_PACKET_READ, read_elapsed);
-                let payload = Arc::new(payload);
                 if header.kind == PacketKind::Telemetry {
                     let snapshot = parse_telemetry_payload(&payload)?;
                     if let Ok(mut state) = shared.lock() {
@@ -31886,20 +32465,6 @@ fn receive(
                     continue;
                 }
                 if header.kind == PacketKind::Context {
-                    {
-                        let native = Arc::new(CameraThumbnailFrame {
-                            kind: ThumbnailKind::SensorBand,
-                            sensor_size_px: [SENSOR_WIDTH, SENSOR_HEIGHT],
-                            sensor_rect_px: [header.sensor_x, header.sensor_y, config.window_size.0, config.window_size.1],
-                            host_received_unix_ns: host_arrival_unix_ns,
-                            region_session: header.region.map(|r| r.session),
-                            region_generation: header.region.map(|r| r.generation),
-                            camera_header, payload: Arc::clone(&payload),
-                        });
-                        native.validate()?;
-                        recording_trace.thumbnail(Arc::clone(&native));
-                        for publisher in model_publishers.iter() { publisher.submit_thumbnail(Arc::clone(&native)); }
-                    }
                     // The bilateral context matcher assumes both configured eyes occupy this band.
                     // A scheduled eviction must not become loss-of-lock/global reacquisition evidence.
                     if applied_region_mask != 3 { continue; }
@@ -32034,7 +32599,7 @@ fn receive(
                             auto_focus_selected = true;
                             auto_focus_scores = [Vec::new(), Vec::new()];
                             if let Ok(mut state) = shared.lock() {
-                                state.focus_eye = config.focus_eye;
+                                set_gaze_reference_eye(&mut state, config.focus_eye);
                             }
                             eprintln!(
                                 "RAW host cancelled the focus sweep after its selected eye became occluded and switched the sole metric ROI to {}",
@@ -32087,13 +32652,10 @@ fn receive(
                 let PacketKind::Eye(eye_id) = header.kind else {
                     return Err("unsupported packet kind in RAW eye stream".to_string());
                 };
-                if roi_tracker.live_region_transactions && header.region.is_none() {
-                    return Err("negotiated region stream omitted source metadata".to_string());
-                }
                 let eye_process_started = Instant::now();
                 let raw_packet_arrived = packet_arrived;
                 let active_mask = header.region.map_or(3, |metadata| metadata.active_mask);
-                let (first_in_set, last_in_set) = region_set_boundary(active_mask, eye_id);
+                let (_, last_in_set) = region_set_boundary(active_mask, eye_id);
                 if last_in_set {
                     if let Some(previous) = last_raw_set_arrival {
                         host_telemetry.record(
@@ -32102,248 +32664,6 @@ fn receive(
                         );
                     }
                     last_raw_set_arrival = Some(raw_packet_arrived);
-                }
-                if let Some(recorder) = recorder.as_mut() {
-                    recorder.record(&header, &payload, Some(&recording_clock))?;
-                    recorder.record_recovery(&header, &roi_tracker)?;
-                }
-                if first_in_set {
-                    let request = shared
-                        .lock()
-                        .ok()
-                        .and_then(|mut state| state.hotkey_record_request.take());
-                    if let Some(request) = request {
-                        match request {
-                            HotkeyRecordRequest::Start(path) => {
-                                if recorder.is_some() || timed_recording.is_some() {
-                                    if let Ok(mut state) = shared.lock() {
-                                        state.hotkey_record_result = Some(HotkeyRecordResult {
-                                            state: "failed",
-                                            path,
-                                            elapsed_ms: 0,
-                                            complete_sets: 0,
-                                            frames: 0,
-                                            error: Some(
-                                                "another RAW bundle writer already owns the eye stream"
-                                                    .to_string(),
-                                            ),
-                                        });
-                                    }
-                                } else {
-                                    match Recorder::new(&path, &config, &recording_trace) {
-                                        Ok(dynamic_recorder) => {
-                                            eprintln!(
-                                                "S/H started two-ROI RAW recording with frame predictions {}",
-                                                path.display(),
-                                            );
-                                            hotkey_recording = Some(HotkeyRecording {
-                                                path: path.clone(),
-                                                recorder: dynamic_recorder,
-                                                started_at: Instant::now(),
-                                                frames: 0,
-                                                complete_sets: 0,
-                                            });
-                                            if let Ok(mut state) = shared.lock() {
-                                                state.hotkey_record_result =
-                                                    Some(HotkeyRecordResult {
-                                                        state: "recording",
-                                                        path,
-                                                        elapsed_ms: 0,
-                                                        complete_sets: 0,
-                                                        frames: 0,
-                                                        error: None,
-                                                    });
-                                            }
-                                        }
-                                        Err(error) => {
-                                            if let Ok(mut state) = shared.lock() {
-                                                state.hotkey_record_result =
-                                                    Some(HotkeyRecordResult {
-                                                        state: "failed",
-                                                        path,
-                                                        elapsed_ms: 0,
-                                                        complete_sets: 0,
-                                                        frames: 0,
-                                                        error: Some(error),
-                                                    });
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            HotkeyRecordRequest::Stop => {
-                                if let Some(mut active) = hotkey_recording.take() {
-                                    let finalize_error = active.recorder.finalize().err();
-                                    let state_name = if finalize_error.is_some() {
-                                        "failed"
-                                    } else {
-                                        "complete"
-                                    };
-                                    eprintln!(
-                                        "S/H stopped two-ROI RAW recording {} ({} complete sets)",
-                                        active.path.display(),
-                                        active.complete_sets,
-                                    );
-                                    if let Ok(mut state) = shared.lock() {
-                                        state.hotkey_record_result = Some(HotkeyRecordResult {
-                                            state: state_name,
-                                            path: active.path,
-                                            elapsed_ms: active
-                                                .started_at
-                                                .elapsed()
-                                                .as_millis()
-                                                .min(u64::MAX as u128)
-                                                as u64,
-                                            complete_sets: active.complete_sets,
-                                            frames: active.frames,
-                                            error: finalize_error,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if first_in_set && timed_recording.is_none() {
-                    let request = shared
-                        .lock()
-                        .ok()
-                        .and_then(|mut state| state.timed_record_request.take());
-                    if let Some(request) = request {
-                        if recorder.is_some() || hotkey_recording.is_some() {
-                            if let Ok(mut state) = shared.lock() {
-                                state.timed_record_result = Some(TimedRecordResult {
-                                    id: request.id,
-                                    state: "failed",
-                                    path: request.path,
-                                    duration_ms: request.duration.as_millis().min(u64::MAX as u128)
-                                        as u64,
-                                    complete_sets: 0,
-                                    frames: 0,
-                                    error: Some(
-                                        "another RAW bundle writer already owns the eye stream"
-                                            .to_string(),
-                                    ),
-                                });
-                            }
-                        } else {
-                            match Recorder::new(&request.path, &config, &recording_trace) {
-                                Ok(dynamic_recorder) => {
-                                    if let Ok(mut state) = shared.lock() {
-                                        if let Some(result) = state.timed_record_result.as_mut() {
-                                            if result.id == request.id {
-                                                result.state = "recording";
-                                            }
-                                        }
-                                    }
-                                    timed_recording = Some(TimedRecording {
-                                        request,
-                                        recorder: dynamic_recorder,
-                                        started_at: Instant::now(),
-                                        frames: 0,
-                                        complete_sets: 0,
-                                    });
-                                }
-                                Err(error) => {
-                                    if let Ok(mut state) = shared.lock() {
-                                        state.timed_record_result = Some(TimedRecordResult {
-                                            id: request.id,
-                                            state: "failed",
-                                            path: request.path,
-                                            duration_ms: request
-                                                .duration
-                                                .as_millis()
-                                                .min(u64::MAX as u128)
-                                                as u64,
-                                            complete_sets: 0,
-                                            frames: 0,
-                                            error: Some(error),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                let mut timed_completion = None;
-                if let Some(active) = timed_recording.as_mut() {
-                    match active.recorder.record(&header, &payload, Some(&recording_clock)).and_then(|()|active.recorder.record_recovery(&header,&roi_tracker)) {
-                        Ok(()) => {
-                            active.frames = active.frames.saturating_add(1);
-                            if last_in_set {
-                                active.complete_sets = active.complete_sets.saturating_add(1);
-                                if timed_region_recording_complete(active_mask, eye_id, active.started_at.elapsed(), active.request.duration) {
-                                    timed_completion = Some(None);
-                                }
-                            }
-                        }
-                        Err(error) => timed_completion = Some(Some(error)),
-                    }
-                }
-                if let Some(record_error) = timed_completion {
-                    let mut active = timed_recording
-                        .take()
-                        .expect("timed RAW completion lost its recorder");
-                    let finalize_error = active.recorder.finalize().err();
-                    let error = record_error.or(finalize_error);
-                    let state_name = if error.is_some() {
-                        "failed"
-                    } else {
-                        "complete"
-                    };
-                    if error.is_none() {
-                        pupil_center_health = PupilCenterHealth::default();
-                        pupil_center_health_warning_logged = false;
-                    }
-                    if let Ok(mut state) = shared.lock() {
-                        state.timed_record_result = Some(TimedRecordResult {
-                            id: active.request.id,
-                            state: state_name,
-                            path: active.request.path,
-                            duration_ms: active
-                                .started_at
-                                .elapsed()
-                                .as_millis()
-                                .min(u64::MAX as u128)
-                                as u64,
-                            complete_sets: active.complete_sets,
-                            frames: active.frames,
-                            error,
-                        });
-                    }
-                }
-                let mut hotkey_error = None;
-                if let Some(active) = hotkey_recording.as_mut() {
-                    match active.recorder.record(&header, &payload, Some(&recording_clock)).and_then(|()|active.recorder.record_recovery(&header,&roi_tracker)) {
-                        Ok(()) => {
-                            active.frames = active.frames.saturating_add(1);
-                            if last_in_set {
-                                active.complete_sets = active.complete_sets.saturating_add(1);
-                            }
-                        }
-                        Err(error) => hotkey_error = Some(error),
-                    }
-                }
-                if let Some(record_error) = hotkey_error {
-                    let mut active = hotkey_recording
-                        .take()
-                        .expect("hotkey RAW failure lost its recorder");
-                    let finalize_error = active.recorder.finalize().err();
-                    if let Ok(mut state) = shared.lock() {
-                        state.hotkey_record_result = Some(HotkeyRecordResult {
-                            state: "failed",
-                            path: active.path,
-                            elapsed_ms: active
-                                .started_at
-                                .elapsed()
-                                .as_millis()
-                                .min(u64::MAX as u128)
-                                as u64,
-                            complete_sets: active.complete_sets,
-                            frames: active.frames,
-                            error: Some(finalize_error.unwrap_or(record_error)),
-                        });
-                    }
                 }
                 let index = eye_id as usize - 1;
                 let eye_source = RoiSource {
@@ -32661,7 +32981,7 @@ fn receive(
                                 config.autofocus_armed && rough_focus_available;
                             coarse_focus_deadline = Instant::now() + ROUGH_FOCUS_SESSION_TIMEOUT;
                             if let Ok(mut state) = shared.lock() {
-                                state.focus_eye = config.focus_eye;
+                                set_gaze_reference_eye(&mut state, config.focus_eye);
                             }
                             eprintln!(
                                 "RAW host selected {} as the sole autofocus metric ROI; any prior sweep was cancelled",
@@ -32882,6 +33202,7 @@ fn receive(
                     sam31_semantic_prompt,
                     r_frozen,
                     gaze_input_generation,
+                    gaze_settings_generation,
                 ) = shared
                     .lock()
                     .map(|state| {
@@ -32900,6 +33221,7 @@ fn receive(
                             state.sam31_semantic_prompt,
                             state.mediapipe_reacquisition_disabled,
                             state.gaze_input_generation,
+                            state.segmentation_generation,
                         )
                     })
                     .unwrap_or((
@@ -32916,6 +33238,7 @@ fn receive(
                         false,
                         None,
                         false,
+                        0,
                         0,
                     ));
                 if active_gaze_input_generation != Some(gaze_input_generation) {
@@ -32998,6 +33321,7 @@ fn receive(
                 // same pupil independently of how its rough center was found.
                 if segmentation_mode != runtime_segmentation_mode {
                     let previous_mode = runtime_segmentation_mode;
+                    sam31_start_failed = false;
                     for session in &mut sam31_sessions {
                         session.invalidate();
                     }
@@ -33097,8 +33421,19 @@ fn receive(
                     raw_sclera_red_canny::ScleraRedCannyOverlay::default()
                 };
                 let sam31_target =
-                    sam31_target_for_modes(segmentation_mode, rough_pupil_center_mode);
+                    sam31_target_for_joint_modes(segmentation_mode, rough_pupil_center_mode, second_roi_enabled);
                 let sam31_requested = sam31_target.is_some();
+                // The unused detector stays resident but idle. Dropping a
+                // CUDA worker here would block camera ingest while it joins.
+                let student_requested = segmentation_mode == SegmentationMode::EyeStudent;
+                if sam31_client.as_ref().is_some_and(|c|c.is_student()!=student_requested)
+                    || (sam31_client.is_none() && parked_mask_client.as_ref().is_some_and(|c|c.is_student()==student_requested)) {
+                    std::mem::swap(&mut sam31_client,&mut parked_mask_client);
+                    sam31_start_failed=false;
+                    if let Some(client)=sam31_client.as_ref() {
+                        client.drain_results();client.drain_proposal_masks();
+                    }
+                }
                 if sam31_requested {
                     let transition = sam31_sessions[index].observe(eye_source, SAM31_RESULT_MAX_AGE_NS);
                     apply_sam31_source_transition(
@@ -33129,10 +33464,13 @@ fn receive(
                         .lock()
                         .ok()
                         .and_then(|state| state.sam31_prompt_bundle_override.clone());
-                    match sam31_outer::Client::start_with_prompt_bundle(
+                    let start = if student_requested {
+                        sam31_outer::Client::start_student(sam31_outer::student::default_model_path())
+                    } else {sam31_outer::Client::start_with_prompt_bundle(
                         &config.sam31_model,
                         prompt_override.as_deref(),
-                    ) {
+                    )};
+                    match start {
                         Ok(client) => {
                             eprintln!(
                                 "SAM31 runtime started for iris={} rough-center={}",
@@ -33166,7 +33504,7 @@ fn receive(
                     sam31_latest = [None, None];
                     sam31_latest_proposals = [None, None];
                 }
-                if sam31_requested {
+                if sam31_requested && !student_requested {
                     let pending_prompt = shared.lock().ok().and_then(|state| {
                         (state.sam31_prompt_bundle_generation != sam31_prompt_bundle_generation)
                             .then(|| {
@@ -33234,6 +33572,12 @@ fn receive(
                                     SAM31_RESULT_MAX_AGE_NS,
                                 )
                             {
+                                if segmentation_mode.uses_mask_geometry() {
+                                    joint_gaze_bridge.observe_proposal(&proposals, &recording_stream_epoch,
+                                        gaze_authority_generations,
+                                        config.centimeter_scales[proposal_eye].map(|s| [s.estimate_px, s.minimum_px, s.maximum_px]),
+                                        &recording_trace);
+                                }
                                 sam31_latest_proposals[proposal_eye] = Some(proposals);
                             }
                         }
@@ -33278,26 +33622,35 @@ fn receive(
                         }
                     }
                 }
-                // Each enabled eye has independent source/session history.
-                // Each lane replaces its one waiting RAW frame under load;
-                // encoding overlaps ordered per-eye tracking, never a FIFO.
+                // Joint mode submits exact same-read ROIs atomically. Under
+                // overload we drop/replace a whole waiting pair, never just
+                // its slower eye. Physically evicted eyes still permit mono
+                // work; an incomplete nominal stereo read is not fabricated
+                // from the partner's previous frame.
                 if let Some(target) = sam31_target {
                     if let Some(client) = sam31_client.as_ref() {
-                        let motion = sam31_outer::memory_arbitration_enabled().then(||
+                        let source_motion = |eye| sam31_outer::memory_arbitration_enabled().then(||
                             sam31_outer::SourceMotionSnapshot {
-                                eye_index: index,
-                                tracking_epoch: sam31_sessions[index].epoch(),
+                                eye_index: eye,
+                                tracking_epoch: sam31_sessions[eye].epoch(),
                                 clock: roi_evidence::SourceClock { domain: 0, epoch: source_clock_epoch },
-                                timeline: global_similarity_timelines[index].clone(),
+                                timeline: global_similarity_timelines[eye].clone(),
                             });
-                        let _ = client.submit_history_with_motion(
-                            &sam31_histories[index],
-                            target,
-                            sam31_semantic_prompt.unwrap_or(sam31_outer::OUTER_IRIS_PROMPT),
-                            sam31_prompt_bundle_generation,
-                            sam31_sessions[index].epoch(),
-                            motion,
-                        );
+                        if second_roi_enabled && segmentation_mode.uses_mask_geometry()
+                            && active_mask==3 && client.supports_source_groups() {
+                            if let Some(frames)=last_in_set.then(||sam31_source_group_for_read(
+                                &sam31_histories,&recording_trace,&recording_stream_epoch,header.timestamp_ns)).flatten() {
+                                let _=client.submit_source_group(frames,target,
+                                    sam31_semantic_prompt.unwrap_or(sam31_outer::OUTER_IRIS_PROMPT),
+                                    sam31_prompt_bundle_generation,std::array::from_fn(|eye|sam31_sessions[eye].epoch()),
+                                    std::array::from_fn(source_motion));
+                            }
+                        } else {
+                            let _ = client.submit_history_with_motion(
+                                &sam31_histories[index], target,
+                                sam31_semantic_prompt.unwrap_or(sam31_outer::OUTER_IRIS_PROMPT),
+                                sam31_prompt_bundle_generation, sam31_sessions[index].epoch(),source_motion(index));
+                        }
                     }
                 }
                 let raw_focus_center = (border_focus.eye_basin_valid
@@ -33313,7 +33666,7 @@ fn receive(
                 let sam_shared_result = sam31_target.and_then(|_| sam31_latest[index].as_ref());
                 let sam_shared_proposals =
                     sam31_target.and_then(|_| sam31_latest_proposals[index].as_ref());
-                let sam_outer_result = (segmentation_mode == SegmentationMode::Sam31)
+                let sam_outer_result = (segmentation_mode.uses_mask_geometry())
                     .then_some(sam_shared_result)
                     .flatten();
                 let sam_pupil_result = (rough_pupil_center_mode == RoughPupilCenterMode::Sam31)
@@ -34405,7 +34758,7 @@ fn receive(
                 let sam_raw_support = sam_outer_result
                     .map(|result| result.raw_ring_support_score)
                     .unwrap_or(0.0);
-                let sam_outer_requested = segmentation_mode == SegmentationMode::Sam31;
+                let sam_outer_requested = segmentation_mode.uses_mask_geometry();
                 let native_override = sam_outer_requested
                     && sam_boundary.as_ref().is_some_and(|sam| {
                         native_boundary_ready
@@ -34452,7 +34805,7 @@ fn receive(
                     native_outer_iris
                 };
                 let selected_iris_measurement_confidence = match segmentation_mode {
-                    SegmentationMode::Sam31 if sam_boundary_selected => {
+                    SegmentationMode::Sam31 | SegmentationMode::EyeStudent if sam_boundary_selected => {
                         Some((sam_raw_support / SAM31_RAW_SUPPORT_DECISIVE).clamp(0.0, 1.0))
                     }
                     SegmentationMode::Clusters => cluster_hypothesis
@@ -34460,6 +34813,7 @@ fn receive(
                         .map(|hypothesis| hypothesis.score),
                     SegmentationMode::Driving
                     | SegmentationMode::Sam31
+                    | SegmentationMode::EyeStudent
                     | SegmentationMode::Native
                     | SegmentationMode::ScleraRedCanny => None,
                 };
@@ -34753,7 +35107,7 @@ fn receive(
                                     )
                                 }
                             }
-                            SegmentationMode::Sam31 if sam_boundary_selected && outer_iris.points.is_empty() => {
+                            SegmentationMode::Sam31 | SegmentationMode::EyeStudent if sam_boundary_selected && outer_iris.points.is_empty() => {
                                 format!(
                                     "SAM31 SCALE {}  OBS {:.1}PX EXPECT {}  PROPOSAL ONLY  G CYCLE",
                                     selected_scale_admission.map_or_else(|| "UNAVAILABLE".to_string(), LimbusRadiusAdmission::label),
@@ -34761,9 +35115,12 @@ fn receive(
                                     selected_iris_radius_prior.map_or_else(|| "COLD".to_string(), |prior| format!("{:.1}PX", prior.estimate_px)),
                                 )
                             }
-                            SegmentationMode::Sam31 if sam_boundary_selected => {
+                            SegmentationMode::Sam31 | SegmentationMode::EyeStudent if sam_boundary_selected => {
                                 let result = sam_outer_result.unwrap();
-                                if result.video_tracked {
+                                if student_requested {
+                                    format!("EYE STUDENT CUDA  RAW {:.2}  {}MS  LAG {}  G CYCLE",
+                                        result.raw_ring_support_score,result.elapsed_ms,header.sequence.saturating_sub(result.source_sequence))
+                                } else if result.video_tracked {
                                     format!(
                                         "SAM31 VIDEO MEMORY  RAW {:.2}  {}MS  LAG {}  G CYCLE",
                                         result.raw_ring_support_score,
@@ -34780,13 +35137,13 @@ fn receive(
                                     )
                                 }
                             }
-                            SegmentationMode::Sam31 if native_override => {
+                            SegmentationMode::Sam31 | SegmentationMode::EyeStudent if native_override => {
                                 format!(
                                     "SAM31/NATIVE SCALE DISAGREEMENT; NATIVE LIMBUS  RAW {:.2}  G CYCLE",
                                     sam_raw_support,
                                 )
                             }
-                            SegmentationMode::Sam31 if sam_radius_rejected => {
+                            SegmentationMode::Sam31 | SegmentationMode::EyeStudent if sam_radius_rejected => {
                                 format!(
                                     "SAM31 IRIS-RADIUS REJECT OBS {}  G CYCLE",
                                     unbounded_sam_radius_px.map_or_else(
@@ -34795,7 +35152,7 @@ fn receive(
                                     ),
                                 )
                             }
-                            SegmentationMode::Sam31 => sam31_client.as_ref().map_or_else(
+                            SegmentationMode::Sam31 | SegmentationMode::EyeStudent => sam31_client.as_ref().map_or_else(
                                 || {
                                     if native_boundary_ready {
                                         "SAM31 UNAVAILABLE; NATIVE FALLBACK  G CYCLE".to_string()
@@ -35003,6 +35360,9 @@ fn receive(
                                 sclera_red_canny.elapsed_us + sclera_vein_graph.elapsed_us,
                             ),
                         };
+                        if student_requested {
+                            state.segmentation_status=state.segmentation_status.replace("SAM31","EYE STUDENT");
+                        }
                     }
                 }
                 let driving_pupil =
@@ -35265,7 +35625,7 @@ fn receive(
                 // that mode: downstream consumers must not accidentally use a
                 // geometrically unrelated result merely because it is fresh.
                 let surface_gaze = (segmentation_mode != SegmentationMode::ScleraRedCanny
-                    && segmentation_mode != SegmentationMode::Sam31)
+                    && !segmentation_mode.uses_mask_geometry())
                     .then(|| {
                         surface_gaze_trackers[index].observe(
                             now,
@@ -35281,7 +35641,7 @@ fn receive(
                 // support a clearly provisional contact without publishing
                 // anatomy. Keep this tracker separate from `surface_gaze` so
                 // the perimeter tier cannot train cursor/gaze authority.
-                let sam_presentation_boundary = (segmentation_mode == SegmentationMode::Sam31)
+                let sam_presentation_boundary = (segmentation_mode.uses_mask_geometry())
                     .then(|| sam_shared_proposals)
                     .flatten()
                     .and_then(|proposals| {
@@ -35294,7 +35654,7 @@ fn receive(
                             header.height,
                         )
                     });
-                let virtual_contact_surface_gaze = if segmentation_mode == SegmentationMode::Sam31 {
+                let virtual_contact_surface_gaze = if segmentation_mode.uses_mask_geometry() {
                     sam_presentation_boundary
                         .as_ref()
                         .zip(sam_shared_proposals)
@@ -35534,7 +35894,7 @@ fn receive(
                     && steering_velocity.confidence >= 0.4 {
                     steering_velocity.velocity_px_s.map(f64::from)
                 } else { [0.0; 2] };
-                if segmentation_mode == SegmentationMode::Sam31 && !manual_roi_hold && !checkerboard_active {
+                if segmentation_mode.uses_mask_geometry() && !manual_roi_hold && !checkerboard_active {
                     if let (Some(result), Some(admitted), Some(review), Some(sample)) = (
                         sam_outer_result, sam_boundary.as_ref(),
                         sam_presentation_boundary.as_ref(), virtual_contact_surface_gaze,
@@ -35564,7 +35924,7 @@ fn receive(
                         }
                     }
                 } else if segmentation_mode != SegmentationMode::ScleraRedCanny
-                    && segmentation_mode != SegmentationMode::Sam31
+                    && !segmentation_mode.uses_mask_geometry()
                     && !manual_roi_hold && !checkerboard_active
                     && steering_globe.publishable && steering_globe.anatomy_authorized
                     && !steering_globe.temporally_bridged
@@ -35664,7 +36024,7 @@ fn receive(
                         autofocus_evidence_frames = 0;
                         autofocus_motion_gate.reset();
                         if let Ok(mut state) = shared.lock() {
-                            state.focus_eye = config.focus_eye;
+                            set_gaze_reference_eye(&mut state, config.focus_eye);
                         }
                         eprintln!(
                             "RAW host auto-selected {} as the sole autofocus metric ROI (evidence {:.3}/{:.3}, provisional={})",
@@ -35916,7 +36276,7 @@ fn receive(
                             "NO COARSE SEED".to_string()
                         }
                     }
-                    SegmentationMode::Sam31 => {
+                    SegmentationMode::Sam31 | SegmentationMode::EyeStudent => {
                         if sam_boundary_selected {
                             let result = sam_shared_result
                                 .expect("a selected SAM boundary carries its source result");
@@ -36070,7 +36430,7 @@ fn receive(
                         autofocus_evidence_frames = 0;
                         autofocus_motion_gate.reset();
                         if let Ok(mut state) = shared.lock() {
-                            state.focus_eye = index;
+                            set_gaze_reference_eye(&mut state, index);
                         }
                     }
                     initial_focus_completed = true;
@@ -36552,9 +36912,10 @@ fn receive(
                     recording_clock,
                     recording_ready: serde_json::Value::Null,
                     segmentation_mode,
+                    gaze_settings_generation,
+                    gaze_policy_error: None,
                     gaze_authority_generation: gaze_authority_generations[index],
-                    gaze_authority_sam_prompt_generation: (segmentation_mode
-                        == SegmentationMode::Sam31)
+                    gaze_authority_sam_prompt_generation: (segmentation_mode.uses_mask_geometry())
                         .then_some(sam31_prompt_bundle_generation),
                     sensor_x: header.sensor_x,
                     sensor_y: header.sensor_y,
@@ -38299,9 +38660,7 @@ fn draw_sensor_overview_eye_laser(
     let Some(start) = project_sensor_point_to_image(apex_sensor, image_rect) else {
         return;
     };
-    let laser_gaze=if frame.joint_gaze_active {
-        let Some(gaze)=joint_gaze_live::gaze(frame) else {return;};gaze
-    } else {pose.relative_gaze};
+    let Some(laser_gaze) = gaze_output_direction(frame) else { return; };
     let direction = (
         laser_gaze.right * image_rect.2 as f64 / PREVIEW_SENSOR_WIDTH.max(1) as f64,
         laser_gaze.down * image_rect.3 as f64 / PREVIEW_SENSOR_HEIGHT.max(1) as f64,
@@ -39597,8 +39956,15 @@ fn draw_eye_with_spatial_debug(
     let segmentation_profile = frame.segmentation_mode.profile();
     let roi_overlay_mode = roi_overlay_mode.normalized_for(frame.segmentation_mode);
     let (overlay_ordinal, overlay_count) = roi_overlay_mode.position_for(frame.segmentation_mode);
-    let display_width = frame.width * pixel_scale;
-    let display_height = frame.height * pixel_scale;
+    let student_source_view = frame.segmentation_mode == SegmentationMode::EyeStudent
+        && roi_overlay_mode.uses_student_source();
+    let (source_width, source_height) = if student_source_view {
+        student_preview::source_dimensions(frame).unwrap_or((frame.width, frame.height))
+    } else {
+        (frame.width, frame.height)
+    };
+    let display_width = source_width * pixel_scale;
+    let display_height = source_height * pixel_scale;
     fill_rect(
         pixels,
         width,
@@ -39625,6 +39991,20 @@ fn draw_eye_with_spatial_debug(
         display_height as i32,
         0,
     );
+    if student_source_view {
+        let count = student_preview::draw(
+            pixels, width, height, x, y, pixel_scale, frame, mode, roi_overlay_mode,
+        );
+        draw_text(
+            pixels, width, height, x + 4, y - 20,
+            &format!("{label}  F {overlay_ordinal}/{overlay_count} {}  N {count}",
+                roi_overlay_mode.label_for(frame.segmentation_mode)),
+            0x00ff_ffff,
+        );
+        // These are intentionally isolated evidence layers. No scale,
+        // reticles, unrelated pupil points or native/J overlays may leak in.
+        return;
+    }
     let regular_source = match mode {
         ViewMode::QuadColor
         | ViewMode::BlueFilter
@@ -39673,9 +40053,12 @@ fn draw_eye_with_spatial_debug(
             );
         }
     }
-    // Physical scale is part of the base image presentation, not an F-key
-    // diagnostic layer. Keep it visible in CLEAN and SAM review views too.
-    if let Some(scale) = frame.centimeter_scale {
+    // Physical scale remains visible in the established CLEAN/SAM views.
+    // Student's explicitly uncluttered inspection views opt out; its full
+    // diagnostics and the global thumbnail still expose the scale.
+    if let Some(scale) = frame.centimeter_scale.filter(|_| {
+        frame.segmentation_mode != SegmentationMode::EyeStudent || roi_overlay_mode.show_full_diagnostics()
+    }) {
         draw_centimeter_scale(
             pixels,
             width,
@@ -39725,6 +40108,8 @@ fn draw_eye_with_spatial_debug(
                 }
                 count
             },
+            RoiOverlayMode::SamTweakedContactGeometry => limbus_refiner_view::draw(
+                pixels,width,height,x,y,pixel_scale,frame),
             RoiOverlayMode::SamDeflattenedVirtualContact => draw_sam31_deflattened_virtual_contact(
                 pixels,
                 width,
@@ -39749,6 +40134,10 @@ fn draw_eye_with_spatial_debug(
                 frame.sam31_proposal_masks.as_deref(),
             ),
             RoiOverlayMode::Clean => 0,
+            RoiOverlayMode::StudentMaskOutline
+            | RoiOverlayMode::StudentEllipseOnly
+            | RoiOverlayMode::StudentPupilOnly
+            | RoiOverlayMode::StudentSourceRaw => unreachable!("student source view handled above"),
             RoiOverlayMode::FullDiagnostics => unreachable!(),
         };
         draw_text(
@@ -39761,7 +40150,7 @@ fn draw_eye_with_spatial_debug(
                 "{label}  F {}/{} {}  N {count}",
                 overlay_ordinal,
                 overlay_count,
-                roi_overlay_mode.label(),
+                roi_overlay_mode.label_for(frame.segmentation_mode),
             ),
             0x00ff_ffff,
         );
@@ -40226,14 +40615,14 @@ fn draw_eye_with_spatial_debug(
         // diagnostic pupil cannot infer the globe center. A manually locked
         // sphere may, however, visualize a directly observed clipped limbus
         // because the lock supplies the otherwise missing 3D authority.
-        let admitted_inner_ring: &[(f64, f64)] = if frame.segmentation_mode != SegmentationMode::Sam31
+        let admitted_inner_ring: &[(f64, f64)] = if !frame.segmentation_mode.uses_mask_geometry()
             && frame.detected_gaze_feature.is_some()
         {
             frame.inner_iris_points.as_slice()
         } else {
             &[]
         };
-        let sam_contact_boundary = (frame.segmentation_mode == SegmentationMode::Sam31)
+        let sam_contact_boundary = (frame.segmentation_mode.uses_mask_geometry())
             .then(|| {
                 if frame.joint_gaze_active {return joint_gaze_live::ellipse(frame).map(|e|e.dense_points(240));}
                 frame.sam31_proposal_masks.as_deref().and_then(|proposals| {
@@ -40255,7 +40644,7 @@ fn draw_eye_with_spatial_debug(
                 })
             })
             .flatten();
-        let meridian_boundary: &[(f64, f64)] = if frame.segmentation_mode == SegmentationMode::Sam31 {
+        let meridian_boundary: &[(f64, f64)] = if frame.segmentation_mode.uses_mask_geometry() {
             // Match virtual_contact_pose's lineage: the UI-only held SAM
             // contact, or the exact SAM review ellipse. Native fallback rings
             // must not deform an otherwise valid SAM cap (or its convexity
@@ -40311,7 +40700,8 @@ fn draw_eye_with_spatial_debug(
         }
         if frame.eye_laser_enabled {
             if let Some(pose) = virtual_contact_pose {
-                if let Some(style) = pose.authority.eye_laser_style() {
+                if let (Some(style), Some(laser_gaze)) =
+                    (pose.authority.eye_laser_style(), gaze_output_direction(frame)) {
                     draw_rotation_meridians_with_laser_axis(
                         pixels,
                         width,
@@ -40330,7 +40720,7 @@ fn draw_eye_with_spatial_debug(
                         meridian_boundary,
                         frame.width,
                         frame.height,
-                        joint_gaze_live::gaze(frame),
+                        Some(laser_gaze),
                     );
                 }
             }
@@ -40416,7 +40806,7 @@ fn draw_eye_with_spatial_debug(
             "{label}  F {}/{} {}",
             overlay_ordinal,
             overlay_count,
-            roi_overlay_mode.label(),
+            roi_overlay_mode.label_for(frame.segmentation_mode),
         ),
         0x00ff_ffff,
     );
@@ -41851,6 +42241,7 @@ fn checked_virtual_contact_pose(
 }
 
 fn virtual_contact_pose(frame: &EyeFrame) -> Option<VirtualContactPose> {
+    if frame.gaze_policy_error.is_some() { return None; }
     if frame.joint_gaze_active && !frame.presentation_pivot_held {
         let boundary=joint_gaze_live::ellipse(frame)?.dense_points(240);
         let provisional=provisional_surface_pose(joint_gaze_live::surface(frame,false),&boundary)?;
@@ -41864,7 +42255,7 @@ fn virtual_contact_pose(frame: &EyeFrame) -> Option<VirtualContactPose> {
     // bypasses the lease solely because SAM normally rejects carried masks.
     // The receiver never sets presentation_pivot_held, so this cannot turn
     // presentation geometry into tracking or calibration evidence.
-    if frame.segmentation_mode == SegmentationMode::Sam31
+    if frame.segmentation_mode.uses_mask_geometry()
         && frame.presentation_pivot_held
         && frame.presentation_contact_boundary.len() >= 8
     {
@@ -41899,7 +42290,7 @@ fn virtual_contact_pose(frame: &EyeFrame) -> Option<VirtualContactPose> {
     // Keep SAM on a single geometry lineage even when native limbus and motion
     // products happen to be present in the same EyeFrame. This branch must
     // precede both the injected presentation pivot and admitted-limbus paths.
-    if frame.segmentation_mode == SegmentationMode::Sam31 {
+    if frame.segmentation_mode.uses_mask_geometry() {
         if !frame.eye_identity_present {
             return None;
         }
@@ -42042,7 +42433,7 @@ fn current_virtual_contact_boundary(frame: &EyeFrame) -> Option<Arc<Vec<(f64, f6
     if frame.joint_gaze_active {return joint_gaze_live::ellipse(frame).map(|e|Arc::new(e.dense_points(240)));}
     // SAM contact and its lease must remain on the same fitted-ellipse
     // lineage even if stale native/presentation geometry shares the frame.
-    if frame.segmentation_mode == SegmentationMode::Sam31 {
+    if frame.segmentation_mode.uses_mask_geometry() {
         let boundary = sam31_presentation_boundary_for_frame(
             frame.sam31_proposal_masks.as_deref()?,
             frame.timestamp_ns,
@@ -42116,6 +42507,7 @@ impl PresentationLaserLease {
             eye,
             segmentation_mode: frame.segmentation_mode,
             gaze_authority_generation: frame.gaze_authority_generation,
+            gaze_settings_generation: frame.gaze_settings_generation,
             sam_prompt_generation: frame.gaze_authority_sam_prompt_generation,
             surface_gaze: mouse_gaze_surface(frame),
             rotation_center_sensor: (
@@ -42131,6 +42523,16 @@ impl PresentationLaserLease {
     }
 
     fn apply_held(&self, frame: &mut EyeFrame) {
+        // Reject before writing any geometry: a presentation lease must not
+        // revive the previous global detector/settings while a switch warms.
+        if frame.gaze_policy_error.is_some()
+            || frame.segmentation_mode != self.segmentation_mode
+            || frame.gaze_settings_generation != self.gaze_settings_generation
+            || frame.gaze_authority_generation != self.gaze_authority_generation
+            || frame.gaze_authority_sam_prompt_generation != self.sam_prompt_generation
+        {
+            return;
+        }
         let boundary = Arc::new(
             self.boundary_sensor
                 .iter()
@@ -42182,7 +42584,7 @@ impl PresentationLaserLease {
             && frame.gaze_authority_sam_prompt_generation == self.sam_prompt_generation
         {
             match frame.segmentation_mode {
-                SegmentationMode::Sam31 => frame.virtual_contact_surface_gaze = self.surface_gaze,
+                SegmentationMode::Sam31 | SegmentationMode::EyeStudent => frame.virtual_contact_surface_gaze = self.surface_gaze,
                 _ => frame.surface_gaze = self.surface_gaze,
             }
         }
@@ -42271,7 +42673,7 @@ fn presentation_pivot_contact_from_frame(
     // SAM's visible contact is reconstructed exclusively from its reviewed,
     // de-flat-tired ellipse. A native motion-globe publication may coexist in
     // the receiver, but must not replace SAM geometry in the main view.
-    if frame.segmentation_mode == SegmentationMode::Sam31 {
+    if frame.segmentation_mode.uses_mask_geometry() {
         return None;
     }
     // Only a directly published pivot is authoritative enough to display.
@@ -42709,7 +43111,7 @@ fn draw_calibration_eye_thumbnail(
     );
     let sam_source = frame.and_then(|frame| {
         frame.sam31_proposal_masks.as_deref().filter(|proposal| {
-            frame.segmentation_mode == SegmentationMode::Sam31
+            frame.segmentation_mode.uses_mask_geometry()
                 && proposal.outer_fit.is_some()
                 && proposal.source_raw.len() == frame.width * frame.height
                 && sam31_presentation_boundary_for_frame(
@@ -43314,7 +43716,9 @@ fn refresh_viewer_frames(app: &mut App) -> Result<(), String> {
     if let Some(action)=action {viewer_ui::apply(app,action);}
     let prompt=app.shared.lock().ok().and_then(|mut shared|shared.ui_prompt_request.take());
     if let Some(prompt)=prompt {
-        if app.ui.object_view() || app.ui.scope==viewer_ui::Scope::Roi {
+        if app.shared.lock().is_ok_and(|s|s.segmentation_mode==SegmentationMode::EyeStudent) {
+            if let Ok(mut s)=app.shared.lock() {s.sam31_prompt_status="STUDENT HAS FIXED EYE LABELS; SELECT SAM TO EDIT PROMPTS".into();}
+        } else if app.ui.object_view() || app.ui.scope==viewer_ui::Scope::Roi {
             compile_live_sam31_outer_prompt(Arc::clone(&app.shared),prompt,app.ui.object_view());
         }
     }
@@ -43379,12 +43783,14 @@ fn refresh_viewer_frames(app: &mut App) -> Result<(), String> {
 
 /// Shared preparation for the visible contact and desktop pointer. Holding a
 /// laser between observations remains a later, strictly presentation-only step.
-fn prepare_current_contact_frame(app: &App, eye: usize, frame: &mut EyeFrame, prompt_generation: u64) {
+fn prepare_current_contact_frame(app: &App, eye: usize, frame: &mut EyeFrame, policy: GlobalGazePolicy) {
+    frame.gaze_policy_error = policy.frame_error(frame);
     if frame.sam31_proposal_masks.as_ref()
-        .is_some_and(|proposal| proposal.prompt_generation != prompt_generation)
+        .is_some_and(|proposal| proposal.prompt_generation != policy.prompt_generation)
     {
         frame.sam31_proposal_masks = None;
     }
+    if frame.gaze_policy_error.is_some() { return; }
     if let Some(lock) = app.ray_origin_lock {
         if lock.eye == eye { apply_ray_origin_lock(eye, frame, lock); }
     } else if let Some(contact) = app.presentation_pivot_contact {
@@ -43392,8 +43798,27 @@ fn prepare_current_contact_frame(app: &App, eye: usize, frame: &mut EyeFrame, pr
     }
 }
 
+/// The globally selected published gaze, not a second ray reconstructed from
+/// the presentation contact's normal. Calibration observes this same surface;
+/// focus, pointer and both laser views must therefore use its direction too.
+fn gaze_output_direction(frame: &EyeFrame) -> Option<RelativeGazeVector> {
+    let surface = mouse_gaze_surface(frame)?;
+    if !surface.sign_resolved || !surface.relative_gaze.is_camera_facing() { return None; }
+    let source_timestamp_ns = surface.source_timestamp_ns?;
+    if source_timestamp_ns > frame.timestamp_ns { return None; }
+    if frame.segmentation_mode.uses_mask_geometry() && !frame.presentation_pivot_held {
+        let proposal = frame.sam31_proposal_masks.as_ref()?;
+        if proposal.source_timestamp_ns != source_timestamp_ns
+            || Some(proposal.prompt_generation) != frame.gaze_authority_sam_prompt_generation
+        {
+            return None;
+        }
+    }
+    Some(surface.relative_gaze)
+}
+
 fn pose_for_cursor(frame:&EyeFrame,mut pose:VirtualContactPose)->Option<VirtualContactPose> {
-    if frame.joint_gaze_active {pose.relative_gaze=joint_gaze_live::gaze(frame)?;}
+    pose.relative_gaze = gaze_output_direction(frame)?;
     Some(pose)
 }
 
@@ -43424,33 +43849,35 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
         app.poll_calibration_capture(now);
         // Keep an owned snapshot for both admission and the thumbnail. This
         // also lets capture finalization mutate `app` before presentation.
-        let focused_frame = app.eyes[app.focus_eye].clone();
-        let (requested_prompt_generation, reacquisition_disabled) = app
+        let calibration_eye = app.virtual_mouse.as_ref().expect("virtual mouse mode").eye_index(app.focus_eye);
+        let mut focused_frame = app.eyes[calibration_eye].clone();
+        let (gaze_policy, reacquisition_disabled) = app
             .shared
             .lock()
             .map(|shared| {
                 (
-                    shared.sam31_prompt_bundle_generation,
+                    GlobalGazePolicy::from_shared(&shared),
                     shared.mediapipe_reacquisition_disabled,
                 )
             })
-            .unwrap_or((0, false));
+            .map_err(|_| "viewer lock poisoned")?;
+        if let Some(frame) = focused_frame.as_mut() {
+            prepare_current_contact_frame(app, calibration_eye, frame, gaze_policy);
+        }
         let active_authority = focused_frame
             .as_ref()
             .map(|frame| CalibrationGazeAuthority {
-                eye: app.focus_eye,
+                eye: calibration_eye,
                 segmentation_mode: frame.segmentation_mode,
                 sam_prompt_generation: frame.gaze_authority_sam_prompt_generation,
                 generation: frame.gaze_authority_generation,
             });
-        let surface_gaze = focused_frame.as_ref().and_then(|frame| {
-            let prompt_matches = frame.segmentation_mode != SegmentationMode::Sam31
-                || frame.sam31_proposal_masks.as_ref().is_some_and(|proposal| {
-                    proposal.prompt_generation == requested_prompt_generation
-                });
-            prompt_matches.then(|| mouse_gaze_surface(frame)).flatten()
-        });
-        let frame_state = calibration_frame_state(focused_frame.as_ref(), surface_gaze);
+        let surface_gaze = focused_frame.as_ref().and_then(mouse_gaze_surface);
+        let frame_state = if app.virtual_mouse.as_ref().is_some_and(|mode|mode.display_plane.is_some()) {
+            gaze_frame_state(focused_frame.as_ref(), surface_gaze)
+        } else {
+            calibration_frame_state(focused_frame.as_ref(), surface_gaze)
+        };
         let observation = focused_frame.as_ref().and_then(|frame| {
             (frame_state == CalibrationFrameState::Ready)
                 .then_some(surface_gaze)
@@ -43489,6 +43916,8 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
             mode.acquisition_source_generation = active_authority.map_or(0, |a|a.generation);
             mode.observe_frame_state(current_frame_timestamp_ns, frame_state);
             mode.surface_gaze = surface_gaze;
+            mode.source_group_complete = focused_frame.as_ref()
+                .is_none_or(joint_gaze_live::calibration_source_group_complete);
             mode.observe_at_frame(now, current_frame_timestamp_ns, observation);
             (
                 mode.display_plane,
@@ -43539,7 +43968,7 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
         gaze.drawn_source_timestamp_ns = drawn.and(mode.reticle_source_timestamp_ns);
         if mode.completed_basis_pause.is_some() { gaze.status = "calibrated-basis-paused"; }
         let scene = recording_trace::scene::snapshot(&app.eyes, recording_trace::scene::Input {
-            reference_eye:app.focus_eye, plane, selected_prediction:predicted,
+            reference_eye:calibration_eye, plane, selected_prediction:predicted,
             selected_ray:observation.filter(|_|mode.completed_basis_pause.is_none()).and_then(|(_,p,_)|RelativeGazeVector::from_projected(p.0,p.1)),
             calibration:serde_json::json!({"phase":if !mode.sequence_started {"arming"} else if mode.calibration_failure.is_some() {"failed"}
                 else if mode.display_plane.is_some() {"complete"} else if mode.sign_acquisition.active() {"sign-acquisition"} else {"collecting"},
@@ -43569,14 +43998,14 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
     // prior-prompt answer immediately when a replacement bundle is ready,
     // even if the new prompt yields no anatomically plausible component.
     // This prevents an old mask from appearing to survive until F is cycled.
-    let requested_prompt_generation = app
+    let gaze_policy = app
         .shared
         .lock()
-        .map(|state| state.sam31_prompt_bundle_generation)
-        .unwrap_or(0);
+        .map(|state| GlobalGazePolicy::from_shared(&state))
+        .map_err(|_| "viewer lock poisoned")?;
     for (eye, frame) in presented_eyes.iter_mut().enumerate() {
         if let Some(frame) = frame {
-            prepare_current_contact_frame(app, eye, frame, requested_prompt_generation);
+            prepare_current_contact_frame(app, eye, frame, gaze_policy);
         }
     }
     let eye_laser_enabled_now = app
@@ -43601,6 +44030,8 @@ fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
         app.presentation_laser_lease = Some(current);
     } else if app.presentation_laser_lease.as_ref().is_some_and(|lease| {
         lease.eye != app.focus_eye
+            || presented_eyes[app.focus_eye].as_ref().is_none_or(|frame|
+                frame.gaze_policy_error.is_some() || frame.gaze_settings_generation != lease.gaze_settings_generation)
             || now.saturating_duration_since(lease.observed_at) > PRESENTATION_LASER_HOLD
     }) {
         app.presentation_laser_lease = None;
@@ -43792,6 +44223,7 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
+            WindowEvent::ModifiersChanged(modifiers) => { self.keyboard_modifiers = modifiers.state(); }
             WindowEvent::CursorMoved { position, .. } => { self.ui.pointer=(position.x,position.y); }
             WindowEvent::MouseInput { state:ElementState::Pressed, button:winit::event::MouseButton::Left, .. }
                 if self.virtual_mouse.is_none() && self.accuracy_check.is_none() && !self.accuracy_requested && self.sam31_prompt_editor.is_none() => { viewer_ui::click(self); }
@@ -43859,11 +44291,25 @@ impl ApplicationHandler for App {
                     }
                     return;
                 }
+                if self.virtual_mouse.is_none() && !event.repeat {
+                    if event.physical_key == PhysicalKey::Code(KeyCode::Tab) && self.keyboard_modifiers.shift_key() {
+                        viewer_ui::apply(self, viewer_ui::Action::TogglePreviewEditScope);
+                        return;
+                    }
+                    if event.physical_key == PhysicalKey::Code(KeyCode::Backspace) {
+                        viewer_ui::apply(self, viewer_ui::Action::ResetPreviewOverrides);
+                        return;
+                    }
+                }
                 if event.physical_key == PhysicalKey::Code(KeyCode::Enter)
                     && !event.repeat
                     && (self.ui.object_view() || (self.ui.scope==viewer_ui::Scope::Roi
                         && matches!(self.roi_overlay_mode, RoiOverlayMode::SamOuterIrisMasks | RoiOverlayMode::SamSegmentationOnly)))
                 {
+                    if self.shared.lock().is_ok_and(|s|s.segmentation_mode==SegmentationMode::EyeStudent) {
+                        if let Ok(mut s)=self.shared.lock() {s.sam31_prompt_status="STUDENT HAS FIXED EYE LABELS; SELECT SAM TO EDIT PROMPTS".into();}
+                        return;
+                    }
                     self.sam31_prompt_editor = Some(String::new());
                     self.ui.panel = viewer_ui::Panel::Selection;
                     self.ui.scroll = 0;
@@ -44140,7 +44586,7 @@ impl ApplicationHandler for App {
                             });
                             if let Some(variant) = selected {
                                 self.edge_map_variant = variant;
-                                self.mode = ViewMode::Canny;
+                                viewer_ui::select_pixels(self, ViewMode::Canny);
                                 eprintln!(
                                     "learning Canny calculation and diagnostic view cycled by K to {}/{} {}",
                                     variant.ordinal(),
@@ -44186,29 +44632,7 @@ impl ApplicationHandler for App {
                     PhysicalKey::Code(KeyCode::KeyG) => {
                         if !event.repeat {
                             if let Ok(mut shared) = self.shared.lock() {
-                                let previous = shared.segmentation_mode;
-                                let mode = shared
-                                    .segmentation_mode
-                                    .cycled_compatible(shared.rough_pupil_center_mode);
-                                if mode == previous {
-                                    eprintln!(
-                                        "segmentation method held at {}; rough-center={} permits no other method (Y changes center)",
-                                        mode.label(),
-                                        shared.rough_pupil_center_mode.label(),
-                                    );
-                                } else {
-                                    match set_segmentation_mode(&mut shared, mode, "G hotkey") {
-                                        Ok(()) => eprintln!(
-                                            "segmentation method cycled to {} by G with rough-center={}",
-                                            mode.label(),
-                                            shared.rough_pupil_center_mode.label(),
-                                        ),
-                                        Err(error) => eprintln!(
-                                            "segmentation method cycle refused for rough-center={}: {error}",
-                                            shared.rough_pupil_center_mode.label(),
-                                        ),
-                                    }
-                                }
+                                cycle_segmentation_mode(&mut shared,"G hotkey");
                             }
                         }
                     }
@@ -44754,7 +45178,7 @@ fn parse_config() -> Result<Config, String> {
             "--segmentation" => {
                 let requested = value()?;
                 config.segmentation = SegmentationMode::parse(requested).ok_or_else(|| {
-                    "--segmentation must be native, sam31, clusters, driving, or vessel-features"
+                    "--segmentation must be native, sam31, eye-student, clusters, driving, or vessel-features"
                         .to_string()
                 })?;
                 requested_segmentation = Some(config.segmentation);
@@ -44806,7 +45230,7 @@ fn parse_config() -> Result<Config, String> {
             }
             "-h" | "--help" => {
                 println!(
-                    "usage: buttercup-eye-viewer [OPTIONS]\n\nNo options are required for the standard Podbay camera. The default view uses a low-bandwidth GRAY16 sensor overview, two native RAW10 eye ROIs, SAM31 segmentation when built with SAM support and local model/prompt/tracker assets (otherwise Native), and automatic focus-eye selection.\n\noptional overrides: --camera HOST:PORT --vcm HOST:PORT --control PATH.sock --origin SENSOR_BAND_X,Y --left ABS_SENSOR_X,Y --right ABS_SENSOR_X,Y --eye WxH --window WxH --focus-eye auto|left|right --tracking FRAME.ppm --record FILE.tar --autofocus-armed --segmentation native|sam31|clusters|driving|vessel-features --rough-center iris-guided|raw-focus|sam31-center|mediapipe-acquire|mediapipe-continuous|driving-topology --driving-submode normal|double-sclera-10deg --global-format gray16|raw10 --model-stream PATH.sock --sam31-model FILE.pt\n\ncontrol commands: STATUS | SEGMENTATION NATIVE|SAM31|CLUSTERS|DRIVING|VESSEL-FEATURES | SEGMENTATION STATUS | IRIS STATUS | IRIS BOUNDS MINIMUM|MAXIMUM +/- | IRIS BOUNDS AUTO | PUPIL STATUS | PUPIL BOUNDS MINIMUM|MAXIMUM +/- | PUPIL BOUNDS DEFAULT | PUPIL CENTER MODE | PUPIL|IRIS RETICLE OFF|STATIC|PROJECTED|ON|TOGGLE | DRIVING NORMAL|DOUBLE-SCLERA-10DEG|STATUS | LEASE CLAIM OWNER TTL_MS | LEASE RENEW TOKEN TTL_MS | LEASE RELEASE TOKEN | LEASE STATUS | WITH TOKEN REACQUIRE | WITH TOKEN LINEAR SNAPSHOT | WITH TOKEN FOCUS EYE RIGHT|LEFT | WITH TOKEN FOCUS SET N | WITH TOKEN FOCUS AUTO | WITH TOKEN EXPORT RAW RIGHT /absolute/path.raw10 | EXPORT PRESENTATION /absolute/path.ppm | EXPORT STATUS"
+                    "usage: buttercup-eye-viewer [OPTIONS]\n\nNo options are required for the standard Podbay camera. The default view uses a low-bandwidth GRAY16 sensor overview, two native RAW10 eye ROIs, SAM31 segmentation when built with SAM support and local model/prompt/tracker assets (otherwise Native), and automatic focus-eye selection.\n\noptional overrides: --camera HOST:PORT --vcm HOST:PORT --control PATH.sock --origin SENSOR_BAND_X,Y --left ABS_SENSOR_X,Y --right ABS_SENSOR_X,Y --eye WxH --window WxH --focus-eye auto|left|right --tracking FRAME.ppm --record FILE.tar --autofocus-armed --segmentation native|sam31|eye-student|clusters|driving|vessel-features --rough-center iris-guided|raw-focus|sam31-center|mediapipe-acquire|mediapipe-continuous|driving-topology --driving-submode normal|double-sclera-10deg --global-format gray16|raw10 --model-stream PATH.sock --sam31-model FILE.pt\n\ncontrol commands: STATUS | SEGMENTATION NATIVE|SAM31|EYE-STUDENT|CLUSTERS|DRIVING|VESSEL-FEATURES | SEGMENTATION STATUS | IRIS STATUS | IRIS BOUNDS MINIMUM|MAXIMUM +/- | IRIS BOUNDS AUTO | PUPIL STATUS | PUPIL BOUNDS MINIMUM|MAXIMUM +/- | PUPIL BOUNDS DEFAULT | PUPIL CENTER MODE | PUPIL|IRIS RETICLE OFF|STATIC|PROJECTED|ON|TOGGLE | DRIVING NORMAL|DOUBLE-SCLERA-10DEG|STATUS | LEASE CLAIM OWNER TTL_MS | LEASE RENEW TOKEN TTL_MS | LEASE RELEASE TOKEN | LEASE STATUS | WITH TOKEN REACQUIRE | WITH TOKEN LINEAR SNAPSHOT | WITH TOKEN FOCUS EYE RIGHT|LEFT | WITH TOKEN FOCUS SET N | WITH TOKEN FOCUS AUTO | WITH TOKEN EXPORT RAW RIGHT /absolute/path.raw10 | EXPORT PRESENTATION /absolute/path.ppm | EXPORT STATUS"
                 );
                 std::process::exit(0);
             }
@@ -44898,8 +45322,8 @@ fn run() -> Result<(), String> {
                 "IRIS NATIVE + CENTER {} (startup)",
                 config.rough_pupil_center.short_label(),
             ),
-            SegmentationMode::Sam31 => format!(
-                "IRIS SAM31 + CENTER {} WARMING (startup)",
+            SegmentationMode::Sam31 | SegmentationMode::EyeStudent => format!(
+                "IRIS {} + CENTER {} WARMING (startup)",config.segmentation.label().to_ascii_uppercase(),
                 config.rough_pupil_center.short_label(),
             ),
             SegmentationMode::Clusters => format!(
@@ -44984,9 +45408,11 @@ fn run() -> Result<(), String> {
         checkerboard_status: checkerboard_calibration::StatusSnapshot::default(),
         keyboard_peeper: keyboard_peeper::Registration::new(None),
         window_focused: false,
+        keyboard_modifiers: ModifiersState::empty(),
         roi_overlay_mode: RoiOverlayMode::SamOuterIrisMasks,
         sam31_prompt_editor: None,
     };
+    viewer_ui::select_pixels(&mut app, initial_view_mode);
     let event_result = event_loop
         .run_app(&mut app)
         .map_err(|error| error.to_string());
@@ -45034,6 +45460,9 @@ fn main() {
         }
         Some("--offline-stereo-sam-export") => {
             offline_segmentation_replay::stereo_sam_export(env::args().skip(2))
+        }
+        Some("--offline-stereo-motion-export") => {
+            offline_segmentation_replay::stereo_motion_export(env::args().skip(2))
         }
         Some("--offline-sam-pupil-refit") => {
             offline_segmentation_replay::sam_pupil_refit(env::args().skip(2))
@@ -49801,6 +50230,61 @@ mod tests {
         );
     }
 
+    fn paired_queue_test_header(eye_id: u32) -> PacketHeader {
+        PacketHeader { kind: PacketKind::Eye(eye_id), sequence: 42, timestamp_ns: 4_200_000_000,
+            sensor_x: 100, sensor_y: 200, width: 400, height: 280, stride: 500,
+            payload_bytes: 140_000,
+            region: Some(RegionMetadata {session: 7, generation: 3, active_mask: 3,
+                eyes: [(100,200),(600,200)], eye_size: (400,280), discarded: 0, band_y: 0}) }
+    }
+
+    #[test]
+    fn paired_queue_header_mapping_requires_attested_pair_membership_and_exact_read_key() {
+        use source_queue_budget::SourcePart;
+        let mut right = paired_queue_test_header(1);
+        let mut left = paired_queue_test_header(2);
+        let SourcePart::First(key) = right.source_queue_part() else { panic!("missing attested pair head"); };
+        assert_eq!(left.source_queue_part(),SourcePart::Last(key));
+        left.timestamp_ns+=1;
+        assert_ne!(left.source_queue_part(),SourcePart::Last(key));
+        left=paired_queue_test_header(2);left.sequence+=1;
+        assert_ne!(left.source_queue_part(),SourcePart::Last(key));
+        left=paired_queue_test_header(2);left.region.as_mut().unwrap().session+=1;
+        assert_ne!(left.source_queue_part(),SourcePart::Last(key));
+        left=paired_queue_test_header(2);left.region.as_mut().unwrap().generation+=1;
+        assert_ne!(left.source_queue_part(),SourcePart::Last(key));
+        right.region.as_mut().unwrap().active_mask=1;
+        left.region.as_mut().unwrap().active_mask=2;
+        assert_eq!(right.source_queue_part(),SourcePart::Independent);
+        assert_eq!(left.source_queue_part(),SourcePart::Independent);
+        right.region=None;
+        assert_eq!(right.source_queue_part(),SourcePart::Independent,"legacy clocks do not attest paired ownership");
+        right.kind=PacketKind::Context;
+        assert_eq!(right.source_queue_part(),SourcePart::Auxiliary);
+    }
+
+    #[test]
+    fn paired_queue_budget_never_overrides_original_warmup_control_or_fatal_rejection() {
+        let now = Instant::now();
+        for stream_age in [Duration::ZERO, TRACKING_QUEUE_WARMUP] {
+            for control in [false,true] {
+                for age_ms in [0,20,199,200,201,350,351,999,1000,1001] {
+                    let mut budget=source_queue_budget::SourceQueueBudget::new(MAX_TRACKING_QUEUE_AGE);
+                    let age=Duration::from_millis(age_ms);
+                    let nominal=tracking_queue_action(stream_age,age,control);
+                    let (actual,_) = apply_paired_queue_budget(&mut budget,&paired_queue_test_header(1),now,age,nominal);
+                    if nominal!=TrackingQueueAction::Consume { assert_eq!(actual,nominal); }
+                    let (mate,_) = apply_paired_queue_budget(&mut budget,&paired_queue_test_header(2),now,age,nominal);
+                    if nominal!=TrackingQueueAction::Consume { assert_eq!(mate,nominal); }
+                    if age>MAX_TRACKING_QUEUE_AGE {
+                        assert_ne!(actual,TrackingQueueAction::Consume);
+                        assert_ne!(mate,TrackingQueueAction::Consume);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn telemetry_packets_cannot_mask_missing_raw_exposure_sets() {
         let start = Instant::now();
@@ -50048,6 +50532,7 @@ mod tests {
             RoiOverlayMode::SamOuterIrisFit,
             RoiOverlayMode::SamConicSegments,
             RoiOverlayMode::SamDeflattenedVirtualContact,
+            RoiOverlayMode::SamTweakedContactGeometry,
             RoiOverlayMode::Clean,
             RoiOverlayMode::FullDiagnostics,
         ];
@@ -50094,7 +50579,7 @@ mod tests {
     #[test]
     fn sam_proposal_overlay_modes_identify_each_semantic_question() {
         assert_eq!(RoiOverlayMode::SamSegmentationOnly.sam31_prompt_index(), Some(0));
-        assert_eq!(RoiOverlayMode::SamSegmentationOnly.position_for(SegmentationMode::Sam31), (2, 7));
+        assert_eq!(RoiOverlayMode::SamSegmentationOnly.position_for(SegmentationMode::Sam31), (2, 8));
         assert_eq!(
             RoiOverlayMode::SamOuterIrisMasks.sam31_prompt_index(),
             Some(0)
@@ -50111,20 +50596,22 @@ mod tests {
         assert_eq!(RoiOverlayMode::Clean.sam31_prompt_index(), None);
         assert_eq!(
             RoiOverlayMode::SamOuterIrisMasks.position_for(SegmentationMode::Sam31),
-            (1, 7)
+            (1, 8)
         );
         assert_eq!(
             RoiOverlayMode::SamOuterIrisFit.position_for(SegmentationMode::Sam31),
-            (3, 7)
+            (3, 8)
         );
         assert_eq!(
             RoiOverlayMode::SamDeflattenedVirtualContact.position_for(SegmentationMode::Sam31),
-            (5, 7)
+            (5, 8)
         );
         assert_eq!(
             RoiOverlayMode::FullDiagnostics.position_for(SegmentationMode::Sam31),
-            (7, 7)
+            (8, 8)
         );
+        assert_eq!(RoiOverlayMode::SamTweakedContactGeometry.position_for(SegmentationMode::Sam31),(6,8));
+        assert!(!RoiOverlayMode::available(SegmentationMode::EyeStudent).contains(&RoiOverlayMode::SamTweakedContactGeometry));
     }
 
     #[test]
@@ -50221,6 +50708,7 @@ mod tests {
             eye_index: 0,
             source_sequence: 103,
             source_timestamp_ns: 1_000,
+            source_group_roi_count: 1,
             source_sensor_origin: (0, 0),
             source_width,
             source_height,
@@ -50397,6 +50885,7 @@ mod tests {
             eye_index: 0,
             source_sequence: 7,
             source_timestamp_ns: 10_000,
+            source_group_roi_count: 1,
             source_sensor_origin: (3000, 2400),
             source_width: 80,
             source_height: 60,
@@ -50756,6 +51245,7 @@ mod tests {
             eye_index: 0,
             source_sequence: 7,
             source_timestamp_ns: 10_000,
+            source_group_roi_count: 1,
             source_sensor_origin: (3000, 2400),
             source_width: 80,
             source_height: 60,
@@ -51064,6 +51554,8 @@ mod tests {
             recording_clock: serde_json::Value::Null,
             recording_ready: serde_json::Value::Null,
             segmentation_mode: SegmentationMode::Native,
+            gaze_settings_generation: 0,
+            gaze_policy_error: None,
             gaze_authority_generation: 1,
             gaze_authority_sam_prompt_generation: None,
             sensor_x: 3000,
@@ -53348,12 +53840,34 @@ mod tests {
         let mut mode = SegmentationMode::Native;
         for ordinal in 1..=SegmentationMode::COUNT {
             assert_eq!(mode.method_control_label(), format!(
-                "G METHOD {ordinal}/5 {}  Y CENTER  U RETICLE 3-STATE",
+                "G METHOD {ordinal}/6 {}  Y CENTER  U RETICLE 3-STATE",
                 mode.label().to_ascii_uppercase(),
             ));
             mode = mode.cycled();
         }
         assert_eq!(mode, SegmentationMode::Native);
+    }
+
+    #[test]
+    fn eye_student_has_its_own_authority_and_shares_the_sam_geometry_contract() {
+        let student=SegmentationMode::EyeStudent;
+        assert_ne!(student,SegmentationMode::Sam31);
+        assert_eq!(SegmentationMode::parse("eye-student"),Some(student));
+        assert_eq!(student.ordinal(),3);
+        assert!(student.uses_mask_geometry());
+        assert_ne!(RoiOverlayMode::available(student),RoiOverlayMode::available(SegmentationMode::Sam31));
+        assert!(RoiOverlayMode::available(student).contains(&RoiOverlayMode::StudentEllipseOnly));
+        assert_eq!(format!("{:?}",student.profile()),format!("{:?}",SegmentationMode::Sam31.profile()));
+        for center in [RoughPupilCenterMode::RawFocus,RoughPupilCenterMode::Sam31] {
+            for stereo in [false,true] {
+                assert_eq!(sam31_target_for_joint_modes(student,center,stereo),
+                    sam31_target_for_joint_modes(SegmentationMode::Sam31,center,stereo));
+            }
+        }
+        assert!(active_segmentation_owns_eye_presence(student,true,false,true,false,false,false));
+        assert!(!active_segmentation_owns_eye_presence(student,true,true,false,true,true,true));
+        assert!(RoiOverlayMode::SamOuterIrisMasks.label_for(student).contains("STUDENT"));
+        assert!(!RoiOverlayMode::SamOuterIrisMasks.label_for(student).contains("ENTER EDIT"));
     }
 
     #[test]
@@ -53425,6 +53939,43 @@ mod tests {
                 mode, true, false, false, false, false, false,
             ));
         }
+    }
+
+    #[test]
+    fn joint_sam_requests_pupil_evidence_without_changing_rough_center_selection() {
+        for rough_center in [RoughPupilCenterMode::RawFocus, RoughPupilCenterMode::IrisGuided,
+            RoughPupilCenterMode::Sam31] {
+            assert_eq!(sam31_target_for_joint_modes(SegmentationMode::Sam31, rough_center, true),
+                Some(sam31_outer::Target::OuterLimbusAndInnerPupilVoid));
+            assert_eq!(sam31_target_for_joint_modes(SegmentationMode::Sam31, rough_center, false),
+                sam31_target_for_modes(SegmentationMode::Sam31, rough_center));
+            assert_eq!(sam31_target_for_joint_modes(SegmentationMode::ScleraRedCanny, rough_center, true), None);
+            assert_eq!(sam31_target_for_joint_modes(SegmentationMode::Native, rough_center, true),
+                sam31_target_for_modes(SegmentationMode::Native, rough_center));
+        }
+    }
+
+    #[test]
+    fn joint_sam_source_groups_require_exact_attested_clocks_not_equal_roi_sequences() {
+        let histories: [VecDeque<_>;2]=std::array::from_fn(|eye|VecDeque::from([Arc::new(sam31_outer::RawFrame {
+            eye_index:eye,sequence:10+eye as u64*100,timestamp_ns:500,
+            sensor_x:0,sensor_y:0,width:12,height:8,pixels:Arc::new(vec![0;96]),
+            registration_anchor:None,pupil_component_seed:None,
+        })]));
+        let hub=recording_trace::Hub::default();
+        for eye in 0..2 {
+            hub.raw_arrived(serde_json::json!({"roi_id":eye+1,"sequence":histories[eye][0].sequence.to_string(),
+                "sensor_timestamp_ns":"500","stream_epoch":"sensor-A"}),Instant::now(),0);
+        }
+        assert!(sam31_source_group_for_read(&histories,&hub,"sensor-A",500).is_some());
+        assert!(sam31_source_group_for_read(&histories,&hub,"sensor-B",500).is_none());
+        assert!(sam31_source_group_for_read(&histories,&hub,"sensor-A",501).is_none());
+        let mut previous=histories.clone();Arc::make_mut(previous[1].back_mut().unwrap()).timestamp_ns=499;
+        assert!(sam31_source_group_for_read(&previous,&hub,"sensor-A",500).is_none());
+        hub.raw_arrived(serde_json::json!({"roi_id":2,"sequence":"110", "sensor_timestamp_ns":"500",
+            "stream_epoch":"sensor-B"}),Instant::now(),0);
+        assert!(sam31_source_group_for_read(&histories,&hub,"sensor-A",500).is_none(),
+            "ambiguous reused clock values cannot attest a same-read pair");
     }
 
     #[test]
@@ -53504,7 +54055,13 @@ mod tests {
             raw_target_strong_sectors: 8,
             elapsed_ms: 1,
             video_tracked: false,
-            proposal_masks: Arc::new(sam31_outer::ProposalMasks::default()),
+            // Registration checks the actual source extent. A zero-sized
+            // placeholder is not a valid source for this otherwise-private
+            // pupil-center fixture.
+            proposal_masks: Arc::new(sam31_outer::ProposalMasks {
+                source_width: 420, source_height: 280,
+                ..sam31_outer::ProposalMasks::default()
+            }),
         };
 
         // There is deliberately no selected-G-iris argument. The returned Y
@@ -53514,6 +54071,11 @@ mod tests {
             sam31_pupil_center_for_frame(&result, timestamp_ns, sensor_x, sensor_y, None,),
             Some((118.0, 108.0)),
         );
+
+        let mut missing_extent=result.clone();
+        missing_extent.proposal_masks=Arc::new(sam31_outer::ProposalMasks::default());
+        assert_eq!(sam31_pupil_center_for_frame(&missing_extent,timestamp_ns,sensor_x,sensor_y,None),None,
+            "unknown source extent cannot authorize registration");
 
         let mut implausible = result;
         implausible.sensor_pupil_ellipse = Some(sam31_outer::Ellipse {
@@ -53538,7 +54100,8 @@ mod tests {
         );
         assert_eq!(RoughPupilCenterMode::Sam31.label(), "sam31-center");
         assert_eq!(SegmentationMode::Native.cycled(), SegmentationMode::Sam31);
-        assert_eq!(SegmentationMode::Sam31.cycled(), SegmentationMode::Clusters);
+        assert_eq!(SegmentationMode::Sam31.cycled(), SegmentationMode::EyeStudent);
+        assert_eq!(SegmentationMode::EyeStudent.cycled(), SegmentationMode::Clusters);
         assert_eq!(
             SegmentationMode::Clusters.cycled(),
             SegmentationMode::Driving
@@ -61281,6 +61844,12 @@ mod tests {
             assert!(at.duration_since(now)<Duration::from_secs(8));
             assert_eq!(mode.target_index,0);
             assert_eq!(mode.target_source_started_ns,Some(source+400_000_000));
+            mode.frame_state=CalibrationFrameState::UnresolvedSign;
+            mode.observe_at_frame(at+Duration::from_millis(100),Some(source+500_000_000),None);
+            assert!(!mode.sign_acquisition.active(),"stationary collection must survive a provisional unsigned result");
+            assert_eq!(mode.sign_acquisition.episodes,1);
+            assert_eq!(mode.calibration_sign_epoch,Some(surface.sign_epoch));
+            mode.frame_state=CalibrationFrameState::Ready;
             let late=source+700_000_000;
             mode.observe_at_frame(at+Duration::from_millis(600),Some(source+1_000_000_000),
                 Some((late,surface.relative_gaze.projected(),surface.sign_epoch)));
@@ -61327,11 +61896,91 @@ mod tests {
         mode.frame_state=CalibrationFrameState::Ready;
         mode.observe_at_frame(now,Some(1),Some((1,(0.1,0.2),9)));
         assert!(!mode.sign_acquisition.active());
+        // Acquired direction is a basis for the stationary sequence, not a
+        // promise that every subsequent SAM completion will be signed.
+        mode.target_index=1;
+        mode.samples[0]=vec![(0.1,0.2);VIRTUAL_MOUSE_MIN_SAMPLES];
+        mode.target_source_windows_ns[0]=Some((1,500_000_001));
+        mode.frame_state=CalibrationFrameState::UnresolvedSign;
+        mode.observe_at_frame(now+Duration::from_secs(1),Some(1_000_000_001),None);
+        assert!(!mode.sign_acquisition.active(),"a provisional unsigned result must not restart acquisition");
+        assert_eq!(mode.target_index,1);
+        assert_eq!(mode.samples[0].len(),VIRTUAL_MOUSE_MIN_SAMPLES);
+        assert_eq!(mode.target_source_windows_ns[0],Some((1,500_000_001)));
+        assert_eq!(mode.calibration_sign_epoch,Some(9));
+        assert_eq!(mode.calibration_sign_restarts,0);
         mode.display_plane=Some(VirtualDisplayPlane::development_default());
         mode.frame_state=CalibrationFrameState::UnresolvedSign;
         mode.observe_at_frame(now+Duration::from_secs(1),Some(1_000_000_001),None);
         assert!(!mode.sign_acquisition.active());
         assert!(mode.display_plane.is_some());
+    }
+
+    #[test]
+    fn calibration_keeps_its_bound_eye_when_automatic_viewer_focus_changes() {
+        let now = Instant::now();
+        let mut mode = VirtualMouseMode::new(now);
+        let authority = CalibrationGazeAuthority { eye: 1, segmentation_mode: SegmentationMode::Sam31,
+            sam_prompt_generation: Some(0), generation: 135 };
+        assert_eq!(mode.eye_index(0), 0, "no arbitrary provider is bound before an admitted sample");
+        mode.bind_authority(now, Some(1), authority);
+        mode.calibration_sign_epoch = Some(30);
+        mode.samples[0] = vec![(0.1, 0.2); VIRTUAL_MOUSE_MIN_SAMPLES];
+        mode.target_index = 1;
+
+        // The recorded failure automatically selected ROI 1 after binding
+        // ROI 2. Selection, thumbnail, clock and scene must all keep ROI 2.
+        let viewer_eye = 0;
+        let bound_eye = mode.eye_index(viewer_eye);
+        assert_eq!(bound_eye, 1);
+        let frames = [Some(control_eye_frame(1)), None];
+        assert!(frames[bound_eye].is_none(), "absence must not fall back to the live sibling");
+        mode.observe_frame_state(None, CalibrationFrameState::MissingFrame);
+        mode.observe_at_frame(now + Duration::from_millis(100), None, None);
+        assert_eq!(mode.target_index, 1);
+        assert_eq!(mode.samples[0].len(), VIRTUAL_MOUSE_MIN_SAMPLES);
+        assert!(mode.calibration_failure.is_none());
+        mode.bind_authority(now + Duration::from_millis(200), Some(2), authority);
+        assert_eq!(mode.calibration_authority_restarts, 0);
+        assert_eq!(mode.calibration_sign_restarts, 0);
+    }
+
+    #[test]
+    fn calibration_terminal_failure_cannot_restart_after_recording_has_stopped() {
+        let now = Instant::now();
+        let mut mode = VirtualMouseMode::new(now);
+        let authority = CalibrationGazeAuthority { eye: 1, segmentation_mode: SegmentationMode::Sam31,
+            sam_prompt_generation: Some(0), generation: 135 };
+        mode.bind_authority(now, Some(1), authority);
+        mode.target_index = 1;
+        mode.samples[0] = vec![(0.1, 0.2); VIRTUAL_MOUSE_MIN_SAMPLES];
+        mode.calibration_failure = Some("GAZE PROVIDER CHANGED DURING CALIBRATION");
+        mode.bind_authority(now + Duration::from_secs(1), Some(2),
+            CalibrationGazeAuthority { generation: 136, ..authority });
+        assert_eq!(mode.calibration_authority, Some(authority));
+        assert_eq!(mode.calibration_authority_restarts, 0);
+        assert_eq!(mode.target_index, 1);
+        assert_eq!(mode.samples[0].len(), VIRTUAL_MOUSE_MIN_SAMPLES);
+        assert_eq!(mode.calibration_failure, Some("GAZE PROVIDER CHANGED DURING CALIBRATION"));
+    }
+
+    #[test]
+    fn calibration_acquisition_still_restarts_after_a_real_source_generation_change() {
+        let now=Instant::now();let mut mode=VirtualMouseMode::new(now);
+        let authority=CalibrationGazeAuthority {eye:0,segmentation_mode:SegmentationMode::Sam31,
+            sam_prompt_generation:Some(0),generation:1};
+        mode.bind_authority(now,Some(1),authority);
+        mode.frame_state=CalibrationFrameState::Ready;
+        mode.observe_at_frame(now,Some(1),Some((1,(0.1,0.2),9)));
+        mode.samples[0]=vec![(0.1,0.2);VIRTUAL_MOUSE_MIN_SAMPLES];mode.target_index=1;
+        let later=now+Duration::from_secs(1);
+        mode.bind_authority(later,Some(1_000_000_001),CalibrationGazeAuthority {generation:2,..authority});
+        assert!(mode.calibration_sign_epoch.is_none());
+        assert_eq!(mode.target_index,0);assert!(mode.samples.iter().all(Vec::is_empty));
+        assert_eq!(mode.calibration_authority_restarts,1);
+        mode.acquisition_source_generation=2;mode.frame_state=CalibrationFrameState::UnresolvedSign;
+        mode.observe_at_frame(later,Some(1_000_000_001),None);
+        assert!(mode.sign_acquisition.active());
     }
 
     #[test]
@@ -61685,6 +62334,27 @@ mod tests {
             mode.observe_at_frame(now, Some(4), None);
             assert_eq!(mode.reticle, None, "loss must not animate a stale target");
         }
+    }
+
+    #[test]
+    fn completed_calibration_cursor_accepts_same_source_refinement_without_a_new_vote() {
+        let now=Instant::now();let mut mode=completed_mouse_calibration_fixture(now);
+        mode.source_group_complete=false;
+        mode.observe_at_frame(now,Some(10),Some((10,(0.1,0.2),0)));
+        assert_eq!(mode.reticle,Some((0.6,0.7)));
+        mode.source_group_complete=true;
+        mode.observe_at_frame(now,Some(10),Some((10,(-0.2,-0.1),0)));
+        assert_eq!(mode.reticle,Some((0.3,0.4)),"paired refinement replaces the provisional location");
+        assert_eq!(mode.unique_surface_updates,1,"one physical source, not two observations");
+        assert_eq!(mode.reticle_source_timestamp_ns,Some(10));
+        mode.observe_at_frame(now,Some(10),Some((10,(0.3,0.3),0)));
+        assert_eq!(mode.reticle,Some((0.3,0.4)),"a duplicate completed source cannot refine again");
+        mode.source_group_complete=false;
+        mode.observe_at_frame(now,Some(10),Some((10,(0.3,0.3),0)));
+        assert_eq!(mode.reticle,Some((0.3,0.4)),"a late provisional result cannot replace its completed pair");
+        mode.observe_at_frame(now,Some(11),Some((9,(0.3,0.3),0)));
+        assert_eq!(mode.reticle,Some((0.3,0.4)),"an older completion cannot rewind placement");
+        assert_eq!(mode.unique_surface_updates,1);
     }
 
     #[test]
@@ -62067,6 +62737,79 @@ mod tests {
     }
 
     #[test]
+    fn monitor_consensus_preserves_clean_rotated_rectangles_and_ignores_rejected_target_forces() {
+        let (width_inches,height_inches)=nominal_display_dimensions_inches();
+        for (center,right,down) in [([-4.0,2.5,31.0],[1.0,0.08,0.16],[-0.06,1.0,-0.10]),
+            ([-6.0,-15.0,19.0],[-1.0,-0.07,0.04],[-0.06,0.98,0.20]),
+            ([-3.0,-13.0,24.0],[-1.0,0.0,0.0],[0.0,1.0,0.1])] {
+            let right_axis=normalized3(right).unwrap();
+            let down_axis=normalized3(crate::geometry::sub3(down,scale3(right_axis,dot3(right_axis,down)))).unwrap();
+            let expected=VirtualDisplayPlane {center_inches:center,right_axis,down_axis,width_inches,height_inches};
+            for rejected in [None,Some(6),Some(8)] {
+                let mut observations=VIRTUAL_MOUSE_CALIBRATION_TARGETS.into_iter().map(|target| {
+                    let p=add3(center,add3(scale3(right_axis,(target.0-0.5)*width_inches),
+                        scale3(down_axis,(target.1-0.5)*height_inches)));
+                    let n=normalized3(p).unwrap();((n[0],n[1]),target)
+                }).collect::<Vec<_>>();
+                if let Some(index)=rejected {
+                    observations[index].0=(-observations[index].0.0,-observations[index].0.1);
+                }
+                let fitted=fit_virtual_display_plane(&observations).unwrap();
+                assert!((fitted.width_inches-width_inches).abs()<1.0e-12);
+                assert!((fitted.height_inches-height_inches).abs()<1.0e-12);
+                assert!(dot3(fitted.right_axis,fitted.down_axis).abs()<1.0e-9);
+                for (index,observation) in observations.iter().enumerate() {
+                    let residual=gaze_target_solver::display_plane_residual(fitted,observation).unwrap();
+                    if Some(index)==rejected {assert!(residual[0].hypot(residual[1])>0.10);}
+                    else {assert!(residual[0].hypot(residual[1])<0.008,"{center:?} rejected={rejected:?} index={index}: {residual:?}");}
+                }
+                assert!((fitted.distance_inches()-expected.distance_inches()).abs()<0.75,
+                    "{center:?} rejected={rejected:?}: {fitted:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn calibration_recorded_nine_inconsistent_targets_cannot_authorize_a_monitor() {
+        // Recorded centroids from 1788826709-274018364. This is a regression
+        // for collection -> final fit -> terminal rejection, NOT a RAW replay
+        // or proof that the observer followed each target. Target 6 -> 8 has
+        // the opposite vertical response from both outer corner pairs.
+        let features = [
+            (0.17108202787783985, -0.7836843085852888),
+            (0.05010590180088876, -0.7926949857931412),
+            (0.10323528616514532, -0.7906081122332667),
+            (0.10626476316588007, -0.7783491926128118),
+            (0.21141091516680782, -0.7423262909181589),
+            (0.15289636020495453, -0.7512479842815509),
+            (0.010955798767493877, -0.7930565922186088),
+            (0.15786802679416678, -0.8002436257186594),
+            (0.15039042904462402, -0.7412627148747174),
+        ];
+        let now = Instant::now();
+        let mut mode = VirtualMouseMode::new(now);
+        mode.display_dimensions = Some((23.228346456692915, 13.110236220472443));
+        let mut source = 1;
+        for feature in features {
+            let started = mode.target_started;
+            for sample in 0..VIRTUAL_MOUSE_MIN_SAMPLES {
+                mode.observe(started + Duration::from_millis(550 + sample as u64 * 80), Some((source, feature)));
+                source += 1;
+            }
+            mode.observe(started + VIRTUAL_MOUSE_TARGET_HOLD, Some((source, feature)));
+            source += 1;
+        }
+        assert!(mode.sequence_completed);
+        assert!(mode.display_plane.is_none());
+        assert!(mode.gaze_affine.is_none());
+        assert_eq!(mode.calibration_failure, Some("DISPLAY POSE COULD NOT BE RESOLVED"));
+        let last_index = mode.target_index;
+        mode.observe(now + Duration::from_secs(30), Some((source, (0.0, 0.0))));
+        assert_eq!(mode.target_index, last_index);
+        assert!(calibration_recording_targets(&mode).is_empty());
+    }
+
+    #[test]
     #[ignore = "set CALIBRATION_REPLAY_SESSION to a runtime calibration sidecar"]
     fn calibration_replay_saved_targets() {
         let path = std::env::var("CALIBRATION_REPLAY_SESSION").unwrap();
@@ -62075,9 +62818,137 @@ mod tests {
             ((v["feature"][0].as_f64().unwrap(), v["feature"][1].as_f64().unwrap()),
              (v["target"][0].as_f64().unwrap(), v["target"][1].as_f64().unwrap()))
         }).collect::<Vec<_>>();
-        let plane = fit_virtual_display_plane(&observations);
+        let dimensions = if session["display_size_source"] == "selected-monitor-edid-dtd-mm" {
+            (session["display_aspect"][0].as_f64().unwrap(), session["display_aspect"][1].as_f64().unwrap())
+        } else { nominal_display_dimensions_inches() };
+        let plane = gaze_target_solver::fit_virtual_display_plane_with_dimensions(&observations, dimensions);
         let affine = fit_robust_gaze_affine(&observations);
         eprintln!("REPLAY plane={} affine={} shared={}", plane.is_some(), affine.is_some(), plane.zip(affine).is_some_and(|(p,a)| calibration_models_have_shared_support(p,a,&observations)));
+    }
+
+    #[test]
+    #[ignore = "set CALIBRATION_REPLAY_SESSION, CALIBRATION_REPLAY_CONICS and CALIBRATION_REPLAY_CAPTURE_ENTRY for post-fit fixed-window scoring"]
+    fn calibration_replay_joint_target_windows() {
+        use std::io::BufRead;
+        let session:serde_json::Value=serde_json::from_slice(&std::fs::read(
+            std::env::var("CALIBRATION_REPLAY_SESSION").unwrap()).unwrap()).unwrap();
+        let path=std::env::var("CALIBRATION_REPLAY_CONICS").unwrap();
+        let capture=std::env::var("CALIBRATION_REPLAY_CAPTURE_ENTRY").unwrap().parse::<u64>().unwrap();
+        let live_bridge=std::env::var_os("CALIBRATION_REPLAY_LIVE_BRIDGE").is_some();
+        let mut clock=None;
+        let mut reads=std::collections::BTreeMap::<u64,[Option<(f64,f64)>;2]>::new();
+        for line in std::io::BufReader::new(std::fs::File::open(&path).unwrap()).lines() {
+            let row:serde_json::Value=serde_json::from_str(&line.unwrap()).unwrap();
+            if live_bridge {
+                // These reports already ran the production source/geometry
+                // and paired-completion gates. Keep only post-acquisition,
+                // qualified current sources, never provisional or held poses.
+                assert_eq!(row["timing_validation"],true);
+                if row["state"]!="Ready" || row["acquisition"]!="Ready" {continue;}
+                let eye=row["calibration_eye"].as_u64().unwrap() as usize;
+                assert!(eye<2);
+                let fit=&row["joint"];let source=&fit["sources"][eye];
+                assert_eq!(fit["calibration_source_group_complete"],true);
+                assert_eq!(fit["contributing_eyes"][eye],true);
+                assert_eq!(source["roi_id"].as_u64(),Some(eye as u64+1));
+                let time=row["qualified_source_ns"].as_str().unwrap().parse::<u64>().unwrap();
+                assert_eq!(source["sensor_timestamp_ns"].as_str().unwrap().parse::<u64>().unwrap(),time);
+                let lineage=format!("{}:{}",source["clock_domain"],source["clock_epoch"]);
+                assert!(clock.as_ref().is_none_or(|c|c==&lineage),"qualified target windows cannot span unrelated clocks");
+                clock=Some(lineage);
+                let feature=(fit["gaze_directions"][eye][0].as_f64().unwrap(),fit["gaze_directions"][eye][1].as_f64().unwrap());
+                // As in collection, the first fully qualified publication is
+                // one vote. Later redraws cannot move that source's sample.
+                reads.entry(time).or_insert([None,None])[eye].get_or_insert(feature);
+                continue;
+            }
+            if row["input"]["capture_entry"].as_u64()!=Some(capture) {continue;}
+            assert_eq!(row["schema"],"buttercup-joint-source-replay-v1");
+            let lineage=row["input"]["clock_lineage"].as_str().unwrap().to_owned();
+            assert!(clock.as_ref().is_none_or(|c|c==&lineage),"target windows cannot span unrelated clocks");
+            clock=Some(lineage);
+            let time=row["input"]["frame"]["timestamp_ns"].as_u64().unwrap();
+            // The final publication supersedes its provisional sibling on
+            // the SAME source read. A held display sample is never a vote.
+            let fit=&row["joint"];
+            let features=std::array::from_fn(|eye| {
+                if fit["available"]!=true || fit["contributing_eyes"][eye]!=true {return None;}
+                Some((fit["eye_gaze_directions"][eye][0].as_f64()?,fit["eye_gaze_directions"][eye][1].as_f64()?))
+            });
+            reads.insert(time,features);
+        }
+        assert!(!reads.is_empty());
+        let dimensions=if session["display_size_source"]=="selected-monitor-edid-dtd-mm" {
+            (session["display_aspect"][0].as_f64().unwrap(),session["display_aspect"][1].as_f64().unwrap())
+        } else {nominal_display_dimensions_inches()};
+        let mut results=Vec::new();
+        for eye in 0..2 {for extra_settle_ns in [0,500_000_000u64] {
+            let mut targets=Vec::new();
+            let mut observations=Vec::new();
+            let mut prefix_observations=Vec::new();
+            for target in session["target_statistics"].as_array().unwrap() {
+                let start=target["source_window_ns"][0].as_str().unwrap().parse::<u64>().unwrap();
+                let end=target["source_window_ns"][1].as_str().unwrap().parse::<u64>().unwrap();
+                let lower=start.saturating_add(extra_settle_ns);
+                let timed_samples=reads.iter().filter(|(time,_)|lower<=**time && **time<=end)
+                    .filter_map(|(time,features)|features[eye].map(|feature|(*time,feature))).collect::<Vec<_>>();
+                // Source-time prefix diagnostic, not simulated presentation:
+                // the archive does not attest host/scanout time or the live
+                // completion/admission schedule for this fresh replay.
+                let mut prefix=Vec::new();
+                let mut first_prefix=None;
+                let hold_ns=VIRTUAL_MOUSE_TARGET_HOLD.as_nanos() as u64;
+                for &(time,feature) in &timed_samples {
+                    prefix.push(feature);
+                    if prefix.len()>VIRTUAL_MOUSE_MAX_RECENT_SAMPLES {prefix.remove(0);}
+                    if time.saturating_sub(start)>=hold_ns {
+                        if let Some(estimate)=calibration_target_estimate(&prefix) {
+                            first_prefix=Some((time,estimate));
+                            prefix_observations.push((estimate.feature,(target["target"][0].as_f64().unwrap(),target["target"][1].as_f64().unwrap())));
+                            break;
+                        }
+                    }
+                }
+                let mut samples=timed_samples.iter().map(|(_,feature)|*feature).collect::<Vec<_>>();
+                let fresh_count=samples.len();
+                if samples.len()>VIRTUAL_MOUSE_MAX_RECENT_SAMPLES {
+                    samples.drain(..samples.len()-VIRTUAL_MOUSE_MAX_RECENT_SAMPLES);
+                }
+                let estimate=calibration_target_estimate(&samples);
+                if let Some(estimate)=estimate {
+                    observations.push((estimate.feature,(target["target"][0].as_f64().unwrap(),target["target"][1].as_f64().unwrap())));
+                }
+                targets.push(serde_json::json!({"target_index":target["target_index"],"source_window_ns":[start.to_string(),end.to_string()],
+                    "fresh_available_sources_in_window":fresh_count,"recent_samples":samples.len(),
+                    "first_source_prefix_estimate":first_prefix.map(|(time,e)|serde_json::json!({
+                        "source_ns":time.to_string(),"source_elapsed_ms":(time-start) as f64/1.0e6,
+                        "feature":e.feature,"inliers":e.inliers,"recent_samples":e.total,
+                        "angular_rms_degrees":e.angular_rms.to_degrees(),
+                        "angle_to_final_estimate_degrees":estimate.map(|last|
+                            projected_gaze_angle_between(e.feature,last.feature).to_degrees())})),
+                    "estimate":estimate.map(|e|serde_json::json!({"feature":e.feature,"inliers":e.inliers,"angular_rms_degrees":e.angular_rms.to_degrees()}))}));
+            }
+            let plane=gaze_target_solver::fit_virtual_display_plane_with_dimensions(&observations,dimensions);
+            let affine=fit_robust_gaze_affine(&observations);
+            let prefix_plane=gaze_target_solver::fit_virtual_display_plane_with_dimensions(&prefix_observations,dimensions);
+            let prefix_affine=fit_robust_gaze_affine(&prefix_observations);
+            let coverage=calibration_targets_have_required_coverage(observations.iter().map(|v|v.1));
+            results.push(serde_json::json!({"eye":eye,"extra_window_settle_ns":extra_settle_ns.to_string(),
+                "target_estimates":targets,"coverage":coverage,"plane":plane.is_some(),"affine":affine.is_some(),
+                "source_prefix_fit":{"target_estimates":prefix_observations.len(),"plane":prefix_plane.is_some(),"affine":prefix_affine.is_some(),
+                    "shared_support":prefix_plane.zip(prefix_affine).is_some_and(|(p,a)|
+                        calibration_models_have_shared_support(p,a,&prefix_observations)),
+                    "contract":"First stable recent cluster after a source-time minimum hold; not an attested live admission or display timestamp."},
+                "display_pose":plane.map(|p|serde_json::json!({"center_eye_relative_inches":p.center_inches,
+                    "right_axis":p.right_axis,"down_axis":p.down_axis,"distance_inches":p.distance_inches(),
+                    "dimensions_inches":[p.width_inches,p.height_inches],
+                    "score":gaze_target_solver::score_virtual_display_plane(p,&observations).map(|s|
+                        serde_json::json!({"inliers":s.inliers,"rms_screen_fraction":s.rms,"full_huber_cost":s.robust_cost}))})),
+                "shared_support":plane.zip(affine).is_some_and(|(p,a)|calibration_models_have_shared_support(p,a,&observations))}));
+        }}
+        eprintln!("FIXED_WINDOW_REPLAY {}",serde_json::json!({"source":path,"capture_entry":capture,"results":results,
+            "source_admission":if live_bridge {"current paired source through live bridge gates, after acquisition"} else {"post-fit geometry; no live admission gates"},
+            "contract":"Post-fit scoring only: recorded targets/windows never enter geometry. Uses actual target clustering and monitor fitters, not a closed-loop replay of SAM latency, sign admission, or target presentation; no independent gaze accuracy ground truth."}));
     }
 
     #[test]
@@ -64089,6 +64960,20 @@ mod tests {
         missing.projected_sphere_radius = None;
         assert!(virtual_contact_pose(&missing).is_none());
 
+        for changed_settings in [true, false] {
+            let mut obsolete = missing.clone();
+            if changed_settings {
+                obsolete.gaze_settings_generation += 1;
+            } else {
+                obsolete.gaze_policy_error = Some("paused: waiting for global gaze method");
+            }
+            lease.apply_held(&mut obsolete);
+            assert!(obsolete.surface_gaze.is_none());
+            assert!(obsolete.virtual_contact_surface_gaze.is_none());
+            assert!(!obsolete.presentation_pivot_held,
+                "a display lease cannot restore a ray across global settings changes");
+        }
+
         lease.apply_held(&mut missing);
         let held = virtual_contact_pose(&missing).expect("leased ray should remain drawable");
         assert_eq!(held.authority, VirtualContactAuthority::MotionHeld);
@@ -64271,6 +65156,12 @@ mod tests {
             sign_diagnostics: None,
         });
         frame.eye_laser_enabled = true;
+
+        // A presentation-only, clockless contact is no longer a gaze input.
+        // Supply the same source-bound published surface calibration uses.
+        assert!(gaze_output_direction(&frame).is_none());
+        frame.virtual_contact_surface_gaze.as_mut().unwrap().source_timestamp_ns = Some(frame.timestamp_ns);
+        frame.surface_gaze = frame.virtual_contact_surface_gaze;
 
         for mode in ViewMode::ALL {
             let mut pixels = vec![0u32; 128 * 128];
@@ -67097,17 +67988,8 @@ mod tests {
         assert_eq!(gaze.drawn, None);
     }
 
-    #[test]
-    fn raw_bundle_index_preserves_sensor_and_host_clock_domains() {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let output = PathBuf::from(format!(
-            "outputs/recording-trace-tests/raw-host-clock-{}-{stamp}.tar",
-            std::process::id()
-        ));
-        let config = Config {
+    fn tiny_recording_test_config() -> Config {
+        Config {
             camera: String::new(),
             vcm: String::new(),
             control: PathBuf::new(),
@@ -67127,7 +68009,16 @@ mod tests {
             global_capture_format: GlobalCaptureFormat::Raw10,
             sam31_model: PathBuf::new(),
             centimeter_scales: [None, None],
-        };
+        }
+    }
+
+    #[test]
+    fn raw_bundle_index_preserves_sensor_and_host_clock_domains() {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let output = PathBuf::from(format!(
+            "outputs/recording-trace-tests/raw-host-clock-{}-{stamp}.tar", std::process::id(),
+        ));
+        let config = tiny_recording_test_config();
         let header = PacketHeader {
             kind: PacketKind::Eye(1),
             sequence: 44,
@@ -67232,6 +68123,143 @@ mod tests {
         assert_eq!(prediction["semantic"]["observed_role"], "unknown");
         assert!(prediction["predictions"]["eye_candidate"].is_null());
         fs::remove_file(output).unwrap();
+    }
+
+    #[test]
+    fn raw_recording_keeps_both_payloads_when_paired_analysis_is_shed() {
+        let stamp=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let output=PathBuf::from(format!("outputs/recording-trace-tests/shed-pair-{}-{stamp}.tar",std::process::id()));
+        let trace=recording_trace::Hub::default();
+        let epoch=trace.start_stream();
+        let mut recorder=Recorder::new(&output,&tiny_recording_test_config(),&trace).unwrap();
+        let mut budget=source_queue_budget::SourceQueueBudget::new(MAX_TRACKING_QUEUE_AGE);
+        let origin=Instant::now();let mut now_ms=0_u64;let mut admitted=0;
+        let mut expected_payloads=[vec![],vec![]];
+        for source in 0..3 {
+            for eye_id in 1..=2 {
+                let mut header=paired_queue_test_header(eye_id);
+                header.sequence=source;header.timestamp_ns=1_000_000_000+source*100_000_000;
+                header.width=4;header.height=1;header.stride=5;header.payload_bytes=5;
+                let payload=[source as u8,eye_id as u8,3,4,5];
+                let clock=trace.raw_arrived(serde_json::json!({"roi_id":eye_id,
+                    "sequence":source.to_string(),"sensor_timestamp_ns":header.timestamp_ns.to_string(),
+                    "stream_epoch":epoch}),origin+Duration::from_millis(source*100),100+source*100);
+                // The same native writer and policy used by live ingress.
+                // A skipped analysis still owns its actual bytes and clocks.
+                recorder.record(&header,&payload,Some(&clock)).unwrap();
+                expected_payloads[eye_id as usize-1].extend_from_slice(&payload);
+                now_ms=now_ms.max(source*100);
+                let age=Duration::from_millis(now_ms-source*100);
+                let nominal=tracking_queue_action(TRACKING_QUEUE_WARMUP,age,false);
+                let (action,paired)=apply_paired_queue_budget(&mut budget,&header,
+                    origin+Duration::from_millis(now_ms),age,nominal);
+                if action==TrackingQueueAction::Consume {
+                    admitted+=1;now_ms+=100;
+                } else {
+                    assert!(paired);
+                    trace.skipped_source_analysis(clock,"tracking-paired-source-headroom",age,Some(true));
+                }
+            }
+        }
+        assert_eq!(admitted,4);
+        recorder.finalize().unwrap();
+        let member=|name:&str| {
+            let result=Command::new("tar").args(["-xOf"]).arg(&output).arg(name).output().unwrap();
+            assert!(result.status.success());result.stdout
+        };
+        for (eye,name) in ["subject-right.raw10","subject-left.raw10"].into_iter().enumerate() {
+            assert_eq!(member(name),expected_payloads[eye],"preserve every byte including the shed pair");
+        }
+        let frames:Vec<serde_json::Value>=String::from_utf8(member("frames.jsonl")).unwrap()
+            .lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(frames.len(),6);
+        for pair in frames.chunks_exact(2) {
+            assert_eq!(pair[0]["timestamp_ns"],pair[1]["timestamp_ns"]);
+            assert_eq!(pair[0]["source_clock"]["source_key"]["stream_epoch"],epoch);
+            assert_eq!(pair[1]["source_clock"]["source_key"]["stream_epoch"],epoch);
+        }
+        let events=recording_trace::decode_metadata(&member(recording_trace::METADATA_FILE));
+        let skipped:Vec<_>=events.iter().filter(|row|row["event"]=="source_dropped").collect();
+        assert_eq!(skipped.len(),2);
+        assert!(skipped.iter().all(|row|row["data"]["archived"]==true && row["data"]["drop_scope"]=="analysis"));
+        assert!(skipped.iter().all(|row|row["data"]["clock"]["source_key"]["sequence"]=="1"));
+        // This test did not run image analysis: no invented EyeFrame or held
+        // prediction is substituted for any of the six archived sources.
+        let predictions:Vec<serde_json::Value>=String::from_utf8(member("predictions.jsonl")).unwrap()
+            .lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(predictions.len(),6);
+        assert!(predictions.iter().all(|row|row["analysis_state"]=="unavailable"));
+        let validation=Command::new("python3").args(["-B","scripts/validate-recording.py"])
+            .arg(&output).output().unwrap();
+        assert!(validation.status.success(),"{}",String::from_utf8_lossy(&validation.stderr));
+        let validated:serde_json::Value=serde_json::from_slice(&validation.stdout).unwrap();
+        assert_eq!(validated["source_drop_archive_classes"]["saved-native-roi-analysis-skipped"],2);
+        assert_eq!(validated["format_and_references_validated"],true);
+        assert_eq!(validated["fixation_verified"],false);
+        fs::remove_file(output).unwrap();
+    }
+
+    #[test]
+    #[ignore = "native corpus CPU/I/O diagnostic; requires explicit index and output paths"]
+    fn native_calibration_ingress_cost_diagnostic() {
+        use std::io::{BufRead, BufReader, Seek, SeekFrom};
+        let index=PathBuf::from(std::env::var("BUTTERCUP_INGRESS_PROFILE_INDEX").expect("native source index"));
+        let output=PathBuf::from(std::env::var("BUTTERCUP_INGRESS_PROFILE_REPORT").expect("fresh profile output"));
+        let archive=output.with_extension("tar");
+        assert!(!archive.exists());
+        assert!(fs::canonicalize(output.parent().unwrap()).unwrap().starts_with(fs::canonicalize("outputs").unwrap()));
+        let mut report=fs::OpenOptions::new().write(true).create_new(true).open(&output).unwrap();
+        let trace=recording_trace::Hub::default();
+        let mut recorder=Recorder::new(&archive,&tiny_recording_test_config(),&trace).unwrap();
+        let mut file:Option<(String,File)>=None;
+        let mut similarity:[raw_motion_octrees::NativeGlobalSimilarityTracker;2]=std::array::from_fn(|_|Default::default());
+        let mut lineage=serde_json::Value::Null;
+        let mut count=0;
+        for line in BufReader::new(File::open(index).unwrap()).lines() {
+            let row:serde_json::Value=serde_json::from_str(&line.unwrap()).unwrap();
+            let meta=&row["frame"];
+            let u=|name:&str|meta[name].as_u64().unwrap();
+            let path=row["raw_file"].as_str().unwrap();
+            if file.as_ref().is_none_or(|(old,_)|old!=path) {file=Some((path.to_owned(),File::open(path).unwrap()));}
+            let input=&mut file.as_mut().unwrap().1;
+            input.seek(SeekFrom::Start(row["raw_offset"].as_u64().unwrap())).unwrap();
+            let mut packed=vec![0;row["raw_length"].as_u64().unwrap() as usize];
+            input.read_exact(&mut packed).unwrap();
+            let header=PacketHeader {kind:PacketKind::Eye(u("eye_id") as u32),sequence:u("sequence"),
+                timestamp_ns:u("timestamp_ns"),sensor_x:u("sensor_x") as u32,sensor_y:u("sensor_y") as u32,
+                width:u("width") as usize,height:u("height") as usize,stride:u("stride") as usize,
+                payload_bytes:packed.len(),region:None};
+            let clock=meta.get("source_clock");
+            let start=Instant::now();recorder.record(&header,&packed,clock).unwrap();
+            let write_ms=start.elapsed().as_secs_f64()*1000.0;
+            let start=Instant::now();
+            let raw=Arc::new(raw10::try_unpack_raw10(&packed,header.width,header.height,header.stride).unwrap());
+            let unpack_ms=start.elapsed().as_secs_f64()*1000.0;
+            let start=Instant::now();
+            let border=raw_iris_focus::score_stream_eye(&raw,header.width,header.height);
+            let focus_ms=start.elapsed().as_secs_f64()*1000.0;
+            let start=Instant::now();
+            let upper=raw_iris_focus::detect_upper_eyelid_points(&raw,header.width,header.height,header.sensor_x,header.sensor_y,&border);
+            let lower=raw_iris_focus::detect_lower_eyelid_points(&raw,header.width,header.height,header.sensor_x,header.sensor_y,&border);
+            let lids_ms=start.elapsed().as_secs_f64()*1000.0;
+            if row["clock_lineage"]!=lineage {
+                lineage=row["clock_lineage"].clone();for tracker in &mut similarity {tracker.clear();}
+            }
+            let start=Instant::now();
+            let motion=similarity[u("eye_id") as usize-1].observe(Arc::clone(&raw),header.width,header.height,header.sensor_x,header.sensor_y);
+            let motion_ms=start.elapsed().as_secs_f64()*1000.0;
+            let result=serde_json::json!({"schema":"buttercup-native-ingress-cpu-diagnostic-v1",
+                "input":row,"milliseconds":{"archive_write":write_ms,"raw_unpack":unpack_ms,
+                    "native_border_focus":focus_ms,"eyelid_points":lids_ms,"global_similarity":motion_ms},
+                "native_focus_score":border.score,"native_focus_points":border.points.len(),
+                "eyelid_point_counts":[upper.len(),lower.len()],"global_similarity_reliable":motion.reliable,
+                "scope":"selected CPU stages only; no SAM, full main loop, camera control, presentation, fsync or live queue",
+                "archive_scope":"I/O benchmark copy of supplied native sources; not a new capture; applied region geometry omitted"});
+            serde_json::to_writer(&mut report,&result).unwrap();writeln!(report).unwrap();count+=1;
+        }
+        let start=Instant::now();recorder.finalize().unwrap();
+        eprintln!("NATIVE_INGRESS_PROFILE frames={count} finalize_ms={:.3} archive={} report={}",
+            start.elapsed().as_secs_f64()*1000.0,archive.display(),output.display());
     }
 
     #[test]

@@ -20,8 +20,8 @@ fn scene() -> JointScenePrior {
             surface_axis_alignment:None,
         })),
         target_reference_camera_mm: [0.0,0.0,-350.0],
-        fixation_forward_mm: support(600.0,350.0,300.0),
-        target_seed_camera_mm: None, maximum_gaze_slope: 1.5,
+        fixation_axial_distance_mm: support(600.0,350.0,300.0),
+        target_seed_camera_mm: None, secondary_target_seed_camera_mm: None, maximum_gaze_slope: 1.5,
         interocular_distance_mm: Some(support(64.0,12.0,8.0)),
     }
 }
@@ -179,6 +179,94 @@ fn joint_fixation_recovers_both_vertical_signs_from_mixed_boundary_samples() {
             assert!(norm3(sub3(n,solution.eye_normals[eye].unwrap()))<1.0e-12);
         }
     }
+}
+
+#[test]
+fn off_axis_visible_eye_does_not_hit_an_optical_axis_gaze_limit() {
+    for sign in [-1.0,1.0] {
+        let mut fixture=Fixture::new([0.0,-1000.0*sign,300.0]);
+        fixture.scene.target_reference_camera_mm=[0.0,130.0*sign,-300.0];
+        // The constructed target is about 1.28 m away, with 1.00 m axial
+        // distance along this off-axis observer ray (not 600 mm optical Z).
+        fixture.scene.fixation_axial_distance_mm=support(1000.0,700.0,500.0);
+        fixture.arcs=[Vec::new(),Vec::new()];fixture.hints=[Vec::new(),Vec::new()];
+        for eye in 0..2 {
+            let center=[if eye==0 {-32.0} else {32.0},130.0*sign,-300.0];
+            fixture.scene.eyes[eye].as_mut().unwrap().limbus_center.camera_mm=center;
+            let sensor=fixture.scene.camera.project(center).unwrap();
+            fixture.origins[eye]=[(sensor[0]-210.0).round() as u32,(sensor[1]-140.0).round() as u32];
+            for kind in [BoundaryKind::OuterLimbus,BoundaryKind::InnerLimbus,BoundaryKind::PupillaryBoundary] {
+                fixture.add_arc(eye,kind,0.0,TAU,16,boundary_index(kind).unwrap() as u32);
+            }
+            let normal=normalized3(sub3(fixture.target,center)).unwrap();
+            assert!(normal[1].abs()/normal[2]>fixture.scene.maximum_gaze_slope,
+                "the historical optical-axis bound must exclude this construction");
+            assert!(dot3(normal,normalized3(scale3(center,-1.0)).unwrap())>0.7,
+                "this is a visible convex eye, not a forbidden back-facing disk");
+        }
+        for enabled in [[true,true],[true,false],[false,true]] {
+            let solution=fixture.solve(enabled,24).unwrap();
+            for eye in 0..2 {if enabled[eye] {
+                assert!(angular_error(&solution,&fixture,eye)<0.5,
+                    "sign={sign} eye={eye} enabled={enabled:?} target={:?} truth={:?} error={} cost={}",solution.target_camera_mm,
+                    fixture.target,angular_error(&solution,&fixture,eye),solution.robust_cost);
+                assert!(solution.arcs.iter().filter(|a|a.exposure.roi==RoiId(eye as u32+1)).all(|a|a.used&&a.rms_px<0.2));
+            }}
+        }
+    }
+}
+
+#[test]
+fn viewpoint_ray_coordinates_round_trip_at_the_specified_axial_distance() {
+    for origin in [[0.0,0.0,-300.0],[-110.0,140.0,-260.0],[110.0,-140.0,-260.0]] {
+        let chart=ViewpointRayChart::new(origin).unwrap();
+        for x in [-1.2,0.0,1.2] {for y in [-1.2,0.0,1.2] {
+            let coordinates=[x,y,600.0_f64.ln()];
+            let Some(target)=chart.target(coordinates) else {continue;};
+            assert!((dot3(sub3(target,origin),chart.toward_camera)-600.0).abs()<1.0e-9);
+            assert!((norm3(sub3(target,origin))-600.0*(1.0+x*x+y*y).sqrt()).abs()<1.0e-9);
+            let recovered=chart.coordinates(target).unwrap();
+            assert!(coordinates.into_iter().zip(recovered).all(|(a,b)|(a-b).abs()<1.0e-12));
+            assert!(dot3(sub3(target,origin),chart.toward_camera)>0.0);
+            if origin[0]==0.0&&origin[1]==0.0 {
+                assert!(norm3(sub3(target,[600.0*x,600.0*y,origin[2]+600.0]))<1.0e-9,
+                    "on-axis coordinates retain the historical exact parameterization");
+            }
+        }}
+    }
+}
+
+#[test]
+fn a_near_optical_horizon_does_not_turn_bounded_viewpoint_depth_into_infinite_range() {
+    let chart=ViewpointRayChart::new([270.0,160.0,-350.0]).unwrap();
+    for optical_forward in [1.0e-3,1.0e-4,1.0e-5] {
+        let direction=normalized3([-0.66,-0.75,optical_forward]).unwrap();
+        let forward=dot3(direction,chart.toward_camera);
+        assert!(forward>0.5,"a camera-facing ray, not a hidden backside");
+        let coordinates=[dot3(direction,chart.right)/forward,
+            dot3(direction,chart.down)/forward,600.0_f64.ln()];
+        assert!(coordinates[..2].iter().all(|v|v.abs()<1.5));
+        let target=chart.target(coordinates).unwrap();
+        let offset=sub3(target,chart.origin_camera_mm);
+        assert!((dot3(offset,chart.toward_camera)-600.0).abs()<1.0e-9);
+        assert!(norm3(offset)<600.0*(1.0+2.0*1.5_f64.powi(2)).sqrt(),
+            "the same finite slope/depth envelope must bound metric range near the optical horizon");
+        assert!(dot3(normalized3(offset).unwrap(),direction)>1.0-1.0e-12,
+            "bounding the range must not silently reverse or clip the ray direction");
+    }
+}
+
+#[test]
+fn viewpoint_ray_chart_rejects_invalid_or_backward_targets_instead_of_flipping_them() {
+    assert!(ViewpointRayChart::new([0.0,0.0,0.0]).is_none());
+    assert!(ViewpointRayChart::new([0.0,0.0,300.0]).is_none());
+    assert!(ViewpointRayChart::new([f64::NAN,0.0,-300.0]).is_none());
+    let chart=ViewpointRayChart::new([0.0,130.0,-300.0]).unwrap();
+    assert!(chart.target([0.0,-10.0,600.0_f64.ln()]).is_none(),
+        "dividing by a negative camera-Z component would manufacture its antipode");
+    assert!(chart.coordinates([0.0,130.0,-400.0]).is_none());
+    assert!(chart.coordinates([0.0,1.0e6,1.0]).is_none());
+    assert!(chart.target([f64::NAN,0.0,1.0]).is_none());
 }
 
 #[test]
@@ -404,7 +492,7 @@ fn uncertain_contour_directions_are_a_compatibility_band_not_a_second_precise_fi
 fn numerical_linearization_cannot_turn_a_capped_arc_into_a_force() {
     let scene=scene();
     let center=scene.eyes[0].unwrap().limbus_center.camera_mm;
-    let target=add3(scene.target_reference_camera_mm,[0.0,0.0,scene.fixation_forward_mm.nominal]);
+    let target=add3(scene.target_reference_camera_mm,[0.0,0.0,scene.fixation_axial_distance_mm.nominal]);
     let points=ring_points(scene.camera,center,normalized3(sub3(target,center)).unwrap(),6.0,[3500,2850],0.1,0.5,12);
     let arcs=[BoundaryArcObservation {evidence_group:0,kind:BoundaryKind::OuterLimbus,points_roi_px:&points,
         outward_normals_roi:None,normal_band_half_width_px:Some(0.0),detector_score:None}];
@@ -710,4 +798,40 @@ fn a_secondary_circle_seed_carries_its_own_center_and_metric_radius() {
     let k=TARGET_PARAMETERS;
     assert!(problem.seeds().iter().any(|p|(p[k+2]+350.0).abs()<1.0e-5&&(p[k+3]-6.0).abs()<1.0e-5),
         "normal-only starts remain stuck in the first conic's center/range geometry");
+}
+
+#[test]
+fn previous_targets_are_competing_initializations_not_averaged_points_or_extra_residuals() {
+    let mut fixture=Fixture::new([70.0,-130.0,250.0]);
+    let targets=[[-100.0,80.0,250.0],[150.0,-120.0,250.0]];
+    fixture.scene.target_seed_camera_mm=Some(targets[0]);
+    fixture.scene.secondary_target_seed_camera_mm=Some(targets[1]);
+    let arcs=[BoundaryArcObservation {evidence_group:0,kind:BoundaryKind::OuterLimbus,
+        points_roi_px:&fixture.arcs[0][0].points,outward_normals_roi:None,normal_band_half_width_px:Some(0.0),detector_score:None}];
+    let evidence=RoiConicEvidence {exposure:fixture.exposures[0],sensor_origin_px:fixture.origins[0],
+        dimensions_px:[420,280],arcs:&arcs,conics:&[],detail_reliability:Some(1.0)};
+    let request=JointConicRequest {eyes:[Some(evidence),None],scene:&fixture.scene,
+        maximum_hypotheses:8,maximum_refinements:12,maximum_source_skew_ns:0,
+        exposure_uncertainty_ns:0,motion_bound_px_per_second:0.0};
+    let problem=Problem::new(request).unwrap();
+    let seeds=problem.seeds();
+    assert!(seeds.len()<=8);
+    for i in 0..2 {assert!(norm3(sub3(problem.target(&seeds[i]).unwrap(),targets[i]))<1e-9,
+        "a previous read supplies its own start, not an average with a different read/eye");}
+    let mut unseeded=fixture.scene;unseeded.target_seed_camera_mm=None;unseeded.secondary_target_seed_camera_mm=None;
+    let control=Problem::new(JointConicRequest {scene:&unseeded,..request}).unwrap();
+    let selected=problem.select(&problem.conics(&problem.initial).unwrap());
+    assert_eq!(problem.initial,control.initial);
+    assert_eq!(problem.residuals(&problem.initial,&selected),control.residuals(&control.initial,&selected),
+        "historical initializations cannot become temporal observations, extra weights or new pixels");
+    let solved=solve_joint_conics(request).unwrap();
+    assert!(solved.hypotheses_evaluated<=8);
+    assert_eq!(solved.hypotheses_by_association.iter().sum::<usize>(),solved.hypotheses_evaluated);
+    let mut single=fixture.scene;single.secondary_target_seed_camera_mm=None;
+    let expected=Problem::new(JointConicRequest {scene:&single,..request}).unwrap().seeds();
+    for secondary in [targets[0],[f64::NAN;3]] {
+        let mut duplicate=single;duplicate.secondary_target_seed_camera_mm=Some(secondary);
+        assert_eq!(Problem::new(JointConicRequest {scene:&duplicate,..request}).unwrap().seeds(),expected,
+            "duplicate/nonfinite starts do not crowd out useful hypotheses");
+    }
 }

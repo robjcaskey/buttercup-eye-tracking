@@ -191,7 +191,7 @@ pub fn snapshot(
         states.push(json!({"roi_id": index+1, "enabled": enabled[index], "sensor_resident": resident, "state": state}));
         let reference = index == input.reference_eye;
         let usable = enabled[index] && !stale && resident != Some(false) && transport["global_capture_active"] != true;
-        let contact_surface=frame.and_then(|f|if f.segmentation_mode==crate::SegmentationMode::Sam31 {f.virtual_contact_surface_gaze} else {f.surface_gaze});
+        let contact_surface=frame.and_then(|f|if f.segmentation_mode.uses_mask_geometry() {f.virtual_contact_surface_gaze} else {f.surface_gaze});
         let axis = contact_surface.map(|s| s.relative_gaze.as_array());
         let source = hub.source_reference(index as u32 + 1, surface.and_then(|s| s.source_timestamp_ns));
         let analysis_pending = transport["latest_ingress"][index]["source_key"].as_object().is_some()

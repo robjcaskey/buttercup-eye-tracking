@@ -3256,7 +3256,12 @@ struct SharedNativeRawFrame {
 #[derive(Default)]
 pub struct NativeGlobalSimilarityTracker {
     previous: Option<SharedNativeRawFrame>,
+    previous_exclusion: Option<crate::geometry::Ellipse>,
     stable_frames: u16,
+    retain_correspondences: bool,
+    last_correspondences: Vec<crate::roi_evidence::NativePatchCorrespondence>,
+    #[cfg(test)]
+    reference_patch_cost: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -7129,6 +7134,14 @@ fn shared_native_global_features(
     frame: &SharedNativeRawFrame,
     current: &SharedNativeRawFrame,
 ) -> Vec<[f32; 2]> {
+    shared_native_global_features_where(frame,current,|_|true)
+}
+
+fn shared_native_global_features_where(
+    frame:&SharedNativeRawFrame,
+    current:&SharedNativeRawFrame,
+    allowed:impl Fn([f32;2])->bool,
+)->Vec<[f32;2]> {
     if frame.width < 64 || frame.height < 48 || frame.pixels.len() < frame.width * frame.height {
         return Vec::new();
     }
@@ -7169,6 +7182,10 @@ fn shared_native_global_features(
             let mut best = None::<(f32, i32, i32)>;
             for y in (top..bottom).step_by(4) {
                 for x in (left..right).step_by(4) {
+                    // Apply the support mask before spending this cell's one
+                    // feature slot. Masking its strongest corner afterward
+                    // needlessly loses valid exterior texture in the cell.
+                    if !allowed([x as f32+frame.sensor_x as f32,y as f32+frame.sensor_y as f32]) {continue;}
                     let score = shared_native_corner_score(frame, x as i32, y as i32);
                     if score.is_finite() && best.is_none_or(|candidate| score > candidate.0) {
                         best = Some((score, x as i32, y as i32));
@@ -7184,6 +7201,63 @@ fn shared_native_global_features(
     features
 }
 
+/// One sparse reference patch is shared by its bounded candidate search.
+/// Preserve the scalar sample order and f32 arithmetic exactly; this is not
+/// a neutral image, resampling, quantized descriptor or different matcher.
+struct SharedNativePatch {
+    samples: [f32; (NATIVE_GLOBAL_PATCH_RADIUS as usize + 1).pow(2)],
+    sum: f32,
+    energy: f32,
+}
+
+impl SharedNativePatch {
+    fn new(frame: &SharedNativeRawFrame, point: [f32; 2]) -> Option<Self> {
+        let x = point[0].round() as i32;
+        let y = point[1].round() as i32;
+        let mut patch = Self { samples: [0.0; (NATIVE_GLOBAL_PATCH_RADIUS as usize + 1).pow(2)],
+            sum: 0.0, energy: 0.0 };
+        let mut index = 0;
+        let mut squared = 0.0;
+        for dy in (-NATIVE_GLOBAL_PATCH_RADIUS..=NATIVE_GLOBAL_PATCH_RADIUS).step_by(2) {
+            for dx in (-NATIVE_GLOBAL_PATCH_RADIUS..=NATIVE_GLOBAL_PATCH_RADIUS).step_by(2) {
+                let value = shared_native_neutral_sample(frame, x+dx, y+dy)?;
+                patch.samples[index] = value;
+                patch.sum += value;
+                squared += value*value;
+                index += 1;
+            }
+        }
+        patch.energy = squared - patch.sum*patch.sum/patch.samples.len() as f32;
+        Some(patch)
+    }
+
+    fn cost(&self, current: &SharedNativeRawFrame, point: [f32; 2]) -> f32 {
+        if self.energy < 48.0 { return f32::INFINITY; }
+        let x = point[0].round() as i32;
+        let y = point[1].round() as i32;
+        let mut sum = 0.0;
+        let mut squared = 0.0;
+        let mut cross = 0.0;
+        let mut index = 0;
+        for dy in (-NATIVE_GLOBAL_PATCH_RADIUS..=NATIVE_GLOBAL_PATCH_RADIUS).step_by(2) {
+            for dx in (-NATIVE_GLOBAL_PATCH_RADIUS..=NATIVE_GLOBAL_PATCH_RADIUS).step_by(2) {
+                let Some(value) = shared_native_neutral_sample(current, x+dx, y+dy) else {return f32::INFINITY;};
+                sum += value;
+                squared += value*value;
+                cross += self.samples[index]*value;
+                index += 1;
+            }
+        }
+        let count = self.samples.len() as f32;
+        let energy = squared-sum*sum/count;
+        if energy < 48.0 { return f32::INFINITY; }
+        let covariance = cross-self.sum*sum/count;
+        let correlation = (covariance/(self.energy*energy).sqrt().max(48.0)).clamp(-1.0,1.0);
+        (1.0-correlation).max(0.0).sqrt()
+    }
+}
+
+#[cfg(test)]
 fn shared_native_patch_cost(
     previous: &SharedNativeRawFrame,
     current: &SharedNativeRawFrame,
@@ -7241,7 +7315,21 @@ fn shared_native_parabolic_patch_offset(negative: f32, center: f32, positive: f3
 
 impl NativeGlobalSimilarityTracker {
     pub fn clear(&mut self) {
-        *self = Self::default();
+        *self = Self {retain_correspondences:self.retain_correspondences,
+            #[cfg(test)] reference_patch_cost:self.reference_patch_cost,
+            ..Self::default()};
+    }
+
+    #[cfg(test)]
+    pub(crate) fn use_reference_patch_cost(&mut self) { self.reference_patch_cost = true; }
+
+    pub(crate) fn retain_diagnostic_correspondences(&mut self, retain:bool) {
+        self.retain_correspondences=retain;
+        self.last_correspondences.clear();
+    }
+
+    pub(crate) fn diagnostic_correspondences(&self)->&[crate::roi_evidence::NativePatchCorrespondence] {
+        &self.last_correspondences
     }
 
     pub fn observe(
@@ -7252,6 +7340,29 @@ impl NativeGlobalSimilarityTracker {
         sensor_x: u32,
         sensor_y: u32,
     ) -> NativeGlobalSimilarityEvidence {
+        self.observe_excluding(pixels, width, height, sensor_x, sensor_y, None)
+    }
+
+    /// Optional source-sensor exclusion for diagnosing motion outside the iris.
+    /// The region comes from a 2D boundary, not a chosen 3D sign. Exclude patch
+    /// support in BOTH frames. This still measures image motion, not pure head
+    /// translation: eyelids, glasses and reflections may move independently.
+    pub(crate) fn observe_excluding(
+        &mut self,
+        pixels: Arc<Vec<u16>>,
+        width: usize,
+        height: usize,
+        sensor_x: u32,
+        sensor_y: u32,
+        exclusion_sensor: Option<crate::geometry::Ellipse>,
+    ) -> NativeGlobalSimilarityEvidence {
+        self.last_correspondences.clear();
+        if exclusion_sensor.is_some_and(|e| !e.center.0.is_finite() || !e.center.1.is_finite()
+            || !e.angle.is_finite() || !e.major_radius.is_finite() || !e.minor_radius.is_finite()
+            || e.minor_radius<=0.0 || e.major_radius<e.minor_radius) {
+            self.clear();
+            return NativeGlobalSimilarityEvidence::default();
+        }
         let current = SharedNativeRawFrame {
             sensor_x,
             sensor_y,
@@ -7263,6 +7374,7 @@ impl NativeGlobalSimilarityTracker {
             self.clear();
             return NativeGlobalSimilarityEvidence::default();
         }
+        let previous_exclusion = std::mem::replace(&mut self.previous_exclusion, exclusion_sensor);
         let Some(previous) = self.previous.replace(current.clone()) else {
             self.stable_frames = 0;
             return NativeGlobalSimilarityEvidence::default();
@@ -7271,9 +7383,26 @@ impl NativeGlobalSimilarityTracker {
             self.stable_frames = 0;
             return NativeGlobalSimilarityEvidence::default();
         }
+        // A support-policy transition is not a source-to-source motion vote.
+        if previous_exclusion.is_some()!=exclusion_sensor.is_some() {
+            self.stable_frames=0;
+            return NativeGlobalSimilarityEvidence::default();
+        }
+        let excluded = |point:[f32;2], region:Option<crate::geometry::Ellipse>| {
+            region.is_some_and(|mut ellipse| {
+                // Native patch radius plus the CFA neighborhood footprint.
+                // Homothetic inflation by the minor-axis margin keeps support
+                // away from the excluded disk, not merely its patch center.
+                let factor=1.0+12.0/ellipse.minor_radius;
+                ellipse.major_radius*=factor;
+                ellipse.minor_radius*=factor;
+                crate::geometry::ellipse_coordinate((point[0] as f64,point[1] as f64),ellipse)<=1.0
+            })
+        };
 
         let mut matches = Vec::<Match>::new();
-        for (track_index, previous_local) in shared_native_global_features(&previous, &current)
+        for (track_index, previous_local) in shared_native_global_features_where(&previous, &current,
+            |point|!excluded(point,previous_exclusion))
             .into_iter()
             .enumerate()
         {
@@ -7281,16 +7410,25 @@ impl NativeGlobalSimilarityTracker {
                 previous_local[0] + previous.sensor_x as f32,
                 previous_local[1] + previous.sensor_y as f32,
             ];
+            if excluded(previous_sensor,previous_exclusion) {continue;}
             let predicted = [
                 previous_sensor[0] - current.sensor_x as f32,
                 previous_sensor[1] - current.sensor_y as f32,
             ];
+            let reference_patch = SharedNativePatch::new(&previous, previous_local);
+            let forward_cost = |candidate| {
+                #[cfg(test)]
+                if self.reference_patch_cost {
+                    return shared_native_patch_cost(&previous, &current, previous_local, candidate);
+                }
+                reference_patch.as_ref().map_or(f32::INFINITY, |patch| patch.cost(&current, candidate))
+            };
             let mut candidates = Vec::<(f32, [f32; 2])>::new();
             for delta_y in -NATIVE_GLOBAL_SEARCH_RADIUS..=NATIVE_GLOBAL_SEARCH_RADIUS {
                 for delta_x in -NATIVE_GLOBAL_SEARCH_RADIUS..=NATIVE_GLOBAL_SEARCH_RADIUS {
                     let candidate = [predicted[0] + delta_x as f32, predicted[1] + delta_y as f32];
-                    let cost =
-                        shared_native_patch_cost(&previous, &current, previous_local, candidate);
+                    if excluded([candidate[0]+sensor_x as f32,candidate[1]+sensor_y as f32],exclusion_sensor) {continue;}
+                    let cost = forward_cost(candidate);
                     if cost.is_finite() {
                         candidates.push((cost, candidate));
                     }
@@ -7319,12 +7457,9 @@ impl NativeGlobalSimilarityTracker {
             // scale/rotation estimate is not quantized independently at every
             // corner.  No interpolated or resized image is constructed.
             let cost_at = |delta_x: f32, delta_y: f32| {
-                shared_native_patch_cost(
-                    &previous,
-                    &current,
-                    previous_local,
-                    [best_local[0] + delta_x, best_local[1] + delta_y],
-                )
+                if excluded([best_local[0]+delta_x+sensor_x as f32,
+                    best_local[1]+delta_y+sensor_y as f32],exclusion_sensor) {return f32::INFINITY;}
+                forward_cost([best_local[0] + delta_x, best_local[1] + delta_y])
             };
             let refined_local = [
                 best_local[0]
@@ -7340,17 +7475,27 @@ impl NativeGlobalSimilarityTracker {
                         cost_at(0.0, 1.0),
                     ),
             ];
+            if excluded([refined_local[0]+sensor_x as f32,refined_local[1]+sensor_y as f32],exclusion_sensor) {continue;}
             // Native-resolution forward/backward identity check. Search only
             // the immediate source neighborhood: a repeated lid/glasses edge
             // may win forward matching, but should not return to this corner.
             let mut backward = (f32::INFINITY, [0.0f32; 2]);
+            let backward_patch = SharedNativePatch::new(&current, best_local);
+            let backward_cost = |candidate| {
+                #[cfg(test)]
+                if self.reference_patch_cost {
+                    return shared_native_patch_cost(&current, &previous, best_local, candidate);
+                }
+                backward_patch.as_ref().map_or(f32::INFINITY, |patch| patch.cost(&previous, candidate))
+            };
             for delta_y in -2..=2 {
                 for delta_x in -2..=2 {
                     let candidate = [
                         previous_local[0] + delta_x as f32,
                         previous_local[1] + delta_y as f32,
                     ];
-                    let cost = shared_native_patch_cost(&current, &previous, best_local, candidate);
+                    if excluded([candidate[0]+previous.sensor_x as f32,candidate[1]+previous.sensor_y as f32],previous_exclusion) {continue;}
+                    let cost = backward_cost(candidate);
                     if cost < backward.0 {
                         backward = (cost, candidate);
                     }
@@ -7385,6 +7530,12 @@ impl NativeGlobalSimilarityTracker {
         ];
         let candidate_matches = matches.len();
         let (motion, inlier_indices) = shared_native_robust_global_similarity(&matches, center);
+        if self.retain_correspondences {
+            self.last_correspondences.extend(matches.iter().enumerate().map(|(index,m)|
+                crate::roi_evidence::NativePatchCorrespondence {previous_sensor_px:m.previous,
+                    current_sensor_px:m.current,photometric_score:m.score,distinct_match_margin:m.assignment_margin,
+                    global_similarity_inlier:inlier_indices.contains(&index)}));
+        }
         let range = |axis: usize| {
             inlier_indices
                 .iter()
@@ -15950,6 +16101,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sparse_reference_patch_cache_preserves_every_native_cost_bit() {
+        for (width,height) in [(72,56),(75,59)] {
+            for shift in [0,2,7] {
+                let previous=SharedNativeRawFrame {sensor_x:18,sensor_y:20,width,height,
+                    pixels:Arc::new((0..width*height).map(|i| {
+                        let x=i%width;let y=i/width;
+                        (90+(x*37+y*71+x*y*3)%850) as u16
+                    }).collect())};
+                let current=SharedNativeRawFrame {pixels:Arc::new((0..width*height).map(|i|
+                    previous.pixels[(i/width)*width+(i%width).saturating_sub(shift)]).collect()),
+                    ..previous.clone()};
+                for from in [[0.0,0.0],[7.0,9.0],[34.3,28.6],[width as f32-7.0,height as f32-8.0]] {
+                    let cached=SharedNativePatch::new(&previous,from);
+                    for dy in -14..=14 {
+                        for dx in -14..=14 {
+                            let to=[from[0]+dx as f32,from[1]+dy as f32];
+                            let scalar=shared_native_patch_cost(&previous,&current,from,to);
+                            let candidate=cached.as_ref().map_or(f32::INFINITY,|patch|patch.cost(&current,to));
+                            assert_eq!(scalar.to_bits(),candidate.to_bits(),"{width}x{height} {from:?} -> {to:?}");
+                        }
+                    }
+                }
+            }
+            for value in [0,512,1023] {
+                let flat=SharedNativeRawFrame {sensor_x:0,sensor_y:0,width,height,
+                    pixels:Arc::new(vec![value;width*height])};
+                let cached=SharedNativePatch::new(&flat,[30.0,25.0]).unwrap();
+                assert_eq!(cached.cost(&flat,[31.0,26.0]),f32::INFINITY);
+                assert_eq!(shared_native_patch_cost(&flat,&flat,[30.0,25.0],[31.0,26.0]),f32::INFINITY);
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_patch_reuse_preserves_reframes_exclusions_and_tracker_resets() {
+        let mut reference=NativeGlobalSimilarityTracker::default();
+        let mut candidate=NativeGlobalSimilarityTracker::default();
+        reference.use_reference_patch_cost();
+        reference.retain_diagnostic_correspondences(true);
+        candidate.retain_diagnostic_correspondences(true);
+        let mut supported=0;
+        for step in 0..24 {
+            if step==12 {reference.clear();candidate.clear();}
+            let width=if step<18 {192} else {196};let height=128;
+            let sensor_x=4000+(step/3%3)*4;let sensor_y=3000+(step/4%3)*2;
+            let exclusion=(6..18).contains(&step).then_some(crate::geometry::Ellipse {
+                center:(sensor_x as f64+96.0,sensor_y as f64+64.0),
+                major_radius:25.0,minor_radius:20.0,angle:0.2,
+            });
+            let raw=synthetic_shared_similarity_frame(width,height,
+                1.0+step as f64*0.002,(step as f64*0.7,step as f64*-0.3));
+            let baseline=reference.observe_excluding(Arc::clone(&raw),width,height,sensor_x,sensor_y,exclusion);
+            let optimized=candidate.observe_excluding(raw,width,height,sensor_x,sensor_y,exclusion);
+            assert_eq!(format!("{baseline:?}"),format!("{optimized:?}"),"step {step}");
+            assert_eq!(format!("{:?}",reference.diagnostic_correspondences()),
+                format!("{:?}",candidate.diagnostic_correspondences()),"step {step}");
+            supported+=usize::from(optimized.candidate_matches>0);
+        }
+        assert!(supported>=16,"parity must include supported motion, not only abstentions");
+    }
+
     fn fractional_texture_frame(
         width: usize,
         height: usize,
@@ -16129,6 +16342,64 @@ mod tests {
             // area factor. This scale comes from separate RAW texture.
             assert!((independent_scale.powi(-2) - 1.0).abs() < 0.004, "{evidence:?}");
         }
+    }
+
+    #[test]
+    fn native_global_iris_exclusion_preserves_sensor_coordinates_across_reframes() {
+        let plane=synthetic_shared_similarity_frame(512,384,1.0,(0.0,0.0));
+        let mut tracker=NativeGlobalSimilarityTracker::default();
+        tracker.retain_diagnostic_correspondences(true);
+        let excluded=crate::geometry::Ellipse {center:(4_256.0,3_192.0),major_radius:60.0,minor_radius:45.0,angle:0.4};
+        for (index,offset) in [(48,48),(80,72),(64,56),(32,72)].into_iter().enumerate() {
+            let evidence=tracker.observe_excluding(synthetic_sensor_crop(&plane,512,offset,384,256),
+                384,256,4_000+offset.0 as u32,3_000+offset.1 as u32,Some(excluded));
+            if index==0 {assert!(!evidence.reliable);continue;}
+            assert!(evidence.reliable,"{index} {evidence:?}");
+            assert!(evidence.motion.translation[0].hypot(evidence.motion.translation[1])<0.25,"{evidence:?}");
+            assert!(evidence.motion.diagonal_coefficient_delta.abs()<0.002,"{evidence:?}");
+            assert!(evidence.motion.rotation_coefficient.abs()<0.002,"{evidence:?}");
+            assert!(!tracker.diagnostic_correspondences().is_empty());
+            assert!(tracker.diagnostic_correspondences().len()<=80);
+            let factor=1.0+12.0/excluded.minor_radius;
+            let margin=crate::geometry::Ellipse {major_radius:excluded.major_radius*factor,
+                minor_radius:excluded.minor_radius*factor,..excluded};
+            for correspondence in tracker.diagnostic_correspondences() {
+                for point in [correspondence.previous_sensor_px,correspondence.current_sensor_px] {
+                    assert!(crate::geometry::ellipse_coordinate((point[0] as f64,point[1] as f64),margin)>1.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_global_masked_corner_does_not_starve_other_texture_in_its_grid_cell() {
+        let frame=SharedNativeRawFrame {sensor_x:4_000,sensor_y:3_000,width:384,height:256,
+            pixels:synthetic_shared_similarity_frame(384,256,1.0,(0.0,0.0))};
+        let original=shared_native_global_features(&frame,&frame);
+        let allowed=|point:[f32;2]|original.iter().all(|p|
+            (point[0]-p[0]-4_000.0).hypot(point[1]-p[1]-3_000.0)>1.0);
+        assert!(original.len()>=32);
+        assert!(original.iter().all(|p|!allowed([p[0]+4_000.0,p[1]+3_000.0])));
+        let exterior=shared_native_global_features_where(&frame,&frame,allowed);
+        assert!(exterior.len()>=32,"the next supported corner should use an otherwise empty cell");
+        assert!(exterior.len()<=80);
+        assert!(exterior.iter().all(|p|allowed([p[0]+4_000.0,p[1]+3_000.0])));
+    }
+
+    #[test]
+    fn native_global_missing_exterior_support_is_not_an_identity_measurement() {
+        let raw=synthetic_shared_similarity_frame(192,128,1.0,(0.0,0.0));
+        let mut tracker=NativeGlobalSimilarityTracker::default();
+        let excluded=crate::geometry::Ellipse {center:(4_096.0,3_064.0),major_radius:256.0,minor_radius:256.0,angle:0.0};
+        for _ in 0..3 {
+            let evidence=tracker.observe_excluding(Arc::clone(&raw),192,128,4_000,3_000,Some(excluded));
+            assert!(!evidence.reliable);
+            assert_eq!(evidence.motion.support,0);
+            assert_eq!(evidence.candidate_matches,0);
+        }
+        // Changing the support policy cannot reuse an incompatible interval.
+        assert!(!tracker.observe(Arc::clone(&raw),192,128,4_000,3_000).reliable);
+        assert!(tracker.observe(raw,192,128,4_000,3_000).reliable);
     }
 
     #[test]

@@ -5,7 +5,12 @@ use std::time::{Duration, Instant};
 pub(crate) const MAX_DURATION: Duration = Duration::from_secs(20);
 pub(crate) const REQUIRED_SOURCES: usize = 4;
 const MIN_SOURCE_SPAN_NS: u64 = 300_000_000;
-const MAX_SOURCE_GAP_NS: u64 = 750_000_000;
+// Independent sign evidence is intermittent even with a continuously visible
+// ellipse (e.g. a pupil boundary behind a reflection). A 750 ms confirmation
+// gap was shorter than one missed ~500 ms live stereo result. This is NOT the
+// observation age limit: the caller still rejects stale (>900 ms) SAM data.
+// Permit one missed confirmation at that measured cadence, with a hard bound.
+const MAX_SOURCE_GAP_NS: u64 = 1_500_000_000;
 
 #[derive(Clone, Copy)]
 pub(crate) struct QualifiedSign {
@@ -97,7 +102,10 @@ impl Acquisition {
             self.clear_votes();
         }
         let Some(sample) = sample else {
-            self.clear_votes();
+            // UI refreshes and provisional single-eye publications can have
+            // no qualified sample between two matching stereo completions.
+            // Absence is not contradictory evidence. Preserve the bounded
+            // window; neither this tick nor a held sample refreshes its age.
             return Update::Waiting;
         };
         if self
@@ -235,12 +243,40 @@ mod tests {
             sample(1_600_000_001, 1, true),
         );
         assert_eq!(
-            a.ready_sources, 0,
-            "a held old sample cannot start another confirmation window"
+            a.ready_sources, 1,
+            "a held old sample cannot add another confirmation vote"
         );
+        a.observe(now + Duration::from_millis(3510), 2, None);
+        assert_eq!(a.ready_sources, 0, "missing ticks cannot renew the evidence window");
         assert_eq!(
             a.observe(now + MAX_DURATION, 99, sample(1, 1, true)),
             Update::TimedOut
         );
+    }
+
+    #[test]
+    fn incomplete_stereo_publications_between_fresh_signed_pairs_do_not_erase_progress() {
+        let now=Instant::now();let mut a=Acquisition::default();a.start(now);
+        for i in 0..4 {
+            let t=now+Duration::from_millis(i*200);
+            assert_eq!(a.observe(t,1,None),Update::Waiting);
+            assert_eq!(a.observe(t+Duration::from_millis(10),1,sample(1+i*200_000_000,7,true)),
+                if i==3 {Update::Ready} else {Update::Waiting});
+        }
+    }
+
+    #[test]
+    fn intermittent_signed_sources_at_live_stereo_cadence_can_confirm_but_held_samples_cannot() {
+        let now=Instant::now();let mut a=Acquisition::default();a.start(now);
+        for (i,ms) in [0,500,1400,2400].into_iter().enumerate() {
+            let t=now+Duration::from_millis(ms);
+            assert_eq!(a.observe(t,1,sample(1+ms*1_000_000,7,true)),
+                if i==3 {Update::Ready} else {Update::Waiting});
+            if i<3 {
+                a.observe(t+Duration::from_millis(50),1,None);
+                a.observe(t+Duration::from_millis(100),1,sample(1+ms*1_000_000,7,true));
+                assert_eq!(a.ready_sources,i+1);
+            }
+        }
     }
 }

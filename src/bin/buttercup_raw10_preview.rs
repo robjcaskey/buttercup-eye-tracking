@@ -244,10 +244,21 @@ fn indexed_preview(arguments:&[String])->Result<(),String> {
     if let Some(path)=arguments.get(4) {
         for line in BufReader::new(File::open(path).map_err(|e|e.to_string())?).lines() {
             let row:Value=serde_json::from_str(&line.map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
-            if row["inputs"].as_array().is_some_and(|inputs|inputs.iter().any(|v|v["index"].as_u64()==Some(index))) {evaluated=Some(row);break;}
+            let source_replay=row["schema"]=="buttercup-joint-source-replay-v1";
+            let inputs=if source_replay {&row["publication_inputs"]} else {&row["inputs"]};
+            let same_read=source_replay && row["input"]["clock_lineage"]==record["clock_lineage"]
+                && row["input"]["frame"]["timestamp_ns"]==meta["timestamp_ns"];
+            if same_read || inputs.as_array().is_some_and(|inputs|inputs.iter().any(|v|v["index"].as_u64()==Some(index))) {
+                evaluated=Some(row);
+                // A paired completion supersedes the first-eye result of
+                // this same immutable source. Do not display the provisional
+                // monocular publication as the final stereo reconstruction.
+                if !source_replay {break;}
+            }
         }
     }
-    let panels=if evaluated.is_some() {4} else {1};
+    let source_replay=evaluated.as_ref().is_some_and(|r|r["schema"]=="buttercup-joint-source-replay-v1");
+    let panels=if source_replay {2} else if evaluated.is_some() {4} else {1};
     let mut comparison=vec![0;width*panels*height*3];
     for y in 0..height {for panel in 0..panels {
         let begin=(y*width*panels+panel*width)*3;
@@ -256,8 +267,11 @@ fn indexed_preview(arguments:&[String])->Result<(),String> {
     if let Some(row)=evaluated {
         let eye=number(meta,"eye_id")? as usize-1;
         let mono=if eye==0 {"monocular_right"} else {"monocular_left"};
-        for (panel,ellipse,color) in [(1,&row["baseline_sam_outer"][eye],[255,80,220]),
-            (2,&row["joint"]["outer_ellipses"][eye],[40,255,100]),(3,&row[mono]["outer_ellipses"][eye],[255,210,30])] {
+        let overlays=if source_replay {vec![(1,&row["joint"]["outer_ellipses"][eye],
+            if row["joint"]["contributing_eyes"][eye]==true {[40,255,100]} else {[130,130,130]})]} else {
+            vec![(1,&row["baseline_sam_outer"][eye],[255,80,220]),
+                (2,&row["joint"]["outer_ellipses"][eye],[40,255,100]),(3,&row[mono]["outer_ellipses"][eye],[255,210,30])]};
+        for (panel,ellipse,color) in overlays {
             let Some(x)=ellipse["center"][0].as_f64() else {continue;};
             let y=ellipse["center"][1].as_f64().ok_or("missing center y")?;
             let a=ellipse["major_radius"].as_f64().ok_or("missing major")?;
@@ -276,7 +290,7 @@ fn indexed_preview(arguments:&[String])->Result<(),String> {
         // Optional evaluator diagnostics: actual training points, never a
         // synthetic completed perimeter. Panel 1 shows all alternatives;
         // panel 2 shows selected/used points in cyan, rejected ones in gray.
-        if let Some(arcs)=row["sparse_evidence"][eye]["arcs"].as_array() {
+        if let Some(arcs)=row["sparse_evidence"][eye]["arcs"].as_array().filter(|_|!source_replay) {
             for (index,arc) in arcs.iter().enumerate() {
                 let used=row["joint"]["support"].as_array().is_some_and(|support|support.iter().any(|s|
                     s["roi"].as_u64()==Some(eye as u64+1)&&s["arc"].as_u64()==Some(index as u64)&&s["used"]==true));
@@ -317,7 +331,9 @@ fn indexed_preview(arguments:&[String])->Result<(),String> {
     let output=Path::new(&arguments[3]);
     if let Some(parent)=output.parent() {fs::create_dir_all(parent).map_err(|e|e.to_string())?;}
     write_png(output,width*panels,height,&comparison)?;
-    eprintln!("native RAW source {index}: left-to-right raw / magenta SAM baseline / green joint / yellow monocular -> {}",output.display());
+    let legend=if source_replay {"raw / final same-source joint (green admitted, gray diagnostic only)"}
+        else {"raw / magenta SAM baseline / green joint / yellow monocular"};
+    eprintln!("native RAW source {index}: left-to-right {legend} -> {}",output.display());
     Ok(())
 }
 

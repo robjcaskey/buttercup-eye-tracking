@@ -63,7 +63,7 @@ pub(crate) enum BoundaryKind {
 /// RAW polarity establishes outward direction; a fitted ellipse must never
 /// manufacture this observation. Its angular sigma is an engineering model,
 /// not a calibrated posterior or an independent second vote for the contour.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct BoundaryNormalObservation {
     pub(crate) unit_outward_roi: [f64;2],
     pub(crate) angular_sigma_radians: f64,
@@ -192,6 +192,18 @@ impl SimilarityMotion {
             point[1] + self.translation[1] + self.rotation_coefficient * x + self.diagonal_coefficient_delta * y,
         ]
     }
+}
+
+/// One native patch correspondence. The enclosing source interval owns its
+/// clocks; these coordinates are full-sensor pixels, not current ROI pixels.
+/// A match is not an anatomical identity or a pure head-motion observation.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativePatchCorrespondence {
+    pub(crate) previous_sensor_px: [f32; 2],
+    pub(crate) current_sensor_px: [f32; 2],
+    pub(crate) photometric_score: f32,
+    pub(crate) distinct_match_margin: f32,
+    pub(crate) global_similarity_inlier: bool,
 }
 
 /// Independent full-ROI evidence that an apparent radius change is supported

@@ -303,12 +303,28 @@ impl Hub {
     }
 
     pub fn dropped_source(&self, clock: Value, reason: &str) {
+        self.dropped_source_event(clock, reason, None, Some(false));
+    }
+
+    /// Skipping analysis does not imply that native evidence was discarded.
+    /// `archived` attests a successful ROI writer call, not completed tar
+    /// finalization. None means resolve membership in the thumbnail index.
+    pub fn skipped_source_analysis(&self, clock: Value, reason: &str, queue_age: Duration,
+        archived: Option<bool>) {
+        self.dropped_source_event(clock, reason, Some(queue_age), archived);
+    }
+
+    fn dropped_source_event(&self, clock: Value, reason: &str, queue_age: Option<Duration>,
+        archived: Option<bool>) {
         self.0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .scene_event(
                 "source_dropped",
-                json!({"clock": clock, "reason": reason, "archived": false}),
+                json!({"clock": clock, "reason": reason, "archived": archived,
+                    "drop_scope": if queue_age.is_some() {"analysis"} else {"source"},
+                    "archive_membership": "resolve-in-frames-or-thumbnail-index; finalization-status-is-separate",
+                    "queue_age_ns": queue_age.map(|age| age.as_nanos().to_string())}),
             );
     }
 
@@ -737,6 +753,41 @@ mod tests {
                 _ => vec![],
             })
             .collect()
+    }
+
+    #[test]
+    fn queue_drop_keeps_its_source_clock_and_separate_measured_queue_age() {
+        let hub=Hub::default();let subscription=hub.subscribe();
+        let clock=json!({"source_key":{"roi_id":2,"sensor_timestamp_ns":"100",
+            "sequence":"7","stream_epoch":"test-clock"}});
+        hub.skipped_source_analysis(clock.clone(),"tracking-paired-source-headroom",
+            Duration::from_nanos(200_000_123), Some(false));
+        let batches=subscription.take(false).batches;
+        let drop=batches.iter().filter_map(|batch|match batch {Batch::Scene(rows)=>Some(rows),_=>None})
+            .flat_map(|rows|rows.iter()).find(|row|row["event"]=="source_dropped").unwrap();
+        assert_eq!(drop["data"]["clock"],clock);
+        assert_eq!(drop["data"]["queue_age_ns"],"200000123");
+        assert_eq!(drop["data"]["archived"],false);
+        assert_eq!(drop["data"]["reason"],"tracking-paired-source-headroom");
+        assert_eq!(drop["data"]["drop_scope"],"analysis");
+    }
+
+    #[test]
+    fn saved_but_unanalyzed_raw_is_distinct_from_discarded_or_unverified_native_payloads() {
+        let hub=Hub::default();let subscription=hub.subscribe();
+        hub.skipped_source_analysis(json!({"source_key":{"roi_id":1}}),"test-saved",
+            Duration::from_millis(220),Some(true));
+        hub.dropped_source(json!({"source_key":{"roi_id":2}}),"test-discarded");
+        hub.skipped_source_analysis(Value::Null,"test-thumbnail",Duration::from_millis(250),None);
+        let values:Vec<_>=subscription.take(false).batches.into_iter().flat_map(|batch|match batch {
+            Batch::Scene(rows)=>rows.as_ref().clone(),_=>vec![],
+        }).filter(|row|row["event"]=="source_dropped").collect();
+        assert_eq!(values.len(),3);
+        assert_eq!(values[0]["data"]["archived"],true);
+        assert_eq!(values[0]["data"]["drop_scope"],"analysis");
+        assert_eq!(values[1]["data"]["archived"],false);
+        assert_eq!(values[1]["data"]["drop_scope"],"source");
+        assert!(values[2]["data"]["archived"].is_null());
     }
 
     #[test]

@@ -50,6 +50,19 @@ that choice. `BUTTERCUP_ENABLE_SAM31=0` skips the optional SAM build;
 the launcher's automatic fallback. Explicit SAM requests still report errors
 if loading or CUDA initialization fails.
 
+`G` also offers the experimental `EYE-STUDENT` mode immediately after SAM.
+It uses a compact CUDA-trained SAM mask student and the same RAW/conic/3D gaze
+pipeline. Start it directly with `--segmentation eye-student`; weights and their
+manifest live under `data/models/eye_student_v1.*`. It is faster but has lower
+pupil coverage on the initial replay, so SAM remains the default. See
+[training, measurements, and limitations](docs/eye-student.md).
+
+SAM's `F` cycle also includes experimental **Tweaked Contact Geometry** after
+the original contact view (`6/8` for an ROI, `4/4` for linked ROIs). A separate
+native-RAW local model makes bounded limbus corrections and distinguishes the
+surface from deeper visible optical continuation. This is presentation-only,
+not a change to gaze/calibration. See [the refiner and corpus results](docs/limbus-refiner.md).
+
 The launcher
 prefers `data/models/sam31_semantic_video_shared_features_u8.pt` when available,
 and falls back to the older `sam31_semantic_video_features_u8.pt` export. The
@@ -186,17 +199,34 @@ cargo run --release --bin buttercup-screen-reflection-raw-decode -- \
 ```
 # Main-screen workspaces
 
-Click the **ROI / Linked ROIs / Global** tabs, or press **Tab**. **F** cycles
+Click the **Preview / Linked Views / Overview** tabs, or press **Tab**. **F** cycles
 views within the current workspace; browsing never starts object acquisition.
 
+The always-visible **G detector** bar names the global analysis mode, including
+**EYE-STUDENT (3/6)**, and can be clicked to cycle it. The detector is shared by
+all enabled ROIs; selecting an ROI changes its presentation, not its detector.
+Each ROI card repeats the selected detector and identifies its displayed frame's
+mode separately while a switch is pending. The **F view** heading below the bar
+names only the visualization, not the analysis method. Focus follows eyes,
+desktop pointer output, the J cursor, calibration and accuracy measurement all
+use the global analysis settings. Old-method/settings frames cannot drive these
+outputs while a change is pending.
+
+**Shift+Tab** switches between editing **global preview defaults** and
+**selected-preview overrides**. **F/V** edit the overlay/pixel appearance in
+that scope. **Backspace** restores the selected preview's inherited defaults.
+Overrides are per setting: a local F choice does not freeze inherited V.
+G and solver settings stay global regardless of this presentation edit scope.
+
 - **ROI:** one large region with global context underneath. **1** selects
-  subject-left, **2** subject-right. Each retains its own **V** pixel view and
-  **F** overlay. Selection does not change the physical autofocus reference.
+  subject-left, **2** subject-right. Each inherits the global **V** pixel view
+  and **F** overlay unless explicitly overridden. Selection does not change the
+  physical autofocus or gaze reference.
 - **Linked ROIs:** compare both retained ROI views, inspect separate source
   timings, or compare contacts. Missing/disabled ROIs are labelled explicitly;
-  paired presentation is not an implemented joint stereo solve. **V** here
-  deliberately changes both ROI pixel views together.
-- **Global:** full sensor snapshot or prompted object search with an object crop.
+  a paired layout alone is not proof of an admitted joint stereo solution.
+  **V** still follows the chosen presentation edit scope.
+- **Overview:** full sensor snapshot or prompted object search with an object crop.
 
 The inspector has **View / Model / Cam / More** tabs (comma **,** cycles them).
 View controls, shared analysis, physical whole-camera controls, and diagnostics
@@ -209,6 +239,8 @@ The **J** cursor and post-calibration cursor use absolute placement: each new
 gaze target is displayed immediately, without cursor or gaze-direction easing.
 Temporal sign validation and scale/geometry admission remain intact; SAM inference
 latency still applies, and unsmoothed gaze can show more measurement jitter.
+The SAM tweaked-contact F view remains an experimental preview, not an implicit
+switch of the global gaze geometry. See [settings and output scope](docs/viewer-workspaces.md#global-gaze-settings-versus-preview-settings).
 
 The local control socket supports `VIEW STATUS`, `VIEW ROI|LINKED|GLOBAL`,
 `VIEW LEFT|RIGHT`, and `VIEW NEXT`. `VIEW PROMPT text` applies a prompt to the
