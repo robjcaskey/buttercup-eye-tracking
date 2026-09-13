@@ -14,6 +14,7 @@ mapfile -t unexpected_files < <(
       ./.cargo/config.toml \
       ./.gitignore \
       ./AGENTS.md \
+      ./bootstrapability.md \
       ./Cargo.lock \
       ./Cargo.toml \
       ./crates/buttercup/Cargo.toml \
@@ -25,20 +26,21 @@ mapfile -t unexpected_files < <(
       ./docs/flat-tire-area-and-motion.md \
       ./docs/sign-acquisition-trials.md \
       ./docs/meridian-sign-continuity.md \
+      ./docs/kinematic-sign-beam.md \
+      ./docs/perspective-sign.md \
       ./docs/roi-reframe-continuity.md \
       ./docs/viewer-workspaces.md \
       ./docs/sam-concurrency-and-gaze-latency.md \
       ./docs/eye-student.md \
+      ./docs/raw-native-student.md \
       ./docs/limbus-refiner.md \
       ./docs/raw-recording-evidence.md \
+      ./docs/presence-cooperation.md \
+      ./docs/eyewear-reflection-labels.md \
+      ./docs/glasses-parallax.md \
+      ./docs/optical-clock-debugging.md \
       ./docs/physics-naming-audit.md \
       ./scripts/audit-tree.sh \
-      ./scripts/prepare-eye-student.py \
-      ./scripts/prepare-limbus-refiner.py \
-      ./scripts/test-limbus-refiner.py \
-      ./scripts/report-limbus-refiner.py \
-      ./scripts/report-eye-student.py \
-      ./scripts/test-eye-student.py \
       ./scripts/run-viewer.sh \
       ./scripts/audit-readmission-corpus.py \
       ./scripts/inventory-stereo-corpus.py \
@@ -55,28 +57,54 @@ mapfile -t unexpected_files < <(
       ./scripts/prompt-lab-troublesome-3.txt \
       ./scripts/prompt-lab-troublesome-20.txt \
       ./src/checkerboard_calibration.rs \
+      ./src/bootstrapability.rs \
+      ./src/bootstrapability/tests.rs \
+      ./src/bin/buttercup_bootstrap_check.rs \
+      ./src/bin/buttercup_prepare_eye_student.rs \
+      ./src/bin/buttercup_prepare_limbus_refiner.rs \
+      ./src/bin/buttercup_report_eye_student.rs \
+      ./src/bin/buttercup_report_limbus_refiner.rs \
+      ./src/training_refiner_data.rs \
+      ./src/student_comparison.rs \
       ./src/calibration_acquisition.rs \
       ./src/geometry.rs \
       ./src/limbus_refiner.rs \
       ./src/limbus_refiner_train.rs \
       ./src/limbus_refiner_view.rs \
+      ./src/limbus_refinement.rs \
+      ./src/refinement_target_report.rs \
       ./src/display_pose_wireframe.rs \
       ./src/monitor_location.rs \
       ./src/mouse_output.rs \
       ./src/mouse_output/linux.rs \
       ./src/desktop_gaze.rs \
+      ./src/presence_protocol.rs \
+      ./src/camera_cooperation.rs \
+      ./src/camera_cooperation/tests.rs \
+      ./src/bin/buttercup_eyewear_review.rs \
+      ./src/bin/buttercup_glasses_parallax.rs \
+      ./src/glasses_parallax.rs \
+      ./src/glasses_parallax_inventory.rs \
+      ./src/recorded_stimulus.rs \
       ./src/gaze_focus.rs \
       ./src/gaze_focus/sway.rs \
       ./src/gaze_focus/tests.rs \
       ./src/gaze_accuracy.rs \
       ./src/conic_solver.rs \
       ./src/conic_solver/joint.rs \
+      ./src/conic_solver/joint/mask_levels.rs \
       ./src/conic_solver/joint/tests.rs \
+      ./src/conic_solver/joint/uncertainty.rs \
+      ./src/conic_solver/joint/posterior.rs \
+      ./src/conic_solver/joint/posterior/annealed.rs \
+      ./src/conic_solver/joint/posterior/populations.rs \
       ./src/conic_solver/fidelity.rs \
       ./src/conic_solver/constraint_tests.rs \
       ./src/outline_conic_segments.rs \
       ./src/outline_conic_segments/recent_exclusion.rs \
       ./src/outline_conic_segments/sparse_evidence.rs \
+      ./src/outline_conic_segments/sparse_evidence/uncertainty.rs \
+      ./src/outline_conic_segments/sparse_evidence/outer_candidates.rs \
       ./src/outline_conic_segments/partial_outline.rs \
       ./src/bin/buttercup_stereo_conic_eval/source_order.rs \
       ./src/roi_evidence.rs \
@@ -91,6 +119,8 @@ mapfile -t unexpected_files < <(
       ./src/eye_scene_model/pupil_size.rs \
       ./src/eye_scene_model/sign_motion.rs \
       ./src/eye_scene_model/sign_continuity.rs \
+      ./src/eye_scene_model/sign_kinematic_beam.rs \
+      ./src/eye_scene_model/perspective_sign.rs \
       ./src/gaze_target_solver.rs \
       ./src/joint_gaze_live.rs \
       ./src/gaze_target_solver/joint_tracking.rs \
@@ -99,6 +129,8 @@ mapfile -t unexpected_files < <(
       ./src/bin/buttercup_screen_reflection_raw_decode.rs \
       ./src/bin/buttercup_sam31_arc_trial.rs \
       ./src/bin/buttercup_flat_tire_eval.rs \
+      ./src/bin/buttercup_kinematic_sign_replay.rs \
+      ./src/bin/buttercup_perspective_sign_replay.rs \
       ./src/bin/buttercup_stereo_conic_eval.rs \
       ./src/bin/buttercup_sam31_prompt_bundle.rs \
       ./src/bin/buttercup_sam31_video_graph.rs \
@@ -109,7 +141,9 @@ mapfile -t unexpected_files < <(
       ./src/coupled_eye_kinematics.rs \
       ./src/keyboard_peeper.rs \
       ./src/main.rs \
+      ./src/lib.rs \
       ./src/viewer_ui.rs \
+      ./src/viewer_ui/stereo.rs \
       ./src/native_mediapipe.rs \
       ./src/offline_segmentation_replay.rs \
       ./src/offline_segmentation_replay/showcase.rs \
@@ -130,7 +164,9 @@ mapfile -t unexpected_files < <(
       ./src/raw_sclera_vein_graph.rs \
       ./src/raw_sclera_red_canny.rs \
       ./src/sam31_outer.rs \
+      ./src/sam31_boundary_logits.rs \
       ./src/sam31_student.rs \
+      ./src/sam31_student_raw.rs \
       ./src/sam31_pipeline.rs \
       ./src/source_queue_budget.rs \
       ./src/student_preview.rs \
@@ -142,6 +178,8 @@ mapfile -t unexpected_files < <(
       ./src/screen_reflection_live.rs \
       ./src/screen_reflection_raw.rs \
       ./src/screen_reflection_stimulus.rs \
+      ./src/screen_reflection_temporal.rs \
+      ./src/screen_reflection_border.rs \
       ./src/specular_map.rs \
       ./src/visible_lighthouse_control.rs | sort)
 )

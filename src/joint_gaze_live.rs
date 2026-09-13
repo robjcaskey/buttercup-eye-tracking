@@ -29,6 +29,7 @@ impl Bridge {
     pub(crate) fn set_enabled(&mut self, enabled:bool, authority_generations:&mut [u64;2]) {
         if self.enabled==enabled {return;}
         self.enabled=enabled;self.signature=None;self.submitted=[None,None];self.last_status=[None,None];self.tracker=JointTracker::default();
+        self.tracker.set_probabilistic(true);
         // A monocular-surface calibration is not silently reused for a
         // different observation model, even though both are SAM providers.
         for generation in authority_generations {*generation=generation.wrapping_add(1);}
@@ -182,7 +183,9 @@ pub(crate) fn surface(frame:&EyeFrame, gaze_axis:bool)->Option<SurfaceGazeSample
     // call a numerical basin margin independent sign evidence for that case.
     let noncoplanar=solution.arcs.iter().any(|a|a.used&&a.kind==BoundaryKind::PupillaryBoundary);
     let sign_resolved=(solution.contributing_eyes==[true,true]||noncoplanar)
-        && solution.alternative_cost_margin.is_some_and(|margin|margin>2.0);
+        && solution.posterior.as_ref().map_or_else(
+            ||solution.alternative_cost_margin.is_some_and(|margin|margin>2.0),
+            |posterior|posterior.supports_direction(eye));
     Some(SurfaceGazeSample {source_timestamp_ns:Some(publication.exposures[eye]?.timestamp_ns),
         frontal_equivalent_disk_area_px2:area,area_bucket,quantized_frontal_disk_radius_px:radius,
         near_surface_point_sensor_px:(frame.sensor_x as f64+ellipse.center.0+relative_gaze.right*radius,
@@ -199,6 +202,35 @@ pub(crate) fn surface(frame:&EyeFrame, gaze_axis:bool)->Option<SurfaceGazeSample
             temporal_margin_px:None,pending_anchor_votes:0,near_frontal_continuation:false})})
 }
 
+/// Preserve fitted source conics directly. The contact's disk area and normal
+/// are insufficient to recover image axes under off-axis perspective. These
+/// are conditional solution outputs, not new independent boundary observations.
+fn source_projected_conics_json(publication:&PublishedJoint)->Value {
+    let ellipse_json=|ellipse:Option<crate::geometry::Ellipse>| {
+        ellipse.filter(|e|e.center.0.is_finite() && e.center.1.is_finite()
+            && e.major_radius.is_finite() && e.minor_radius.is_finite()
+            && e.angle.is_finite() && e.minor_radius>0.0 && e.major_radius>=e.minor_radius)
+            .map(|e|json!({"center":[e.center.0,e.center.1],"major_radius":e.major_radius,
+                "minor_radius":e.minor_radius,"angle_rad":e.angle})).unwrap_or(Value::Null)
+    };
+    let eyes:[Value;2]=std::array::from_fn(|eye| {
+        let Some((source,(origin,dimensions)))=publication.exposures[eye]
+            .zip(publication.sensor_origins_px[eye].zip(publication.dimensions_px[eye])) else {
+            return Value::Null;
+        };
+        json!({"source":{"roi_id":source.roi.0,"clock_domain":source.clock.domain.to_string(),
+                "clock_epoch":source.clock.epoch.to_string(),"sequence":source.sequence.to_string(),
+                "sensor_timestamp_ns":source.timestamp_ns.to_string()},
+            "sensor_origin_px":origin,"dimensions_px":dimensions,
+            "modeled_eye":publication.solution.modeled_eyes[eye],
+            "contributing_eye":publication.solution.contributing_eyes[eye],
+            "ellipses":publication.solution.ellipses_roi_px[eye].map(ellipse_json)})
+    });
+    json!({"coordinate_frame":"source-roi-pixels",
+        "boundary_order":["OuterLimbus","InnerLimbus","PupillaryBoundary"],"eyes":eyes,
+        "provenance":"conditional joint-conic fit; not independent observed boundary evidence"})
+}
+
 pub(crate) fn json(frame:&EyeFrame)->Value {
     let Some(publication)=frame.joint_conic.as_deref() else {
         return json!({"active":frame.joint_gaze_active,"status":frame.joint_conic_status,"target":null});
@@ -210,6 +242,8 @@ pub(crate) fn json(frame:&EyeFrame)->Value {
         "frame":"camera-optical-center-mm-v1","units":"mm","axes":["sensor-right","sensor-down","toward-camera"],
         "method":"one shared fixation fitted to raw boundary segments; not averaged gaze points",
         "target":s.target_camera_mm,"target_covariance":null,
+        "local_uncertainty":s.local_uncertainty.as_ref().map(|u|u.json()),
+        "posterior":s.posterior.as_ref().map(|p|p.json()),
         "target_search_chart":{"frame":"reference-to-camera-tangent-plane","slopes":s.target_viewpoint_slopes,
             "reference_camera_mm":s.target_reference_camera_mm,
             "axial_distance_mm":s.target_viewpoint_axial_distance_mm,"distance_axis":"reference-to-camera",
@@ -220,6 +254,10 @@ pub(crate) fn json(frame:&EyeFrame)->Value {
         "sources":publication.exposures.map(|e|e.map(|e|json!({"roi_id":e.roi.0,"clock_domain":e.clock.domain.to_string(),
             "clock_epoch":e.clock.epoch.to_string(),"sequence":e.sequence.to_string(),"sensor_timestamp_ns":e.timestamp_ns.to_string()}))),
         "eye_centers":s.eye_centers_camera_mm,"surface_normals":s.eye_normals,"gaze_directions":s.eye_gaze_directions,
+        "source_projected_conics":source_projected_conics_json(publication),
+        "effective_pivots_camera_mm":s.effective_pivots_camera_mm,
+        "surface_axis_alignment_radians":s.surface_axis_alignment_radians,
+        "effective_pivot_provenance":"conditional fitted nuisance geometry; not an independent head/pivot measurement",
         "contributing_eyes":s.contributing_eyes,"cost":s.robust_cost,"alternative_cost_margin":s.alternative_cost_margin,
         "modeled_eyes":s.modeled_eyes,"unlocalized_eye_cost":s.unlocalized_eye_cost,
         "hypotheses":s.hypotheses_evaluated,"hypotheses_by_association":s.hypotheses_by_association,
@@ -249,8 +287,8 @@ mod tests {
         for (kind,radius,depth,group) in [(BoundaryKind::OuterLimbus,6.0,0.0,0),(BoundaryKind::PupillaryBoundary,2.4,0.6,10)] {
             let center=std::array::from_fn(|i|center[i]-depth*normal[i]);
             let ellipse=ProjectedCircle::project(camera,center,normal,radius,origin).unwrap().ellipse().unwrap();
-            packet.arcs.push(OwnedBoundaryArc {evidence_group:group,kind,points_roi_px:ellipse.dense_points(32),
-                outward_normals_roi:None,normal_band_half_width_px:0.0,detector_score:None});
+            packet.arcs.push(OwnedBoundaryArc { level_sets_roi: None,evidence_group:group,kind,points_roi_px:ellipse.dense_points(32),
+                outward_normals_roi:None,localization_sigma_px:None,normal_band_half_width_px:0.0,detector_score:None});
             packet.conics.push(OwnedConicHint {kind,ellipse_roi_px:ellipse,supporting_arc_indices:vec![packet.arcs.len()-1]});
         }
         FrameEvidence {packet,pose:EyePoseInput {limbus_center_sensor_px:camera.project(center).unwrap(),
@@ -295,6 +333,53 @@ mod tests {
         bridge.observe_proposal(&proposal(0,time),"test:1",generations,None,&hub);
         bridge.observe_proposal(&proposal(0,time+1),"test:1",generations,None,&hub);
         assert!(Arc::ptr_eq(&publication,&bridge.tracker.latest(0,clock("test:1"),time,1).unwrap()));
+    }
+
+    #[test]
+    fn projected_conic_metadata_stays_with_its_actual_source_after_display_reframe() {
+        let time=1_000_000_000;
+        let camera=PinholeCamera {focal_px:[4000.0;2],principal_px:[4000.0,3000.0]};
+        let mut tracker=JointTracker::default();tracker.begin(clock("test:1"),15);
+        tracker.observe(evidence(0,time),camera).unwrap();
+        let publication=tracker.observe(evidence(1,time),camera).unwrap().unwrap();
+        let expected=publication.solution.ellipses_roi_px[0][0].unwrap();
+        let mut frame=crate::tests::control_eye_frame(1);
+        frame.timestamp_ns=time;frame.width=420;frame.height=280;
+        frame.sensor_x=3424;frame.sensor_y=2860;frame.joint_gaze_active=true;
+        frame.joint_conic=Some(publication);
+        let before=json(&frame)["source_projected_conics"].clone();
+        assert_eq!(before["coordinate_frame"],"source-roi-pixels");
+        assert_eq!(before["eyes"][0]["source"]["sequence"],"100");
+        assert_eq!(before["eyes"][1]["source"]["sequence"],"900");
+        assert_eq!(before["eyes"][0]["sensor_origin_px"],json!([3424,2860]));
+        assert_eq!(before["eyes"][0]["ellipses"][0]["center"],json!([expected.center.0,expected.center.1]));
+        assert_eq!(before["eyes"][0]["ellipses"][0]["minor_radius"],expected.minor_radius);
+        assert_eq!(before["eyes"][0]["ellipses"][0]["angle_rad"],expected.angle);
+        frame.sensor_x+=64;frame.sensor_y-=32;frame.timestamp_ns+=100_000_000;
+        assert_eq!(json(&frame)["source_projected_conics"],before,
+            "moving/redrawing the display ROI cannot rebase or freshen fitted source conics");
+        Arc::make_mut(frame.joint_conic.as_mut().unwrap()).exposures[1]=None;
+        assert!(json(&frame)["source_projected_conics"]["eyes"][1].is_null(),
+            "a missing source cannot export the other eye's model as a sourced observation");
+        Arc::make_mut(frame.joint_conic.as_mut().unwrap()).sensor_origins_px[0]=None;
+        assert!(json(&frame)["source_projected_conics"]["eyes"][0].is_null());
+    }
+
+    #[test]
+    fn projected_conic_metadata_leaves_missing_or_invalid_boundaries_unknown() {
+        let time=1_000_000_000;
+        let camera=PinholeCamera {focal_px:[4000.0;2],principal_px:[4000.0,3000.0]};
+        let mut tracker=JointTracker::default();tracker.begin(clock("test:1"),15);
+        let mut publication=tracker.observe(evidence(0,time),camera).unwrap().unwrap();
+        let solution=&mut Arc::make_mut(&mut publication).solution;
+        solution.ellipses_roi_px[0][1]=None;
+        solution.ellipses_roi_px[0][2]=Some(crate::geometry::Ellipse {
+            center:(f64::NAN,0.0),major_radius:10.0,minor_radius:5.0,angle:0.0});
+        let report=source_projected_conics_json(&publication);
+        assert!(report["eyes"][0]["ellipses"][0].is_object());
+        assert!(report["eyes"][0]["ellipses"][1].is_null());
+        assert!(report["eyes"][0]["ellipses"][2].is_null());
+        assert!(report["eyes"][1].is_null());
     }
 
     #[test]
@@ -394,6 +479,11 @@ mod tests {
 
             let start=Instant::now();let mut mode=crate::VirtualMouseMode::new(start);
             mode.target_source_started_ns=Some(time-600_000_000);
+            let hidden=start+crate::VIRTUAL_MOUSE_TARGET_SETTLE;
+            mode.calibration_presented(hidden,hidden);
+            // Both completion revisions retain the same original RAW receipt;
+            // inference completion never renews the calibration eligibility.
+            mode.sample_source_arrived_at=Some(start+Duration::from_millis(600));
             mode.frame_state=WaitingForSourcePartner;
             mode.observe_at_frame(start+Duration::from_millis(600),Some(time),None);
             assert!(mode.samples.iter().all(Vec::is_empty));
@@ -465,10 +555,18 @@ mod tests {
         let output=std::env::var("BUTTERCUP_JOINT_CALIBRATION_REPORT").unwrap();
         let require_ready=std::env::var("BUTTERCUP_JOINT_CALIBRATION_REQUIRE_READY").as_deref()==Ok("1");
         let ignore_source_group=std::env::var("BUTTERCUP_JOINT_CALIBRATION_IGNORE_SOURCE_GROUP").as_deref()==Ok("1");
+        let integration_recipe=std::env::var("BUTTERCUP_JOINT_CALIBRATION_INTEGRATION")
+            .unwrap_or_else(|_|"live".into());
         let calibration_eye=std::env::var("BUTTERCUP_JOINT_CALIBRATION_EYE").map(|v|v.parse::<usize>().unwrap()).unwrap_or(0);
         assert!(calibration_eye<2,"calibration eye must be zero-based 0 or 1");
         let mut writer=std::fs::OpenOptions::new().create_new(true).write(true).open(output).unwrap();
         let mut bridge=Bridge::default();let mut generations=[0;2];bridge.set_enabled(true,&mut generations);
+        match integration_recipe.as_str() {
+            "live"=>{},
+            "baseline"=>bridge.tracker.set_posterior_diagnostic(
+                crate::conic_solver::joint::posterior::IntegrationConfig::default()),
+            _=>panic!("select live or baseline integration for the matched calibration diagnostic"),
+        }
         let hub=crate::recording_trace::Hub::default();
         let mut frames:[Option<EyeFrame>;2]=[None,None];
         let start=Instant::now();let mut first_time=None;let mut acquired_at=None;
@@ -557,6 +655,7 @@ mod tests {
             calibration.observe_at_frame(now,current_time,qualified.zip(surface).map(|(q,s)|
                 (q.source_ns,s.relative_gaze.projected(),q.epoch)));
             let report=json!({"input_index":row["index"],"source_ns":time.to_string(),"elapsed_ms":elapsed_ns/1_000_000,
+                "integration_recipe":integration_recipe,
                 "calibration_eye":calibration_eye,"selected_query":candidate.map(|c|&c["query"]),
                 "source_group_roi_count":source_group_roi_count,"source_group_metadata":source_group_metadata,
                 "source_group_ignored_for_control":ignore_source_group,
@@ -617,6 +716,10 @@ mod tests {
             frame.width=420;frame.height=280;frame.segmentation_mode=SegmentationMode::Sam31;
             let origin=result.sensor_origins_px[eye].unwrap();frame.sensor_x=origin[0];frame.sensor_y=origin[1];
             frame.joint_gaze_active=true;frame.joint_conic=Some(Arc::clone(&result));
+            // Cursor authority requires the exact provider/prompt source,
+            // independently of whether geometry exists in the publication.
+            frame.sam31_proposal_masks=Some(Arc::new(proposal(eye,time)));
+            frame.gaze_authority_sam_prompt_generation=Some(0);
             let contact=surface(&frame,false).unwrap();
             assert!((40.0..100.0).contains(&contact.quantized_frontal_disk_radius_px),"area must be converted back to radius");
             assert_eq!(contact.source_timestamp_ns,Some(time));
@@ -626,7 +729,16 @@ mod tests {
             assert!((gaze.right-exact[0]).abs()<1e-10&&(gaze.down-exact[1]).abs()<1e-10);
             frame.virtual_contact_surface_gaze=Some(contact);
             let pose=crate::virtual_contact_pose(&frame).expect("joint contact should render");
+            assert_eq!(crate::pose_for_cursor(&frame,pose).is_some(),contact.sign_resolved,
+                "an ambiguous optimizer result must retain the sign gate");
+            // This is a routing fixture, not proof of statistical sign
+            // acquisition. Exercise an explicitly admitted synthetic branch.
+            Arc::make_mut(frame.joint_conic.as_mut().unwrap()).solution.alternative_cost_margin=Some(3.0);
             assert_eq!(crate::pose_for_cursor(&frame,pose).unwrap().relative_gaze,gaze);
+            let mut no_source=frame.clone();no_source.sam31_proposal_masks=None;
+            assert!(crate::pose_for_cursor(&no_source,pose).is_none(),"missing source cannot gain cursor authority");
+            Arc::make_mut(frame.joint_conic.as_mut().unwrap()).solution.alternative_cost_margin=None;
+            assert!(crate::pose_for_cursor(&frame,pose).is_none(),"unknown branch margin cannot gain cursor authority");
             let before=ellipse(&frame).unwrap();frame.sensor_y+=24;
             assert!((ellipse(&frame).unwrap().center.1-before.center.1+24.0).abs()<1e-10);
             frame.joint_conic=None;
@@ -636,6 +748,88 @@ mod tests {
         assert!(tracker.latest(0,clock("test:1"),time-1,900_000_000).is_none());
         tracker.begin(clock("test:1"),8);
         assert!(tracker.latest(0,clock("test:1"),time,900_000_000).is_none());
+    }
+
+    #[test]
+    #[ignore = "larger numerical references for the native synthetic publication fixture"]
+    fn synthetic_publication_posterior_reference() {
+        use crate::conic_solver::joint::posterior::IntegrationConfig;
+        let camera=PinholeCamera {focal_px:[4000.0;2],principal_px:[4000.0,3000.0]};
+        let time=1_000_000_000;
+        let budget=std::env::var("BUTTERCUP_PUBLICATION_REFERENCE_BUDGET")
+            .map(|s|s.parse::<usize>().expect("integer draw ceiling")).unwrap_or(65536);
+        assert!((8192..=1048576).contains(&budget));
+        let mut selected=None;
+        for seed in [0xd1b5_4a32_d192_ed03,0x94c5_09a1_814f_753d,0x419b_79df_a2c7_5301] {
+            for (recipe,mut config) in [("baseline",IntegrationConfig::default()),("live",IntegrationConfig::live())] {
+                config.seed=seed;config.budget=budget;config.early_stop=false;
+                let mut tracker=JointTracker::default();tracker.set_probabilistic(true);tracker.begin(clock("test:1"),7);
+                tracker.set_posterior_diagnostic(IntegrationConfig {budget:0,..config});
+                tracker.observe(evidence(0,time),camera).unwrap();
+                tracker.set_posterior_diagnostic(config);
+                let start=std::time::Instant::now();
+                let result=tracker.observe(evidence(1,time),camera).unwrap().unwrap();
+                if let Some(target)=selected {assert_eq!(result.solution.target_camera_mm,target);}
+                selected=Some(result.solution.target_camera_mm);
+                assert_eq!(result.solution.contributing_eyes,[true,true]);
+                eprintln!("publication-reference {}",serde_json::json!({
+                    "recipe":recipe,"seed":seed.to_string(),"budget":budget,
+                    "elapsed_ms":start.elapsed().as_secs_f64()*1000.0,
+                    "target_camera_mm":result.solution.target_camera_mm,
+                    "posterior":result.solution.posterior.as_ref().unwrap().json(),
+                    "contract":"Exact synthetic projected circles through native coarse scene priors; numerical reference, not empirical gaze accuracy."}));
+            }
+        }
+    }
+
+    #[test]
+    fn publication_routes_only_numerically_supported_current_gaze() {
+        use crate::conic_solver::joint::posterior::DirectionNumerics;
+        let camera=PinholeCamera {focal_px:[4000.0;2],principal_px:[4000.0,3000.0]};
+        let time=1_000_000_000;
+        let mut tracker=JointTracker::default();tracker.set_probabilistic(true);tracker.begin(clock("test:1"),7);
+        tracker.observe(evidence(0,time),camera).unwrap();
+        let result=tracker.observe(evidence(1,time),camera).unwrap().unwrap();
+        for eye in 0..2 {
+            let mut frame=crate::tests::control_eye_frame(1);
+            frame.eye_id=eye as u32+1;frame.timestamp_ns=time+50_000_000;
+            frame.width=420;frame.height=280;frame.segmentation_mode=SegmentationMode::Sam31;
+            let origin=result.sensor_origins_px[eye].unwrap();frame.sensor_x=origin[0];frame.sensor_y=origin[1];
+            frame.joint_gaze_active=true;frame.joint_conic=Some(Arc::clone(&result));
+            frame.sam31_proposal_masks=Some(Arc::new(proposal(eye,time)));
+            frame.gaze_authority_sam_prompt_generation=Some(0);
+            let uncertainty=result.solution.posterior.as_ref().unwrap();
+            eprintln!("live posterior eye {eye}: {} {:?}",uncertainty.status,uncertainty.gaze_radius_90_degrees);
+            // One-million-draw controls under these unchanged coarse anatomy
+            // priors put only 85--90% near the selected ray. Perfect projected
+            // circles do not make this particular native fixture identifiable.
+            assert!(!uncertainty.supports_direction(eye));
+            assert!(crate::gaze_output_direction(&frame).is_none());
+            // Explicit posterior doubles test publication routing separately
+            // from numerical integration. Production-entry conic tests cover
+            // actual estimated positive cases; these values are not estimates
+            // or a way to narrow the coarse fixture's posterior.
+            for (mass,error,radius,status,batches,expected) in [
+                (0.97,0.01,3.0,"estimated-conditional",1,true),
+                (0.91,0.01,3.0,"estimated-conditional",1,false),
+                (0.97,0.01,35.0,"estimated-conditional",1,false),
+                (0.97,0.01,3.0,"insufficient-sampling",1,false),
+                (0.97,0.01,3.0,"estimated-conditional",4,false),
+            ] {
+                let mut controlled=frame.clone();
+                let solution=&mut Arc::make_mut(controlled.joint_conic.as_mut().unwrap()).solution;
+                solution.alternative_cost_margin=Some(1000.0);
+                let posterior=solution.posterior.as_mut().unwrap();
+                posterior.status=status;
+                posterior.require_numerical_margin=true;
+                posterior.replicas=batches;
+                posterior.replicate_direction_numerics=[None,None];
+                posterior.direction_numerics[eye]=Some(DirectionNumerics {mass,standard_error:error});
+                posterior.gaze_radius_90_degrees[eye]=Some(radius);
+                assert_eq!(crate::gaze_output_direction(&controlled).is_some(),expected,
+                    "a large MAP gap cannot overrule angular spread, precision, missing batches or failed integration");
+            }
+        }
     }
 
     #[test]

@@ -337,8 +337,62 @@ fn indexed_preview(arguments:&[String])->Result<(),String> {
     Ok(())
 }
 
+/// Native diagnostic only: never supplies rendered images back to a model.
+/// Columns are source / baseline / candidate / reference, not confidence ranks.
+fn student_comparison(arguments:&[String])->Result<(),String> {
+    use sha2::{Digest,Sha256};
+    if arguments.len()!=7 {return Err("usage: --students INDEX.jsonl INDEX OUTPUT.png BASE.jsonl CAND.jsonl REFERENCE.jsonl".into());}
+    let index=arguments[2].parse::<u64>().map_err(|e|e.to_string())?;
+    let read_rows=|path:&str|->Result<Vec<Value>,String> {
+        BufReader::new(File::open(path).map_err(|e|e.to_string())?).lines()
+            .map(|l|serde_json::from_str(&l.map_err(|e|e.to_string())?).map_err(|e|e.to_string())).collect()
+    };
+    let rows=read_rows(&arguments[1])?;
+    let record=rows.iter().find(|r|r["index"].as_u64()==Some(index)).ok_or("missing source index")?;
+    let f=&record["frame"];
+    if f["pixel_format"]!="RAW10_LE40_1X1" {return Err("native Quad Bayer source required".into());}
+    let (w,h)=(number(f,"width")? as usize,number(f,"height")? as usize);
+    let length=number(record,"raw_length")?;
+    if length>64*1024*1024 || w<8 || h<8 || w.checked_mul(h).is_none_or(|n|n>16_000_000) {return Err("invalid native source extent".into());}
+    let mut raw_file=File::open(record["raw_file"].as_str().ok_or("missing RAW file")?).map_err(|e|e.to_string())?;
+    raw_file.seek(SeekFrom::Start(number(record,"raw_offset")?)).map_err(|e|e.to_string())?;
+    let mut bytes=vec![0;length as usize];raw_file.read_exact(&mut bytes).map_err(|e|e.to_string())?;
+    if record["raw_sha256"]!=format!("{:x}",Sha256::digest(&bytes)) {return Err("RAW hash mismatch".into());}
+    let raw=raw10::try_unpack_raw10(&bytes,w,h,number(f,"stride")? as usize)?;
+    let rgb=decode_quad_bayer(&raw,w,h,number(f,"sensor_x")? as u32,number(f,"sensor_y")? as u32,PreviewMode::Color,1.0);
+    let mut image=vec![0;w*h*12];
+    for y in 0..h {for panel in 0..4 {image[(y*4*w+panel*w)*3..(y*4*w+(panel+1)*w)*3].copy_from_slice(&rgb[y*w*3..(y+1)*w*3]);}}
+    for (i,path) in arguments[4..].iter().enumerate() {
+        let rows=read_rows(path)?;
+        let matches:Vec<_>=rows.iter().filter(|r|r["input"]["raw_sha256"]==record["raw_sha256"]
+            && r["input"]["clock_lineage"]==record["clock_lineage"] && r["input"]["frame"]==*f).collect();
+        if matches.len()!=1 || matches[0]["source_identity_verified"]!=true {return Err("missing, duplicate or unverified comparison exposure".into());}
+        let row=matches[0];let panel=i+1;
+        let admitted=row["accepted"]==true;
+        let color=if admitted {[[255,100,220],[60,255,110],[255,210,50]][i]}else{[130,130,130]};
+        // A top stripe identifies panel/color even when there is no proposal.
+        for y in 0..3 {for x in 0..w {let at=(y*w*4+panel*w+x)*3;image[at..at+3].copy_from_slice(&color);}}
+        for (ellipse,color) in [(&row["outer_ellipse"],color),(&row["pupil_void"]["ellipse"],if admitted {[50,210,255]}else{[130,130,130]})] {
+            if ellipse.is_null() {continue;}
+            let n=|k:&str|ellipse[k].as_f64().filter(|v|v.is_finite()).ok_or("invalid ellipse");
+            let x=ellipse["center"][0].as_f64().ok_or("missing center")?;
+            let y=ellipse["center"][1].as_f64().ok_or("missing center")?;
+            let (a,b)=(n("major_radius")?,n("minor_radius")?);let (s,c)=n("angle")?.sin_cos();
+            for j in 0..2048 {let t=j as f64*std::f64::consts::TAU/2048.;
+                let px=(x+a*t.cos()*c-b*t.sin()*s).round() as isize;
+                let py=(y+a*t.cos()*s+b*t.sin()*c).round() as isize;
+                if px>=0&&py>=0&&px<w as isize&&py<h as isize {let at=(py as usize*w*4+panel*w+px as usize)*3;image[at..at+3].copy_from_slice(&color);}
+            }
+        }
+    }
+    write_png(Path::new(&arguments[3]),w*4,h,&image)?;
+    eprintln!("left to right: native RAW presentation / baseline magenta / candidate green / reference yellow; pupil cyan; rejected gray");
+    Ok(())
+}
+
 fn main() -> Result<(), String> {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
+    if arguments.first().map(String::as_str)==Some("--students") {return student_comparison(&arguments);}
     if arguments.first().map(String::as_str)==Some("--source-index") {return indexed_preview(&arguments);}
     if arguments.len() < 4 || arguments.len() > 6 {
         return Err(usage());

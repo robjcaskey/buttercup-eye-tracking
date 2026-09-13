@@ -4,9 +4,8 @@
 //! camera nor relies on compositor or packet timestamps for frame identity.
 
 use crate::screen_reflection_code::{
-    FrameCode, OpticalCodeScheme, CHECKED_COUNTER_BITS, CHECKED_COUNTER_MODULUS,
-    DISPLAY_GRID_COLUMNS, DISPLAY_GRID_ROWS, GRID_COLUMNS, GRID_ROWS, LOGICAL_BIT_COUNT,
-    PAIR_NEGATIVE_CELLS, PAIR_POSITIVE_CELLS,
+    FrameCode, OpticalCodeScheme, SpatialCodeLayout, CHECKED_COUNTER_BITS, CHECKED_COUNTER_MODULUS,
+    GRID_COLUMNS, GRID_ROWS, LOGICAL_BIT_COUNT, PAIR_NEGATIVE_CELLS, PAIR_POSITIVE_CELLS,
 };
 use serde_json::{json, Value};
 use softbuffer::{Context, Surface};
@@ -50,11 +49,13 @@ const STIMULUS_CODE_SCHEME: OpticalCodeScheme = OpticalCodeScheme::ReedMullerV3;
 
 // Approximately isoluminant opponent colors. Blue carries most code energy so
 // the clock remains comparatively unobtrusive around the fixation target.
-const BASE_RGB: [f64; 3] = [0.39, 0.405, 0.42];
-const OPPONENT_AXIS_RGB: [f64; 3] = [0.55, -0.30, 1.00];
+use crate::screen_reflection_temporal::{BASE_RGB, OPPONENT_AXIS_RGB};
 
 #[derive(Clone, Debug)]
 struct Config {
+    code_layout: SpatialCodeLayout,
+    temporal_code: bool,
+    fixed_target: bool,
     output: PathBuf,
     render_hz: f64,
     code_hz: f64,
@@ -180,6 +181,8 @@ struct StimulusApp {
 
 #[derive(Clone, Debug)]
 pub struct ClockSessionSnapshot {
+    pub code_layout: SpatialCodeLayout,
+    pub temporal_code: bool,
     pub session_id: String,
     pub session_tag: u8,
     pub code_hz: f64,
@@ -327,13 +330,8 @@ fn send_control(request: &str) -> Result<String, String> {
     stream
         .write_all(format!("{request}\n").as_bytes())
         .map_err(|error| format!("send screen-clock {request}: {error}"))?;
-    let mut response = [0u8; 1_024];
-    let count = stream
-        .read(&mut response)
+    let response = read_control_response(&mut stream)
         .map_err(|error| format!("read screen-clock {request}: {error}"))?;
-    let response = String::from_utf8_lossy(&response[..count])
-        .trim()
-        .to_string();
     if response.is_empty() || response.starts_with("error") {
         Err(format!("screen-clock {request} returned {response:?}"))
     } else {
@@ -341,7 +339,33 @@ fn send_control(request: &str) -> Result<String, String> {
     }
 }
 
+fn read_control_response(reader: &mut impl Read) -> Result<String, String> {
+    // Unix streams are byte streams, not messages. serde_json::to_writer can
+    // issue many small writes, so one successful read is not a whole snapshot.
+    const MAX_RESPONSE_BYTES: usize = 4096;
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        let n = reader.read(&mut chunk).map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("closed before response newline".into());
+        }
+        let end = chunk[..n].iter().position(|b| *b == b'\n');
+        let take = end.unwrap_or(n);
+        if response.len() + take > MAX_RESPONSE_BYTES {
+            return Err("response exceeds 4096 bytes".into());
+        }
+        response.extend_from_slice(&chunk[..take]);
+        if end.is_some() {
+            return String::from_utf8(response)
+                .map(|s| s.trim().to_owned())
+                .map_err(|e| e.to_string());
+        }
+    }
+}
+
 pub fn session_snapshot() -> Result<ClockSessionSnapshot, String> {
+    if let Some(snapshot) = crate::screen_reflection_border::snapshot() { return Ok(snapshot); }
     let response = send_control("snapshot")?;
     let value: Value = serde_json::from_str(&response)
         .map_err(|error| format!("parse screen-clock snapshot: {error}"))?;
@@ -358,6 +382,14 @@ pub fn session_snapshot() -> Result<ClockSessionSnapshot, String> {
             .ok_or_else(|| format!("screen-clock snapshot lacks {name}"))
     };
     Ok(ClockSessionSnapshot {
+        temporal_code: value["temporal_code"].as_bool().unwrap_or(false),
+        code_layout: value
+            .get("spatial_repeats")
+            .and_then(Value::as_array)
+            .and_then(|a| {
+                SpatialCodeLayout::new(a.first()?.as_u64()? as usize, a.get(1)?.as_u64()? as usize)
+            })
+            .unwrap_or(SpatialCodeLayout::CURRENT),
         session_id: value
             .get("session_id")
             .and_then(Value::as_str)
@@ -379,6 +411,7 @@ pub fn session_snapshot() -> Result<ClockSessionSnapshot, String> {
 }
 
 pub fn report_recovery_progress(progress: RecoveryProgress<'_>) -> Result<(), String> {
+    if let Some(result) = crate::screen_reflection_border::progress(&progress) { return result; }
     let response = send_control(&format!(
         "progress {} {} {} {}",
         progress.session_id,
@@ -392,6 +425,7 @@ pub fn report_recovery_progress(progress: RecoveryProgress<'_>) -> Result<(), St
 }
 
 pub fn report_recovered_frame(report: RecoveryReport<'_>) -> Result<(), String> {
+    if let Some(result) = crate::screen_reflection_border::report(&report) { return result; }
     let response = send_control(&format!(
         "recovery {} {} {} {} {:.8} {:.8} {}",
         report.session_id,
@@ -411,14 +445,40 @@ pub fn report_recovered_frame(report: RecoveryReport<'_>) -> Result<(), String> 
         .ok_or_else(|| format!("screen-clock recovery returned {response:?}"))
 }
 
+fn executable_for_child() -> Result<PathBuf, String> {
+    // A rebuild can unlink the running image. On Linux current_exe() then
+    // returns a non-existent pathname ending in " (deleted)". The proc handle
+    // still refers to this exact executable and survives that replacement;
+    // don't strip the suffix and silently launch an unrelated/newer image.
+    #[cfg(target_os = "linux")]
+    {
+        Ok(PathBuf::from("/proc/self/exe"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        env::current_exe().map_err(|error| format!("locate viewer: {error}"))
+    }
+}
+
 pub fn toggle_or_start() -> Result<bool, String> {
     if send_control("status").as_deref() == Ok("on") {
         send_control("quit")?;
         return Ok(false);
     }
-    let executable = env::current_exe().map_err(|error| format!("locate viewer: {error}"))?;
+    let executable = executable_for_child()?;
     let mut child = Command::new(&executable)
         .arg(SUBCOMMAND)
+        // Standalone bring-up: the checked temporal code also works when a
+        // reflection is too blurred to resolve the spatial grid. No changes
+        // to recorded-stimulus/presentation recipes are implied by this key.
+        .args([
+            "--temporal-code",
+            "--fixed-target",
+            "--code-hz",
+            "5",
+            "--amplitude",
+            "0.12",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -524,9 +584,13 @@ fn usage() -> &'static str {
      --output PATH                 presentation manifest\n\
      --hz HZ                       fixation render cadence [100]\n\
      --code-hz HZ                  optical identity cadence [30]\n\
+     --temporal-code               checked whole-field temporal color clock\n\
      --amplitude FRACTION          opponent-color amplitude [0.035]\n\
      --duration-seconds N          automatically stop after N seconds\n\
      --windowed                    1280x720 diagnostic window\n\
+     --large-cells                 one 8x4 code tile instead of four repeats\n\
+     --temporal-code               63-symbol error-checked whole-field color clock\n\
+     --fixed-target                keep fixation centered for clock diagnosis\n\
      --self-test-render            exercise encoder and 4K renderer without a window\n\
      Keys in stimulus: Z/Esc/Q exit, Space pause/resume"
 }
@@ -536,6 +600,9 @@ where
     I: IntoIterator<Item = String>,
 {
     let mut config = Config {
+        code_layout: SpatialCodeLayout::CURRENT,
+        temporal_code: false,
+        fixed_target: false,
         output: default_output(now_ns),
         render_hz: environment_f64("BUTTERCUP_SCREEN_CLOCK_HZ", 100.0)?,
         code_hz: environment_f64("BUTTERCUP_SCREEN_CLOCK_CODE_HZ", 30.0)?,
@@ -567,6 +634,9 @@ where
                 config.duration_seconds = Some(option_f64("--duration-seconds", arguments.next())?)
             }
             "--windowed" => config.fullscreen = false,
+            "--large-cells" => config.code_layout = SpatialCodeLayout::LEGACY,
+            "--temporal-code" => config.temporal_code = true,
+            "--fixed-target" => config.fixed_target = true,
             "--self-test-render" => config.self_test_render = true,
             "-h" | "--help" => {
                 println!("{}", usage());
@@ -619,13 +689,17 @@ fn screen_field_degrees(config: &Config) -> (f64, f64) {
 }
 
 fn ball_pose(config: &Config, elapsed_seconds: f64) -> BallPose {
-    if elapsed_seconds < config.warmup_seconds {
+    if config.fixed_target || elapsed_seconds < config.warmup_seconds {
         return BallPose {
             x_norm: 0.5,
             y_norm: 0.5,
             vx_norm_per_sec: 0.0,
             vy_norm_per_sec: 0.0,
-            phase: "warmup",
+            phase: if config.fixed_target {
+                "fixed-clock-target"
+            } else {
+                "warmup"
+            },
         };
     }
     let time = elapsed_seconds - config.warmup_seconds;
@@ -651,12 +725,7 @@ fn packed_rgb(rgb: [f64; 3]) -> u32 {
 }
 
 fn code_rgb(sign: i8, amplitude: f64) -> [f64; 3] {
-    let sign = f64::from(sign);
-    [
-        BASE_RGB[0] + sign * amplitude * OPPONENT_AXIS_RGB[0],
-        BASE_RGB[1] + sign * amplitude * OPPONENT_AXIS_RGB[1],
-        BASE_RGB[2] + sign * amplitude * OPPONENT_AXIS_RGB[2],
-    ]
+    crate::screen_reflection_temporal::symbol_rgb(sign, amplitude)
 }
 
 fn ball_radius_pixels(config: &Config, width: usize) -> f64 {
@@ -745,20 +814,9 @@ impl RecoveryReadout {
         }) {
             return None;
         }
-        self.last_sequence = Some(report.sequence);
-        self.last_sequence_verified = report.verified;
-        self.last_update = Some(Instant::now());
-        self.phase = if report.verified {
-            RecoveryPhase::Locked
-        } else {
-            RecoveryPhase::Noisy
-        };
-        self.last_score = report.score;
-        self.last_margin = report.confidence_margin;
         if self.last_sampled_code_index == Some(report.recovered_code_index) && !verified_upgrade {
             return None;
         }
-        self.last_sampled_code_index = Some(report.recovered_code_index);
         let latency_ns = report
             .host_arrival_unix_ns
             .checked_sub(transition.commit_unix_ns)?;
@@ -785,6 +843,17 @@ impl RecoveryReadout {
                 return None;
             }
         }
+        self.last_sequence = Some(report.sequence);
+        self.last_sequence_verified = report.verified;
+        self.last_update = Some(Instant::now());
+        self.phase = if report.verified {
+            RecoveryPhase::Locked
+        } else {
+            RecoveryPhase::Noisy
+        };
+        self.last_score = report.score;
+        self.last_margin = report.confidence_margin;
+        self.last_sampled_code_index = Some(report.recovered_code_index);
         self.last_accepted_sequence = Some(report.sequence);
         self.last_accepted_code_index = Some(report.recovered_code_index);
         self.last_accepted_at = Some(Instant::now());
@@ -1031,22 +1100,31 @@ fn render_stimulus(
     if output.len() != width * height {
         return (0.0, (0.0, 0.0));
     }
-    let signs = code.display_signs_for(STIMULUS_CODE_SCHEME);
+    let signs = code.physical_signs_for(STIMULUS_CODE_SCHEME);
+    let columns = config.code_layout.display_columns();
+    let rows = config.code_layout.display_rows();
     let colors = [
         packed_rgb(code_rgb(-1, config.amplitude)),
         packed_rgb(code_rgb(1, config.amplitude)),
     ];
-    for row in 0..DISPLAY_GRID_ROWS {
-        let top = row * height / DISPLAY_GRID_ROWS;
-        let bottom = (row + 1) * height / DISPLAY_GRID_ROWS;
-        for column in 0..DISPLAY_GRID_COLUMNS {
-            let left = column * width / DISPLAY_GRID_COLUMNS;
-            let right = (column + 1) * width / DISPLAY_GRID_COLUMNS;
-            let color = colors[usize::from(signs[row * DISPLAY_GRID_COLUMNS + column] > 0)];
+    for row in 0..rows {
+        let top = row * height / rows;
+        let bottom = (row + 1) * height / rows;
+        for column in 0..columns {
+            let left = column * width / columns;
+            let right = (column + 1) * width / columns;
+            let color = colors
+                [usize::from(signs[config.code_layout.canonical_cell(column, row).unwrap()] > 0)];
             for y in top..bottom {
                 output[y * width + left..y * width + right].fill(color);
             }
         }
+    }
+    if config.temporal_code {
+        output.fill(packed_rgb(code_rgb(
+            crate::screen_reflection_temporal::sign(code.counter_mod as u64, code.session_tag),
+            config.amplitude,
+        )));
     }
     let target = draw_target(output, width, height, config, pose);
     draw_recovery_overlay(output, width, height, recovery, display_refresh_hz);
@@ -1185,6 +1263,26 @@ fn sway_window_is_visible_fullscreen(pid: u32) -> Result<bool, String> {
     }
     let tree: Value = serde_json::from_slice(&tree.stdout)
         .map_err(|error| format!("parse Sway tree: {error}"))?;
+    let output_name = tree["nodes"]
+        .as_array()
+        .and_then(|nodes| nodes.iter().find(|node| find_pid_node(node, pid).is_some()))
+        .and_then(|node| node["name"].as_str());
+    if let Some(name) = output_name {
+        let outputs = Command::new("swaymsg")
+            .args(["-t", "get_outputs", "-r"])
+            .output()
+            .map_err(|e| format!("check optical display power: {e}"))?;
+        if !outputs.status.success() {
+            return Err(command_output_error(
+                "check optical display power",
+                &outputs,
+            ));
+        }
+        let outputs: Value = serde_json::from_slice(&outputs.stdout).map_err(|e| e.to_string())?;
+        if !sway_output_powered(&outputs, name) {
+            return Err(format!("optical clock output {name} is powered off or unavailable; wake the monitor before testing"));
+        }
+    }
     Ok(find_pid_node(&tree, pid).is_some_and(|node| {
         node.get("fullscreen_mode")
             .and_then(Value::as_i64)
@@ -1194,39 +1292,26 @@ fn sway_window_is_visible_fullscreen(pid: u32) -> Result<bool, String> {
     }))
 }
 
-fn enforce_sway_fullscreen(pid: u32, workspace: Option<&str>) -> Result<bool, String> {
+fn sway_output_powered(outputs: &Value, name: &str) -> bool {
+    outputs
+        .as_array()
+        .and_then(|a| a.iter().find(|o| o["name"].as_str() == Some(name)))
+        .is_some_and(|o| {
+            o["active"].as_bool() == Some(true)
+                && o.get("power")
+                    .or_else(|| o.get("dpms"))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+        })
+}
+
+fn enforce_sway_fullscreen(pid: u32, _workspace: Option<&str>) -> Result<bool, String> {
     if env::var_os("SWAYSOCK").is_none() {
         return Ok(true);
     }
-    // `fullscreen enable` is not idempotent in every Sway release: asking an
-    // already-fullscreen container to enable it again may return an error even
-    // though the desired state is valid. Verify before issuing mutations.
-    if sway_window_is_visible_fullscreen(pid)? {
-        return Ok(true);
-    }
-    let criterion = format!("[pid=\"{pid}\"]");
-    let command = match workspace {
-        Some(workspace) => {
-            let workspace = serde_json::to_string(workspace)
-                .map_err(|error| format!("quote Sway workspace: {error}"))?;
-            format!(
-                "{criterion} move container to workspace {workspace}; {criterion} focus; {criterion} fullscreen enable"
-            )
-        }
-        None => format!("{criterion} focus; {criterion} fullscreen enable"),
-    };
-    let response = Command::new("swaymsg")
-        .args(["-r", &command])
-        .output()
-        .map_err(|error| format!("enforce Sway fullscreen: {error}"))?;
-    let verified = sway_window_is_visible_fullscreen(pid)?;
-    if verified {
-        Ok(true)
-    } else if !response.status.success() {
-        Err(command_output_error("enforce Sway fullscreen", &response))
-    } else {
-        Ok(false)
-    }
+    // Winit requests fullscreen. Placement/focus belongs to the attention
+    // manager; never move/focus a container to manufacture a visibility claim.
+    sway_window_is_visible_fullscreen(pid)
 }
 
 impl StimulusApp {
@@ -1259,7 +1344,7 @@ impl StimulusApp {
         let pairs = (0..LOGICAL_BIT_COUNT)
             .map(|index| json!([PAIR_POSITIVE_CELLS[index], PAIR_NEGATIVE_CELLS[index]]))
             .collect::<Vec<_>>();
-        self.manifest.write(&json!({
+        let mut header = json!({
             "record_type": "session",
             "schema": MANIFEST_SCHEMA,
             "session_id": self.session_id,
@@ -1281,7 +1366,7 @@ impl StimulusApp {
             "ball_diameter_degrees": self.config.ball_diameter_degrees,
             "stimulus_kind": "balanced_chromatic_reflection_clock",
             "motion": {
-                "kind": "smooth_lissajous_bounce",
+                "kind": if self.config.fixed_target {"fixed-center"} else {"smooth_lissajous_bounce"},
                 "horizontal_period_seconds": self.config.horizontal_period_seconds,
                 "vertical_period_seconds": self.config.vertical_period_seconds,
                 "warmup_seconds": self.config.warmup_seconds,
@@ -1289,9 +1374,9 @@ impl StimulusApp {
                 "y_range_normalized": [0.10, 0.90]
             },
             "code": {
-                "grid": [DISPLAY_GRID_COLUMNS, DISPLAY_GRID_ROWS],
+                "grid": [self.config.code_layout.display_columns(), self.config.code_layout.display_rows()],
                 "logical_grid": [GRID_COLUMNS, GRID_ROWS],
-                "spatial_repeats": [2, 2],
+                "spatial_repeats": [self.config.code_layout.repeat_columns, self.config.code_layout.repeat_rows],
                 "counter_bits": CHECKED_COUNTER_BITS,
                 "counter_modulus": CHECKED_COUNTER_MODULUS,
                 "payload": "5-bit optical epoch counter in a session-keyed nonlinear coset",
@@ -1309,7 +1394,16 @@ impl StimulusApp {
                 "every_2x2_block_mean_invariant": true
             },
             "timing_note": "the reflected spatial identity is authoritative; host commit time is diagnostic"
-        }))?;
+        });
+        if self.config.temporal_code {
+            header["code"] = json!({"symbol_sequence":crate::screen_reflection_temporal::SCHEME,
+                "grid":[1,1],"counter_modulus":1023,"temporal_word_bits":63,"minimum_hamming_distance":17,
+                "maximum_accepted_bit_errors":6,"error_check":"unique nearest 63-symbol temporal word, runner margin and photometric agreement",
+                "base_srgb":BASE_RGB,"opponent_axis_srgb":OPPONENT_AXIS_RGB,"amplitude":self.config.amplitude,
+                "screen_mean_invariant":false,"session_phase_shift":"61*session_tag modulo 1023; not an independent session authentication code"});
+            header["timing_note"]=json!("Temporal optical identity; nominal code rate prior. Host submit is not scanout/exposure time.");
+        }
+        self.manifest.write(&header)?;
         self.manifest.flush()?;
         self.header_written = true;
         Ok(())
@@ -1327,11 +1421,9 @@ impl StimulusApp {
             };
             let _ = stream.set_read_timeout(Some(CONTROL_TIMEOUT));
             let _ = stream.set_write_timeout(Some(CONTROL_TIMEOUT));
-            let mut request = [0u8; 512];
-            let count = stream.read(&mut request).unwrap_or(0);
-            let request = String::from_utf8_lossy(&request[..count])
-                .trim()
-                .to_string();
+            let Ok(request) = read_control_response(&mut stream) else {
+                continue;
+            };
             let fields = request.split_whitespace().collect::<Vec<_>>();
             match fields.as_slice() {
                 ["status"] => {
@@ -1344,6 +1436,8 @@ impl StimulusApp {
                             "session_tag": self.session_tag,
                             "code_hz": self.config.code_hz,
                             "code_scheme": STIMULUS_CODE_SCHEME.wire_name(),
+                            "temporal_code": self.config.temporal_code,
+                            "spatial_repeats": [self.config.code_layout.repeat_columns,self.config.code_layout.repeat_rows],
                             "display_refresh_hz": self.display_refresh_hz,
                             "presentation_index": self.presentation_index.saturating_sub(1),
                             "code_index": code_index,
@@ -1438,6 +1532,9 @@ impl StimulusApp {
                                 "display transition commit to independently error-checked single-frame camera recovery"
                             }
                         }));
+                    } else {
+                        let _ = stream.write_all(b"error recovery-not-accepted\n");
+                        continue;
                     }
                     let _ = stream.write_all(b"ok\n");
                 }
@@ -1471,16 +1568,16 @@ impl StimulusApp {
         }
     }
 
-    fn present_now(&mut self) -> Result<(), String> {
+    fn present_now(&mut self, trigger: &str) -> Result<(), String> {
         let Some(mut state) = self.window_state.take() else {
             return Ok(());
         };
-        let result = self.present_to(&mut state);
+        let result = self.present_to(&mut state, trigger);
         self.window_state = Some(state);
         result
     }
 
-    fn present_to(&mut self, state: &mut ScreenWindow) -> Result<(), String> {
+    fn present_to(&mut self, state: &mut ScreenWindow, trigger: &str) -> Result<(), String> {
         let size = state.window.inner_size();
         if size.width == 0 || size.height == 0 {
             return Ok(());
@@ -1492,7 +1589,14 @@ impl StimulusApp {
         let elapsed_seconds = elapsed.as_secs_f64();
         let pose = ball_pose(&self.config, elapsed_seconds);
         let code_index = (elapsed_seconds * self.config.code_hz).floor() as u64;
-        let code = FrameCode::new(code_index, self.session_tag);
+        let code = FrameCode::new(
+            if self.config.temporal_code {
+                code_index % crate::screen_reflection_temporal::PERIOD as u64
+            } else {
+                code_index
+            },
+            self.session_tag,
+        );
         let mut buffer = state
             .surface
             .buffer_mut()
@@ -1558,17 +1662,20 @@ impl StimulusApp {
             "presentation_index": self.presentation_index,
             "code_index": code_index,
             "counter_mod": code.counter_mod,
-            "gray": code.gray,
-            "crc4": code.crc4,
-            "logical_word": code.logical_word,
-            "logical_word_hex": format!("{:04x}", code.logical_word),
-            "optical_word": code.optical_word(STIMULUS_CODE_SCHEME),
-            "optical_word_hex": format!("{:04x}", code.optical_word(STIMULUS_CODE_SCHEME)),
-            "code_scheme": STIMULUS_CODE_SCHEME.wire_name(),
+            "gray": (!self.config.temporal_code).then_some(code.gray),
+            "crc4": (!self.config.temporal_code).then_some(code.crc4),
+            "logical_word": (!self.config.temporal_code).then_some(code.logical_word),
+            "logical_word_hex": (!self.config.temporal_code).then(|| format!("{:04x}", code.logical_word)),
+            "optical_word": (!self.config.temporal_code).then(|| code.optical_word(STIMULUS_CODE_SCHEME)),
+            "optical_word_hex": (!self.config.temporal_code).then(|| format!("{:04x}", code.optical_word(STIMULUS_CODE_SCHEME))),
+            "code_scheme": if self.config.temporal_code {crate::screen_reflection_temporal::SCHEME} else {STIMULUS_CODE_SCHEME.wire_name()},
+            "temporal_code": self.config.temporal_code,
+            "actual_encoding": if self.config.temporal_code {crate::screen_reflection_temporal::SCHEME} else {STIMULUS_CODE_SCHEME.wire_name()},
+            "temporal_symbol": self.config.temporal_code.then(||crate::screen_reflection_temporal::sign(code_index,self.session_tag)),
             "active_elapsed_ns": elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
             "present_commit_unix_ns": commit_unix_ns,
             "inter_commit_us": inter_commit_us,
-            "redraw_source": "wayland-frame-callback",
+            "redraw_source": trigger,
             "render_duration_us": committed.saturating_duration_since(render_started).as_micros().min(u128::from(u64::MAX)) as u64,
             "window_px": [size.width, size.height],
             "ball_center_px": [center.0, center.1],
@@ -1663,7 +1770,7 @@ impl ApplicationHandler for StimulusApp {
                 }
             }
             WindowEvent::RedrawRequested if self.surface_ready && !self.paused => {
-                if let Err(error) = self.present_now() {
+                if let Err(error) = self.present_now("redraw-requested") {
                     self.fatal_error = Some(error);
                     event_loop.exit();
                     return;
@@ -1731,7 +1838,7 @@ impl ApplicationHandler for StimulusApp {
             // Commit frame zero here to start the pre_present_notify/frame-
             // callback chain instead of waiting for the very callback that
             // this first presentation is meant to arm.
-            if let Err(error) = self.present_now() {
+            if let Err(error) = self.present_now("initial-visible-frame") {
                 self.fatal_error = Some(error);
                 event_loop.exit();
                 return;
@@ -1753,10 +1860,43 @@ impl ApplicationHandler for StimulusApp {
             event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(50)));
             return;
         }
-        // Frame callbacks drive rendering. This short wake only services the
-        // local recovery/status socket if the compositor is temporarily idle.
+        // A lost/throttled Wayland callback used to leave this diagnostic
+        // displaying only frame zero indefinitely. Kick a bounded real commit,
+        // not merely another request_redraw (Winit can suppress that while a
+        // callback is pending). Actual submits remain individually recorded;
+        // this is NOT evidence that a hidden surface was scanned out.
+        if self.last_commit.is_some_and(|(last, _)| {
+            redraw_watchdog_due(now.saturating_duration_since(last), self.display_refresh_hz)
+        }) {
+            if self.config.fullscreen {
+                match enforce_sway_fullscreen(std::process::id(), self.target_workspace.as_deref())
+                {
+                    Ok(true) => {}
+                    outcome => {
+                        self.fatal_error = Some(outcome.err().unwrap_or_else(|| {
+                            "optical clock lost visible fullscreen output".to_string()
+                        }));
+                        self.log_event("display_unavailable");
+                        event_loop.exit();
+                        return;
+                    }
+                }
+            }
+            if let Err(error) = self.present_now("callback-watchdog") {
+                self.fatal_error = Some(error);
+                event_loop.exit();
+                return;
+            }
+            if let Some(state) = self.window_state.as_ref() {
+                state.window.request_redraw();
+            }
+        }
         event_loop.set_control_flow(ControlFlow::WaitUntil(now + CONTROL_POLL_INTERVAL));
     }
+}
+
+fn redraw_watchdog_due(age: Duration, refresh_hz: f64) -> bool {
+    age >= Duration::from_secs_f64((3.0 / refresh_hz.clamp(20.0, 360.0)).max(0.040))
 }
 
 fn run_self_test(config: &Config) -> Result<(), String> {
@@ -1872,8 +2012,118 @@ where
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_launch_survives_unlinked_running_executable() {
+        const CHILD: &str = "BUTTERCUP_TEST_UNLINKED_CLOCK_EXEC";
+        if let Some(path) = env::var_os(CHILD) {
+            let path = PathBuf::from(path);
+            assert_eq!(
+                fs::canonicalize(&path).unwrap(),
+                env::current_exe().unwrap()
+            );
+            fs::remove_file(&path).unwrap();
+            assert!(!env::current_exe().unwrap().exists());
+            let result = Command::new(executable_for_child().unwrap())
+                .arg("--help")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("outputs")
+            .join(format!(
+                "clock-exec-regression-{}-{}",
+                std::process::id(),
+                unix_time_ns()
+            ));
+        fs::create_dir(&directory).unwrap();
+        let copied = directory.join("viewer-test");
+        fs::copy(executable_for_child().unwrap(), &copied).unwrap();
+        let result=Command::new(&copied).args(["--exact","screen_reflection_stimulus::tests::child_launch_survives_unlinked_running_executable","--nocapture"])
+            .env(CHILD,&copied).output().unwrap();
+        let _ = fs::remove_file(&copied);
+        fs::remove_dir(&directory).unwrap();
+        assert!(
+            result.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[test]
+    fn output_visibility_does_not_imply_output_power() {
+        assert!(!sway_output_powered(
+            &json!([{"name":"DP-3","active":true,"power":false}]),
+            "DP-3"
+        ));
+        assert!(sway_output_powered(
+            &json!([{"name":"DP-3","active":true,"power":true}]),
+            "DP-3"
+        ));
+        assert!(sway_output_powered(
+            &json!([{"name":"DP-3","active":true,"dpms":true}]),
+            "DP-3"
+        ));
+        assert!(!sway_output_powered(&json!([]), "DP-3"));
+        assert!(!redraw_watchdog_due(Duration::from_millis(17), 60.));
+        assert!(redraw_watchdog_due(Duration::from_millis(60), 60.));
+    }
+
     fn test_config() -> Config {
         parse_config(Vec::<String>::new(), 123).unwrap()
+    }
+
+    #[test]
+    fn diagnostic_large_cells_keep_the_target_still() {
+        let c = parse_config(
+            [
+                "--large-cells",
+                "--fixed-target",
+                "--code-hz",
+                "5",
+                "--amplitude",
+                "0.12",
+            ]
+            .map(String::from),
+            123,
+        )
+        .unwrap();
+        assert_eq!(c.code_layout, SpatialCodeLayout::LEGACY);
+        assert_eq!(c.code_hz, 5.);
+        for t in [0., 2., 10., 30.] {
+            let p = ball_pose(&c, t);
+            assert_eq!(
+                (p.x_norm, p.y_norm, p.vx_norm_per_sec, p.vy_norm_per_sec),
+                (0.5, 0.5, 0., 0.)
+            );
+        }
+    }
+
+    #[test]
+    fn control_snapshot_waits_for_all_fragments_and_bounds_input() {
+        struct Fragmented<'a>(&'a [u8]);
+        impl Read for Fragmented<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.0.len().min(out.len()).min(3);
+                out[..n].copy_from_slice(&self.0[..n]);
+                self.0 = &self.0[n..];
+                Ok(n)
+            }
+        }
+        let input = b"{\"code_hz\":5.0,\"code_index\":17,\"session_id\":\"fragmented\"}\n";
+        let response = read_control_response(&mut Fragmented(input)).unwrap();
+        let value: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["code_index"], 17);
+        assert!(read_control_response(&mut &input[..input.len() - 1]).is_err());
+        let huge = vec![b'x'; 4097];
+        assert!(read_control_response(&mut huge.as_slice()).is_err());
     }
 
     #[test]

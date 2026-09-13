@@ -1,5 +1,6 @@
-//! Experimental F view. No candidate from this module mutates tracking, conic
-//! authority, laser/mouse output or calibration. All pixels use the SAM source.
+//! Experimental F view. Rendering never mutates tracking or gaze. If the
+//! worker refined the shared geometry, display that exact decision, without
+//! refining a second time. Otherwise this remains a preview-only comparison.
 use super::*;
 use limbus_refiner::{Context, Field, Model, Support};
 use std::cell::RefCell;
@@ -14,11 +15,14 @@ fn field_for(frame: &EyeFrame) -> Result<Arc<Field>, String> {
     let proposal = frame
         .sam31_proposal_masks
         .as_ref()
-        .ok_or("WAITING FOR SAM SOURCE")?;
+        .ok_or("WAITING FOR MASK SOURCE")?;
+    if let Some(attempt) = &proposal.limbus_refinement {
+        return attempt.field.clone().ok_or_else(||attempt.status.clone());
+    }
     let review = proposal
         .outer_fit
         .as_ref()
-        .ok_or("NO SAM LIMBUS TO REFINE")?;
+        .ok_or("NO SOURCE LIMBUS TO REFINE")?;
     let eye = proposal.eye_index.min(1);
     CACHE.with(|cache| {
         let mut state = cache.borrow_mut();
@@ -66,6 +70,14 @@ fn preview_surface(
         || !surface.relative_gaze.is_camera_facing()
     {
         return None;
+    }
+    if proposal.limbus_refinement.is_some() {
+        // The pose solver already consumed the effective shared ellipse.
+        // Never manufacture a display-only normal after that solve.
+        if frame.joint_gaze_active && joint_gaze_live::source_ellipse(frame) != Some(candidate) {
+            return None;
+        }
+        return Some(surface);
     }
     let reference = surface.relative_gaze;
     let tilt = (1.0 - (candidate.minor_radius / candidate.major_radius).powi(2))
@@ -124,7 +136,7 @@ pub(super) fn draw(
                 height,
                 x + 4,
                 y + 24,
-                if error == "NO SAM LIMBUS TO REFINE" || error == "WAITING FOR SAM SOURCE" {
+                if error == "NO SOURCE LIMBUS TO REFINE" || error == "WAITING FOR MASK SOURCE" {
                     &error
                 } else {
                     "MODEL MISSING OR INCOMPATIBLE"
@@ -144,7 +156,12 @@ pub(super) fn draw(
     {
         // An abstention retains the exact source's original contact. It is not
         // a newly refined observation and is explicitly labeled below.
-        let candidate = field.candidate.unwrap_or(field.baseline);
+        let shared_candidate = frame.sam31_proposal_masks.as_ref()
+            .filter(|p|p.limbus_refinement.is_some())
+            .and_then(|p|p.outer_fit.as_ref()).map(|r|r.ellipse);
+        let candidate = shared_candidate.and_then(|ellipse|
+            joint_gaze_live::source_ellipse(frame).or(Some(ellipse)))
+            .unwrap_or_else(||field.candidate.unwrap_or(field.baseline));
         let boundary = candidate.dense_points(240);
         if let Some(pose) = frame
             .sam31_proposal_masks
@@ -245,7 +262,11 @@ pub(super) fn draw(
         height,
         x + 4,
         y + 8,
-        if field.candidate.is_some() {
+        if frame.sam31_proposal_masks.as_ref().and_then(|p|p.limbus_refinement.as_ref()).is_some_and(|a|a.applied) {
+            "TWEAKED CONTACT / SHARED SOLUTION"
+        } else if frame.sam31_proposal_masks.as_ref().is_some_and(|p|p.limbus_refinement.is_some()) {
+            "REFINEMENT ABSTAINED / BASELINE"
+        } else if field.candidate.is_some() {
             "TWEAKED CONTACT / PREVIEW"
         } else {
             "ABSTAINED / ORIGINAL CONTACT"
@@ -298,6 +319,36 @@ pub(super) fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_refinement_is_not_inferred_again_or_resigned_by_preview() {
+        let mut frame=crate::tests::control_eye_frame(79);
+        let ellipse=geometry::Ellipse {center:(100.0,100.0),major_radius:50.0,minor_radius:40.0,angle:0.2};
+        let field=Arc::new(Field {baseline:ellipse,unmodified_refit:None,candidate:Some(ellipse),
+            samples:vec![],corrected_points:vec![],elapsed_ms:0.5,status:"TEST"});
+        let review=sam31_outer::OuterMaskFitReview {ellipse,source_component_area_px:6000.0,
+            retained_points:Arc::new(vec![]),conic_segments:Arc::new(vec![]),flat_tire_points:Arc::new(vec![]),
+            upper_flat_tire:false,lower_flat_tire:false};
+        frame.sam31_proposal_masks=Some(Arc::new(sam31_outer::ProposalMasks {
+            source_timestamp_ns:123,outer_fit:Some(review.clone()),
+            limbus_refinement:Some(sam31_outer::limbus_refinement::Attempt {baseline:review,field:Some(field.clone()),applied:true,status:"TEST".into()}),
+            ..Default::default()}));
+        // No model or source pixels are supplied: this must reuse the worker.
+        assert!(Arc::ptr_eq(&field,&field_for(&frame).unwrap()));
+        let proposal=frame.sam31_proposal_masks.as_ref().unwrap();
+        assert!(preview_surface(&frame,proposal,ellipse).is_none(),"no invented sign");
+        let gaze=eye_scene_model::RelativeGazeVector::from_projected(0.1,-0.2).unwrap();
+        frame.virtual_contact_surface_gaze=Some(SurfaceGazeSample {
+            source_timestamp_ns:Some(123),frontal_equivalent_disk_area_px2:7000.0,
+            area_bucket:0,quantized_frontal_disk_radius_px:50.0,
+            near_surface_point_sensor_px:(100.0,100.0),relative_gaze:gaze,
+            sign_resolved:true,sign_epoch:7,kinematic_sign_correction:[false;2],sign_diagnostics:None});
+        let displayed=preview_surface(&frame,proposal,ellipse).unwrap();
+        assert_eq!(displayed.relative_gaze,gaze,"shared pose must not be recomputed from the rim");
+        assert_eq!(displayed.sign_epoch,7);
+        frame.joint_gaze_active=true;
+        assert!(preview_surface(&frame,proposal,ellipse).is_none(),"joint mode needs its own same-source ellipse");
+    }
+
     #[test]
     fn native_corpus_preview_is_cached_and_never_borrows_newer_crop_pixels() {
         // Opt-in integration fixture, not a repository dependency or a new
@@ -422,6 +473,15 @@ mod tests {
             pixels,
             "review pixels, geometry and clipping all use the SAM exposure, not newer ROI"
         );
+        frame.eye_id=2;
+        frame.segmentation_mode=SegmentationMode::EyeStudent;
+        let mut student_pixels=vec![0;width*height];
+        student_preview::draw(&mut student_pixels,width,height,0,0,2,&frame,
+            ViewMode::QuadColor,RoiOverlayMode::SamTweakedContactGeometry);
+        let mut native=vec![0;w*h];
+        draw(&mut native,w,h,0,0,1,&frame);
+        assert!(student_pixels.iter().enumerate().all(|(i,p)|*p==native[(i/width/2)*w+(i%width/2)]),
+            "Obelisk scales the same source-local refinement renderer, including its labels");
         export_eye_ppm(
             &root.join("refined-corpus-preview.ppm"),
             &pixels,

@@ -23,12 +23,17 @@ mod pipeline;
 #[path = "sam31_student.rs"]
 pub mod student;
 
+#[path = "sam31_boundary_logits.rs"]
+pub mod boundary_logits;
+
 pub use crate::geometry::Ellipse;
 pub use crate::conic_solver::OuterContourScaleContext;
 // Compatibility entry point for the existing offline tools.
 #[allow(unused_imports)]
 pub use crate::conic_solver::fit_trusted_arc_points;
 pub use crate::outline_conic_segments::ContourFitEvidence as OuterMaskFitReview;
+#[path = "limbus_refinement.rs"]
+pub mod limbus_refinement;
 use crate::geometry::ellipse_coordinate;
 use crate::conic_solver::{
     moments_ellipse, normalize_ellipse, plausible_ellipse, ellipse_support_summary, median,
@@ -103,6 +108,7 @@ fn startup_assets_available(model: &Path, prompts: &Path, tracker: &Path) -> boo
 pub fn live_configuration() -> serde_json::Value {
     serde_json::json!({
         "parallel_eye_workers": enabled_env_flag("BUTTERCUP_SAM31_PARALLEL_EYES", true),
+        "limbus_refinement": std::env::var("BUTTERCUP_LIMBUS_REFINEMENT").unwrap_or_else(|_|"off".into()),
         "preprocess": PreprocessRegime::configured_live().ok().map(PreprocessRegime::label),
         "stable_photometry_enabled": enabled_env_flag("BUTTERCUP_SAM31_STABLE_PHOTOMETRY", false),
         "photometry_policy": if enabled_env_flag("BUTTERCUP_SAM31_STABLE_PHOTOMETRY", false) {
@@ -538,6 +544,14 @@ pub struct ProposalMasks {
     /// mandatory OUTER IRIS DISK question.  This remains available even when
     /// later adapter-consensus or RAW photometric gates reject the batch.
     pub outer_fit: Option<OuterMaskFitReview>,
+    /// Opt-in source-native profiles of the selected mask's logits along the
+    /// published retained arcs. Sensitivity alternatives of this same mask,
+    /// never independent observations or calibrated boundary probabilities.
+    pub outer_boundary_logits: Option<Arc<boundary_logits::Evidence>>,
+    /// One source-local refinement decision shared by tracking and every gaze
+    /// consumer. The original contour is retained in this audit, not as a
+    /// competing independent observation. F only selects its visualization.
+    pub limbus_refinement: Option<limbus_refinement::Attempt>,
     /// Dark pupil void fitted from the untouched RAW source inside the exact
     /// de-flat-tired review ellipse above. This is retained with the proposal
     /// so consumers can disambiguate the two projected normal branches
@@ -547,6 +561,12 @@ pub struct ProposalMasks {
 }
 
 impl ProposalMasks {
+    pub(crate) fn export_boundary_logits(&self, record: &mut serde_json::Value) {
+        if let Some(evidence) = self.outer_boundary_logits.as_ref() {
+            record["outer_boundary_logits"] = serde_json::json!(evidence.as_ref());
+        }
+    }
+
     pub fn adapter(&self, adapter: ProposalAdapter) -> Option<&AdapterProposalMasks> {
         self.adapters
             .iter()
@@ -889,6 +909,9 @@ pub struct StatusSnapshot {
     pub last_track_ms: Option<u64>,
     pub last_source_sequence: Option<u64>,
     pub last_source_ns: Option<u64>,
+    /// Opt-in synchronized benchmark: preparation, H2D, forward, mask
+    /// materialization, remaining downstream work, in milliseconds.
+    pub student_stages_ms: Option<[f64;5]>,
 }
 
 impl Default for StatusSnapshot {
@@ -906,6 +929,7 @@ impl Default for StatusSnapshot {
             last_track_ms: None,
             last_source_sequence: None,
             last_source_ns: None,
+            student_stages_ms: None,
         }
     }
 }
@@ -4482,6 +4506,8 @@ mod runtime {
     const RTLD_GLOBAL: c_int = 0x0100;
 
     #[link(name = "dl")]
+    #[link(name = "buttercup_cuda_stream", kind = "static")]
+    #[link(name = "c10_cuda")]
     unsafe extern "C" {
         fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
         fn dlerror() -> *const c_char;
@@ -6616,8 +6642,30 @@ mod runtime {
     struct LiveTemporalOuterProposal {
         semantic: SemanticProposalMasks,
         outer_fit: Option<OuterMaskFitReview>,
+        outer_logits: Option<boundary_logits::Plane>,
         outer_support: RawRingSupport,
         pupil_fit: Option<PupilVoidFitReview>,
+    }
+
+    fn capture_outer_logits(logits: &Tensor, enabled: bool)
+        -> Result<Option<boundary_logits::Plane>, String>
+    {
+        // Keep the default live path free of extra tensor transfers and work.
+        if !enabled { return Ok(None); }
+        let shape = logits.size();
+        if shape.len() != 4 || shape[0] != 1 || shape[1] != 1
+            || shape[2] <= 0 || shape[3] <= 0
+        {
+            return Err("boundary logit capture requires one selected current mask plane".into());
+        }
+        let height = shape[2] as usize;
+        let width = shape[3] as usize;
+        let count = width.checked_mul(height).filter(|&n| n <= 4_194_304)
+            .ok_or("selected boundary logit plane exceeds bounded export size")?;
+        let cpu = logits.to_device(Device::Cpu).to_kind(Kind::Float).contiguous();
+        let mut values = vec![0.0f32; count];
+        cpu.copy_data(&mut values, count);
+        Ok(Some(boundary_logits::Plane { width, height, values }))
     }
 
     struct LiveSelectedMask {
@@ -7045,7 +7093,7 @@ mod runtime {
                         semantic:SemanticProposalMasks {prompt_index:OUTER_IRIS_PROMPT,
                             width:output.mask_width,height:output.mask_height,
                             selected_query:None,masks:diagnostic_partial_masks},
-                        outer_fit:None,outer_support:RawRingSupport::default(),pupil_fit:None,
+                        outer_fit:None,outer_logits:None,outer_support:RawRingSupport::default(),pupil_fit:None,
                     });
                 };
                 (candidate, false)
@@ -7188,6 +7236,8 @@ mod runtime {
             }
         }
         Ok(LiveTemporalOuterProposal {
+            outer_logits: capture_outer_logits(&selected.logits,
+                enabled_env_flag("BUTTERCUP_OUTER_BOUNDARY_LOGITS", false))?,
             pupil_fit,
             semantic: SemanticProposalMasks {
                 prompt_index: OUTER_IRIS_PROMPT,
@@ -7673,6 +7723,21 @@ mod runtime {
         Ok(())
     }
 
+    pub(super) fn student_inference_device() -> Result<Device, String> {
+        let choice = student::InferenceDevice::configured()?;
+        // In forced CPU mode do not even probe/initialize CUDA. In auto mode
+        // only availability failure falls back; model/corruption errors do not.
+        let available = choice != student::InferenceDevice::Cpu
+            && load_cuda_dispatch_library().is_ok() && tch::Cuda::is_available();
+        if choice.select_gpu(available)? {
+            Ok(Device::Cuda(0))
+        } else {
+            static CPU_THREADS: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            CPU_THREADS.get_or_init(|| tch::set_num_threads(2));
+            Ok(Device::Cpu)
+        }
+    }
+
     fn student_head(logits:&Tensor,prompt:usize)->Result<InferenceOutput,String> {
         student_head_with_levelsets(logits,prompt,
             enabled_env_flag("BUTTERCUP_EYE_STUDENT_PUPIL_LEVELSETS",true))
@@ -7734,8 +7799,10 @@ mod runtime {
     }
 
     fn student_outer_proposal(source:&RawFrame,logits:&Tensor,target:Target,
-        current_luma:&FloatImage,history:&mut PupilContourHistory)->Result<LiveTemporalOuterProposal,String> {
+        current_luma:&FloatImage,history:&mut PupilContourHistory,materialization_ms:&mut f64)->Result<LiveTemporalOuterProposal,String> {
+        let head_started=Instant::now();
         let output=student_head(logits,OUTER_IRIS_PROMPT)?;
+        *materialization_ms+=head_started.elapsed().as_secs_f64()*1000.;
         let mask=&output.masks;
         let area=mask.iter().filter(|&&v|v!=0).count() as f64/mask.len().max(1) as f64;
         let fit=tracker_fit_review(mask,output.mask_width,output.mask_height)
@@ -7744,7 +7811,9 @@ mod runtime {
             .unwrap_or_default();
         let semantic_requested=matches!(target,Target::InnerPupilVoid|Target::OuterLimbusAndInnerPupilVoid)
             && enabled_env_flag("BUTTERCUP_SAM31_SEMANTIC_PUPIL",true);
+        let head_started=Instant::now();
         let pupil_output=semantic_requested.then(||student_head(logits,PUPIL_DISK_PROMPT)).transpose()?;
+        *materialization_ms+=head_started.elapsed().as_secs_f64()*1000.;
         let pupil_fit=fit.as_ref().and_then(|fit| {
             let outer=model_ellipse_in_source(fit.ellipse,source.width);
             let selection=select_pupil_observation_from_masks(pupil_output.as_ref(),semantic_requested,
@@ -7758,6 +7827,8 @@ mod runtime {
             width:output.mask_width,height:output.mask_height,selected_query:(!mask.iter().all(|&v|v==0)).then_some(0),
             masks:vec![ProposalMask {query:0,score:output.scores[0],pixels:Arc::new(mask.clone()),
                 boundary_pixels:Arc::new(binary_mask_boundary_indices(mask,output.mask_width,output.mask_height))}]},
+            outer_logits:capture_outer_logits(&output.logits,
+                enabled_env_flag("BUTTERCUP_OUTER_BOUNDARY_LOGITS",false))?,
             outer_fit:fit,outer_support:support,pupil_fit})
     }
 
@@ -7768,7 +7839,7 @@ mod runtime {
 
     pub(super) fn student_evaluation(source:&RawFrame,logits:&Tensor)->Result<serde_json::Value,String> {
         let luma=raw_luma(&[Arc::new(source.clone())]).into_iter().next().ok_or("missing RAW luma")?;
-        let proposal=student_outer_proposal(source,logits,Target::OuterLimbusAndInnerPupilVoid,&luma,&mut PupilContourHistory::default())?;
+        let proposal=student_outer_proposal(source,logits,Target::OuterLimbusAndInnerPupilVoid,&luma,&mut PupilContourHistory::default(),&mut 0.)?;
         Ok(serde_json::json!({"outer_ellipse":ellipse_diagnostic(proposal.outer_fit.as_ref().map(|r|model_ellipse_in_source(r.ellipse,source.width))),
             "raw_admitted":live_detector_raw_gate_passes(proposal.outer_support),"raw_score":proposal.outer_support.score,
             "pupil_ellipse":ellipse_diagnostic(proposal.pupil_fit.map(|r|r.ellipse)),
@@ -7835,7 +7906,8 @@ mod runtime {
                     }
                     weights.push(weight);reports.push(serde_json::json!({"prompt":prompt,"query":query,"score":score,"weight":weight}));
                 }
-                visitor(row,student::TeacherSample {image,masks,weights,report:serde_json::json!({"heads":reports,
+                let raw_image=student::prepare_raw(&source)?;
+                visitor(row,student::TeacherSample {image,raw_image,masks,weights,report:serde_json::json!({"heads":reports,
                     "outer_ellipse":ellipse_diagnostic(selected_outer.map(|s|s.1)),"raw_admitted":selected_outer.is_some(),
                     "raw_score":selected_outer.map(|s|s.2.score),"pupil_ellipse":ellipse_diagnostic(pupil),
                     "teacher_ms":started.elapsed().as_secs_f64()*1000.0})})?;
@@ -7847,40 +7919,49 @@ mod runtime {
     pub(super) fn student_worker(lane:usize,model_path:PathBuf,request:RequestReceiver,
         results:SyncSender<OuterResult>,proposals:SyncSender<Arc<ProposalMasks>>,
         status:Arc<Mutex<StatusSnapshot>>,stop:Arc<AtomicBool>) {
-        if let Err(error)=student_cuda_init() {update_status(&status,"error",&error);return;}
+        let device = match student_inference_device() {
+            Ok(device) => device,
+            Err(error) => { update_status(&status,"error",&error); return; }
+        };
+        eprintln!("OBELISK_DEVICE lane={lane} requested={} selected={device:?}",
+            student::InferenceDevice::configured().unwrap_or_default().label());
         let mut stream=None;let mut model=None;let mut state=LiveTrackerState::default();
         while let Ok(request)=request.recv() {
             if stop.load(AtomicOrdering::Acquire) {break;}
             let batch=match request {WorkerRequest::Batch(batch)=>batch,WorkerRequest::Scene(scene)=> {
                 let _=scene.reply.try_send(Err("eye student has fixed eye labels; arbitrary object search requires SAM".into()));continue;
             }};
-            let started=Instant::now();let mut encode_ms=0;
+            let started=Instant::now();let mut encode_ms=0;let mut stages=None;
             let run:Result<OuterResult,String>=(|| {
-                if stream.is_none() {stream=Some(WorkerStream::enter()?);}
-                if model.is_none() {update_status(&status,"loading","loading compact CUDA eye student");model=Some(student::Model::load(&model_path)?);}
+                if device.is_cuda() && stream.is_none() {stream=Some(WorkerStream::enter()?);}
+                if model.is_none() {update_status(&status,"loading",if device.is_cuda(){"loading Obelisk on GPU"}else{"loading Obelisk on CPU"});model=Some(student::Model::load_on_device(&model_path,device)?);}
                 let source=batch.frames.last().ok_or("student received no source")?;
                 let input=LiveTrackerInput {tracking_epoch:batch.tracking_epoch,prompt_generation:batch.prompt_generation,
                     sequence:source.sequence,timestamp_ns:source.timestamp_ns,sensor_origin:(source.sensor_x,source.sensor_y),width:source.width,height:source.height};
                 if !live_source_is_fresh(state.last_input,input) {return Err("SAM31 video stale student source ignored".into());}
                 state.prepare(input);
-                let mut image=vec![0;FRAME_WIDTH*FRAME_HEIGHT*3];
-                write_preprocessed_filmstrip(std::slice::from_ref(source),PreprocessRegime::configured_live()?,&mut image)?;
-                let logits=model.as_ref().unwrap().infer(&image)?;
+                let timed=enabled_env_flag("BUTTERCUP_EYE_STUDENT_TIMING",false);
+                let (logits,times) =model.as_ref().unwrap().infer_source(source,timed)?;
                 // Materialize on the worker's own stream before reusing input.
                 let _=logits.sum(Kind::Float).double_value(&[]);
                 encode_ms=started.elapsed().as_millis() as u64;
+                let downstream_started=Instant::now();let mut materialization_ms=0.;
                 let luma=raw_luma(std::slice::from_ref(source)).into_iter().next().ok_or("student missing RAW luma")?;
-                let proposal=student_outer_proposal(source,&logits,batch.target,&luma,&mut state.pupil_history)?;
-                let mut result=process_video_frame(&batch,&proposals,Some(&luma),Some(proposal))?;
+                let proposal=student_outer_proposal(source,&logits,batch.target,&luma,&mut state.pupil_history,&mut materialization_ms)?;
+                let processed=process_video_frame(&batch,&proposals,Some(&luma),Some(proposal));
+                if timed {stages=Some([times[0],times[1],times[2],materialization_ms,
+                    (downstream_started.elapsed().as_secs_f64()*1000.-materialization_ms).max(0.)]);}
+                let mut result=processed?;
                 result.video_tracked=false;Ok(result)
             })();
             let elapsed_ms=batch.submitted_at.elapsed().as_millis() as u64;
             match run {
                 Ok(mut result)=> {result.elapsed_ms=elapsed_ms;let _=results.try_send(result);
-                    update_status(&status,"ready","EYE STUDENT CUDA masks + shared RAW/conic gates; fixed vocabulary");}
+                    let name=if model.as_ref().is_some_and(|m|m.raw_native){"BUTTER OBELISK RAW 16-PHASE F32"}else{"RGB STUDENT"};
+                    update_status(&status,"ready",&format!("{name} {} + shared RAW/conic gates",if device.is_cuda(){"GPU"}else{"CPU"}));}
                 Err(error)=> {let state=if error.starts_with("SAM31 ") {"rejected"}else {"error"};update_status(&status,state,&error);}
             }
-            if let Ok(mut s)=status.lock() {s.completed_batches+=1;s.last_elapsed_ms=Some(elapsed_ms);s.last_encode_ms=Some(encode_ms);
+            if let Ok(mut s)=status.lock() {s.completed_batches+=1;s.last_elapsed_ms=Some(elapsed_ms);s.last_encode_ms=Some(encode_ms);s.student_stages_ms=stages;
                 s.last_track_ms=Some((started.elapsed().as_millis() as u64).saturating_sub(encode_ms));
                 s.last_queue_ms=Some(elapsed_ms.saturating_sub(started.elapsed().as_millis() as u64));
                 s.last_source_sequence=batch.frames.last().map(|f|f.sequence);s.last_source_ns=batch.frames.last().map(|f|f.timestamp_ns);}
@@ -8492,6 +8573,18 @@ mod runtime {
         current_luma: Option<&FloatImage>,
         video_outer: Option<LiveTemporalOuterProposal>,
     ) -> Result<OuterResult, String> {
+        process_video_frame_with_refiner(batch, proposal_publisher, current_luma,
+            video_outer, limbus_refinement::apply)
+    }
+
+    fn process_video_frame_with_refiner(
+        batch: &Batch,
+        proposal_publisher: &SyncSender<Arc<ProposalMasks>>,
+        current_luma: Option<&FloatImage>,
+        video_outer: Option<LiveTemporalOuterProposal>,
+        refine: impl FnOnce(&RawFrame, &FloatImage, &mut OuterMaskFitReview,
+            &mut RawRingSupport, Option<PupilVoidFitReview>) -> Option<limbus_refinement::Attempt>,
+    ) -> Result<OuterResult, String> {
         let source = batch
             .frames
             .last()
@@ -8499,6 +8592,7 @@ mod runtime {
         let LiveTemporalOuterProposal {
             semantic,
             outer_fit,
+            outer_logits,
             outer_support,
             pupil_fit,
         } = video_outer
@@ -8506,7 +8600,23 @@ mod runtime {
         if semantic.prompt_index!=OUTER_IRIS_PROMPT {
             return Err("SAM31 video geometry requires the mandatory outer-iris prompt".into());
         }
-        let outer_fit = outer_fit.map(|fit|model_review_in_source(fit, source.width));
+        let mut outer_fit = outer_fit.map(|fit|model_review_in_source(fit, source.width));
+        let mut outer_support = outer_support;
+        let limbus_refinement = outer_fit.as_mut().zip(current_luma).and_then(|(review, image)|
+            refine(source, image, review, &mut outer_support, pupil_fit));
+        let outer_boundary_logits = outer_logits.as_ref().zip(outer_fit.as_ref())
+            .zip(semantic.selected_query).map(|((plane, fit), query)| {
+                boundary_logits::measure(plane, boundary_logits::Source {
+                    eye_index: source.eye_index, sequence: source.sequence,
+                    timestamp_ns: source.timestamp_ns.to_string(),
+                    tracking_epoch: batch.tracking_epoch,
+                    prompt_generation: batch.prompt_generation,
+                    sensor_origin: (source.sensor_x, source.sensor_y),
+                    width: source.width, height: source.height,
+                }, semantic.prompt_index, query,
+                    limbus_refinement.as_ref().is_some_and(|attempt| attempt.applied),
+                    &fit.retained_points, &fit.conic_segments).map(Arc::new)
+            }).transpose()?;
         let quality = semantic
             .selected_query
             .and_then(|selected| semantic.masks.iter().find(|mask| mask.query == selected))
@@ -8533,6 +8643,8 @@ mod runtime {
             source_raw: Arc::clone(&source.pixels),
             semantic: Some(semantic),
             outer_fit,
+            outer_boundary_logits,
+            limbus_refinement,
             inner_pupil_fit: proposal_pupil_fit,
             adapters: Vec::new(),
         });
@@ -8604,6 +8716,109 @@ mod runtime {
     #[cfg(test)]
     mod video_publication_tests {
         use super::*;
+        #[test]
+        fn boundary_logits_capture_is_opt_in_and_keeps_the_tensor_unchanged() {
+            let malformed = Tensor::zeros([2, 3], (Kind::Float, Device::Cpu));
+            assert!(capture_outer_logits(&malformed, false).unwrap().is_none());
+            assert!(capture_outer_logits(&malformed, true).is_err());
+            let logits = Tensor::arange(12, (Kind::Float, Device::Cpu)).reshape([1,1,3,4]);
+            let before = logits.copy();
+            let plane = capture_outer_logits(&logits, true).unwrap().unwrap();
+            assert_eq!((plane.width, plane.height), (4,3));
+            assert_eq!(plane.values, (0..12).map(|i| i as f32).collect::<Vec<_>>());
+            assert!(logits.equal(&before));
+            let alternatives = logits.expand([1,2,3,4], true);
+            assert!(capture_outer_logits(&alternatives, true).is_err());
+        }
+
+        #[test]
+        fn boundary_logits_publish_exact_native_source_without_changing_geometry_or_pupil() {
+            let (source,image,review,_)=limbus_refinement::tests::fixture();
+            // Publication performs center-aligned model-to-native conversion
+            // even at unit scale; compare the exact converted values (the
+            // +0.5/-0.5 round trip can change an irrational point by one ULP).
+            let native_review=model_review_in_source(review.clone(),source.width);
+            let pupil=PupilVoidFitReview {ellipse:Ellipse {major_radius:24.0,minor_radius:21.0,..review.ellipse},
+                raw_support:RawRingSupport {score:4.0,points:32,positive_fraction:0.8,strong_sectors:8}};
+            let mut request=batch();
+            request.frames=vec![Arc::new(source.clone())];
+            let mut published=Vec::new();
+            let mut outcomes=Vec::new();
+            for enabled in [false,true] {
+                let mut input=partial(OUTER_IRIS_PROMPT,Vec::new());
+                input.semantic.selected_query=Some(0);
+                input.outer_support=raw_ring_support(&image,review.ellipse);
+                input.outer_fit=Some(review.clone());
+                input.pupil_fit=Some(pupil);
+                input.outer_logits=enabled.then(||boundary_logits::Plane {width:384,height:256,
+                    values:(0..384*256).map(|i|(i%384) as f32-192.0).collect()});
+                let (tx,rx)=sync_channel(1);
+                outcomes.push(process_video_frame_with_refiner(&request,&tx,Some(&image),Some(input),
+                    |_,_,_,_,_|None).is_ok());
+                published.push(rx.try_recv().unwrap());
+            }
+            assert_eq!(outcomes[0],outcomes[1]);
+            assert!(published[0].outer_boundary_logits.is_none());
+            let evidence=published[1].outer_boundary_logits.as_ref().unwrap();
+            assert_eq!(evidence.source.eye_index,source.eye_index);
+            assert_eq!(evidence.source.sequence,source.sequence);
+            assert_eq!(evidence.source.timestamp_ns,source.timestamp_ns.to_string());
+            assert_eq!(evidence.source.sensor_origin,(source.sensor_x,source.sensor_y));
+            assert_eq!((evidence.source.tracking_epoch,evidence.source.prompt_generation),(9,7));
+            assert_eq!((evidence.source.width,evidence.source.height),(source.width,source.height));
+            assert!(!evidence.contour_refined);
+            for p in &published {
+                assert!(Arc::ptr_eq(&p.source_raw,&source.pixels));
+                assert_eq!(p.inner_pupil_fit,Some(pupil));
+                let fit=p.outer_fit.as_ref().unwrap();
+                assert_eq!(fit.ellipse,native_review.ellipse);
+                assert_eq!(*fit.retained_points,*native_review.retained_points);
+                assert_eq!(*fit.conic_segments,*native_review.conic_segments);
+                assert_eq!(*fit.flat_tire_points,*native_review.flat_tire_points);
+            }
+            for arc in &evidence.arcs { for profile in &arc.profiles {
+                assert!(review.conic_segments[arc.arc_index].contains(&profile.point_index));
+                assert_eq!(profile.point_roi_px,native_review.retained_points[profile.point_index]);
+            }}
+            let mut baseline=serde_json::json!({"existing":"unchanged"});
+            published[0].export_boundary_logits(&mut baseline);
+            assert!(baseline.get("outer_boundary_logits").is_none());
+            let mut candidate=baseline.clone();
+            published[1].export_boundary_logits(&mut candidate);
+            assert_eq!(candidate["outer_boundary_logits"],serde_json::json!(evidence.as_ref()));
+            candidate.as_object_mut().unwrap().remove("outer_boundary_logits");
+            assert_eq!(candidate,baseline);
+        }
+
+        #[test]
+        fn limbus_refinement_is_one_source_product_for_result_and_proposal() {
+            let (source,image,review,field)=limbus_refinement::tests::fixture();
+            let candidate=field.candidate.unwrap();
+            let mut request=batch();
+            request.frames=vec![Arc::new(source.clone())];
+            request.target=Target::OuterLimbusAndInnerPupilVoid;
+            let pupil=PupilVoidFitReview {ellipse:Ellipse {major_radius:24.0,minor_radius:21.0,..review.ellipse},
+                raw_support:RawRingSupport {score:4.0,points:32,positive_fraction:0.8,strong_sectors:8}};
+            let mut input=partial(OUTER_IRIS_PROMPT,Vec::new());
+            input.outer_support=raw_ring_support(&image,review.ellipse);
+            input.outer_fit=Some(review);
+            input.pupil_fit=Some(pupil);
+            let (tx,rx)=sync_channel(1);
+            let result=process_video_frame_with_refiner(&request,&tx,Some(&image),Some(input),
+                |source,image,review,support,pupil|Some(limbus_refinement::apply_field(source,image,review,support,pupil,field))).unwrap();
+            let proposal=rx.try_recv().unwrap();
+            assert!(Arc::ptr_eq(&proposal,&result.proposal_masks));
+            assert!(Arc::ptr_eq(&proposal.source_raw,&source.pixels));
+            assert_eq!(proposal.source_timestamp_ns,source.timestamp_ns);
+            assert_eq!(result.source_timestamp_ns,source.timestamp_ns);
+            assert!(proposal.limbus_refinement.as_ref().unwrap().applied);
+            assert_eq!(proposal.outer_fit.as_ref().unwrap().ellipse,candidate);
+            assert_eq!(result.sensor_outer_ellipse.center,(candidate.center.0+400.0,candidate.center.1+800.0));
+            assert_eq!(result.sensor_ellipse,result.sensor_outer_ellipse);
+            assert_eq!(proposal.inner_pupil_fit,Some(pupil));
+            assert_eq!(result.sensor_pupil_ellipse.unwrap().center,(pupil.ellipse.center.0+400.0,pupil.ellipse.center.1+800.0));
+        }
+
         fn batch()->Batch {
             Batch {submitted_at:Instant::now(),target:Target::OuterLimbus,semantic_prompt:OUTER_IRIS_PROMPT,
                 prompt_generation:7,tracking_epoch:9,eye_index:1,
@@ -8614,7 +8829,7 @@ mod runtime {
         }
         fn partial(prompt_index:usize,masks:Vec<ProposalMask>)->LiveTemporalOuterProposal {
             LiveTemporalOuterProposal {semantic:SemanticProposalMasks {prompt_index,width:3,height:2,
-                selected_query:None,masks},outer_fit:None,outer_support:RawRingSupport::default(),pupil_fit:None}
+                selected_query:None,masks},outer_fit:None,outer_logits:None,outer_support:RawRingSupport::default(),pupil_fit:None}
         }
         #[test]
         fn a_current_unfitted_or_empty_mask_is_published_without_admitting_an_ellipse() {
@@ -8767,6 +8982,8 @@ mod runtime {
             semantic,
             source_group_roi_count: if batch.source_group_claimed.is_some() { 2 } else { 1 },
             outer_fit,
+            outer_boundary_logits: None, // legacy adapter consensus does not retain a selected current plane
+            limbus_refinement: None, // legacy adapter consensus is not this source-local video path
             inner_pupil_fit: proposal_pupil_fit,
             adapters: proposal_adapters,
         });

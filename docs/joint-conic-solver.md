@@ -1,6 +1,25 @@
 # Source-aligned joint conic gaze solving
 
-Development status (2026-09-08): implemented core and live adapter; the matched
+Current integration update (2026-09-12): the live distribution uses discarded
+pilot fitting, conditional nuisance proposals, analytical integration of
+unobserved inner radii, and four sampling batches with a numerical admission
+margin. The matched comparison below records substantial recent-SAM coverage
+gains, remaining SAM/Student losses, and increased work. This improves numerical
+integration; it does not establish native gaze accuracy or calibrated model
+probabilities. The older experimental verdicts below describe their dated
+controls; `IntegrationConfig::live()` specifies the current production recipe.
+
+The matched native calibration audit below confirms more qualifying sources
+with identical fitted conics and source handling. Both brighter clips retain
+their final fits, but the dark clip still fails with the required 500 ms source
+settle. Its within-target scatter is comparable to neighboring target spacing;
+having enough numerically supported samples does not establish useful accuracy.
+The source-motion follow-up also finds an admitted 85-degree iris-plane switch
+inside the middle clip. Matched million-draw references still support that
+frame under the current observation model; monitor-fit acceptance and numerical
+integration precision do not certify every native gaze sample.
+
+Broader replay status (2026-09-08): implemented core and live adapter; the matched
 replay covers all **387,519 surviving RAW exposures**, with mixed results.
 Calibration source/phase handling and the off-axis distance singularity are
 corrected. Paired host admission now anticipates work, and recording preserves
@@ -1817,3 +1836,2778 @@ If comparing LightBox states, record actual focus/exposure and sensor cadence;
 the historical dark/bright clips do not hold those conditions fixed. New
 human localization evidence must use the canonical native-RAW labeler with
 predictions hidden until `SAVE + DONE`, not these preview overlays.
+
+## Conditional probabilistic integration (September 12 stereo viewer)
+
+SAM3.1 and Eye Student now share a source-aligned probabilistic joint solver
+in the Stereo viewer. Enabling the existing second-ROI solver also enables this
+integration. The joint MAP target, contributing groups and selected association are
+preserved. In probabilistic mode, direction admission now requires a sampled
+90% angular radius of at most 15 degrees, plus the existing two-eye or pupil
+support condition. Unresolved sampling withholds direction authority. This is
+an engineering support gate, not calibrated screen accuracy; exact-source,
+age, camera-facing and paired-calibration completion checks still apply. A strong single eye can
+contribute when its partner has no usable arcs; two independent gaze estimates
+are never averaged. The newer bright clips retain their calibration support;
+the dark clip remains a documented failure below.
+
+The undamped full parameter information matrix yields a local angular and target
+covariance after marginalizing eye-center/range, radii, pupil offset/depth and
+axis alignment. Freezing those quantities at their fitted values would understate
+uncertainty. Active constraints and rank deficiency keep this symmetric local
+covariance unavailable. See [Ceres covariance documentation](https://raw.githubusercontent.com/ceres-solver/ceres-solver/master/docs/source/nnls_covariance.rst)
+for the distinction between observation covariance and optimizer damping.
+
+The local matrix also proposes heavy-tailed Student-t samples around up to four
+current direction basins. At a hard constraint, a feasible one-sided derivative
+can propose samples without being published as Gaussian confidence. Every
+sample must satisfy the original bounds and is rescored against the original
+robust arc objective and priors, reconsidering arc alternatives and group
+rejection. Density correction uses the complete mixture proposal; repeated
+optimizer starts do not acquire extra mass. The axial-distance/log-distance
+Jacobian is included. Gaussian engineering priors and uniform bounded viewpoint
+slopes define the integration measure. The density is conditional on the selected
+ROI association; an unlocalized-eye alternative is not integrated as another
+probability model with a different dimensionality.
+
+Integration uses deterministic common random numbers in batches of roughly 512,
+up to 8,192 samples. It may stop with at least 48 effective samples and no sample
+carrying over 10% of the weight. At the limit it reports an estimate only with
+at least 24 effective samples and maximum weight at most 20%; otherwise covariance,
+direction masses and the 90% angular radius remain unavailable. Those thresholds
+are engineering diagnostics, not a guarantee of integration accuracy. Large
+ESS does not certify that a region was visited; see [Owen, Importance sampling,
+section 9.3](https://artowen.su.domains/mc/Ch-var-is.pdf). The reported target mean
+is a distribution summary, never a replacement cursor target. No historical
+sample is counted as a fresh observation.
+
+The live recording JSON and `VIEW STATUS` expose `local_uncertainty` and
+`posterior`. The latter contains conditional direction-region masses, the
+sampled target covariance, and a per-eye angular radius enclosing 90% of the
+sampled model mass about the selected gaze. A radius is not a pixel error or a
+screen accuracy guarantee. Source/prompt/crop/clock checks and the 900 ms
+presentation age limit also apply to these diagnostics. Unknown sampling support
+is shown as unresolved, not zero spread.
+
+### Matched validation and remaining failures
+
+Frozen baseline: commit `eda3aa0` standalone evaluator, built before these changes.
+Artifacts are under `outputs/probabilistic-stereo-20260912`; `baseline-eval.sha256`
+identifies the executable. Candidate `posterior-eval-v4` uses `--probabilistic`.
+No labels or screen targets are solver inputs.
+
+- **Development:** first 2,500 exposures of each immutable `sam-all-a.jsonl` and
+  `sam-all-b.jsonl` cache: 5,000 exposures, 3,226 reads, 18 capture entries,
+  indices 100–2,599 and 193,759–196,258. All lack independent scale; 4,173 have
+  unattested source clocks. Geometry and admission match the frozen baseline
+  exactly. Of 2,384 available solves, 1,928 have an integration estimate and 456
+  have insufficient sampling. Another 842 reads have no boundary solve. Sampled
+  90% radii are often broad (per-eye medians approximately 60° for either eye), so this
+  corpus does not demonstrate dependable gaze direction. Descriptive joint time
+  median/p95 was 3.47/17.66 ms versus 2.15/8.39 ms baseline.
+- **Reviewed subset:** 76 exposures / 49 reads / six capture entries, also without
+  independent scale or attested clocks. All geometry/admission is unchanged;
+  37 solves have estimates, four insufficient sampling, eight no solve. Human
+  localization scores therefore remain unchanged. Ten source-matched reviewed
+  labels exist, eight with jointly accepted visible-point scores; this is a
+  small localization check, not gaze truth.
+- **Source ordering:** first 1,000 exposures from each full cache: 2,000 sources,
+  1,434 physical reads, six lineages, four native ROI reframes. Native and an
+  added 100 ms partner-arrival delay preserve exact pairing, duplicate suppression
+  and current-source checks. Repeated provisional/paired publications are not
+  additional exposures. See the `posterior-source-*-report.json` artifacts for
+  the exact candidate revision and source-count accounting.
+- **Synthetic/contract tests:** 123 standalone component tests, 23 UI tests and
+  ten live-adapter tests pass. Strong same-eye outer+pupil support narrows the
+  sampled radius compared with the outer-only mirror pair (approximately 5.9°
+  versus 34.9° in the fixture). The full two-eye fixture gives about 3.7° versus
+  6.1° for one eye. A sharp pupil with a quarter outer arc recovers the exact
+  synthetic target but retains broad uncertainty (about 33°); recovery of a
+  noiseless optimum is not proof of identifiability. Two separated eighth-circle outer arcs near the pupil-offset direction
+  support a sharp pupil with about a 12° radius and do authorize a direction;
+  support placement matters, not just point count. Existing glare/blur,
+  complementary-arc, crop, clock and duplicate tests remain included.
+
+All timing runs announced shared low-priority CPU/block claims; some overlapped
+concurrent student live activity. They are not exclusive latency benchmarks.
+The older subsets provide no independent SN-FEIDA evaluation: candidate radius
+was never substituted for missing external scale. The recent clips below provide
+a separate comparison with their recorded, candidate-independent coarse scale. The camera still uses engineering
+intrinsics, and refraction, subject visual-axis calibration, likelihood/coverage
+calibration and missed posterior modes remain unvalidated. This phase does not
+establish new-user readiness or resolve the darker clip's calibration failure.
+
+### Recent recordings and production direction admission
+
+Three cached production-worker clips (`recent-offered-{0,1,2}-sam.jsonl` under
+`outputs/calibration-provider-fit.cVlx1Z`) add **998 exposures / 499 paired reads**.
+They carry recorded MediaPipe-derived coarse scale, held between independent
+acquisition updates under a nominal limbus-size assumption. This is not a fresh
+physical ruler or candidate-radius normalization. Across 474 right-eye and 485
+left-eye matched adjacent transitions, SN-FEIDA log steps remain exactly equal
+to baseline (median 0.01332 and 0.01473, respectively). Geometry and geometric
+admission are unchanged. The 8,192-sample budget provides 357 estimated
+posteriors, 141 insufficient integrations and one unavailable solve. The older
+2,048-sample budget estimated 168 of those reads. Descriptive joint time is
+14.55 ms median / 22.44 ms p95. In the clearest clip, 103/111 reads yield estimates
+with approximately 6.2° median angular radius; the dark clip still contains
+broad modes and failed integration. These radii do not validate accuracy.
+
+The frozen native test executables `viewer-calibration-{baseline,candidate}-tests`
+and `calibration_compare.py` replay the same actual bridge, source/prompt gates,
+paired completion barrier, acquisition state machine and recorded original
+target windows for both eyes. Targets are post-fit scoring inputs only. No new
+GPU inference or subject session was run. The cached worker arrival schedule is
+preserved; this does not simulate extra backend latency or a subject waiting
+longer when a target lacks support.
+
+With a 500 ms source settle, **both eyes in both brighter clips retain passing
+plane, affine and shared-support fits** under the new posterior direction gate.
+The first target of the middle clip has no qualifying sources in either arm;
+its other windows provide the existing fitter's sufficient coverage. This is
+an original-window comparison, not a prediction of live completion times or
+independent gaze accuracy.
+
+The darker clip **still fails for both eyes**. Its source coverage regresses
+from sufficient to insufficient: right-eye source counts per target change
+from `[8,12,10,12,13,9,10,9,24]` to `[1,5,6,7,2,4,4,7,14]`; the left eye similarly
+loses eligible support. Its formerly passing left-eye plane-only fit also
+becomes unavailable/failing; the joint plane+affine criterion already failed.
+The new gate withholds ambiguous directions rather than fixing those images.
+This failure is not hidden by counting held frames, lowering the acquisition
+requirements or changing the monitor fitter. Logs and full per-window reports
+are `admission-*.jsonl`, `windows-*-summary.json` and
+`recent-sampling-budget-comparison.json` in the work directory.
+
+### RAW optical weighting experiment — disabled in live operation
+
+`--raw-boundary-uncertainty` is an explicit offline experiment. It measures
+per-arc native RAW edge widths, position mismatch and photometric variation
+without moving points or using the candidate's own fit residual. Its optional
+`localization_sigma_px` replaces the ROI optical fallback only for that arc;
+contour and timing allowances remain separate. SAM and Student training and
+preprocessing are not changed.
+
+Do not enable this policy by default based on its synthetic tests. In the
+reviewed subset, 169/216 arcs hit the conservative unknown allowance. It worsened
+unchanged held-out outer-point RMS on many reads and produced a 3.50 px regression
+on one visible-label case. Eight accepted label cases were mixed (median RMS
+4.26→3.81 px; one severe case improved 37.40→29.90 px), which does not compensate
+for the broader regressions or establish accuracy. The 5,000-exposure development
+comparison also worsened many common accepted contour fits. Coarse priors can
+pull weakly weighted geometry away from useful segmentation evidence. The frozen
+`raw-uncertainty-eval-v1`, matched reports and `raw-v1-rejection-summary.json`
+preserve this negative result. Live operation retains the established arc
+allowances while the new posterior describes their conditional uncertainty.
+
+### Real temporal pupil ablation: promising area case, not validated geometry
+
+The September 12 pupil ablation now contains a reproducible **real-source area
+diagnostic**, but not a human-validated example establishing that pupil support
+is necessary for a correct, stable outer ellipse. The result includes a clear
+counterexample in the same dark recording.
+
+`buttercup_stereo_conic_eval --without-pupil` removes both eyes' pupil arcs and
+pupil initialization hints after the normal shared extraction. It preserves
+outer observations, RAW admission, camera/pose priors, independent scale and
+source identities. Surviving conic support indices are remapped. The matched
+998-exposure audit verifies 2,084 identical non-pupil arc records and 985
+identical outer hints; it removes 5,469 pupil arc records and 764 pupil hints.
+This tests the joint effect of pupil observations and initialization, not the
+separate contributions of each eye or each mechanism.
+
+All three recent SAM3.1 worker caches were replayed with and without pupils:
+**499 physical paired reads, 998 native ROI exposures, three clips, one person**.
+This is the recorded worker's offered subset, not every camera frame and not an
+Eye Student evaluation. There are 474 comparable right-eye and 485 left-eye
+adjacent area transitions. Neither arm loses extra fits: 489/499 right and
+496/499 left. Source-order replay uses the live tracker, then counts each final
+physical read once; held or provisional publications are not extra samples.
+No transition bridges a dropout, changed clock/dimensions/scale reference or
+gap over 500 ms. History supplies optimization seeds, not area smoothing.
+
+The first pass retained the evaluator's ordinary training/withheld split.
+`--all-boundary-samples` then repeated the entire comparison using every
+retained native point, as the live geometry adapter does. This mode emits no
+withheld probes: its outer-contour residuals are explicitly in-sample. Both
+passes preserve the following area effect and regression. Figures and tables
+use the full-sample pass unless marked `v1`.
+
+The metric is **SN-FEIDA**, `pi * major_radius² / independent_scale²`, under the
+frontal-equivalent planar disk model. It is neither screen-calibration affine
+area nor a measured curved surface. The recorded independent MediaPipe coarse
+scale is held throughout each clip, with broad engineering bounds; it does not
+correct fresh within-clip depth changes. No candidate radius supplies scale.
+
+| Case | Fresh right-eye frames / duration | Mean absolute log area step, without pupil | With pupil | Interpretation |
+| --- | ---: | ---: | ---: | --- |
+| Dark clip 0, sequences 313–333 | 9 / 1.940 s | 0.06582 | 0.02142 | 67% smaller mean step; an isolated area spike at 329 disappears |
+| Same clip, sequences 602–620 | 8 / 1.744 s | 0.08205 | 0.13627 | 66% larger mean step; pupil support introduces a downward excursion at 611 |
+| Bright clip 2, sequences 89–98 | 9 / 1.814 s | 0.00803 | 0.00681 | Small improvement, insufficient to call pupil support instrumental |
+
+These values are dimensionless absolute natural-log steps, not percentages of
+anatomical area. All fixed two-second windows are retained in the report; these
+examples were selected after examining the results and are exploratory.
+The dark recording is `sam31-mouse-3d-1788826709-274018364.tar`; the bright one is
+`sam31-mouse-3d-1788827261-537156697.tar`, under `outputs/calibration-corpus`.
+The case report retains exact RAW offsets, SHA256, native origins, timestamps
+and sequences for repeat review.
+
+The apparent win at 329 rejects some observed outer fragments. Its all-fragment
+in-sample outer RMS gets worse, and its posterior integration is insufficient;
+it is not an admitted, accurate gaze result. Current accepted contour support
+and sensor-coordinate motion are checked by the diagnostic test, but neither
+certifies the discarded or hidden rim. The later regression also worsens
+outer-contour localization. No human labels match these recent intervals.
+On the separate reviewed subset, eight accepted visible-label comparisons
+were available: seven are unchanged and sequence 222 improves from 4.035 to
+3.378 px RMS **when the pupil is removed** in the ordinary withheld-split
+evaluator. Those older examples lack independent scale. This evidence does
+not justify claiming a uniform pupil benefit or tuning for constant area.
+
+Artifacts under `outputs/probabilistic-stereo-20260912`:
+
+- `pupil-temporal-report-v2.json`: full timelines, every fixed window, exact case
+  sources, uncertainty status and coverage; `pupil-full-comparison-v2.json`
+  contains independent source/duplicate audits for both arms.
+- `pupil-area-cases-v2.png`, `pupil-area-all-clips-v2.png`, and
+  `pupil-raw-cases-v2.png`: case comparisons, complete scope and native RAW.
+- `pupil-ablation-isolation-v1.json`, `pupil-reviewed-labels-v1.json`, and
+  `pupil_temporal_report.py`: unchanged-evidence audit, post-fit labels and
+  reproducible analysis. The script accepts `v1` or `v2` and creates new output.
+
+The real-source Rust test is opt-in because captures stay outside the source
+tree. It uses the existing immutable cache by default, overridable with
+`BUTTERCUP_PUPIL_ABLATION_CACHE`, and replays 18 source exposures through both
+arms with all retained samples. It passed, alongside 125 component tests.
+This guards a causal area diagnostic, not a full geometry quality claim:
+
+```sh
+cargo test --no-default-features --bin buttercup_stereo_conic_eval \
+  recorded_dark_clip_pupil_support_suppresses_one_area_spike -- --ignored --nocapture
+```
+
+`--without-pupil` and `--all-boundary-samples` are offline evaluator controls.
+They do not change live detector/training defaults. Independent temporal
+scale/motion and canonical human labels for before/target/after exposures are
+still needed before calling the area-only case a validated localization win.
+
+### Pupil-edge continuity experiment: retained offline, not enabled live
+
+The competing RAW peaks are ranked by contrast independently at each profile.
+When their strengths exchange, following rank zero can connect different
+physical edges. `--coherent-pupil-arcs` tests matching the two original peaks by
+radial offset within each sector, with a 4 px adjacent-profile gate. Missing
+profiles and larger jumps terminate a path. It preserves observed coordinates,
+photometry and widths, and gives competing paths the same correlation group;
+it does not fill gaps, borrow temporal points or turn alternatives into
+independent votes. The gate is an engineering assumption, not a learned or
+calibrated uncertainty model.
+
+This remains an **offline evaluator option**. The live shared extractor calls
+the original ranked-path behavior. A matched 258-exposure source replay with
+the option omitted is exactly equal to the frozen baseline after excluding
+elapsed runtime and the new, false option metadata. The extraction refactor
+therefore has no demonstrated default-behavior change on that fixture.
+
+The matched evaluation under `outputs/stereo-conflict-20260912` includes:
+
+- The same three recent SAM clips as the pupil ablation: 499 paired reads,
+  998 native ROI exposures, all retained samples in source-order replay.
+  Geometric coverage stays at 489 right / 496 left observations, but the
+  95th-percentile adjacent absolute log SN-FEIDA step worsens from 0.12029 to
+  0.13260 on the right and from 0.07167 to 0.07858 on the left. There are
+  474 / 485 common, fresh, short-interval transitions; absent fits break the
+  chain. Scale remains the same recorded acquisition estimate, held within
+  each clip, rather than a fresh physical scale measurement.
+- Native SAM and Student caches for the **same** 129 paired reads / 258 ROI
+  exposures from `both-eyes-1789218305-631052561.tar`, sequences 4395–4523.
+  These are frozen completion-paced contour exports in
+  `outputs/student-shadow.FkzvzE/{sam,student}-live.jsonl`; this evaluation does
+  not rerun inference or change training. Eighty-three input exposures lack
+  scale hints; 175 have acquisition hints, which are not independently
+  validated rulers. Neither full-clip physical area nor gaze accuracy is
+  established by these caches.
+- The recent clips with the ordinary withheld-point split, plus the existing
+  reviewed-label subset. Changed pupil probe sets are skipped; unchanged
+  outer-limbus probes retain their exact coordinate fingerprints.
+
+| Same-read diagnostic | Ranked baseline | Continuity experiment |
+| --- | ---: | ---: |
+| SAM geometrically contributing eyes, right / left | 121 / 121 | 121 / 121 |
+| SAM estimated conditional posteriors | 112 | 113 |
+| SAM supported directions, right / left | 67 / 66 | 56 / 55 |
+| Student geometrically contributing eyes, right / left | 123 / 121 | 123 / 121 |
+| Student estimated conditional posteriors | 89 | 85 |
+| Student supported directions, right / left | 42 / 41 | 25 / 25 |
+
+Counts use final physical reads, not provisional or repeated publications.
+Supported directions require the existing conditional sampling and angular
+width checks; these are model-conditional estimates, not measured gaze
+successes. The candidate also changes some fitted ray branches by over 70
+degrees, so a lower contour cost alone cannot select it for live use.
+
+Unchanged withheld outer-contour RMS improves slightly: right median/p95
+1.386/2.717 to 1.379/2.631 px, left 1.534/2.354 to 1.534/2.311 px. Three
+eye-frame comparisons improve by more than 1 px and none regress by that
+threshold. Of eight accepted visible human-label comparisons, seven are
+unchanged; sequence 222 improves from 4.035 to 3.648 px. Those older labels
+lack independent scale and do not cover the recent pupil-conflict intervals.
+The small localization benefit does not outweigh the temporal and supported
+coverage regressions, so the experiment is not promoted.
+
+A separate opt-in Rust diagnostic,
+`recorded_pupil_conflict_search_diagnostic`, compares 16 starts / 12 refinements
+with 24 / 16 on real dark-clip sequences 325, 329 and 611. It completed; the
+larger search barely changes the first two fits and reproduces the same cost,
+area and rejected outer fragment at 611. This bounded result argues against
+optimizer budget alone as the cause of that conflict; it is not an accuracy
+test. The component suite passes 128 tests, with three corpus diagnostics
+opt-in. `source-audits-v1.json` verifies source clocks, exact native identities,
+reframes and duplicate suppression across both matched caches and the recent
+candidate replay. `flag-off-identity-v1.json` records default equivalence.
+
+For independent review, eight exact native targets are prepared beneath the
+dark capture's `annotator/archive`: right sequences 327, 329, 331, 609, 611,
+614 and left 329, 611. Each includes the immediately preceding and following
+actual same-eye exposure. Left-eye sequence 328 does not exist; the context
+for left 329 is 327/329/331, preserving actual times rather than fabricating
+consecutive frames. Twenty-one unique RAW pieces have verified SHA256 and
+native origins, dimensions and stride. `annotation-preparation.json` and
+`annotation-verification.json` retain the exact provenance and checks.
+The canonical labeler specified in [AGENTS.md](../AGENTS.md) loads all eight
+with predictions hidden; no human labels were authored by this
+evaluation. Paired, triplet and possibly-occluded annotations belong in this
+capture's `annotator/labels` directory. Human review remains outstanding.
+
+### Independent numerical references: useful joint evidence and remaining failures
+
+The September 12 numerical audit finds real cases where combining the two
+eyes reduces conditional ambiguity, but also finds that the current sampling
+admission is not consistently reliable near a competing-mode threshold.
+An estimated posterior and a good MAP are insufficient evidence of numerical
+convergence. None of the experimental proposals below is enabled in the live
+viewer, and this audit does not establish measured gaze accuracy.
+
+`IntegrationConfig` makes the seed, integration budget and early stopping
+explicit for numerical comparisons. The production configuration retains the
+original seed, Student-t mixture, 8,192-draw ceiling and admission rules.
+Experimental adaptation, a broad scene proposal and conditional nuisance
+proposals are compiled only under `cfg(test)`. They keep the original target
+loss, priors, arc alternatives, optimizer and selected MAP unchanged.
+
+The pilot-adaptive experiment discards its pilot draws, freezes the fitted
+proposal mixture while retaining the original components, and uses only fresh
+draws with the full mixture density for estimation. The scene proposal adds
+proposal coverage, not extra observations or a new target prior. The third
+experiment mixes full Student-t components with Student-t target coordinates
+and conditional Gaussian nuisances, including their relative normalization.
+Density correction and limitations follow the importance-sampling framework
+in [Owen, chapter 9](https://artowen.su.domains/mc/Ch-var-is.pdf). Analytic
+Gaussian and bounded uniform fixtures check moments and relative mixture
+normalization; these checks do not establish coverage on the eye model.
+
+Seven deliberately difficult paired reads use every retained native point:
+SAM sequences 4396/4430, Student 4397/4411/4418 from the same hotkey recording,
+and recent dark SAM 329/611. Each variant has three independent seeds per
+budget. The 8,192-draw arm permits normal early stopping; the 65,536-draw
+reference consumes its full budget. Both eyes, sources, priors and MAP remain
+identical between proposal variants.
+
+| Proposal | Estimated / 21, up to 8,192 | Median effective samples | Estimated / 21, 65,536 | Median effective samples |
+| --- | ---: | ---: | ---: | ---: |
+| Original mixture | 7 | 15.20 | 12 | 41.33 |
+| Discarded-pilot adaptation | 8 | 20.69 | 15 | 71.25 |
+| Additional scene proposal | 11 | 24.97 | 11 | 48.50 |
+| Adaptation and scene proposal | 11 | 25.07 | 12 | 37.90 |
+| Conditional nuisance proposal | 10 | 22.46 | 16 | 80.32 |
+
+These are integration-status counts, not correct-gaze counts. Improvements
+are mixed across cases, budgets and seeds; more work can discover a dominant
+weight and reduce effective sample size. Dark sequence 611 remains difficult.
+The consolidated report retains every improvement and regression. Shared,
+low-priority CPU timings are diagnostic and do not constitute an isolated
+performance comparison. No candidate is promoted on these results.
+
+The full-sample **static** comparison separately covers the same 129 paired
+SAM reads, 129 paired Student reads and 499 reads from the three recent SAM
+clips. Joint support for both directions while neither monocular arm admits
+its own direction occurs on 58/129 SAM, 38/129 Student and 121/499 recent reads.
+All three posteriors are numerically estimated on 58, 35 and 116 of those
+reads respectively. These are per-read optimizations without history seeds;
+they must not be substituted for the preceding source-order replay counts.
+
+The common ten-read interval **4487–4496** initially appears fully supported
+with both providers at the default seed. It spans 0.872 seconds and exactly
+20 native RAW10 exposures from `both-eyes-1789218305-631052561.tar`. The audit
+verifies their SHA256, source clocks, timestamps, native origins and dimensions.
+Within each provider, all arms share the same coarse scene and priors; only
+the presence of an eye's conic observations changes. Retained-point
+fingerprints, source identities and each arm's MAP remain identical across
+budgets and seeds. Monocular results are separately optimized, never averaged.
+
+| Joint reference on those ten reads | SAM: both directions admitted / 30 frame-seed estimates | Student: both admitted / 30 |
+| --- | ---: | ---: |
+| Up to 8,192 draws, three seeds | 29 | 27 |
+| 65,536 draws, three seeds | 30 | 27 |
+| 1,048,576 draws, three seeds | 29 | 23 |
+
+Every entry in this table has status `estimated-conditional`. At 65,536 draws,
+each monocular arm remains broad on every frame and seed: its angular radius
+ranges from approximately 55 to 75 degrees. At 1,048,576 draws, nine SAM frames
+and seven Student frames admit both directions for all three seeds. This
+preserves a conditional cross-eye benefit on much of the interval, while
+refuting the initial interpretation of a consistently supported ten-frame run.
+
+Student sequence 4488 is the clearest failure of the default numerical
+interpretation: its default maximum radius is about 11.3 degrees, but the
+million-draw references consistently reveal about 60 degrees of spread and
+17–18% mass in the other explored basin. Student 4487/4490 also disagree across
+large reference seeds. SAM 4492 straddles the 15-degree gate. Finite importance
+sampling does not certify all unvisited modes; even the larger budget is a
+reference diagnostic, not truth. Effective sample size and largest-weight
+checks alone do not establish precision for a direction-admission quantile.
+
+The same concern appears in synthetic support cases with the extra artificial
+inner-limbus boundary removed. Complete same-eye outer/pupil evidence stays
+near a 5-degree radius across three million-draw references; an outer-only
+mirror case remains near 35 degrees and correctly withholds direction. Two
+separated partial outer arcs plus a full pupil initially appeared supported,
+but its reference radii span 13.94–15.98 degrees. A weak complementary stereo
+case remains broad at about 33–35 degrees. An initial assertion that all such
+partial cases were supported failed at 65,536 draws. That failure is preserved
+in the logs; the explicit reference diagnostic reports the unresolved cases
+instead of turning a good MAP into an unsupported convergence assertion.
+
+There are no matching human localization labels or known screen targets for
+the ten-read interval. Fourteen of its twenty exposures have coarse acquisition
+scale hints; six lack them. SN-FEIDA therefore excludes three paired reads,
+and the available hints are not independently validated physical rulers. The
+numerical variants do not change MAP area or localization, so this audit
+claims neither an area-stability improvement nor anatomical correctness.
+The recordings cover one person and the workers' offered subset of exposures.
+The pending native before/target/after review described above remains necessary
+for the separate pupil/outer-boundary conflict.
+
+Artifacts under `outputs/posterior-proposal-20260912`:
+
+- `numerical-reference-report-v1.json` and `report_numerical_references.py`:
+  every proposal outcome, reference seed, cohort count, exact source identity
+  and recorded limitation; all 20 selected RAW hashes are checked.
+- `cross-eye-reference-v2.png` / `.svg`: the full interval, including the
+  higher-budget failures; angular spread is explicitly not measured gaze error.
+- `real-cases-v4.log`: the consolidated five-proposal comparison;
+  `cross-eye-reference-v2.log` and `cross-eye-large-reference-v1.log` preserve
+  the native 8,192/65,536 and full-interval million-draw references.
+- `supported-reference-v2.log`, `supported-cases-v1.log` and
+  `supported-cases-tail-v1.log`: synthetic references and the original failed
+  partial-case assumption, including the competing draw's actual arc support.
+- `default-identity-v1.json`: 258 source-order events match the frozen prior
+  default exactly after excluding elapsed time and added diagnostic metadata.
+  This is separate from the static comparisons above.
+
+The component suite passes 130 tests; eight diagnostics requiring native
+runtime data or large sampling budgets are opt-in. Six native stereo UI tests,
+twelve live joint-publication tests, the native SAM viewer build and the
+source-tree audit also pass. No running viewer was restarted. For example:
+
+```sh
+cargo test --profile live --no-default-features --bin buttercup_stereo_conic_eval \
+  recorded_posterior_proposal_diagnostic -- --ignored --nocapture
+cargo test --profile live --no-default-features --bin buttercup_stereo_conic_eval \
+  recorded_cross_eye_support_reference_diagnostic -- --ignored --nocapture
+cargo test --profile live --no-default-features --bin buttercup_stereo_conic_eval \
+  recorded_cross_eye_support_large_reference_diagnostic -- --ignored --nocapture
+```
+
+The next numerical work must address integration and admission precision near
+competing-mode thresholds, while retaining honest abstention on weak geometry.
+Relaxing the uncertainty gate or promoting a proposal merely because it
+increases estimated-count coverage would not resolve the demonstrated failures.
+
+### Numerical precision is observable; the stricter admission experiment is not promoted
+
+The posterior now exports `direction_numerics` for each modeled eye: sampled
+mass within 15 degrees of the selected ray, its approximate numerical standard
+error, and the estimate plus/minus two standard errors. The native stereo VIEW
+inspector displays the mass and numerical error in percentage points only for
+the same fresh publication as its other uncertainty fields. This telemetry
+does not change the selected gaze, posterior proposal, early stopping or live
+admission policy. It is not a calibrated gaze-confidence interval, and it
+cannot rule out an unvisited tail or mode.
+
+The variance is a delta-method estimate for a self-normalized importance ratio,
+stratified by the proposal that **generated** each sample, rather than by its
+nearest fitted mode. For normalized weights `w`, event indicator `I`, estimated
+mass `m`, and influence `z = w*(I-m)`, each proposal stratum contributes
+`n/(n-1) * (sum(z²) - sum(z)²/n)`. Its `n` includes infeasible zero-weight
+draws. Any adaptive pilot is excluded. This applies the ratio-variance and
+multiple-importance-sampling ideas in
+[Owen, chapter 9](https://artowen.su.domains/mc/Ch-var-is.pdf); the finite-sample
+and unexplored-mode limitations remain. Eight hundred independent trials of
+an analytically known stratified probability check its variance, alongside
+the existing density/moment tests and a zero-weight-draw test.
+
+A test-only candidate uses this error to continue sampling when the admission
+decision is unsettled, up to the existing 8,192-draw ceiling. It admits only
+when `m - 2*SE >= 0.9`, in addition to the existing integration and radius gates.
+This is an engineering decision margin, not a certified coverage guarantee.
+The short ten-read SAM/Student comparison removes both admitted-eye outcomes
+on the three reference-broad Student-4488 seeds and retains 47 of 48 frame-seed
+outcomes that stay narrow in the prior million-draw references. One consistently
+narrow Student-4491 outcome is lost, and several unsettled cases remain admitted.
+Strong complete same-eye outer/pupil evidence still passes; the outer-only
+mirror case still withholds. Partial same-eye evidence retains numerical tail
+failures, so these results do not establish all requested geometry cases.
+
+The broader **source-order** comparison exposes a material coverage cost:
+
+| Same native cohort | Original admitted directions R / L | Precision margin | Conditional nuisance + margin | Adaptive conditional nuisance + margin |
+| --- | ---: | ---: | ---: | ---: |
+| SAM, 129 paired reads | 67 / 66 | 56 / 56 | 49 / 49 | 46 / 45 |
+| Student, same 129 reads | 42 / 41 | 37 / 35 | 33 / 32 | 35 / 34 |
+| Three recent SAM clips, 499 reads | 299 / 302 | 281 / 283 | 302 / 303 | 270 / 271 |
+
+All four arms preserve every MAP target, eye direction, ellipse, arc support,
+SN-FEIDA value, source identity and replay scheduling field exactly. The
+comparison covers 1,514 native ROI events per arm and counts final physical
+reads once. Geometric contribution is unchanged: SAM 121/121 eyes, Student
+123/121, recent 489/496. More admitted directions are not assumed to be better.
+The conditional proposal increases estimated posteriors in the recent clips
+from 364 to 382; adaptation instead reduces them to 325. Shared, low-priority
+timings do not establish a live-pipeline speed improvement.
+
+Every changed physical read from the initial precision-margin experiment is
+then checked with **three independent 1,048,576-draw references**, along with
+an equal-sized retained control sample. Controls are chosen by native RAW
+SHA256 order, independently of their fitted confidence. That is 11+11 SAM,
+7+7 Student and 19+19 recent reads, 74 selected physical reads in total.
+The replay still solves the entire source history; it spends the large sampling
+budget only on the selected final-arrival events. Every event's geometry and
+source context is verified against the baseline. Missing or provisional
+publications never become extra reference observations.
+
+| Directions newly withheld by the initial margin | Reference stays narrow in all three seeds | Reference stays broad | Straddles threshold | Integration remains unresolved |
+| --- | ---: | ---: | ---: | ---: |
+| SAM | 2 | 16 | 1 | 2 |
+| Student | 0 | 6 | 4 | 2 |
+| Recent clips | 28 | 0 | 9 | 0 |
+
+These classify numerical model support, **not signed gaze truth**. They show
+why the blanket margin is not a sufficient repair: it removes many broad
+SAM/Student directions but also rejects 28 recent-clip directions whose larger
+references stay narrow. One newly admitted Student direction is reference-broad.
+The retained controls themselves include four reference-broad and four
+numerically unresolved directions, so the original policy is not certified.
+
+The conditional nuisance proposal restores 16 of those 28 recent narrow
+directions while preserving all 38 recent retained-control directions. It
+still loses twelve narrow recent directions and has mixed outcomes elsewhere.
+Adding pilot adaptation worsens recent coverage and introduces additional
+reference-broad Student admissions. The fixed 74-read reference sample was
+chosen for the original precision-margin comparison; newly changed cases
+outside that sample are not independently certified for the later variants.
+Neither proposal nor the stricter admission rule is enabled live.
+
+No human localization or screen-target truth is added by this numerical audit.
+Scale availability and held acquisition-scale limitations are unchanged from
+the preceding corpus descriptions; no candidate radius supplies normalization.
+The exact geometry identity also means there is no claimed localization or
+area-stability improvement. The canonical native temporal label review remains
+outstanding. Live subject/lighting work by the other agent retains priority;
+the later comparisons use one low-priority CPU with idle I/O and no GPU.
+
+Artifacts under `outputs/posterior-admission-20260912`:
+
+- `source-comparison-v1.json` and the `conditional` / `adaptive-conditional`
+  variants: complete source audits, unchanged geometry and every admission change.
+- `reference-selection-v1.json`, `selected-reference-comparison-v1.json` and
+  its proposal variants: exact selected sources, all three large-reference
+  posteriors and outcomes, including regressions and unresolved sampling.
+- `short-reference-comparison-v1.json`, `synthetic-admission-v1.log` and
+  `report_admission.py`: initial controlled cases and reproducible analysis.
+- `numerical-admission-tests-v1`, `selected-reference-tests-v1` and
+  `proposal-admission-tests-v1`: frozen native test runners for the compared
+  stages. Their source lives in the existing evaluator and joint-solver tests.
+- `telemetry-production-identity-v1.json`: all 1,514 production events match
+  the frozen default, including sampled numerical error, after excluding
+  elapsed time, diagnostic contract wording and the absent test-only flag.
+  The older SAM/Student baseline also matches after excluding explicitly
+  checked inactive proposal metadata added during the preceding experiments.
+- `inspector-render-v1`: inspected SAM and Student native VIEW fixtures, with
+  both numerical-error rows visible. The exact-publication expiry test passes.
+
+The component suite passes 132 tests, with twelve corpus/large-budget
+diagnostics opt-in. Six native stereo UI tests and twelve live joint-publication
+tests pass. The production evaluator and native SAM viewer builds pass; the
+latter was completed with the concurrent lighting update after these telemetry
+source changes. The source-tree audit passes. These are software and replay
+checks; no new live gaze-accuracy measurement or human label is claimed.
+
+The native source-order diagnostics require a fresh output directory beneath
+`outputs`; they are opt-in and write new files instead of replacing prior runs:
+
+```sh
+BUTTERCUP_POSTERIOR_REPLAY_DIR=outputs/NEW_RUN \
+  cargo test --profile live --no-default-features --bin buttercup_stereo_conic_eval \
+  recorded_numerical_admission_source_replay -- --ignored --nocapture
+```
+
+Optional `BUTTERCUP_POSTERIOR_REPLAY_COHORT` selects `sam`, `student` or `recent`.
+`BUTTERCUP_POSTERIOR_REPLAY_PROPOSAL` selects `conditional`, `adaptive` or
+`adaptive-conditional` for a separate candidate output. Selected large
+references additionally require `reference-selection-v1.json` in that run
+directory and use `recorded_selected_posterior_reference_replay`.
+
+### Integrating an unobserved inner radius helps coverage but does not settle competing modes
+
+The native SAM/Student cohorts above provide outer-limbus and pupil arcs but
+no observed inner-limbus arcs. A test-only integration path removes that
+unobserved radius from numerical integration while preserving its Gaussian
+prior and `outer >= inner > pupil` constraint. It does not remove observed
+pupil evidence, change an ellipse, or turn an initializer into an observation.
+Eligibility checks **all** alternative arcs, including those rejected at the
+selected fit; any observed inner-limbus alternative keeps its radius explicit.
+
+For an omitted inner radius, the admissible interval is
+`[max(prior_min, pupil_radius), min(prior_max, outer_radius)]`. Its integrated
+factor is `sigma*sqrt(2*pi)*(Phi(upper_z)-Phi(lower_z))`. A representative
+interior radius lets the remaining unchanged conic calculation run, and its
+Gaussian residual is removed from the loss before adding that factor. This
+representative radius is not a fitted surface or a measurement. The proposal
+uses the retained **covariance** submatrix, rather than conditioning on omitted
+coordinates through an information submatrix. Student-t marginals retain the
+same degrees of freedom. Tail probabilities use
+[libm's complementary error function](https://docs.rs/libm/0.2.16/libm/fn.erfc.html);
+very narrow intervals use direct Gaussian quadrature to avoid cancellation.
+`libm` is a development dependency because this path remains test-only.
+
+Four focused checks cover direct Gaussian integration, integration of a
+correlated Student-t density, the original full conic loss integrated over
+nested radius bounds, and exact output identity when inner evidence is present.
+A second draw implementation retains the original full proposal's random
+stream and every retained gaze candidate, while weighting with the same
+marginal density. Its transformed draws are checked bit-for-bit against the
+original sampler. This separates radius integration from changing which
+finite set of gaze candidates happens to be sampled.
+
+The default-seed, full-source comparison is:
+
+| Native cohort | Original estimated posteriors | Integrated radius | Integrated radius, original draws |
+| --- | ---: | ---: | ---: |
+| SAM, 129 physical reads / 124 solves | 112 | 116 | 118 |
+| Student, same 129 reads / 124 solves | 89 | 89 | 89 |
+| Three recent SAM clips, 499 reads / 498 solves | 364 | 448 | 439 |
+
+In the first implementation, usable draws rise from roughly 9–13% to 33–35%.
+Mean draws per solved read change from 3,955/6,097/6,317 to
+2,556/5,387/3,560 for SAM/Student/recent, respectively. The implementation using
+the original draws uses 3,010/5,325/4,244. These are integration-work counts;
+shared low-priority execution does not establish a measured live speedup.
+Every native source, MAP target, eye direction, ellipse, support group,
+SN-FEIDA value and scheduling field stays exactly equal in all comparisons.
+
+The gains do not justify live promotion. Across three numerical seeds on the
+previously fixed 74-read subset, the original-draw variant retains 56/66,
+20/24 and 170/198 reference-narrow direction outcomes for SAM/Student/recent;
+the unchanged sampler retains 58/66, 24/24 and 180/198. It also admits 32/57
+reference-broad SAM outcomes versus 29/57 originally. The first marginal-draw
+implementation has better aggregate counts on that subset, but the expanded
+comparison reveals additional losses. A stricter two-standard-error margin
+and a matched full-8,192-draw control do not eliminate the tradeoffs.
+
+The expanded audit covers **every status/admission change** in the first
+implementation: 35 SAM, 39 Student and 124 recent physical reads. Including
+the earlier controls gives 259 provider/read cases, representing 240 unique
+physical reads, each checked with three independent
+65,536-draw references through the complete source history. Of the recent
+directions newly admitted by this implementation, 144 stay narrow in all
+three references, three stay broad, eighteen straddle the threshold, and
+thirty have unresolved integration. It also newly withholds twelve recent
+reference-narrow directions, nineteen SAM directions and twelve Student
+directions. Those categories describe conditional numerical support, not gaze
+truth. Several reference masses themselves vary substantially with seed;
+comparison against the older million-draw runs remains recorded rather than
+treating 65,536 draws as an automatic certificate. The fixed 259-read reference
+set does not cover every new change introduced by the original-draw variant.
+
+The strong complete same-eye outer/pupil synthetic case remains supported;
+an outer-only mirror remains ambiguous. Partial same-eye support still lies
+near the admission threshold, and the weak complementary-eye fixture remains
+broad. No extra anatomical, scale or temporal observation was supplied to
+force those outcomes. No new localization labels or measured gaze accuracy
+were obtained, and no area-stability improvement is claimed from unchanged
+geometry. The existing canonical eight-triplet native review was restored
+after its server was verified stopped; all predictions remain hidden.
+
+Both radius integration and its alternative draw policy remain `cfg(test)`
+and disabled by default. The remaining task is to improve integration of
+competing directions without losing supported observations, then verify
+localization and gaze behavior against independent evidence. Neither more
+estimated posteriors nor fewer draws alone establishes that outcome.
+
+Artifacts under `outputs/posterior-integrated-inner-20260912` include
+`report-integrated-inner-v2.json`, its `seed-*` / `fixed-budget-v1` /
+`paired-draws-v1` variants, `expanded-reference-v1/expanded-report-v1.json`,
+the old-million-reference comparison, and the inspected
+`integrated-inner-comparison-v2.png` / `.svg`. Frozen test runners v1/v2 use
+the first draw implementation; v3 uses the original full draws. The current
+source selects either explicitly and records `marginal_draw_policy`.
+
+To reproduce with a fresh directory beneath `outputs`:
+
+```sh
+BUTTERCUP_POSTERIOR_REPLAY_DIR=outputs/NEW_RUN \
+BUTTERCUP_POSTERIOR_REPLAY_PROPOSAL=integrated-inner \
+  cargo test --profile live --no-default-features --bin buttercup_stereo_conic_eval \
+  recorded_numerical_admission_source_replay -- --ignored --nocapture
+```
+
+Use `integrated-inner-paired` for original draws; either name accepts
+`-precision` for the separate admission-margin experiment. Optional
+`BUTTERCUP_POSTERIOR_REPLAY_SEED`, `BUTTERCUP_POSTERIOR_REPLAY_BUDGET` and
+`BUTTERCUP_POSTERIOR_REPLAY_FULL_BUDGET=1` select independent randomness and
+fixed work. The selected-reference diagnostic also accepts a budget, a seed
+and either draw policy, with the default three seeds preserved when omitted.
+`BUTTERCUP_POSTERIOR_PAIRED_DRAWS=1` selects the paired version of the synthetic
+integrated-inner diagnostic. Output files are created fresh, not overwritten.
+
+Final verification passes 136 component tests, six native stereo UI tests,
+twelve native joint-publication tests, both production builds and the source
+audit. Thirteen data/large-budget component diagnostics remain opt-in. The
+production replay matches all 1,514 earlier production events exactly after
+excluding elapsed time, including the full posterior and numerical-error
+fields; see `production-identity-v1.json`. No live viewer was restarted.
+
+### Broader proposals in the reduced model: gains remain seed- and source-dependent
+
+The next offline comparison combines analytic inner-radius integration with
+global scene proposals, conditional Gaussian nuisance draws, and discarded-pilot
+adaptation. Five initial recipes run on all three frozen cohorts. Two then run
+with three independent numerical seeds and a matched full-8,192-draw control.
+A sixth recipe adds a second global component: its target coordinates retain
+Student-t tails while its conditional nuisance innovations are Gaussian. The
+original global Student-t component remains in the mixture, and every final
+sample is corrected using the entire generating mixture. These changes alter
+the integration proposal, not the conic loss, scale support or anatomical priors.
+
+The conditional sampler also now counts the actual free target coordinates.
+Previously, fixing a target coordinate could cause a nuisance coordinate among
+the first three active parameters to receive the target's Student-t scaling.
+A regression checks both the draw moments and density ratios against the
+known one-dimensional Student-t plus two-dimensional Gaussian distribution.
+This correction and all new proposal switches remain test-only.
+
+The default-seed full-source counts are:
+
+| Native cohort | Original estimates | Global + conditional local proposal | Also conditional global scene proposal |
+| --- | ---: | ---: | ---: |
+| SAM, 129 reads / 124 solves | 112 | 112 | 115 |
+| Student, same 129 reads / 124 solves | 89 | 94 | 88 |
+| Recent SAM, 499 reads / 498 solves | 364 | 453 | 432 |
+
+Across three seeds on the earlier fixed 74-case million-draw reference subset,
+the global/conditional-local recipe admits 62/66, 24/24 and 184/198 directions
+that stayed narrow in those references, versus 58/66, 24/24 and 180/198 for the
+original sampler. It admits 14/57 reference-broad SAM outcomes instead of 29/57,
+but 11/30 Student outcomes remain, versus 12/30 originally. Adding the conditional
+global component reduces that Student count to 5/30 but returns SAM to 28/57,
+and retains only 178/198 of the recent reference-narrow outcomes. These repeated
+numerical seeds are not additional physical exposures or measured gaze truth.
+
+The larger, previously fixed 259-case/240-physical-read comparison exposes
+further regressions. Across the same three seeds, the global/conditional-local
+recipe admits 562/654 recent reference-narrow directions versus 367/654
+originally, but also admits two of 63 reference-broad outcomes and 78 of 138
+numerically unresolved outcomes. The additional conditional scene component
+loses ten Student reference-narrow outcomes relative to the original sampler
+(60/81 versus 70/81). Each run reports every changed read outside this fixed
+reference subset; the subset does not certify all newly admitted cases.
+
+Simply forcing the full budget does not resolve the tradeoff. For the
+global/conditional-local recipe, the fixed-budget SAM control admits eleven
+of nineteen earlier reference-broad directions; the matched original sampler
+admits three. Tail diagnostics show that some dominating samples still fit
+many observed arcs, so discarding them as if all evidence were rejected would
+hide model ambiguity. The updated synthetic diagnostic keeps complete same-eye
+support near five degrees and an outer-only mirror near thirty-five degrees
+at a million draws. The partial same-eye case remains near the admission
+threshold; the weak complementary-eye case remains broad at about 33–34 degrees.
+
+Artifacts are under `outputs/posterior-reduced-proposals-20260912`:
+`proposal-comparison-v1.json`, `report_proposals.py`, the inspected
+`proposal-comparison-v1.png`/`.svg`, per-source outputs and tail logs, and
+`scene-synthetic-v1.log`. All fourteen complete candidate/run combinations
+preserve the exact geometry and source fields in their 1,514 events. The
+137 component tests and source-tree audit pass. No new localization labels,
+independent scale measurements, empirical gaze accuracy or SN-FEIDA improvement
+are claimed. No experimental proposal is enabled in the live solver.
+
+The existing source-replay diagnostic accepts `integrated-inner-global`,
+`integrated-inner-conditional`, `integrated-inner-adaptive`,
+`integrated-inner-global-conditional`, `integrated-inner-global-adaptive`, and
+`integrated-inner-global-conditional-scene`. Its existing seed and fixed-budget
+environment variables still apply. The selected-reference diagnostic also
+accepts `integrated-inner-global-conditional-scene`; the new
+`same_eye_and_complementary_stereo_conditional_scene_diagnostic` uses this
+mixture for all four known-geometry cases and three seeds at each budget.
+
+The conditional scene mixture was additionally run with **three independent
+1,048,576-draw references on all fourteen previously selected Student reads**.
+This repeats the complete source history, preserves every original selection
+and changes no priors or fitted geometry. Across the 28 eye directions, median
+seed-to-seed mass range falls from 3.28 to 1.42 percentage points, and the
+maximum from 56.41 to 6.66 points. Four directions still span more than five
+points, versus twelve previously. All eight earlier consistently narrow
+directions remain narrow in these runs. Of ten earlier consistently broad
+directions, six stay broad, two straddle admission, and two now have unresolved
+integration. One read (sequence 4415) remains insufficient in one new reference;
+sequence 4439 is only just estimated, with one run's ESS around 25. The narrower
+seed range is evidence of better numerical behavior on this subset, not a
+finite-sample certificate or calibrated direction probability.
+
+`student-reference-comparison-v1.json` and its inspected figure retain all
+three posterior estimates for both methods, including those that disagree.
+Sequence 4488 remains broad in both reference methods, despite the original
+small-budget solver's confident direction. The new reference's right-eye mass
+within fifteen degrees is about 86.7–88.5%, versus 81.7–83.2% earlier; that
+remaining proposal dependence is not hidden by the aggregate improvement.
+The production build passes and all 1,514 production replay events match the
+earlier production telemetry exactly except elapsed time, including every
+posterior field. No live viewer was restarted.
+
+### Independent batches: isolate numerical diagnostics from changed draws
+
+Four separately seeded importance-sampling streams exposed instability, but
+also lost useful observations. Each stream samples the same frozen mixture,
+and samples retain their original joint importance weights. Averaging the
+four normalized posterior ratios would suppress a stream carrying substantial
+competing probability mass and is deliberately forbidden. At an 8,192-draw
+total ceiling, the separate-stream precision gate admitted one of three seeds
+on the synthetic pupil-plus-partial-outer fixture. The original stream with the
+existing precision gate admitted all three. That fixture's million-draw
+references straddle the admission threshold, so admitting all three seeds is
+not itself evidence of better integration. Increasing the ceiling to 65,536 did not
+repair the corresponding Student losses: the missed reads actually consumed
+the larger budget, rather than stopping early.
+
+The new test-only `preserve_replica_draws` control partitions the **unchanged
+original draw stream** into four batches, assigning complete proposal cycles
+to each. Every batch balances the same proposal components. Original budget
+rounding and stopping cadence remain unchanged, so batch sizes may differ by
+one proposal cycle. Infeasible zero-weight draws count toward batch work; a
+batch with no posterior mass cannot establish numerical agreement.
+
+For batch indicator sums `A_r`, normalizers `Z_r`, draw counts `n_r`, total work
+`N`, and `R` batches, the pooled estimate remains `m = sum(A_r) / sum(Z_r)`.
+Linearizing that ratio gives the work-weighted between-batch variance estimate
+`N/(R-1) * sum(((A_r-m*Z_r)/sum(Z_r))^2 / n_r)`. It reduces to the equal-work
+formula when every `n_r` is equal. The self-normalized importance ratio and its
+delta-method interpretation follow [Owen, chapter 9](https://artowen.su.domains/mc/Ch-var-is.pdf);
+the unequal-batch expression is the implementation's corresponding derivation.
+Tests compare its average estimated variance with independent simulations of
+a known probability for both equal and unequal work allocations. Four batches
+provide only three degrees of freedom; neither this diagnostic nor the optional
+two-error margin has calibrated coverage, especially at adaptive stopping times.
+
+With numerical admission disabled, the paired control preserves every original
+posterior field, weight-derived estimate and stopping decision in all 1,514
+native source events, excluding only the newly added diagnostic fields and
+elapsed time. A dedicated synthetic regression and all 36 ungated synthetic
+case/seed/budget comparisons also verify this identity. The core suite now has
+140 passing tests. With the precision gate enabled, all three partial same-eye
+synthetic solves survive; complete support remains admitted, and the weak
+complementary-eye and outer-only mirror fixtures remain broad and withheld.
+
+The default-seed comparison on the fixed earlier 74-case reference subset is:
+
+| Outcome | Original stream + precision | Separate streams + precision | Same draws + batch precision |
+| --- | ---: | ---: | ---: |
+| Reference-narrow SAM retained | 22/22 | 16/22 | 22/22 |
+| Reference-narrow Student retained | 8/8 | 4/8 | 8/8 |
+| Reference-narrow recent SAM retained | 64/66 | 56/66 | 64/66 |
+| Reference-broad SAM admitted | 5/19 | 2/19 | 3/19 |
+| Reference-broad Student admitted | 4/10 | 2/10 | 4/10 |
+
+Two additional seeds show that the batch check adds only a modest benefit to
+the existing precision estimate. Across three seeds, earlier reference-broad
+SAM admissions fall from 11/57 to 9/57, with the same 59/66 reference-narrow
+retention. Student and recent admission decisions are unchanged. On the wider
+259-case reference subset, SAM reference-narrow retention falls from 106/162
+to 105/162. The newer fourteen-read Student million-draw references still have
+only 34/39 reference-narrow directions admitted and 6/21 reference-broad
+directions admitted under either precision method. Those repeated seeds are
+numerical trials on the same physical reads, not independent recordings.
+
+The candidate remains experimental. It isolates the earlier regression without
+solving the remaining proposal-tail problem or establishing real gaze accuracy.
+No new canonical human labels or independent scale measurements were available;
+there is no claimed localization or SN-FEIDA improvement. All 18 new native
+candidate files preserve their geometry and source fields in 9,084 event
+comparisons. The production replay remains exactly identical in its 1,514
+events apart from elapsed time, including the complete posterior. Six native
+stereo UI tests, twelve joint-publication tests and the SAM-enabled native build
+pass. The initial native compile encountered concurrent optical-clock edits;
+their author repaired those errors before the successful retry. This work
+does not restart the live viewer or alter camera ownership.
+
+Artifacts are under `outputs/posterior-replicates-20260912`: the original and
+65,536-ceiling separate-stream comparisons, `original-draws-v1`, the two
+`original-seed-*-v1` directories, `synthetic-original-comparison-v1.json`,
+`original-control-summary-v1.json`, the inspected
+`original-control-comparison-v1.png`/`.svg`, and
+`production-original-identity-v1.json`. The source replay accepts
+`integrated-inner-global-conditional-replicated-original` and its
+`-precision` variant. `BUTTERCUP_POSTERIOR_REPLICA_ORIGINAL_DRAWS=1` selects the
+same control in `same_eye_and_complementary_stereo_replicated_diagnostic`.
+
+### Broader scene sampling plus numerical precision is still not a default
+
+The next comparison combines the conditional global-scene proposal with both
+the existing numerical margin and the paired batch check. The original local
+Student-t, conditional local and global Student-t components remain; the
+additional global component retains Student-t target coordinates and Gaussian
+conditional nuisance innovations. Every sample uses the complete frozen
+mixture density. The joint loss, priors, source association and selected MAP
+geometry remain unchanged. New source-replay recipes select this combination
+explicitly instead of accidentally dropping the scene component when a
+precision suffix is present.
+
+All three frozen cohorts run with three numerical seeds at the same 8,192-draw
+ceiling. They contain 628 unique physical reads: 129 shared by the SAM and
+Student providers, plus 499 recent SAM reads. The extra default-seed ungated
+paired control preserves all posterior fields in the earlier scene-proposal
+replay, excluding only batch telemetry and elapsed time. Across the 21 new
+candidate files, all 10,598 source events preserve their geometry and source
+fields. Numerical repetitions are not additional recordings or fresh evidence.
+
+For the paired precision gate, the three-seed totals are:
+
+| Outcome on earlier fixed references | Previous proposal | Also conditional global scene |
+| --- | ---: | ---: |
+| Reference-narrow SAM retained | 59/66 | 50/66 |
+| Reference-narrow Student retained | 24/24 | 22/24 |
+| Reference-narrow recent SAM retained | 188/198 | 176/198 |
+| Reference-broad SAM admitted | 9/57 | 13/57 |
+| Reference-broad Student admitted | 8/30 | 1/30 |
+
+The wider fixed 259-case reference subset also retains losses: narrow SAM
+retention changes from 105/162 to 102/162, Student from 65/81 to 52/81, and
+recent SAM from 553/654 to 543/654. The newer fourteen-read Student
+million-draw references show fewer broad admissions, 6/21 to 1/21, but narrow
+retention falls from 34/39 to 30/39. The version without the batch check still
+has these Student losses. Selecting only the improved ambiguity counts would
+hide the losses on numerically reference-narrow native directions.
+
+The synthetic comparison covers all four support cases, three seeds, both
+precision settings, one/four batches and the existing 8,192/65,536/1,048,576
+budget schedule. All 36 ungated one/four-batch posterior comparisons remain
+exact. Complete support stays admitted. Two of three seeds on the partial
+same-eye pupil/outer fixture pass at the small budget, versus all three with
+the previous proposal. Longer numerical runs put this fixture near the
+admission threshold; that difference alone is not a demonstrated regression.
+Weak complementary-eye and outer-only mirror cases
+remain broad and withheld.
+
+A new diagnostic also exports each selected gaze and its error against the
+independent 3D-circle forward fixture. All four noiseless fits recover their
+constructed directions to numerical precision (below 0.00001 degrees). This
+does **not** make the weak or mirror solutions identifiable: a correct selected
+mode can coexist with substantial competing mass. These favorable fixtures
+use the specified pinhole camera and anatomy; their near-zero error is not
+native gaze accuracy or evidence of performance under unknown anatomy.
+`BUTTERCUP_POSTERIOR_REFERENCE_FITS_ONLY=1` runs these four fits without repeating
+the integration matrix, and its log explicitly distinguishes fit truth from
+posterior validation.
+
+The change inventory records every newly admitted/lost direction, including
+those outside the fixed reference sets. Among the paired candidate's lost
+recent-SAM admissions across seeds, 179 fail the integration-quality checks,
+43 fail only the numerical margin and five have a broad sampled direction.
+It also newly admits 167 recent directions. Thus the small net change hides
+substantial sampling churn; changing the margin alone would not fix it.
+These counts describe repeated numerical evaluations, not independent eyes.
+
+This combination remains test-only. There are no new canonical human labels,
+independent scale measurements, localization or SN-FEIDA improvements, or
+calibrated gaze probabilities. The 140 core tests pass; the native SAM-enabled
+fit diagnostic and production builds pass. The rebuilt production evaluator
+is byte-identical to the preceding executable whose complete 1,514-event
+posterior replay was verified. No live viewer is restarted.
+
+Artifacts live under `outputs/posterior-scene-precision-20260912`: each
+`seed-*-v1/scene-precision-comparison-v1.json`, `synthetic-comparison-v1.json`,
+`synthetic-fits-v2.log`, `scene-summary-v1.json` with the complete change
+inventory, and the inspected `scene-comparison-v1.png`/`.svg`. The added
+source recipes are `integrated-inner-global-conditional-scene-precision`,
+`integrated-inner-global-conditional-scene-replicated-original`, and its
+`-precision` variant. The corresponding synthetic test is
+`same_eye_and_complementary_stereo_scene_replicated_diagnostic`, with
+`BUTTERCUP_POSTERIOR_REPLICA_ORIGINAL_DRAWS=1` selecting the paired draw control.
+
+### Fit eye geometry before proposing around a discarded pilot
+
+The next bounded experiment tests a specific sampling failure: a high-weight
+pilot point can lie in an underrepresented region while still having a poor
+local eye-geometry fit. Merely moving an existing proposal to that point, or
+computing its curvature there, spends too much of the final budget on poor
+configurations. Four test-only recipes separate the effects: discard a pilot
+without adapting, recenter the original shape, refit the shape at the raw
+pilot, and refine nuisance geometry before refitting the shape.
+
+All recipes spend at most 2,048 pilot draws from the original proposal mixture.
+Adaptive recipes add up to four components, choosing successive pilot points
+by their importance weight against the currently augmented mixture. Pilots
+are discarded. The original components remain and every fresh final draw is
+weighted by the complete frozen mixture density. These are importance proposals
+for the same generalized posterior; they neither add observations nor average
+independent gaze solutions.
+
+Using high-weight configurations to place new components is motivated by
+[incremental mixture importance sampling](https://arxiv.org/pdf/1611.06874).
+This implementation uses bounded conditional Gauss–Newton refinement and a
+discarded pilot, rather than that paper's Langevin moment equations or reuse
+of adaptation samples in the final estimate.
+
+The conditional-refit variant holds the three coordinates of the **one shared
+fixation** fixed and runs at most six existing refinement iterations on eye
+geometry. Only that temporary proposal-fitting problem has fixed coordinates.
+The original model supplies the full-dimensional curvature and final density;
+its priors, source associations and selected MAP remain unchanged. The bounded
+refinement is not claimed to find a global conditional optimum, especially
+after analytic elimination of an unobserved inner radius. Correct importance
+weights still target the original density. Four six-iteration refinements add
+CPU work beyond the pilot/final draw counts; equal draw ceilings do not imply
+equal runtime.
+
+At the 8,192-draw ceiling, the three-seed fixed-reference comparison is:
+
+| Outcome | No pilot + paired precision | Pilot only | Shape at raw pilot | Refine eye geometry first |
+| --- | ---: | ---: | ---: | ---: |
+| Earlier reference-narrow SAM retained | 59/66 | 62/66 | 48/66 | 54/66 |
+| Earlier reference-narrow Student retained | 24/24 | 18/24 | 16/24 | 24/24 |
+| Earlier reference-narrow recent SAM retained | 188/198 | 182/198 | 172/198 | 188/198 |
+| Earlier reference-broad SAM admitted | 9/57 | 16/57 | 21/57 | 6/57 |
+| Earlier reference-broad Student admitted | 8/30 | 8/30 | 6/30 | 3/30 |
+
+The recentered proposal also loses reference-narrow directions (40/66 SAM,
+10/24 Student, 170/198 recent) and remains in the complete report. Conditional
+refinement is substantially better than both unrefined adaptations. On the
+wider 259-case reference subset it changes narrow retention from 105/162 to
+109/162 SAM, 65/81 to 66/81 Student, and 553/654 to 615/654 recent SAM. On the
+newer fourteen-read Student references, narrow retention stays 34/39 while
+broad admissions fall from 6/21 to 0/21. One direction categorized as unresolved
+by those newer references is now admitted; zero broad admissions does not
+certify every newly admitted case.
+
+The conditional variant's remaining earlier-reference SAM misses occur on
+sources 4406, 4410, 4452, 4480 and 4495, depending on seed. They are estimated
+posteriors withheld by the numerical margin, with reference masses close to
+the 0.9 threshold. This accounts for real small-budget losses but is not proof
+that the earlier small-budget admissions were correct. The complete inventory
+also retains changes outside the fixed reference subsets. No new canonical
+human labels or independent scale measurements were used, so this experiment
+does not establish gaze accuracy, localization or SN-FEIDA improvement.
+
+All four recipes cover the four existing synthetic support geometries, three
+seeds and both 8,192/65,536 budgets. Complete same-eye pupil/outer support stays
+admitted; weak complementary-eye and outer-only mirror support stays withheld.
+The separated pupil/outer fixture requires a correction to the interpretation
+of earlier experiments: its three existing million-draw mass estimates are
+0.9260, 0.9097 and 0.8779. It is threshold-sensitive, not a proven must-admit
+positive. Forcing three small-budget admissions would be an invalid objective.
+With conditional refinement it admits one of three small-budget seeds and
+none at the larger budget. One weak complementary-eye larger-budget run still
+fails the integration-quality check despite spending the full budget.
+
+The 36 candidate files preserve all source and MAP fields in 18,168 event
+comparisons on 628 unique physical reads. These comprise 129 reads shared by
+SAM and Student plus 499 recent SAM reads. Repeated seeds are numerical trials,
+not new recordings. The 142 core tests include the recentered-density check
+and a regression proving that nuisance refinement improves fit without moving
+the shared target or changing the original model bounds.
+
+The SAM-enabled native build, the same refinement regression, six stereo UI
+tests and twelve joint-publication tests pass. The newly built production
+executable has a different hash, so it was replayed rather than assumed
+identical: all 1,514 complete production events, including posterior fields,
+match the preceding verified replay exactly apart from elapsed time.
+
+Artifacts are under `outputs/posterior-tail-refinement-20260912`: the original
+three `original-seed-*-v1` reports, `conditional-refit-v3`, the four synthetic
+logs, `tail-summary-v3.json`, and the inspected `tail-comparison-v3.png`/`.svg`.
+The new source recipe is
+`integrated-inner-global-conditional-tail-conditional-refit-replicated-original-precision`;
+the synthetic diagnostic accepts
+`BUTTERCUP_POSTERIOR_TAIL_PROPOSAL=conditional-refit`. Production defaults remain
+unchanged while numerical failures and native accuracy remain under evaluation.
+
+The complete 65,536-draw follow-up disables early stopping. Its 4,437 pilot
+sequences, including conditional-refinement decisions, are exactly equal to
+the corresponding 8,192-draw runs. All 4,542 additional native events preserve
+source and selected geometry. This isolates the final draw budget and stopping
+policy from changing pilot proposals. All sampled solves spend at least 65,000
+draws, so the remaining failures cannot be attributed to early termination.
+
+| Conditional-refit outcome | 8,192 ceiling | 65,536 fixed budget |
+| --- | ---: | ---: |
+| Earlier reference-narrow SAM retained | 54/66 | 60/66 |
+| Earlier reference-narrow Student retained | 24/24 | 18/24 |
+| Earlier reference-narrow recent SAM retained | 188/198 | 188/198 |
+| Wider reference-narrow SAM retained | 109/162 | 103/162 |
+| Wider reference-narrow Student retained | 66/81 | 48/81 |
+| Wider reference-narrow recent SAM retained | 615/654 | 621/654 |
+| Earlier reference-broad SAM admitted | 6/57 | 0/57 |
+| Earlier reference-broad Student admitted | 3/30 | 2/30 |
+
+Newer Student reference-narrow retention also falls from 34/39 to 27/39, while
+its broad admissions remain 0/21. Across the complete corpus, Student has 55
+lost and 18 new direction admissions; recent SAM has 120 lost and 74 new.
+Some changing directions lie outside the fixed references or near their
+thresholds. The aggregate improvements therefore do not justify promotion.
+
+The dominant-weight diagnostic is now joined to exact native publications,
+with matching seed, sample weight, pilot and arc order. At 65,536 draws, 32
+Student publications and 55 recent-SAM publications still contain a single
+sample with more than 20% of total weight. In 24 and 43 of those respectively,
+that sample rejects arcs used by the selected MAP. The newly rejected arcs
+include 23 Student and 73 recent pupil arcs. These counts include both arrivals
+of a physical read and repeated seeds; they are not independent observations
+or labels proving that a detected pupil was wrong. They identify a concrete
+proposal-coverage problem involving alternative contour/outlier explanations,
+which the next experiment must explore while scoring the complete original
+model. Removing those samples or their pupil evidence would conceal it.
+
+The follow-up artifacts are `conditional-refit-65536-v3`,
+`conditional-budget-comparison-v3.json`, `dominant-samples-v3.json`, and
+`verdict-v3.json`. Across all 45 candidate files in this phase, 22,710 source
+event comparisons preserve geometry. The broader stereo objective remains
+unfinished; production sampling and camera ownership are unchanged.
+
+### Competing contour proposals need more than omitted factors or reallocation
+
+The next comparison explores the pupil/outlier alternatives exposed by the
+dominant-weight audit. Three test-only recipes change **proposal fitting**;
+every final sample still uses the complete original current-contour density,
+including pupil factors, priors, nested-radius bounds and outlier charges.
+Neither ROI association nor the selected shared-fixation MAP changes.
+
+`OutlierRefit` temporarily omits groups already rejected at a selected pilot
+point while refining nuisance geometry at that same shared fixation. Its full
+proposal curvature uses that temporary objective. This mostly reproduces the
+constant-cost plateaus of the existing capped loss: 22/24 synthetic posteriors
+remain exactly equal, and native changes are small. It is not a way to remove
+the pupil's penalty from the final estimate; a dedicated regression checks
+that the original objective continues to pay the complete rejected-group cost.
+
+`BoundaryRefit` also deliberately relaxes all groups for one boundary kind
+from one eye during proposal fitting. The bounded attempt order is right
+pupil, left pupil, right outer, left outer, then available inner-limbus groups
+when earlier kinds are absent. There are at most four attempts; available
+masks repeat if fewer than four exist. Mixed-kind alternatives stay together.
+All other-eye geometry, original scene bounds and final evidence remain.
+This expands proposal coverage but loses too many numerically supported solves.
+Some relaxations also lack valid full-dimensional curvature: 324 SAM and
+1,644 recent-SAM refinement attempts cannot create a component across the
+three seeds. They are skipped without adding a ridge or asserting certainty.
+
+`BoundaryDefensive` isolates a possible allocation problem. It uses precisely
+the same pilot, nuisance refinements and proposed boundary alternatives, then
+triples each original component's allocation in the final mixture. Repeated
+slots are integer mixture weights, not new modes or observations. Draws use
+the complete weighted density. The known-uniform-target regression now checks
+both equal and 3:1 component allocations. All 4,437 native pilot/refinement
+sequences match `BoundaryRefit` exactly; only final allocation and subsequent
+stopping change. This control does not repair the regressions.
+
+At the same 8,192-draw ceiling and across the same three numerical seeds:
+
+| Outcome | Prior conditional refinement | Pilot outlier pattern | Explicit boundary alternatives | Triple original allocation |
+| --- | ---: | ---: | ---: | ---: |
+| Earlier narrow SAM retained | 54/66 | 54/66 | 50/66 | 54/66 |
+| Earlier narrow Student retained | 24/24 | 24/24 | 20/24 | 20/24 |
+| Earlier narrow recent SAM retained | 188/198 | 186/198 | 184/198 | 176/198 |
+| Earlier broad SAM admitted | 6/57 | 7/57 | 17/57 | 16/57 |
+| Earlier broad Student admitted | 3/30 | 2/30 | 5/30 | 4/30 |
+| Wider narrow Student retained | 66/81 | 66/81 | 52/81 | 60/81 |
+| Wider narrow recent SAM retained | 615/654 | 611/654 | 552/654 | 537/654 |
+
+The wider SAM subset improves from 109/162 to 120/162 with explicit boundary
+alternatives, but selecting that result alone would conceal Student and recent
+losses. On the newer Student references, narrow retention changes from 34/39
+to 29/39 and 32/39 for explicit/weighted alternatives; broad admissions rise
+from 0/21 to 1/21 and 2/21. Across all reads, those two alternatives lose 355
+and 329 recent-SAM direction admissions to integration insufficiency alone.
+The prior refinement therefore remains the more useful experimental control.
+
+The three recipes each run all four synthetic support cases, three seeds and
+8,192/65,536 budgets. Complete same-eye pupil/outer support stays admitted;
+weak complementary-eye and outer-only mirror cases stay withheld. The partial
+same-eye fixture remains threshold-sensitive and has no larger-budget
+admissions. Reallocation makes all three larger-budget weak-stereo estimates
+numerically available, but they remain broad; the other two recipes still
+have one insufficient-sampling seed. This is neither a new positive stereo
+success case nor evidence of anatomical accuracy.
+
+The 27 candidate files preserve geometry and source fields in 13,626 event
+comparisons. All 1,514 complete prior-control events are reproduced after each
+of the three source changes, including posterior fields apart from elapsed
+time. The rebuilt production evaluator also preserves its complete 1,514-event
+replay. The 144 core tests, fifteen SAM-enabled proposal tests, six stereo UI
+tests and twelve joint-publication tests pass; the production builds pass.
+No new source-tree paths, training material or camera changes are introduced.
+
+These are still 628 unique physical reads, including the 129 shared by SAM and
+Student and 499 recent SAM reads. Numerical repetition does not add labels,
+independent scale, source timing information or measured gaze accuracy. The
+next useful experiment must improve the shape and discovery of proposal
+support, rather than treating arbitrary contour omission or simple allocation
+as a validated remedy. All three variants remain test-only.
+
+Artifacts are under `outputs/posterior-outlier-proposals-20260912`:
+`comparison-v3.json`, `original-seed-*-v1`, `boundary-v2`, `defensive-v3`,
+the three synthetic logs, complete control reproductions, and
+`production-identity-v3.json`. Source recipes append
+`tail-outlier-refit`, `tail-boundary-refit` or `tail-boundary-defensive` to
+`integrated-inner-global-conditional`, followed by
+`-replicated-original-precision`. The corresponding synthetic environment
+values are `outlier-refit`, `boundary-refit` and `boundary-defensive`.
+
+### Curved conditional proposals preserve density but do not resolve the native losses
+
+The next matched experiment adds test-only `ProfileAffine` and
+`ProfileQuadratic` recipes. Neither is promoted. Both first perform the
+unchanged discarded pilot and four conditional refinements. Only after all
+ordinary components have been fitted do they transform the newly added
+components. Original local, conditional and global components remain present.
+The two variants therefore share their pilot, anchors, covariance, allocation
+and profile-fitting probes; the quadratic coefficients are their only
+difference before final draws.
+
+For target coordinates `t` and retained nuisance parameters `u`, the transport
+is `S(t,u) = (t,u+d(t))`. Its block-triangular Jacobian has determinant one,
+so the transported proposal density is exactly
+`q_S(t,u) = q_0(t,u-d(t))`. Fixation coordinates are unchanged. The sampler
+applies the forward shift after any delegated full-dimensional marginal draw;
+the density applies the inverse shift before evaluating the base density.
+Omitted inner radii are never shifted. This is still one shared latent fixation,
+with the original evidence, priors and feasibility checks in every final
+importance weight; it does not average separately estimated eye gazes.
+
+Each component probes its center and both signs of up to three whitened target
+axes. At each fixed target, the original full conditional robust objective gets
+at most six nuisance-refinement iterations. The resulting displacements fit a
+constant, affine terms and diagonal quadratic terms. These are conditional
+mode fits, not exact conditional posterior means. Probe steps keep both signs
+inside the original target bounds; bound-active axes may be skipped. Shift
+features are clipped to twice the probe step, while the fixation itself is
+never clipped by this transform. There are no quadratic cross terms and no
+target-dependent nuisance covariance. An invalid profile retains its proper
+base proposal.
+
+The analytic regression samples a correlated mixture against a uniform target
+in the final coordinates and checks its known means, second moments and cross
+moment. It covers affine and quadratic shifts, Student-t and conditional
+Gaussian nuisance proposals, delegated marginal draws, non-unit parameter
+scales, inverse round trips and both clipping tails. It also checks that target
+coordinates and RNG state remain exactly paired.
+
+All 4,437 native pilot sequences match the previous conditional-refinement
+control. All 17,746 fitted transports match between affine and quadratic arms,
+apart from applying curvature. Every transport fit succeeds; 17,707 fit all
+three axes and 39 fit fewer. The work adds 124,056 conditional fits and 830,728
+line-search steps per recipe across the three seeds. This optimization cost is
+additional to the 8,192-draw ceiling, not part of a fixed CPU-time comparison.
+
+| Outcome across three seeds | Previous conditional refinement | Affine profile | Quadratic profile |
+| --- | ---: | ---: | ---: |
+| Earlier narrow SAM retained | 54/66 | 54/66 | 54/66 |
+| Earlier narrow Student retained | 24/24 | 22/24 | 22/24 |
+| Earlier narrow recent SAM retained | 188/198 | 188/198 | 186/198 |
+| Earlier broad SAM admitted | 6/57 | 6/57 | 7/57 |
+| Earlier broad Student admitted | 3/30 | 4/30 | 3/30 |
+| Wider narrow SAM retained | 109/162 | 108/162 | 108/162 |
+| Wider narrow Student retained | 66/81 | 61/81 | 61/81 |
+| Wider narrow recent SAM retained | 615/654 | 606/654 | 610/654 |
+
+On the newer Student references, narrow retention is 34/39, 34/39 and 35/39,
+with no broad admissions in any arm. That isolated improvement does not erase
+the wider losses. Across all reads, affine/quadratic transport loses 10/8
+Student and 29/21 recent-SAM direction admissions to insufficient integration;
+the remaining losses come from a broad sampled direction or the numerical
+margin. `comparison-v1.json` retains every changed direction and its before/
+after posterior. These fixed reference classes are finite numerical estimates,
+not measured gaze truth; a changed admission alone cannot establish accuracy.
+
+All 48 synthetic case/seed/budget evaluations finish. Complete same-eye outer
+and pupil support remains admitted for all seeds at 8,192 and 65,536 draws.
+Weak complementary-eye and outer-only mirror cases remain withheld. Quadratic
+transport makes the previously insufficient larger-budget weak-stereo estimate
+available, but broad; this is numerical progress, not a new positive stereo
+identifiability case. The threshold-sensitive partial-pupil fixture admits
+1/3 seeds with affine transport and 0/3 with quadratic at the small budget;
+both withhold all three at the larger budget. Do not tune this fixture toward
+unanimous small-budget admission.
+
+The 18 candidate source files preserve geometry and source fields in all 9,084
+event comparisons. All 1,514 complete conditional-control events reproduce
+exactly apart from elapsed time, and the rebuilt production evaluator also
+preserves all 1,514 production events. The 145 core tests, sixteen native
+proposal tests, six stereo UI tests and twelve joint-publication tests pass;
+the live-worker replay remains explicitly ignored. Native and evaluator
+production builds pass. Source-tree and diff checks pass. The first synthetic
+invocation was rejected before solving by an outdated test recipe allowlist;
+v2 corrects only that guard, and its solver/evaluator sources match v1 exactly.
+
+The actual subset is unchanged: 628 unique physical reads, comprising the 129
+shared by SAM and Student plus 499 recent SAM reads from three frozen captures.
+There is no observed true inner-limbus boundary in these caches, only outer
+limbus and pupil evidence. This experiment adds no canonical human localization
+labels, independent scale, native gaze truth or measured SN-FEIDA improvement.
+Correct transport density and lower profile costs do not establish posterior
+convergence or empirical probability calibration. The next investigation must
+address the competing posterior mass behind the saved failures, rather than
+treating local curvature or higher effective sample size as sufficient proof.
+
+Artifacts are under `outputs/posterior-profile-transport-20260912`:
+`comparison-v1.json`, the inspected `comparison-v1.png`/`.svg`, the 18 source
+files and complete control reproduction, `synthetic-profile-*-v2.log`,
+`production-identity-v2.json`, both frozen test executables, and source hashes.
+Recipes append `-tail-profile-affine` or `-tail-profile-quadratic` to
+`integrated-inner-global-conditional`, then `-replicated-original-precision`.
+Synthetic recipe values are `profile-affine` and `profile-quadratic`.
+
+### Independent annealed paths improve integration but expose retained-contour ambiguity
+
+An offline reference now uses [Neal's annealed importance sampling](https://arxiv.org/abs/physics/9803008)
+to check the preceding importance-proposal failures. This is test-only
+`posterior::annealed`, not a new production confidence source. It retains one
+shared fixation and the complete original robust contour/prior density.
+No independent-eye gaze average, contour omission, MAP change or default
+promotion is involved.
+
+The frozen conditional-refinement proposal mixture is the starting density.
+Independent paths traverse bridges `q^(1-beta) p^beta`, with
+`beta=(stage/steps)^2`. Each path accumulates the incremental log density ratio
+before a Metropolis transition. Every fourth transition uses an independence
+proposal from the entire frozen mixture; the others use symmetric Gaussian
+walks with fixed component covariances and widths. Hard-bound violations are
+rejected, never projected. Initial infeasible draws remain zero-weight paths
+in the denominators. There is no resampling or adaptive stopping. Each path
+contributes one endpoint with its full path weight; transitions do not count
+as independent observations. The initial proposal draws are exactly matched
+between zero, 32 and 128 transitions. Zero transitions are ordinary importance
+sampling from those same draws.
+
+The selection was fixed before these replays: all lost admissions in the
+preceding quadratic experiment, plus two additional reads per available
+numerical-reference class. SAM and Student use the union of their selections.
+There are 34 SAM, 34 Student and 29 recent-SAM provider reads, representing
+63 unique physical reads. One selected SAM read has unavailable geometry and
+remains in the coverage denominator. This deliberately difficult subset is
+not a representative performance benchmark. Each condition requests 512
+paths, rounded down to an equal allocation across proposal components, and
+runs three fixed seeds.
+
+| Native trials passing the path check | 0 transitions | 32 transitions | 128 transitions |
+| --- | ---: | ---: | ---: |
+| SAM, including unavailable geometry | 62/102 | 77/102 | 92/102 |
+| Student | 23/102 | 42/102 | 74/102 |
+| Recent SAM | 32/87 | 47/87 | 60/87 |
+
+The path check requires effective path count at least 24 and maximum path
+weight at most 0.2. Passing does not establish convergence. Median effective
+path counts rise from 27.3 to 80.3 for SAM, 14.3 to 39.4 for Student and 18.5
+to 39.8 for recent SAM. The 128-transition diagnostics require 2,548,852,
+2,537,080 and 2,064,487 model evaluations respectively across the selected
+three-seed trials, in addition to the unchanged ordinary posterior control.
+This is not an equal-work comparison. Candidate admission counts in the
+report use per-path numerical error; the ordinary control also uses its
+four-batch precision check, so their counts are not matched confidence levels.
+
+Longer paths do not resolve every disagreement. Student read 189 has
+within-15-degree masses 0.977, 0.883 and 0.975 at 128 transitions; all three
+path checks pass. At 32 transitions all three runs had passed the candidate
+direction rule. Student read 255 likewise remains inconsistent at 0.982,
+0.829 and 0.951. Conversely, reads 79 and 249 agree across the three longer
+runs, with joint-weight pooled masses 0.990 and 0.979. Pooling combines
+unnormalized path contributions, not averages of normalized posterior ratios.
+The between-seed diagnostic has only two degrees of freedom and cannot bound
+unvisited modes.
+
+Mapping the saved rejection-pattern indices back to native support changes
+the next investigation. `Problem::solution` emits one `ArcSupport` in model
+group order, and the evaluator serializes that order without filtering.
+Group kinds in this mapping name the MAP-selected alternative. In Student
+read 189, seed two, only 0.995% of sampled mass rejects any MAP-used group,
+while 11.729% lies outside 15 degrees of the selected first-eye gaze. Therefore
+at least 10.734% of that *estimated* mass lies outside while retaining every
+MAP-used contour group. Read 159 has corresponding retained-group tail lower
+bounds 7.680%, 11.335% and 11.372% across its three seeds. These are Frechet
+bounds calculated from saved marginals, not direct joint measurements or
+confidence bounds on the true posterior. Competing sampled gaze cannot be
+attributed solely to dropping pupil/outer groups; simply penalizing group
+rejection would not address these examples.
+
+The synthetic comparison explicitly distinguishes pupil evidence from a
+true inner-limbus ring. All six selected MAP directions agree with the
+independent noiseless forward fixture to below 0.000001 degrees, yet their
+posterior behavior differs. At 128 transitions, full outer-plus-pupil support
+has 90% angular radius 4.96--5.69 degrees; partial outer-plus-pupil support
+remains threshold-sensitive at 14.53--17.29 degrees. Deliberately weak
+complementary stereo is broad at 30.47--37.85 degrees. Full and partial
+outer-plus-true-inner cases remain mirror-ambiguous at approximately
+34--36 degrees, as does outer-only support. The two iris rings are coplanar
+under this fixture and its measurement assumptions; these results do not
+establish that independently sharper inner evidence could never help. They
+do establish that selecting the correct MAP is insufficient evidence of
+direction identifiability.
+
+All 27 native replay conditions finish, with 864 exact exposure-key diagnostic
+joins. Every source and ordinary posterior field is identical across all
+13,626 event comparisons apart from elapsed time. All 1,514 rebuilt production
+events also match the preceding production output apart from elapsed time.
+All 54 synthetic configurations finish and the 36 repeated ordinary controls
+match exactly. Three analytic tests check known mixture moments/normalizers,
+invalid starting points and hard boundaries, and heterogeneous Student-t/
+conditional-Gaussian proposal mixtures with retained marginal samplers.
+The third test was added after the replays; the sampler body is byte-identical
+to the frozen replay version. All 148 core tests and all three native sampler
+math tests pass. The sixteen proposal, six stereo UI and twelve publication
+tests pass; designated live/expensive diagnostics stay ignored. Native and
+evaluator builds pass, as do source-tree and diff checks.
+
+No native true-inner observations, canonical localization labels, independent
+gaze truth or scale/timing measurements were added. Native inputs remain
+outer-limbus/pupil evidence from the frozen SAM/Student caches. This does not
+demonstrate calibrated probabilities, new-user readiness or improved SN-FEIDA.
+Remaining work includes explaining the contour-preserving competing geometry,
+resolving insufficient integration, and validating the intended positive
+partial/cross-eye cases before promoting an inference change.
+
+Artifacts are under `outputs/posterior-annealed-20260912`: fixed
+`reference-selection-v1.json`, `comparison-v3.json`, inspected
+`comparison-v4.png`/`.svg`, `evidence-patterns-v4.json`,
+`production-identity-v3.json`, `source-hashes-v4.json`, all replay/test logs
+and the frozen `annealed-tests-v3` executable. The ignored selected-native
+recipe is `extraction_tests::recorded_selected_annealed_reference_replay`,
+with `BUTTERCUP_POSTERIOR_REPLAY_DIR`, `BUTTERCUP_POSTERIOR_REPLAY_COHORT`,
+`BUTTERCUP_POSTERIOR_REPLAY_SEED`, `BUTTERCUP_ANNEALED_PATHS` and
+`BUTTERCUP_ANNEALED_STEPS` as shown in `run_native_v3.sh`. Synthetic execution
+uses `same_eye_and_complementary_stereo_annealed_reference` and
+`run_synthetic_v3.sh`.
+
+### Endpoint geometry identifies the competing iris-plane branch
+
+The next audit records the actual weighted endpoint geometry, instead of
+inferring it from marginal rejection counts. Set the test-only
+`BUTTERCUP_ANNEALED_GEOMETRY_TRACE=1` to add a bounded trace to the existing
+annealed diagnostic (at most 4,096 requested paths). It records the shared
+target, both eye centers/normals/gazes, sampled radii, pupil offsets/depths,
+surface-axis alignment, original group choices/rejections/costs and frozen
+scene priors. Tracing occurs after sampling and consumes no random draws.
+The independently integrated inner radius is explicitly absent from sampled
+radii: its canonical placeholder and embedded prior cost must not be treated
+as a draw from that omitted conditional. The trace also retains the actual
+marginal log target density.
+
+The fixed subset consists of physical reads 79, 159, 189, 249 and 255 from
+`student-shadow.FkzvzE`, each replayed through both frozen SAM and Student
+providers. Reads 159/189/255 are the preceding ambiguous Student examples;
+79/249 are Student controls. The matching SAM results are not assumed to be
+equally certain. Thus ten provider cases represent five physical reads, not
+ten independent captures. All three numerical seeds use 512 requested paths
+and 128 transitions; the six synthetic support cases are traced as well.
+
+For joint classification, a state is near only if **every modeled eye** lies
+within 15 degrees of its selected gaze. A retained state keeps every group
+used by the selected MAP below its original rejection cap. The four near/far
+and retained/rejected categories partition the weighted sample distribution.
+Three-seed pooling combines unnormalized path contributions using each run's
+normalizer and initial path count, including infeasible draws. Category
+effective path counts measure weight concentration; they are not extra
+observations or calibrated confidence levels.
+
+| Physical read | SAM far mass retaining MAP-used groups | Student far mass retaining MAP-used groups | Student conditional effective paths in that category |
+| --- | ---: | ---: | ---: |
+| 79 | 8.07% | 0.30% | 2.3 |
+| 159 | 18.87% | 11.47% | 13.9 |
+| 189 | 3.34% | 5.80% | 6.0 |
+| 249 | 8.92% | 1.04% | 7.2 |
+| 255 | 8.96% | 1.81% | 8.9 |
+
+These estimates identify competing geometry, not precise tail probabilities.
+In Student read 159 the retained far states have median iris-normal shifts
+61.4 and 61.1 degrees for the two eyes. Near-state medians are 4.3 and
+5.0 degrees. The far states also use a different pupil offset/depth mixture;
+their first-eye median inward depth is 0.297 mm versus 0.701 mm nearby.
+Alignment medians remain within about one degree, so this example is a large
+iris-plane branch change rather than merely a small gaze/surface-axis offset.
+The native assumptions allow pupil depth 0--1.5 mm with sigma 0.5 mm and
+decentration up to 0.9 mm per axis with sigma 0.35 mm. These are engineering
+allowances from `approximate_scene`, not measured subject anatomy.
+
+One high-weight retained far state in read 159 changes the two normals by
+64.57 and 63.52 degrees while projecting to similar outer/pupil outlines.
+The figure shows forward-projected 3D circles, not new observed pixels or
+human labels. Its independent projection of the best state's outer rings
+matches the evaluator's two published ellipses with dimensionless algebraic
+errors below `4e-13`. This checks the visualization's coordinate conventions;
+it does not turn the selected gaze into ground truth. The sampled far branch
+exists with all MAP-used contour groups retained, but its mass still has weak
+numerical support: Student read 159's per-seed retained-far effective counts
+are 7.9, 2.6 and 16.1, despite each whole-run path check passing.
+
+A separate, explicitly hypothetical prior sensitivity calculation multiplies
+the saved endpoint weights by the new/old prior density ratio, retaining the
+original support bounds. It introduces no new measurements and changes no
+viewer setting. Tightening the pupil-depth sigma from 0.5 to 0.15 mm around
+the original 0.6 mm nominal moves Student read 189's joint near mass from
+94.2% to 84.6%, with reweighted effective counts 178.9 and 51.1. Tightening
+pupil-offset sigma to 0.10 mm around zero produces 98.6% near mass but only
+11.5 effective paths. Across all five Student cases that offset experiment
+has only 4.9--11.6 effective paths; combining both pupil changes falls to
+1.2--14.0. Apparent certainty under those changes cannot justify adopting
+them. Narrowing alignment sigma to one degree also reduces weight overlap
+and moves the stable read 79's near mass from 98.9% to 94.8%. Stronger
+unmeasured anatomy assumptions are not a validated substitute for evidence.
+All ten unchanged-prior sensitivity controls reproduce the original pooled
+joint near mass exactly to numerical tolerance.
+
+All 48 original annealed diagnostics (30 native, 18 synthetic) are identical
+after removing only the added geometry trace. All 1,548 native event/source/
+ordinary-posterior comparisons match apart from elapsed time, and all
+eighteen synthetic ordinary controls and six selected fits match. Every
+recorded gaze reconstructs from its own eye center and the **same shared
+target** within `1e-10`; group cost sums, MAP group activity and exposure joins
+are checked. The sampler body is byte-identical to the previous experiment.
+All 148 core tests, 67 native joint-conic tests, twelve publication tests and
+six stereo UI tests pass; explicitly ignored diagnostics remain ignored.
+Native/evaluator builds pass and all 1,514 rebuilt production events match
+the preceding build apart from elapsed time. Source-tree and diff checks pass.
+
+No inference defaults are promoted. These reads still lack independent native
+gaze truth, newly canonical-labeled contours or new scale/timing measurements,
+and no true inner-limbus observation appears in either native provider.
+The concrete remaining numerical issue is reliable mass estimation across
+the distinct iris-plane branches; the measurement issue is resolving those
+branches using supported anatomy, calibration or other independent sign
+evidence. Neither issue is solved by retaining contours or selecting a
+precise MAP alone. The intended partial and complementary-eye capabilities
+still require matched positive/negative validation before claiming readiness.
+
+Artifacts are in `outputs/posterior-geometry-audit-20260912`:
+`reference-selection-v1.json`, all six native logs/source replays,
+`synthetic-128-v1.log`, `comparison-v1.json`, `prior-sensitivity-v1.json`,
+the inspected `comparison-v1.png`/`.svg`, `projection-check-v1.json`,
+`production-identity-v1.json`, source/sampler hashes and both frozen
+executables. `run_native_v1.sh` and `run_synthetic_v1.sh` reproduce the
+diagnostics; `report_v1.py`, `prior_sensitivity_v1.py` and `plot_v1.py` audit
+and summarize them. Those scripts are offline artifacts, not runtime or
+training dependencies of the repository.
+
+## Refined integration in the live distribution (2026-09-12)
+
+The production `solve_joint_conic_distribution` entry point now selects the
+coherent ConditionalRefit recipe through `IntegrationConfig::live()`. Default
+integration configuration retains the original method for explicit offline
+comparison. Both SAM3.1 and Eye Student reach the same production entry point;
+there is no provider-specific gaze averaging or confidence multiplier.
+
+Within the existing 8,192-draw ceiling, at most 2,048 proposal-fitting draws
+select up to four additional components. Each fixes one pilot's shared target
+only while refining nuisance geometry for at most six iterations. All original
+components remain in the frozen proposal mixture. Pilot draws never enter
+posterior estimates. Fresh final draws use the complete mixture density and
+the original robust observation factors, anatomical priors and hard bounds.
+The selected joint MAP and historical source handling are unchanged.
+
+Unobserved true-inner-limbus radii are analytically integrated between the
+observed pupil/outer radius constraints using their existing Gaussian priors.
+An actual inner-limbus observation prevents that elimination. Retained
+Student-t proposals use marginal covariance, and the additional conditional
+proposals decouple target-tail scaling from Gaussian nuisance scaling. The
+ordinary broad scene proposal remains in the mixture. No stronger anatomy or
+new observation is inferred from a segmentation confidence score.
+
+Four proposal-balanced batches partition the final draw stream. Their estimates
+retain joint importance weights and unequal normalizers. Direction admission
+requires the usual finite 90% angular radius no larger than 15 degrees, an
+estimated posterior, and mass minus twice the **larger** within-stratum or
+between-batch standard error reaching 90%. Early stopping uses the same
+precision checks. The inspector and `admission_direction_numerics` export that
+actual admission margin. These errors are numerical diagnostics with finite
+sampling and adaptive stopping; they are not calibrated gaze probabilities or
+guarantees against unseen modes.
+
+`outputs/posterior-live-integration-20260912/comparison-v1.json` compares this
+complete recipe with the live baseline, rather than adding only the final
+margin. It verifies **9,084 exact source/geometry event comparisons** across
+both methods and three fixed numerical seeds. The corpus remains 628 unique
+physical reads: 129 shared by SAM and Student, plus 499 recent SAM reads.
+Counts below repeat the same directions across seeds; repeats are not new
+physical evidence. Both original fixed reference subsets remain visible.
+
+| Reference subset / provider | Reference-narrow admitted, baseline → live recipe | Reference-broad admitted, baseline → live recipe |
+| --- | ---: | ---: |
+| 65,536 draws / SAM | 115/162 → 109/162 | 14/81 → 2/81 |
+| 65,536 draws / Student | 70/81 → 66/81 | 9/66 → 1/66 |
+| 65,536 draws / recent SAM | 367/654 → 615/654 | 0/63 → 0/63 |
+| 1,048,576 draws / SAM | 58/66 → 54/66 | 29/57 → 6/57 |
+| 1,048,576 draws / Student | 24/24 → 24/24 | 12/30 → 3/30 |
+| 1,048,576 draws / recent SAM | 180/198 → 188/198 | no reference-broad directions |
+
+The precision-qualified reference classes are also reported, without replacing
+the original classes or hiding coverage losses. Neither class is native gaze
+truth. The two newly admitted directions classed as broad by the million-draw
+Student reference are read 159 in the second seed: their reference intervals
+still cross the threshold. The previous annealed/geometry audit nevertheless
+found a substantial competing iris-plane branch in that read. It remains a
+specific numerical failure; the margin does not certify its absence. There
+are also lost narrow directions and still-insufficient Student integrations.
+
+The recorded shared-resource medians rise from roughly 8–16 ms to 16–27 ms per
+tracker event, with extra conditional fitting work despite the same draw
+ceiling. Those archival measurements are not an isolated latency benchmark.
+The selected subset lacks independent native gaze truth, new canonical labels,
+new independent scale support and actual true-inner-limbus observations. This
+promotion therefore establishes an integration improvement, not completion of
+partial-eye, cross-eye or low-light gaze-accuracy validation. The distinct
+iris-plane ambiguity and real measurement/localization errors remain separate
+problems to resolve using supported evidence.
+
+Native verification uses frozen before/after executables and the complete
+original cohort. All **1,514 baseline events** reproduce the preceding build;
+all **1,514 candidate source/geometry events** match; all **1,479 candidate
+posteriors** match the recorded experiment exactly apart from two intentionally
+updated explanatory strings. Another **2,958 admission checks** independently
+recompute the exported larger-error margin and boolean decision. Selected
+ellipses and source-time geometry are identical, so this change cannot claim
+an improvement in localization or SN-FEIDA stability.
+
+The sequential CPU31 replay, shared at low priority, measured these tracker
+event times. It excludes detector inference and is not an isolated throughput
+or latency guarantee for the whole viewer.
+
+| Provider | Median ms, baseline → refined | 95th percentile ms, baseline → refined |
+| --- | ---: | ---: |
+| SAM | 8.42 → 19.09 | 23.22 → 53.14 |
+| Student | 8.19 → 24.58 | 31.37 → 56.74 |
+| recent SAM | 12.44 → 22.10 | 28.81 → 45.07 |
+
+One native publication test initially failed because it presumed a perfect
+synthetic outer/pupil pair under coarse anatomy priors had narrow support.
+Matched 65,536- and 1,048,576-draw integrations kept its evidence, priors,
+selected geometry and three seeds fixed. All six million-draw runs classify
+it as broad: baseline near mass is 84.7–89.2%, refined near mass 87.3–89.6%.
+The test now preserves the actual coarse-fixture abstention and checks the
+publication contract with explicit posterior doubles, including precision,
+angular spread, missing batches and insufficient sampling. Separate conic
+tests exercise actual production-entry positive and ambiguous integrations.
+The ignored `synthetic_publication_posterior_reference` diagnostic reproduces
+the larger comparison; no anatomy prior or runtime gate was loosened to pass.
+
+Final checks pass: 79 native conic tests, 12 publication tests, six stereo UI
+tests and 14 source-history tests, plus native viewer/evaluator builds, source
+tree audit and diff checks. Explicit diagnostics remain ignored in routine
+runs; the publication reference was run separately at both budgets. The
+earlier core check passed 148 tests before the native fixture expectation was
+corrected. Current artifacts include `production-verification-v2.json`,
+`publication-reference-summary-v1.json`, all six frozen native replays,
+`native-checks-v2.log`, `integration-production-v2`, the inspected comparison
+figure, and the source snapshots/hashes in the integration output directory.
+
+## Native calibration after the integration change (2026-09-12)
+
+`outputs/posterior-calibration-admission-20260912` carries the refined
+integrator through the actual native bridge, RAW boundary extraction,
+source/prompt/crop/clock checks, paired completion, sign acquisition and the
+enclosing calibration phase machine. The explicit baseline is the original
+probabilistic integrator, not the earlier no-posterior control. Original
+recorded target positions enter only the separate monitor-fit scorer.
+
+The cohort is the same three SAM3.1 sessions ending in
+`1788826709-274018364`, `1788827178-325761427` and
+`1788827261-537156697`: **499 physical reads / 998 ROI exposures**.
+Each integration arm replays those exposures for both calibration focus eyes,
+producing 1,996 diagnostic rows per arm, not more physical evidence.
+`matched-calibration-report-v1.json` verifies the six input hashes, exact
+recorded completion schedule and all **1,996 matched row pairs**. Selected
+geometry and source metadata, including missing publications, are identical
+after excluding the posterior diagnostic. The baseline also reproduces the
+previous original-integrator target counts, estimates and fit outcomes exactly.
+
+Qualifying sources below require both native frame admission and completed
+acquisition. Repeated publications of one source never add votes. The times
+are offsets in the frozen recorded arrival schedule; they do not include the
+refined integrator's additional measured CPU work or simulate a new user's
+waiting time.
+
+| Clip / focus ROI | Unique qualifying sources, original → current | First acquisition ready, original → current | Final plane + affine with shared support |
+| --- | ---: | ---: | --- |
+| Dark / 1 | 59 → 102 | 2,724 → 1,650 ms | fails → fails |
+| Dark / 2 | 62 → 104 | 2,724 → 1,650 ms | fails → fails |
+| Middle / 1 | 116 → 163 | 5,259 → 2,664 ms | passes → passes |
+| Middle / 2 | 117 → 159 | 5,259 → 2,429 ms | passes → passes |
+| Bright / 1 | 94 → 102 | 1,544 → 1,544 ms | passes → passes |
+| Bright / 2 | 95 → 103 | 1,317 → 1,317 ms | passes → passes |
+
+The current dark replay supplies at least seven qualifying sources at every
+target, and all nine produce native stable-cluster estimates. This recovers
+coverage but not the final fit. The current middle replay still lacks a stable
+first target; the remaining eight provide the required distributed coverage.
+Across the six focus-eye replays there are 212 gained and 22 lost qualifying
+source observations. Do not describe the increase as universal retention or
+as additional independent physical reads.
+
+Stored `source_window_ns` starts before target settling. The 500 ms scoring
+variant matches the native source-settle requirement; zero ms is a deliberate
+pre-settle sensitivity control. The current dark ROI 2 passes a zero-settle
+final fit and a 500 ms first-stable-prefix fit in the original diagnostic, but
+fails the 500 ms final-window affine fit. Neither alternate result replaces
+that failure or proves what a differently timed live session would display.
+
+The timing audit found that inclusive zero-settle boundaries could assign a
+transition source to two consecutive targets. The test-only scorer now uses
+`start < source <= end`, retains the positive settle condition, and asserts
+that one source cannot vote in two windows for the same eye. This matches the
+fact that the saved start is the current sensor frame at a target transition.
+The production calibration already requires the positive source-time settle.
+Original inclusive-control artifacts remain as dated diagnostics, with their
+reused memberships explicitly counted in `target-separation-v1.json`.
+All 12 native scorer runs pass after the correction. Independent source-set
+checks remove 36 reused target memberships across the zero-settle controls;
+every 500 ms target estimate, prefix diagnostic and fit result remains exactly
+identical. Source hashes verify that this edit changes only the test module,
+and the source-tree and diff checks pass. The corrected native results and
+frozen test executable are under `windows-v2`.
+
+The remaining dark failure is not an affine candidate rejected solely by gain
+or conditioning. An independent least-squares enumeration reproduces all 48
+native acceptance decisions across clips, arms, settles and prefix/final
+estimates. Neither dark final fit at 500 ms has a candidate satisfying the
+existing distributed-coverage and residual requirements. This is an
+exploratory numerical cross-check; native Rust fitting remains authoritative.
+
+For dark ROIs 1/2, median native within-target cluster RMS is **3.75° / 3.14°**,
+while median separation of neighboring target estimates is **3.69° / 3.38°**.
+Corresponding within-cluster values are 0.96° / 1.18° in the middle clip and
+1.70° / 1.88° in the bright clip. These are observed direction variations,
+not errors against independently measured fixation. All 87 qualifying dark
+ROI 1 target-window sources use same-eye pupil factors; ROI 2 uses them in
+75 of 89. The failure therefore cannot be explained simply by missing pupil
+support. Boundary localization, motion and the anatomical projection model
+still need to be distinguished with independent evidence.
+
+No production geometry, anatomy prior, probability threshold or calibration
+acceptance limit changed in this audit. There is no SN-FEIDA improvement claim
+from identical conics, no new scale measurement, no independent native gaze
+truth and no actual true-inner-limbus observation in this subset. Eight dark
+native RAW triplets remain prepared in the canonical annotator with recorded
+predictions hidden; all were unreviewed when checked. These three Rob-only
+clips do not validate cross-user or student-model calibration accuracy.
+
+Reproduction and inspection artifacts include `audit_v1.py`,
+`matched-calibration-report-v1.json`, `affine-diagnostic-v1.json`,
+`target-separation-v1.json`, the inspected `calibration-coverage-v1` and
+`dark-target-directions-v1` PNG/SVG figures, and `verify_windows_v2.py` for
+native source-ownership verification. These are offline artifacts beneath
+the checked outputs link, not runtime or training dependencies.
+
+## Separating contour motion from a supported branch switch (2026-09-12)
+
+`outputs/stereo-direction-motion-20260912` joins the current qualifying
+target-window sources to their exact cached detector conics. It retains the
+native 500 ms settle and compares only source-time transitions inside one
+recorded target window; gaps above 500 ms remain in the export but are excluded
+from the short-gap summary. No fit, prior, threshold or gaze output changes.
+
+The input ellipse supplies two unordered camera-facing circle-normal
+hypotheses under the existing intrinsics and circularity assumptions. Their
+minimum inter-frame angle is a lower bound on input orientation change, not
+an independently resolved sign. The independent eigendecomposition reproduces
+the native projected outer-circle normal in 1,314 coordinate checks, with
+maximum disagreement about `1.1e-13` degrees. This checks the model and coordinate
+conventions, not physical camera calibration or contour accuracy.
+
+Median selected-gaze steps in the dark clip are 4.87° / 3.84° for ROIs 1/2;
+the corresponding minimum input-outer-normal steps are 5.83° / 4.42°. The
+bright clip's values are 0.91° / 0.89° and 0.76° / 1.01°, respectively. Thus
+substantial dark-case variation already exists in the fitted detector conics.
+These are observed variations, not ground-truth gaze errors. A recovered pupil
+search ellipse can inherit the outer ellipse's ratio/orientation, so its
+decomposed normals are not an independent pupil-orientation measurement.
+The native pupil factors still use newly extracted RAW boundary samples.
+
+There is a separate, concrete model failure candidate in middle-session
+sequence 160. The first eye's admitted direction changes 85.47° from sequence
+159 over 201.81 ms, then returns about 84.83° at sequence 162. Both eyes share
+the switch through one fitted fixation. The outer hypothesis sets change
+about 6.9° / 14.7° across 159→160; the selected solution changes iris-plane
+branch. The calibration's dominant-cluster reducer excludes this sample, so
+the session can pass its monitor fit while retaining this native outlier.
+
+Three fixed numerical seeds at **1,048,576 draws per selected paired read**
+test sequences 159, 160 and 162. All 998 source exposures remain available as
+initialization context. There are three selected physical reads, not nine new
+observations. The comparison verifies 117 geometry fields and 99 RAW boundary
+factors exactly against the live bridge before using any posterior result.
+
+| Sequence | Current mass within 15° of selected direction | Million-draw range over three seeds |
+| --- | ---: | ---: |
+| 159 | 98.59% | 97.38–97.72% |
+| 160, switched branch | 97.92% | 93.89–95.72% |
+| 162 | 99.02% | 99.43–99.65% |
+
+Both eyes remain numerically supported in all nine paired references. Even
+sequence 160's lowest approximate two-standard-error mass bound is 91.07%,
+and its reference 90% angular radius is 6.31–6.78°. This does not prove correct
+gaze. It shows that merely spending more integration work does not remove
+this switch under the current observation factors and unmeasured anatomy.
+The earlier angular-continuity counterexamples still rule out enabling a
+sign lock or smoothing prior solely because it removes the jump.
+
+An initial reference attempt selected provisional first-eye events 571/573/577
+from the source-order evaluator. It is explicitly excluded in its manifest:
+the native completion order differs from that evaluator's event order. The
+verified paired events are 572/574/578. Their target, normals, gaze, costs and
+factor identities match exactly; no provisional-only result supports the table.
+
+Existing RAW motion records were also matched by complete frame metadata,
+clock lineage, raw offset/length and SHA-256. Exterior-of-limbus motion is
+unreliable for **both** eyes at sequence 160. Whole-ROI similarity is available,
+but cannot substitute for an independently measured head/pivot displacement.
+Missing exterior support must contribute no identity transform or stationary-
+head claim. Both native before/target/after RAW triplets at sequence 160 are
+prepared beneath that capture's `annotator/archive`, with predictions absent
+and human labels confined to its `annotator/labels`. The existing dark review
+remains a separate pending batch.
+
+Artifacts include `direction-motion-v1.json`,
+`paired-reference-comparison-v2.json`, `source-matched-motion-v2.json`,
+the inspected `branch-reference-v2.png`/`.svg`, exact numerical manifests and
+logs under `original-1m-v2`, and `annotation-preparation-v1.json`. The scripts
+retain source hashes and all missing/large-gap cases. No new human labels,
+measured fixation, independent head motion, scale, camera intrinsics, true
+inner-limbus observations or Student calibration data were introduced. Neither
+this diagnostic nor the unchanged conics demonstrate improved localization,
+SN-FEIDA stability or native gaze accuracy.
+
+
+## Native factor attribution and isolated pupil removal (2026-09-12)
+
+`outputs/stereo-branch-factors-20260912` separates the exact native residual
+costs of the selected branch from the lowest-cost returned alternative more
+than 30 degrees away. This is a test-only diagnostic: it consumes each native
+residual exactly once, including quadrature weights, correlated alternatives,
+rejection caps and separate priors. It does not estimate the objective from
+the exported unweighted pixel RMS or treat score differences as calibrated
+probabilities. Production builds exclude the diagnostic field and helpers.
+
+The same 258 SAM, 258 Student and 998 recent source events are replayed.
+All **1,514** source/geometry/publication records match the promoted integrator
+replay after excluding only posterior diagnostics and elapsed time. These
+remain 628 unique physical reads; the SAM/Student shared clip and provisional
+publications are not extra observations. Independent reconstruction checks
+3,861 returned hypothesis costs and 89,012 factor records; maximum total-cost
+disagreement is `2.85e-13`. The 67 joint component tests and six native stereo
+UI tests pass; explicitly ignored corpus diagnostics were run separately.
+
+For the middle clip, the signed table entries are alternative minus selected
+cost. They attribute the optimized score gap, not integrated posterior mass.
+
+| Sequence | Outer boundary contribution | Pupil boundary contribution | Scene/anatomy priors | Total gap |
+| --- | ---: | ---: | ---: | ---: |
+| 159 | 0.042 | -0.039 | 2.360 | 2.363 |
+| 160, switched branch | 1.024 | 0.341 | 1.031 | 2.396 |
+| 162 | 0.097 | 4.853 | 4.166 | 9.116 |
+
+At 159, pupil decentration/depth priors dominate the score difference; the
+actual pupil residual slightly favors the other branch. At 162, ROI 1's
+pupil boundary contributes 4.843 of the 9.116 cost gap. ROI 1 has no cached
+pupil guide at 159/160 and therefore contributes no pupil samples there.
+The cache does not preserve the semantic decision reason for that absence;
+a stateless RAW-component diagnostic cannot reconstruct that decision.
+
+A second native replay removes pupil samples and initialization hints from
+each eye separately, or both, **only for the current read** at 159/160/162.
+The original full-evidence scene priors and preceding-source seeds remain
+frozen. These counterfactuals never update tracker history. All 1,514 original
+history records remain identical, all three full-evidence controls reproduce
+the original posterior exactly, and both empty ROI 1 removals are exact no-ops.
+
+The table shows ROI 1 model mass within 15 degrees of each variant's own
+selected ray, using the default numerical seed. Both eyes have the displayed
+admission outcome. This is conditional model support, not measured accuracy.
+
+| Pupil evidence retained | 159 | 160, switched branch | 162 |
+| --- | --- | --- | --- |
+| All available | 98.6%, admitted | 97.9%, admitted | 99.0%, admitted |
+| Only ROI 1 | 86.4%, withheld | 94.2%, admitted | 97.8%, admitted |
+| Only ROI 2 | 98.6%, admitted | 97.9%, admitted | 95.3%, admitted |
+| None | 86.4%, withheld | 94.2%, admitted | 36.5%, withheld |
+
+Removing every pupil at 160 changes the two selected directions by only
+0.041/0.100 degrees. Its approximate numerical lower mass bound is 90.11%,
+so the single-seed counterfactual still passes the current gate. This is not
+a new large-reference certainty claim. At 162 either eye's pupil alone keeps
+the full-evidence branch within 0.28 degrees, while removing both changes the
+two selected directions by 75.66/72.09 degrees and makes admission fail.
+Thus pupil evidence is useful in this model, but blanket pupil removal does
+not repair the isolated switch. Outer-contour uncertainty and binocular scene
+assumptions remain the next targets for investigation.
+
+The scope is three Rob-only physical reads with twelve current-read controls,
+not a changed-history ablation, temporal area success or new gaze truth.
+Native localization labels, current scale/head motion and measured intrinsics
+remain missing for these comparisons. The canonical dark review was checked
+live again: all eight targets remain unreviewed, three native context frames
+each, recorded predictions hidden. Six RAW pieces for the separate middle
+branch review were independently byte-verified against their native archive;
+the four offered-cache pieces additionally match exact cache metadata/hashes.
+Neither review was replaced or labeled by the agent.
+
+Reproduction uses the ignored Rust `recorded_native_factor_diagnostic` test.
+Set `BUTTERCUP_FACTOR_DIAGNOSTIC_DIR` to a new directory beneath outputs;
+optional `BUTTERCUP_PUPIL_COUNTERFACTUAL_SOURCES` names the exact lineage/time
+selection JSON. The matched artifacts are `matched-factor-audit-v2.json`,
+`current-pupil-ablation-v1.json`, `counterfactual-selection-v1.json`, frozen
+executables/logs, and the inspected `branch-pupil-attribution-v1.png`/`.svg`.
+No geometry, probability gate, training default or live camera setting changed.
+
+## Native scene sensitivity and source optical evidence (2026-09-12)
+
+`outputs/stereo-scene-sensitivity-20260912` tests thirteen fixed scene and
+outer-allowance variants on twelve preselected physical reads: nine from the
+dark/middle/bright calibration clips and three shared SAM/Student reads. These
+are fifteen provider/read cases, not fifteen independent captures. The full
+1,514-event history stays identical to the preceding native factor replay;
+all fifteen unperturbed posterior controls match the promoted integrator.
+The 195 solutions pass 390 independent checks that both eye rays point at
+their one shared latent fixation. No candidate seeds subsequent history.
+
+These are sensitivity probes, not calibrated camera/anatomy confidence ranges.
+Focal length changes recompute camera-dependent metric initialization from the
+same native pixel/scale inputs. Other factors, pupil evidence, anatomy bounds,
+preceding-source seeds and the numerical recipe stay fixed. Outer multipliers
+change only outer localization and contour-band allowances; pupil allowances
+do not inherit them. The table summarizes the middle clip's switched frame 160:
+
+| Perturbation | Largest eye-direction change | Current numerical admission |
+| --- | ---: | --- |
+| Both focal lengths ±10% | 1.414° | Both eyes admitted |
+| Principal point ±80 px X / ±60 px Y | 0.456° | Both eyes admitted |
+| Opposing focal-axis changes ±5% | 6.129° | Both eyes admitted |
+| Outer allowances ×1.5 | 0.403° | Both withheld |
+| Outer allowances ×2 | 0.956° | Both withheld |
+| Alignment sigma ×1.5 | 0.138° | Both admitted |
+| Alignment sigma ×2 | 0.246° | Both withheld |
+
+Every tested variant retains the switched branch. Increasing outer allowances
+reduces frame 160's conditional near-ray mass from 97.9% to 80.4% / 74.0% at
+the live sampling budget, but loses six / fourteen supported eye directions
+across the fifteen cases. These admission changes use one numerical seed;
+they are not larger-reference probability estimates or accuracy improvements.
+One focal-aspect probe also moves the older Student result at sequence 4434
+by 30.14°. This strengthens the need for measured camera parameters rather
+than establishing a replacement camera model. A filename inventory found no
+intrinsic/calibration JSON in the checked runtime roots; that inventory does
+not cover embedded archive metadata or external calibration stores. The middle
+archive explicitly records camera intrinsics as unavailable, and its metadata
+does not provide exposure-bound lens-position/settling measurements.
+
+The exact RAW frames show a conspicuously blurred frame 160 between sharper
+159 and 162. An ignored native viewer diagnostic now recomputes the existing
+`measure_limbus_optical_focus` and `provisional_focus_score` on the source bytes,
+without using joint results, targets or labels. All 1,514 source records match
+their frozen caches; the 258 matching SAM/Student exposures give identical
+RAW-only provisional scores. The conic-guided optical metric may differ by
+provider because its lateral sampling positions depend on the upstream conic.
+
+| Native source | ROI 1 edge concentration | ROI 2 edge concentration |
+| --- | ---: | ---: |
+| 159 | 0.366 | 0.414 |
+| 160 | 0.135 | 0.238 |
+| 162 | 0.395 | 0.409 |
+
+The provisional scores at 160 also fall to 78.5% / 79.3% of their preceding
+values. However, the dark clip's median edge concentration is only 0.141.
+These are engineering optical measurements, not calibrated boundary variance;
+a single cutoff would confound this dark-scene case with the isolated blurred
+source. The useful next experiment is source-dependent outer evidence
+uncertainty, checked against localization, dropouts and the same-eye and
+complementary-support cases. It must retain independently sharp pupil/inner
+evidence and avoid making its uncertainty inherit a weak outer contour.
+The earlier blanket RAW weighting regression still applies.
+
+No new human labels, measured fixation, fresh independent scale, true-inner
+observations or current RAW Student model results were added. The original
+SN-FEIDA outputs remain diagnostics on the existing acquisition scale; neither
+this optical audit nor withholding a blurred solve proves an area/localization
+improvement. The native model and live viewer were not changed or restarted.
+
+Reproduce the scene variants with `recorded_native_factor_diagnostic`, setting
+`BUTTERCUP_SCENE_SENSITIVITY_SOURCES` to the exact lineage/time selection JSON.
+Reproduce optical measurements with the ignored viewer test
+`native_stereo_optical_focus_diagnostic`, `BUTTERCUP_OPTICAL_AUDIT_CACHES` (a JSON
+array of cache paths), and a fresh `BUTTERCUP_OPTICAL_AUDIT_REPORT` under outputs.
+The 67 joint tests, both explicit native corpus diagnostics, four optical
+component tests, production evaluator check and source-tree audit pass.
+Matched reports are `matched-sensitivity-v1.json` and
+`matched-optical-audit-v1.json`; frozen executables and logs accompany them.
+The inspected comparison is `optical-branch-v1.png`/`.svg`. The corrected RAW
+preview is `observed-boundaries-v2.png`; `preview-provenance-v2.json` explicitly
+invalidates the initial Python preview's incorrect MIPI packing assumption.
+
+## RAW outer transition width versus boundary position
+
+Two explicit offline experiments separate optical transition width from
+displacement relative to the detector's original contour points. Neither is
+enabled in `JointTracker` or the live viewer. Both preserve all pupil/true-inner
+factors, contour positions, conic hints, correlation groups and source timing.
+They do not smooth gaze, average eye solutions or normalize by a candidate radius.
+
+`--raw-outer-spread` measures the gradient's second moment about the observed
+point, using 17 normal samples over ±16 native pixels and the median of three
+tangential profiles. It replaces only an outer arc's optical allowance with
+the larger of its existing allowance and the 75th-percentile measured spread.
+This **fails validation**: even an ideal sharp synthetic eye receives about
+2.30 px instead of its original 0.75 px optical allowance, and its otherwise
+supported complete outer-plus-pupil direction becomes unsupported in all
+three numerical seeds. The width describes the optical transition and sampling
+filter, not the variance of the boundary's position.
+
+`--raw-outer-position` instead measures the signed gradient centroid relative
+to the original point, while exporting the centered optical spread separately.
+Only the 75th-percentile absolute displacement can widen the old allowance.
+Both experiments require a measurable rise of at least 7 RAW10 levels,
+net/total variation of at least 0.75, and at least three valid profiles covering
+half the requested samples. Position additionally rejects a window-censored
+transition when either endpoint gradient exceeds 20% of the peak. Unknown is
+reported and retains the original engineering allowance; it is not measured
+precision. No fitted ellipse, solver residual, temporal source or label enters
+these measurements. Neither recipe supplies calibrated localization covariance.
+
+The matched replay covers 1,590 source events per arm: SAM and the older Student
+each see the same 129 physical reads, three calibration clips contribute 499
+reads, and the reviewed subset contributes 49. There are 677 unique physical
+reads and 1,332 distinct native ROI byte ranges; all 1,590 cache receipts match
+their RAW SHA-256 values. Each arm updates its own full source-order history.
+Counts below use the final publication once per provider/source, including
+unavailable outputs, rather than counting provisional revisions as new evidence.
+
+| Provider/subset | Baseline supported eye directions | Width candidate | Position candidate |
+| --- | ---: | ---: | ---: |
+| SAM, 129 reads | 80 | 7 | 78 |
+| Older Student, same 129 reads | 74 | 6 | 74 |
+| Calibration, 499 reads | 791 | 626 | 789 |
+| Reviewed, 49 reads | 13 | 9 | 15 |
+
+Width loses 325 previously supported directions and gains 15. Position loses
+eight and gains six. More retained directions do not establish greater accuracy.
+Position obtains an arc-level measurement on only 529 of 3,309 outer arc
+observations; 2,780 remain unknown, predominantly because transitions are
+nonmonotone or window-censored. These are correlated arc/provider observations,
+not 3,309 independent trials. The six measurable reviewed arcs are particularly
+weak coverage for validating an uncertainty model.
+
+Of sixteen existing reviewed labels, ten match this stereo RAW subset and
+eight have available fits in all arms; the two missing low-light fits stay
+missing. Width worsens six of the eight visible-boundary RMS errors, improves
+one and leaves one unchanged; the largest regression is 4.538 px at sequence
+247. Position leaves seven unchanged and improves that one fit by only 0.052 px
+(3.780 to 3.728 px). The baseline's 29.060 px error at sequence 317 is unchanged
+by position. This is not evidence of general localization improvement.
+
+At the middle clip's source 160, position leaves both the selected rays and
+the 97.9% conditional near-ray mass exactly unchanged; the approximately 85°
+switch remains admitted. Width keeps the switched branch but withholds it.
+Source 159 is also exact under position, while 162 changes by only
+0.022/0.048°. No new independent gaze truth was obtained. Common fresh
+SN-FEIDA log-step comparisons use the original acquisition scale and gaps of
+at most 500 ms: width generally worsens median steps; position is unchanged
+or slightly worse in the three temporal cohorts. The reviewed subset has no
+eligible adjacent pairs. Neither establishes area accuracy or improved motion
+alignment without independent scale support.
+
+The expanded synthetic audit has six cases—complete and partial outer-plus-
+pupil, complete and partial outer-plus-true-inner, complementary stereo, and
+outer-only—at three seeds. Width has 72 case/optical-arm/seed rows. Position has
+90, adding an optical edge displaced eight pixels from the unchanged measured
+contour. Position retains the ideal complete-pupil admission for sharp, dim and
+centered blurred edges, but withholds the displaced case. The partial,
+complementary and true-inner fixtures remain unsupported under the live
+integration recipe even at an exact synthetic MAP; these are unresolved or
+broad distributions, not demonstrated successful gaze cases. Outer-only mirror
+ambiguity also remains unsupported. A zero MAP error is not sufficient proof
+of probabilistic support or of performance on real occlusions.
+
+All 67 joint tests and nine RAW allowance tests pass. The initial position unit
+run exposed a too-tight incidental subpixel assertion: integer quantization of
+the dim RAW edge shifts its centroid by 0.267 px. The corrected test checks the
+existing 0.75 px engineering floor; no candidate algorithm or native threshold
+changed. Failed v1 artifacts remain alongside the successful v2 run.
+
+Reproduce with `outputs/outer-raw-spread-20260913/run_v1.py` and
+`outputs/outer-raw-position-20260913/run_v2.py`; the latter verifies native RAW
+hashes before replay. The corresponding ignored Rust diagnostics are
+`raw_outer_spread_support_cases_diagnostic` and
+`raw_outer_position_support_cases_diagnostic`. Frozen executables, exact cache
+lists, matched audits, canonical-label scores and source receipts accompany
+both experiments. The inspected comparison is
+`outputs/outer-raw-position-20260913/optical-position-comparison-v2.png`/`.svg`.
+The width candidate is rejected and the position candidate remains diagnostic
+only. The next model needs explicit treatment of ambiguous or missing boundary
+location evidence; neither optical width nor a centered local gradient is a
+substitute for it. Training, camera ownership and live gaze behavior are unchanged.
+
+### Selected-mask logit boundary receipts
+
+`BUTTERCUP_OUTER_BOUNDARY_LOGITS=1` now retains source-native boundary profiles
+from the actual selected SAM video mask or Student outer-mask head. The default
+is off, before any extra tensor transfer. Both existing replay exporters append
+`outer_boundary_logits` only when a selected fitted mask supplied the evidence.
+The live conic likelihood does not consume this diagnostic field yet.
+
+The initial v1 exporter in `src/sam31_boundary_logits.rs` sampled 33 positions from −16 to +16 native pixels
+along normals formed by adjacent measured points within each retained run.
+Run endpoints were omitted so a tangent could not bridge an occluded gap. Sampling
+uses the pixel-center transform `(x + 0.5) * mask_width / source_width - 0.5`
+and its independent vertical counterpart, with edge clamping inside the source.
+The packet records native source identity, sensor origin, generation, published
+query, arc and point indices, original point coordinates, logits and every
+crossing of levels −1, 0 and +1. Missing samples, multiple crossings, threshold
+plateaus and budget exclusions remain explicit. That version used at most sixteen
+profiles per arc and 256 per source. Sampling follows the published contour
+after any explicit refinement and records whether refinement was applied.
+
+These are sensitivity alternatives of **one selected mask**, not additional
+independent observations or calibrated probabilities. In particular, the width
+between two logit levels is not automatically localization variance. Contour
+selection, RAW gates, pupil history and pupil level-set selection are unchanged.
+That export-only experiment did not insert mask-level alternatives into the gaze
+solver or average another eye's independently solved direction.
+
+The frozen experiment is `outputs/outer-logit-boundaries-nlOH4wff/`. Four matched
+on/off replays cover 662 provider/source events per arm: SAM sees the complete
+129-read shadow recording, the 35-read completed-worker prefix of the middle
+calibration clip through sequence 162, and 49 reviewed-context reads; CPU-only
+Student sees the same complete shadow recording. This is 213 distinct physical
+reads and 404 distinct native ROI byte ranges, all SHA-verified. The middle
+prefix is the previous offered worker's completed exposures, not every camera
+frame. Replays here are completion-paced and do not measure offered latency.
+
+All 662 on/off records have exactly the same retained/censored contours,
+ellipses, pupils, admission decisions and source provenance. All 17,328 sampled
+points exactly match their published native contour coordinates. The 404 SAM
+results also exactly match the corresponding older cached geometry and pupils.
+The current CPU Student matches 103 of 258 older Student cache records exactly;
+the remaining historical differences are separate from the diagnostic toggle.
+Its on/off comparison is exact on all 258 frames, using the original pinned
+`b780957a…334cf3de` model, with no training or promotion.
+
+| Provider/subset | Frames with a fit | Profiles | Single-band profiles | Median −1/+1 width |
+| --- | ---: | ---: | ---: | ---: |
+| SAM calibration prefix | 70/70 | 1,832 | 1,721 | 3.38 px |
+| SAM reviewed contexts | 62/76 | 1,956 | 1,156 | 4.43 px |
+| SAM shadow recording | 242/258 | 6,764 | 5,495 | 2.92 px |
+| CPU Student, same shadow recording | 243/258 | 6,776 | 6,458 | 1.81 px |
+
+At middle-clip ROI 1 sources 159, 160 and 162, median widths are respectively
+3.50, 6.14 and 4.92 px. Source 160 therefore exposes broader mask sensitivity
+at the existing suspicious gaze switch. This does not repair the switch or
+establish that mask width is a calibrated error estimate. On ten exact native
+human-label matches, 43 visible labels fall within two tangential pixels and
+sixteen normal pixels of an actually sampled profile: nine are inside its
+single −1/+1 band, 27 outside, and seven have ambiguous/missing bands. These
+local, correlated comparisons are sparse and selected; they are not a coverage
+calibration. They demonstrate residual model discrepancy that raw logit widths
+alone cannot be assumed to explain. Unlabelled SAM/Student disagreement is
+also not ground truth, and their different activation scales cannot be ranked
+as confidence without validation.
+
+`build_v3.py` records fourteen passing profile, source-publication, pupil-levelset
+and replay-evidence tests, the production replay build, viewer compile check,
+tree audit and whitespace check. Earlier failed checks are retained: v1 used a
+utility test crate missing existing shared-test modules; v2's new fixture
+compared native points against pre-conversion model points. The corrected
+fixture retains exact equality after the existing conversion; runtime logic
+and tolerance were not changed. `prepare_v1.py`, `replay_v1.py` and
+`analyze_v1.py` record asset hashes, native receipts, exact comparisons and
+post-inference label joins. The inspected figure is
+`boundary-logit-evidence-v2.png`/`.svg`.
+
+The following experiment consumes these alternatives while retaining the
+original model-discrepancy allowance. Exporting them alone does not establish
+gaze accuracy, cross-user readiness or anatomical truth.
+
+### Correlated mask-level likelihood: offline candidate
+
+`buttercup_stereo_conic_eval --mask-levels` attaches selected-mask evidence to
+the existing native outer arcs before optional training/validation decimation.
+Use it with `--source-order-replay --all-boundary-samples --probabilistic` to
+compare full source history. The live adapter still leaves this field absent.
+The experiment and frozen executables are under
+`outputs/mask-level-joint-pQWa7TJ7/`.
+
+The v2 profile export keeps the 256-profile source budget, prioritizing the exact
+sixteen samples per run that the native adapter retains before using remaining
+space for inspection profiles. Endpoints use one-sided, within-run tangents.
+`run_point_index` distinguishes repeated coordinates at a closed run's ends.
+The receiver checks source identity, crop, selected query and native coordinates;
+missing profiles, nonunique crossings and threshold plateaus supply no invented
+alternative. Version 1 receipts remain readable with their limited coverage.
+
+Levels −1/0/+1 define three sensitivity states for one source mask. Their
+displacements are relative to that profile's zero-logit crossing; the central
+state preserves the original raster contour exactly. All profiled groups of
+the same eye and boundary share one state. Each state evaluates the same joint
+fixation, original point mass, localization allowance and robust group cap.
+Pupil and true-inner factors remain separate. With state cost `E_s`, the mask
+contribution is `−2 log(mean_s exp(−E_s/2))`. The equal state weights are declared
+engineering assumptions, not calibrated segmentation probabilities.
+
+The residual representation uses conditional state weights plus their KL
+penalty. Only local optimization/proposal derivatives freeze those weights and
+arc activity; actual trial and posterior densities recompute the full mixture.
+The frozen-state metric is not reported as a marginal Gaussian covariance:
+`local_uncertainty` reports `mask-level-mixture-requires-distribution` instead.
+The full distribution remains responsible for directional uncertainty.
+
+Current validation includes 173 ordinary offline tests, nineteen selected-mask
+publication/export tests in the SAM-enabled viewer build, and ninety synthetic
+results covering complete outer+pupil, complete outer+true-inner, partial
+same-eye support, complementary eyes and outer-only ambiguity. Three displaced
+outer-only controls have no feasible fit and are recorded as dropouts. In the
+complementary displaced case, the best-fit error falls from about 6.9 degrees
+to zero, but no seed passes the directional uncertainty gate. Strong complete
+pupil support remains usable; broad partial cases still have sampling failures.
+An accurate best fit is not sufficient evidence of a useful gaze distribution.
+
+New SAM/CPU Student inference on the same four subsets preserves all 662 prior
+control records exactly, including contours and pupils. All 54,509 exported
+profile points join their native sources; all 18,183 solver-retained points have
+profiles, of which 15,102 provide usable three-level alternatives. There are
+404 distinct SHA-verified ROI byte ranges. The current solver with the flag off
+matches its frozen predecessor on all 662 source events, excluding timing.
+Candidate/control comparisons preserve 6,890 common factor masses and verify
+1,836 eye rays against their one shared fixation.
+
+| Subset | Final directions passing the existing gate, control → candidate |
+| --- | ---: |
+| SAM calibration prefix | 48 → 50 |
+| SAM reviewed contexts | 13 → 9 |
+| SAM shadow recording | 80 → 76 |
+| CPU Student shadow recording | 75 → 68 |
+
+These are final publications once per provider/source, not held-frame votes.
+The total falls from 216 to 203, with 33 gains and 46 losses; insufficient-sampling
+results rise from 27 to 38. Of eight fitted exact-RAW human-label matches, five
+improve, two worsen and one is unchanged; two additional matched labels remain
+without a fit. The calibration prefix's ROI 1 jump at source 160 remains large:
+85.47 degrees in the control and 84.25 degrees in the candidate. Median common
+source-to-source SN-FEIDA log changes worsen in all three time series. The
+Student 95th percentile improves while its maximum worsens. The reviewed contexts lack usable consecutive-scale
+pairs. Original acquisition scale hints are preserved; no new metric head scale
+or measured gaze truth is available.
+
+This candidate is **not promoted**. The following experiment checks coverage
+of alternate mask states against these same native and synthetic inputs.
+Current results do not establish calibrated confidence, reliable
+partial/true-inner gaze, or a repair of the native branch switch.
+
+### Conditional mask-state proposals: offline numerical experiment
+
+`outputs/mask-state-proposals-okq3cr2j/` freezes the implementation, inputs,
+matched audit, independent integration references and inspected native ROI
+figure. `IntegrationConfig.mask_state_proposals` defaults to false, including
+in `live()`. The live adapter still does not attach mask profiles.
+
+The proposal builder conditions a temporary model on each coherent mask-level
+assignment and refines from up to two existing joint basins. It covers all
+assignments for one or two mask families, with a bounded sixteen-state subset
+for larger families. Each family changes together; it never lets each contour
+fragment independently choose its preferred mask. Two scalar radius steps
+initialize displaced states that might otherwise start beyond a robust group's
+zero-gradient cap. These steps and subsequent conditional fits only locate
+sampling proposals. Every pilot and estimation draw still uses the original
+full marginal target and complete frozen proposal-mixture density. No completed
+ellipse hints, observation weights, priors, source-history votes or independent
+eye targets are added. Conditional models preserve the original polyline
+quadrature and mass even when sample coordinates move.
+
+The default and no-profile candidate match the previous production control
+exactly on all 662 source events, excluding elapsed time and test-only factor
+attribution. The masked control matches the preceding mask experiment exactly.
+The new masked proposals preserve all 662 fitted geometries, source identities
+and factors. Running the independent reference beside them leaves their normal
+sampling output unchanged on those same 662 events.
+
+| Subset | Final supported eye directions, masked control → new proposals | Insufficient sampling, control → proposals |
+| --- | ---: | ---: |
+| SAM calibration prefix | 50 → 58 | 4 → 0 |
+| SAM reviewed contexts | 9 → 13 | 5 → 5 |
+| SAM shadow recording | 76 → 106 | 7 → 3 |
+| CPU Student shadow recording | 68 → 84 | 22 → 23 |
+
+The total changes from 203 to 261, with 74 gains and 16 losses. These counts are
+conditional engineering admission decisions, not accuracy improvements. Median
+elapsed times increase despite fewer median sampling draws, because conditional
+proposal fits add work; the shared-host timings are not an isolated benchmark.
+Sixty-four final publications have a conditional proposal center with lower
+full marginal cost than the selected bounded-search fit. These are recorded
+search limitations; this proposal-only experiment deliberately does not replace
+the selected fit. Human-label localization, coverage and SN-FEIDA therefore
+remain identical to the previous mask candidate, including its regressions
+against the nominal-boundary control. No new metric scale or gaze truth was
+introduced.
+
+The ninety synthetic results retain the same six cases, five boundary variants
+and three seeds. All geometry and availability results match; the three
+displaced outer-only dropouts remain. Sampling failures decrease from six to
+one. Complete same-eye pupil support remains admitted, while the ambiguous
+true-inner, partial and complementary cases do not acquire spurious support.
+This verifies numerical behavior on those fixtures, not reliable solutions for
+every requested partial/true-inner scenario. There are 175 passing ordinary
+offline tests, six passing stereo viewer tests, and a passing SAM-enabled
+production viewer check and tree audit.
+
+Independent annealed integration uses two seeds, 4,096 paths and 128 bridge
+steps on eleven selected native reads. The selections include SAM support
+gains/losses, Student gains/losses and the calibration jump. Most selected SAM
+gains agree with these model references, but SAM source 4419 varies by seed and
+source 162 has one insufficient-path result. The Student source 4415 ROI 2 gain
+is suspect. Increasing its references to 16,384 paths and 256 steps estimates
+15-degree model mass at 0.9103 ± 0.0299 and 0.8755 ± 0.0385 (twice numerical
+standard error). Both fail the existing conservative 90% admission margin.
+The reference paths use independent random streams and invariant transitions,
+but share the target and proposal family; they cannot certify unvisited modes
+or calibrated gaze accuracy.
+
+Source 160 still switches by about 84 degrees, and both independent references
+place about 97.6–97.7% model mass near that selected ray. Removing all pupil
+evidence from that current read preserves the opposite branch and its tight
+support. Thus neither sampling noise nor optional pupil evidence alone explains
+this failure. The six SHA-verified native ROI images show abrupt brightening
+and flatter fitted outer contours at source 160. This directs the next
+experiment toward outer-shape/occlusion and scene assumptions, retaining both
+the shared-target constraint and the native source chronology. No measured gaze
+truth is available for these three reads.
+
+The proposal experiment remains **offline and unpromoted**. Further work must
+resolve the Student numerical admission discrepancy, evaluate useful partial
+and true-inner support, and improve native geometry under illumination and
+occlusion before integrating the mask likelihood into live gaze.
+
+
+### Coherent spatial mask sensitivity: offline comparison
+
+`outputs/mask-spatial-sensitivity-yccfttua/verdict-v1.json` and its matched and
+independent-reference audits record this experiment. `--mask-spatial` adds four
+outer-boundary displacement fields to the original three uniform threshold
+states: positive/negative cosine and sine of twice the measured contour-normal
+angle, bounded by the original minus/plus-one-logit displacement envelope.
+Every fragment in an eye/boundary family shares its state. The uniform
+seven-state prior is an engineering sensitivity assumption, not extra observed
+samples or calibrated SAM probabilities. This finite basis is not a
+rotation-invariant continuum. Pupil and true-inner evidence, point mass, noise,
+source history and scene priors remain unchanged. The exact likelihood includes
+all state combinations; the proposal initializer covers a bounded sixteen
+assignments when more exist.
+
+Both default/no-profile and uniform-mask controls match their frozen
+predecessors on all 662 source events. Validation includes 176 ordinary offline
+tests, six stereo viewer tests and a SAM-enabled production check. Exhaustive
+synthetic likelihood checks reconstruct all 49 combinations for two spatial
+families. The native audit checks 6,891 common factor masses/noise values and
+1,836 eye rays against their one shared fixation.
+
+| Subset | Final supported directions, uniform → spatial |
+| --- | ---: |
+| SAM calibration prefix | 58 → 48 |
+| SAM reviewed contexts | 13 → 14 |
+| SAM shadow recording | 106 → 108 |
+| CPU Student shadow recording | 84 → 86 |
+
+The total falls from 261 to 256, with 35 gains and 40 losses. Final publications
+are counted once per provider/source, not as new physical recordings or held
+frame votes. Median common source-to-source SN-FEIDA absolute log changes improve
+from 0.01433 to 0.01069, 0.01242 to 0.01094 and 0.01775 to 0.01616 in the three
+time series, but Student's 95th percentile worsens from 0.14886 to 0.15024. Of
+eight fitted exact-RAW human-label matches, two improve, five worsen and one is
+unchanged; two additional matches remain without a fit. No new scale
+measurement or gaze truth was introduced. The source 159→160 ROI 1 jump grows
+from 84.25 to 84.87 degrees.
+
+The 252 synthetic results compare six support cases, seven boundary variants
+and three seeds in each arm. A deliberately constructed spatial outer-boundary
+distortion with strong complete-pupil support improves from 17.255 degrees to
+zero in all three seeds. This is known fixture geometry inside the sensitivity
+family, not native accuracy. Partial/complementary cases retain ambiguity and
+some unbiased cases develop worse MAP fits. Complete true-inner support still
+does not resolve its mirror pair.
+
+Eight independent annealed references cover four native reads using two seeds,
+4,096 paths and 128 steps. The second reference arm also changes the ordinary
+sampler seed. All 808 source events preserve geometry, factors and source
+identity; complete posterior parity is asserted only for the 404 events using
+the original seed. Source 160 has 0.8973 and 0.9137 reference mass within fifteen
+degrees of its selected ray. Both fail the existing mass-minus-two-standard-errors
+admission margin despite admission by the primary sampler. Reviewed source 246
+is withheld, with about 0.2–0.3% reference mass near its selected MAP.
+
+Student source 4455 changes to a branch that agrees with adjacent fresh reads
+and SAM on the same native recording. That is promising temporal/provider
+agreement, not independent gaze truth. Its reference masses are about 0.929 and
+0.932, but twice the numerical standard errors are about 0.074–0.081, so neither
+reference establishes the admission margin. Student source 4415 retains weak
+numerical support, including one insufficient-path reference.
+
+This spatial candidate remains **offline and unpromoted**. Better area stability
+does not offset localization regressions or optimistic admission. The next
+comparison uses conditional mask fits only to initialize refinement of the
+original full marginal joint objective, testing observed search gaps without
+changing evidence, priors, association penalties or the shared fixation.
+
+
+### Coherent mask-state initialization of the marginal fit
+
+`outputs/mask-marginal-refinement-9l0ay_fq/verdict-v1.json` freezes this comparison.
+`IntegrationConfig.mask_state_refinement` defaults to false, including in `live()`.
+The diagnostic native replay enables it with `BUTTERCUP_MASK_REFINEMENT=1`.
+
+The additional initialization improves the bounded model search, but this comparison does not establish better native gaze. The option remains offline and disabled by default.
+
+Each coherent mask state supplies a temporary starting fit. That fit is then refined against the original complete marginal likelihood before it can compete with the original candidates. A single additional budget of at most 24 starts is shared across existing eye associations. Every omitted eye keeps its original full omission penalty; every result still has one shared fixation. Both conditional and full refinement work are included in diagnostics. No observations, scene priors, per-point noise or camera controls change.
+
+All 177 ordinary solver tests pass. The SAM-enabled viewer build, six stereo UI tests, production check and tree audit pass. Native no-profile, uniform-control and spatial-control outputs each match the frozen predecessor on all 662 events. There are 1,324 matched native event pairs, 13,782 common factor mass/noise checks and 3,672 checks that each eye ray points to the single shared target. All 252 synthetic control results match their frozen predecessors within the 504-result comparison.
+
+| Mask sensitivity | Final supported directions | Lower-cost final fits (> 1e-8) | Human visible-label RMS: improve / worsen / same |
+| --- | ---: | ---: | ---: |
+| Uniform | 261 → 257 | 208 of 325 | 2 / 3 / 3 |
+| Spatial | 256 → 253 | 249 of 325 | 3 / 4 / 1 |
+
+Many cost changes are numerically tiny. Ten labels match exact native RAW sources; eight have fitted results in both arms and two remain unavailable. These are Rob-only data and existing reviewed labels, including historical labeler provenance. They do not supply independently measured gaze. The subset repeats physical recordings across providers/cohorts, so publication counts are not new capture counts.
+
+The source 159→160 ROI 1 jump grows from 84.25 to 84.69 degrees with uniform mask states, and from 84.87 to 85.94 degrees with spatial states. Uniform Student median/p95/max source-to-source SN-FEIDA changes improve, while several SAM metrics and the spatial Student median worsen. Original acquisition scale hints are used; there is no own-radius normalization or new metric scale evidence. The native replay preserves the source-history policy, but changed earlier joint fits become different subsequent initialization values. Small end-to-end cost increases therefore remain in the audit; the largest is 0.000002603 at a provisional source-160 publication. The unchanged fixed-request synthetic objective never increases.
+
+Strong correctly modeled complete-pupil synthetic cases retain zero-error solutions. The uniform model still admits a spatially distorted complete-pupil example with about 16.26 degrees of error. Complete true-inner and complementary cases remain directionally ambiguous; some partial/complementary MAP errors worsen even at lower cost. Spatial partial-pupil admission remains one of three seeds. These fixtures do not establish the requested robust partial/cross-eye gaze behavior.
+
+Fourteen independent annealed references cover all seven newly admitted source/kind combinations, with two seeds, 4,096 paths and 128 steps. Both seeds establish the existing numerical margin for spatial SAM sources 134/138 and uniform SAM source 4504. Uniform source 124 and spatial Student source 4463 are seed-dependent. Neither seed establishes the margin for uniform reviewed source 223 or spatial reviewed source 317. All 1,616 reference replay events preserve geometry, factors and source identity; the 808 events with the original ordinary-sampler seed also preserve the complete posterior. The reference shares the target and proposal family and cannot certify unvisited modes or calibrated accuracy.
+
+The inspected source-317 figure is a concrete failure: retained SAM samples sit inside the human-marked iris boundary; visible-label RMS worsens from 29.01 to 29.17 pixels while the bounded sampler newly admits ROI 1. The independent references estimate only 0.714 and 0.758 mass near that ray, with substantial numerical error. The figure uses an independently SHA-checked native RAW10 buffer and the existing reviewed label file. Labels were read, not edited.
+
+The next work is to address missed posterior mass on fixed native targets using bounded integration that is checked against these references, while retaining the positive sources 134/138/4504. Source 317 also remains a boundary-interpretation failure; more optimizer starts cannot add the missing anatomical evidence. Live mask attachment, reliable partial/true-inner/cross-eye behavior and the full stereo-gaze goal remain incomplete.
+
+Artifacts: matched-audit-v1.json, reference-audit-v1.json, native-label-failure-v1.png, native-label-failure-v1.svg, and native-label-failure-provenance-v1.json. Builds, replays, references and audits are terminal. One initial synthetic launch used an unavailable CPU affinity and was corrected after that launch exited; audit assumptions about fitted publication targets and evolving warm starts were corrected before the final audit. No camera access, training, live viewer restart or deployment occurred.
+
+### Independent annealed populations: confidence improvement with coverage and cost limits
+
+The bounded SMC candidate lives in `joint/posterior/populations.rs` and remains
+disabled in `IntegrationConfig::default()` and `live()`. Its full report and
+audited results are in `outputs/posterior-populations-bu6ffb52/`. The native
+source-223 and source-317 numerical false admissions improve, but broader
+coverage, convergence and latency do not justify live promotion.
+
+Both arms enable the existing experimental coherent mask-state proposals and
+marginal MAP refinement, isolating numerical integration on that same target.
+Live default mask attachment and refinement have not been promoted; this is
+not evidence of a changed live-camera outcome.
+
+The sampler follows the fixed-space SMC construction in
+[Del Moral, Doucet and Jasra (2006), sections 3.2 and 4](https://www.stats.ox.ac.uk/~doucet/delmoral_doucet_jasra_sequentialmontecarlosamplersJRSSB.pdf).
+Each independent population starts from the complete frozen proposal mixture.
+The bridge is `q^(1-beta) p^beta` with `beta=(stage/steps)^2`. Incremental
+weights precede unbiased stratified resampling and invariant Metropolis moves.
+Resampling occurs below half the initial particle-count ESS, except at the
+final stage. Hard bounds reject proposals; invalid starts remain zero-mass
+attempts and extinct populations are never retried. A zero-stage control is
+ordinary stratified importance sampling. Temporary proposal fitting, contours,
+the full marginal objective, priors and selected joint MAP are unchanged.
+
+Population estimates are pooled by estimated normalizers, not by averaging
+their posterior ratios. The existing between-replica delta-method calculation
+now operates on independent populations. Duplicating descendants leaves its
+error unchanged. `effective_samples` and `maximum_sample_mass` explicitly refer
+to population normalizer shares in this mode; endpoint weight concentration
+within a population is not independent-trial precision. The experimental
+admission gate requires at least eight effective populations, no population
+above 25% of normalizer mass, the existing angular-radius condition, and model
+mass minus twice the between-population error of at least 90%. These are
+engineering diagnostics, not calibrated probabilities or unvisited-mode bounds.
+
+The smaller comparison uses 16 populations × at most 256 particles × 16
+stages, at most 69,632 model evaluations after the unchanged pilot. The larger
+selected-case comparison uses 32 × 256 × 64, at most 532,480. These exceed the
+ordinary 8,192-draw cap and are not equivalent-work performance comparisons.
+`BUTTERCUP_POPULATION_PARTICLES`, `BUTTERCUP_POPULATION_STEPS` and
+`BUTTERCUP_POPULATION_COUNT` select the candidate in the ignored
+`extraction_tests::recorded_mask_state_proposal_replay`; an explicit
+`BUTTERCUP_MASK_REFERENCE_SOURCES` selection bounds native application to final
+ROI2 publications. All other source events retain ordinary integration.
+
+The seven existing numerical-reference cases receive both population budgets
+and two seeds, giving 28 matched runs against the frozen independent AIS
+references. The larger budget withholds both eyes at reviewed 223 and 317 in
+both seeds. The smaller budget still admits source-317 ROI2 in one seed.
+Sources 138/4504 retain support; 124 and Student 4463 also pass both population
+budgets/seeds. Larger source 134 loses support in one seed because one
+population carries 60.5% of normalizer mass (effective population count 2.69),
+despite nearly all sampled directions agreeing. Source-317 mass estimates and
+source-223 variance also remain sensitive to numerical work and seed.
+
+The wider replay preserves all 662 native events per mask likelihood. The
+candidate applies to 321 final ROI2 reads: 311 fitted and ten unavailable.
+Twenty-one reviewed sources ending in ROI1 remain exact controls and are
+excluded from candidate coverage. The eight matched cohort/likelihood replays
+verify 1,324 geometry/factor/source event pairs and 1,206 explicit shared-target
+ray identities. Admitted eye directions change as follows:
+
+| Paired subset | Uniform control → population | Spatial control → population |
+| --- | ---: | ---: |
+| SAM middle | 56 → 54 | 50 → 48 |
+| SAM reviewed | 10 → 12 | 12 → 9 |
+| SAM shadow | 108 → 95 | 108 → 84 |
+| CPU Student shadow | 82 → 83 | 82 → 60 |
+| Total | 256 → 244 | 252 → 201 |
+
+Uniform has 27 gains/39 losses; spatial has 13 gains/64 losses. All fitted
+human-label localization, SN-FEIDA, timing alignment and gaze geometry are
+unchanged. The approximately 85-degree source-159→160 jump still admits both
+eyes. Median offline solve times rise from 79–264 ms to 446–1,214 ms across
+cohorts, under low-priority shared CPU claims; this is not an isolated latency
+benchmark. All data remain Rob-only, with no new independent gaze or scale truth.
+
+All 181 ordinary solver tests and six stereo viewer tests pass, along with
+SAM-enabled production checking and the tree audit. The 504-result synthetic
+comparison preserves all 252 frozen controls and all candidate geometry/costs.
+Complete-pupil cases keep 21 admissions per likelihood, including the existing
+incorrect uniform shape-bias example. Four seed-dependent spatial partial-pupil
+admissions disappear; true-inner, partial and complementary cases remain
+withheld. The full gaze objective is therefore still incomplete. The next
+work must address misplaced segmentation evidence and support ambiguities;
+these population and AIS controls provide a stronger audit of numerical claims.
+
+### Rejected outer masks: RAW alternatives and observation-family ablation
+
+`outputs/raw-outer-candidates-iu_wmh21/` contains two **offline, default-off**
+experiments. Neither is promoted. The comparison classifies this goal turn as
+progress through implementation and matched native evaluation; the full gaze
+objective remains incomplete.
+
+The selected SAM mask can fail its existing RAW ring gate while its retained
+outer samples still enter the solver with a wider five-pixel band. Detector
+scores cannot be treated as a shared probability: cached SAM video scores can
+exceed one, and Student scores describe mean foreground activation. A score
+threshold would therefore introduce an unsupported probability interpretation.
+
+The first experiment, `--raw-outer-candidates`, searches four neighboring
+ellipse guides at axis offsets of −8%, 0%, +8%, and +16% of the shorter native
+ROI dimension. It reuses the bounded native RAW peak extractor with coherent
+edge runs. Guides locate searches; they are not emitted as complete boundary
+observations. Measured runs share eight fixed image-angle groups, with at most
+four alternatives per group, preventing repeated guides from creating extra
+votes. Flat and saturated inputs emit no arcs. The rejected SAM samples and
+their mask profiles are replaced, while the original pupil extraction and
+scene initialization remain fixed. This does **not** establish anatomical
+identity: a positive RAW edge can belong to a reflection or internal texture.
+
+The second experiment, `--withhold-rejected-outer`, removes only the outer
+observation family and its conic search hints after the existing gate rejects
+it. Inner/pupil observations, uncertainty, source metadata and original scene
+inputs survive; hint indices are remapped. Accepted masks are unchanged. This
+is an ablation, not a claim that whole-mask rejection is the correct final
+policy. Both experiments still use the baseline-derived scene center, which
+is explicitly not independent anatomical truth. Projected outer ellipses after
+ablation are model predictions rather than observed outer boundaries.
+
+The ignored `extraction_tests::recorded_mask_state_proposal_replay` exposes
+these through `BUTTERCUP_RAW_OUTER_CANDIDATES=1` and
+`BUTTERCUP_WITHHOLD_REJECTED_OUTER=1`. They are mutually exclusive with each
+other and the earlier partial-outline experiment. Native contour likelihood,
+uniform mask-level likelihood, and spatial mask-level likelihood are each
+evaluated with the same existing source-history policy. Source 160 passed the
+existing RAW gate, so these experiments leave its large branch jump untouched.
+
+The frozen SAM-middle, SAM-reviewed, SAM-shadow and CPU-Student-shadow caches
+contain 662 source events, representing 342 final provider/source publications.
+All 404 unique native byte ranges (57,554,880 bytes) match their recorded SHA256.
+Each experiment reproduces 1,986 frozen control events across the three
+likelihoods. Its audit counts final publications once per source, checks source
+pairing and duplicate suppression, and verifies rays from the single shared
+fixation rather than independent gaze averaging.
+
+Only six ROI1 frames trigger either experiment: reviewed 317, 318, 10125 and
+10237; SAM-shadow 4499; and Student-shadow 4465. RAW replacement emits 102 arcs
+across these frames. Ablation removes 22 outer arcs and preserves 119 pupil
+points. At reviewed 318, the new fit selects a different existing RAW pupil
+peak in group 102; the observations themselves are unchanged. The audit compares
+noise and support weight only when the same physical alternative is selected.
+
+| Likelihood | Admitted eye directions: control | RAW alternatives | Outer withheld |
+| --- | ---: | ---: | ---: |
+| Native contours | 216 | 215 | 214 |
+| Uniform mask levels | 257 | 258 | 256 |
+| Spatial mask levels | 253 | 251 | 250 |
+
+Available final fits remain 325/342 with RAW alternatives and fall to 323/342
+with outer withholding for each likelihood. The additional unavailable sources
+are reviewed 10237 and SAM-shadow 4499, where no usable boundary remains.
+Reviewed 10125 retains an other-eye solution but no ROI1 boundary prediction.
+These are coverage losses, not evidence of improved gaze accuracy.
+
+Human-label localization is unchanged on the other matched reviewed frames.
+The main affected labeled failure, source 317, has these visible outer-outline
+RMS values in native ROI pixels:
+
+| Likelihood | Control | RAW alternatives | Outer withheld |
+| --- | ---: | ---: | ---: |
+| Native contours | 29.06 | 31.68 | 16.43 |
+| Uniform mask levels | 29.14 | 31.67 | 35.49 |
+| Spatial mask levels | 29.17 | 31.68 | 16.43 |
+
+The inspected `native-raw-failure-v1.png` shows why extra RAW peaks are not
+sufficient: several measured alternatives lie inside the reviewed outer edge.
+`native-outer-comparison-v2.png` also shows the ablation's uniform-likelihood
+regression. Both ablation variants with mask profiles withhold source-317 gaze;
+a better outer-outline RMS in the spatial case does not prove a correct gaze.
+These are historical reviewed outer labels, not new blinded labels. Source 317
+has no independent scale hint, and no new independently measured gaze or native
+true-inner evidence is available. Common SN-FEIDA temporal steps with acquisition
+scale support are unchanged; there is no demonstrated area-stability gain.
+
+The final evaluator passes 186 ordinary tests, including the RAW-guide support
+tests and the new native-pupil preservation and interleaved inner/pupil hint
+tests. Six stereo UI tests, SAM-enabled viewer production checking, tree audit
+and whitespace checks pass. The evaluator binaries are frozen under the run
+directory (`build-checks-v1.json` and `build-checks-v2.json`); the final SHA256 is
+`744acad9b1a84a31ef13a73ad6a70271b6570e71e82f5701631da1fb200ce2ce`.
+No camera session, training, viewer restart, or deployment is part of this work.
+
+The remaining task is to identify trustworthy anatomical support and retain
+the alternatives that pupil and cross-eye evidence cannot resolve. These native
+counterfactuals show that simply expanding RAW searches or deleting rejected
+outer families does not yet deliver the requested robust gaze solver.
+
+### Correlated arc-alternative likelihood: implemented, not promoted
+
+`outputs/arc-mixture-joint-ppzw25ge/report-v1.md` records an exact finite-mixture
+experiment. The opt-in `IntegrationConfig::marginalize_arc_alternatives` replaces
+the cheapest alternative within each evidence group with
+`-2 log(mean(exp(-C_j/2)))`. The existing robust component costs, support masses,
+shorter-coverage penalties and caps remain intact. Identical observations count
+as one state; distinct alternatives use uniform engineering prior weights.
+Coherent mask-family states enclose these mixtures. Entropy residuals preserve
+the exact objective and its EM tangent gradient. This is an uncalibrated
+generalized likelihood, not a learned anatomical identity or confidence model.
+
+The flag defaults **off**, including in `live()`. Disabled/singleton paths retain
+the original streaming selection without mixture-component allocation. The
+experiment neither adds gaze averaging nor changes source-keyed history.
+
+Four frozen SAM/Student caches contain 662 events and 342 final provider/source
+publications (325 available fits). Across three likelihoods, 1,986 matched event
+pairs preserve the source data; 404 distinct RAW ranges totaling 57,554,880 bytes
+were rehashed. These are Rob-only diagnostics. Native true-inner observations,
+independently measured gaze truth and new metric scale are absent.
+
+| Likelihood | Admitted eye directions: control | Arc mixture |
+| --- | ---: | ---: |
+| Native contours | 216 | 211 |
+| Uniform mask levels | 257 | 249 |
+| Spatial mask levels | 253 | 251 |
+
+Available fits stay 325/342 in both arms for each likelihood. Human outer-outline
+localization changes are negligible and mixed. Reviewed source 317 remains at
+29.06/29.14/29.17px RMS. The source159→160 ROI1 jump changes from 85.46971° to
+85.46787°, with source160 still admitted for both eyes. Area stability is also
+mixed: Student common-step SN-FEIDA p95 absolute log change is
+0.235616→0.235463 native, 0.141433→0.149073 uniform and 0.150856→0.135858 spatial.
+These steps use unchanged acquisition scale hints, which may be held; no
+candidate-radius normalization is used. The reviewed subset lacks eligible
+scale-supported steps. Stability alone cannot establish gaze or anatomical
+accuracy.
+
+144 synthetic results cover complete pupil/outer, complete true-inner/outer,
+partial pupil, partial true-inner, complementary eyes and outer-only support,
+with clean/competing/duplicate alternatives and three seeds per arm. Complete
+pupil support stays admitted at the synthetic truth. Exact duplicate parity
+holds in 36 comparisons. Competing outer arcs move the partial-inner MAP by
+33.42° and complementary MAPs by about 2.4°; both cases remain withheld. The
+partial-pupil candidate gains one admitted seed (2/3→3/3) while increasing MAP
+error to 0.96°. These outcomes do not establish the requested broad recovery.
+
+Final evaluator SHA256 is
+`b673e0d59c866fac628fdf188f171e62f86e2eb40e021b192a0282aa7eb4d63b`.
+190 ordinary tests and six stereo UI tests pass. The allocation optimization
+reproduces all 3,972 native rows in both frozen arms exactly except elapsed_ms,
+and all 144 synthetic rows exactly. Both production checks, tree audit and
+whitespace checks pass. The audit additionally verifies 5,508 shared-fixation
+ray identities, 20,659 unchanged common-factor checks and 2,520 normalized
+mixture/source entries. Live promotion remains unjustified.
+
+A separate unresolved issue is association uncertainty: the posterior currently
+conditions on the winning ROI association. The MAP omission lower bound can
+prune a losing association, but does not prove negligible integrated probability.
+Any association follow-up must normalize different nuisance models before making
+probability claims and retain one fixation within each hypothesis.
+
+### Native association-conditionals: source160 narrows only when coupled
+
+The offline adapter now accepts `BUTTERCUP_ASSOCIATION_DIAGNOSTIC_SOURCES`, using
+the existing explicit array of clock-lineage/timestamp selections. It attaches
+`association_conditionals` only to paired available publications. Three separate
+solves use the original source-bound evidence: the unchanged control, ROI1-only
+observations, and ROI2-only observations. Both coarse scene priors and both
+strictly past target starts remain fixed. No diagnostic output updates the live
+tracker, its source history or presentation. Each hypothesis has one fixation.
+The new helper and adapter code are test-only.
+
+`outputs/association-conditional-6j0eubd6/report-v1.md` and `audit-v3.json` preserve
+the results. All 662 replay event rows match the frozen native control exactly
+after excluding diagnostic output and elapsed_ms. There are 310 paired available
+publications and 1,204 verified conditional shared-fixation ray identities. Each
+conditional receives its own bounded 16-start search and the current live
+posterior configuration with one numerical seed. It is a diagnostic work budget,
+not a live latency benchmark or subtraction from the original joint search.
+
+| Subset | Original admitted directions | ROI1 alone | ROI2 alone |
+| --- | ---: | ---: | ---: |
+| SAM-middle, 35 paired publications | 48 | 10 | 7 |
+| Reviewed, 27 paired publications | 12 | 0 | 1 |
+| SAM-shadow, 124 paired publications | 80 | 2 | 4 |
+| Student-shadow, 124 paired publications | 75 | 8 | 0 |
+
+No separately admitted eye direction differs by over 15° from an admitted
+original direction. No conditional MAP beats the original after paying the
+unchanged omitted-ROI cost. Those penalties are engineering MAP costs, not
+normalized association evidence; nuisance normalization is still needed before
+mixing the models or treating cost gaps as probabilities.
+
+At source160, joint conditional 90% angular radii are about 5.8° for both eyes,
+while ROI1 alone has a 93.45° radius and ROI2 alone 103.30°. Both single-eye
+results are withheld. Their penalized cost gaps are +105.37 and +95.42. The
+known jump is not explained by a strongly supported opposing eye hidden by
+association selection in this diagnostic. Joint constraints supply the narrow
+conditional uncertainty. At source162, where pupil support is available in both
+eyes, both single-eye results are admitted with radii about 8.1° and 8.7°.
+
+Student sources 4456 and 4464 admit ROI1 alone while the original withholds it,
+with direction differences 6.76° and 69.09°. Neither has independent gaze truth
+here, so they are unresolved cases, not rescued gaze estimates.
+
+Historical human-label comparisons also prevent treating single-eye fits as
+automatic repairs: source 317 outer RMS worsens from 29.06px to 44.48px and
+source 247 from 3.78px to 4.86px. Area stability is mixed. Each eye's SN-FEIDA
+comparison uses identical source intervals and acquisition scale, breaking
+adjacency at missing/unpaired final publications or gaps over 500ms. Student
+ROI2 p95 absolute log step improves 0.36481→0.34362 while its maximum worsens
+0.41653→0.61497. No candidate radius normalizes the scale. Reviewed sources
+have no eligible scale-supported intervals; native gaze truth remains absent.
+
+190 ordinary evaluator tests, production checking, source-tree and whitespace
+checks pass. The frozen evaluator SHA256 is
+`810a1ab06e08d3a17c9d6dab05a660a1853170f9cb06236dbe4fd1ff377c0912`.
+This diagnostic changes the next investigation toward joint uncertainty and
+source-timed anatomical support; it does not justify a live association change
+or complete the requested robust gaze recovery.

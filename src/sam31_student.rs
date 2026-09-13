@@ -2,8 +2,121 @@
 //! the shared observed-contour/RAW/3D solver remains the geometry authority.
 //! Weights, teacher exports, and reports belong under the runtime data links.
 use super::*;
+#[path = "sam31_student_raw.rs"]
+pub mod raw;
+#[cfg(feature = "sam31")]
+#[path = "bootstrapability.rs"]
+mod bootstrap;
 
 pub const ARCHITECTURE: &str = "buttercup-eye-mask-unet-v1";
+pub const LUMA_CONTEXT_ARCHITECTURE: &str = "buttercup-eye-mask-unet-luma-context-v2";
+pub const RAW_ARCHITECTURE: &str = "buttercup-eye-mask-unet-raw16-v1";
+pub const RAW_DISPLAY_NAME: &str = "Butter Obelisk";
+
+/// Inference placement only. Shared offline training retains its explicit CUDA
+/// recipe; choosing CPU must never enter a CUDA stream or synchronize CUDA.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InferenceDevice {
+    #[default]
+    Auto,
+    Cpu,
+    Gpu,
+}
+
+impl InferenceDevice {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "cpu" => Ok(Self::Cpu),
+            "gpu" => Ok(Self::Gpu),
+            _ => Err(format!("Obelisk device must be auto, cpu, or gpu; got {value:?}")),
+        }
+    }
+    pub fn configured() -> Result<Self, String> {
+        Self::parse(&std::env::var("BUTTERCUP_OBELISK_DEVICE").unwrap_or_else(|_| "auto".into()))
+    }
+    pub fn label(self) -> &'static str {
+        match self { Self::Auto => "auto", Self::Cpu => "cpu", Self::Gpu => "gpu" }
+    }
+    pub fn select_gpu(self, available: bool) -> Result<bool, String> {
+        match self {
+            Self::Cpu => Ok(false),
+            Self::Auto => Ok(available),
+            Self::Gpu if available => Ok(true),
+            Self::Gpu => Err("Obelisk GPU was forced but CUDA is unavailable; use --obelisk-device cpu or auto".into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod inference_device_tests {
+    use super::*;
+    #[test]
+    fn inference_device_selection_is_explicit_and_auto_falls_back() {
+        assert_eq!(InferenceDevice::default(), InferenceDevice::Auto);
+        for available in [false, true] {
+            assert!(!InferenceDevice::Cpu.select_gpu(available).unwrap());
+            assert_eq!(InferenceDevice::Auto.select_gpu(available).unwrap(), available);
+        }
+        assert!(InferenceDevice::Gpu.select_gpu(true).unwrap());
+        assert!(InferenceDevice::Gpu.select_gpu(false).is_err());
+        for device in [InferenceDevice::Auto, InferenceDevice::Cpu, InferenceDevice::Gpu] {
+            assert_eq!(InferenceDevice::parse(device.label()).unwrap(), device);
+        }
+        assert!(InferenceDevice::parse("gup").is_err());
+    }
+}
+
+fn display_name_for_architecture(architecture: &str) -> &'static str {
+    match architecture {
+        RAW_ARCHITECTURE => RAW_DISPLAY_NAME,
+        ARCHITECTURE => "Eye Student RGB",
+        LUMA_CONTEXT_ARCHITECTURE => "Eye RGB+Luma",
+        _ => "Student missing",
+    }
+}
+
+/// A process selects one immutable student model path at startup. Cache only
+/// its validated display identity; never read model files in the render loop.
+/// Stable acquisition/control identifiers remain `eye-student`.
+pub fn configured_display_name() -> &'static str {
+    static NAME: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        validate_model(&default_model_path()).ok()
+            .and_then(|meta|meta["architecture"].as_str().map(display_name_for_architecture))
+            .unwrap_or("Student missing")
+    })
+}
+
+#[cfg(test)]
+mod display_name_tests {
+    use super::*;
+    #[test]
+    fn raw_and_rgb_assets_have_distinct_human_names() {
+        assert_eq!(display_name_for_architecture(RAW_ARCHITECTURE),"Butter Obelisk");
+        assert_eq!(display_name_for_architecture(ARCHITECTURE),"Eye Student RGB");
+        assert_eq!(display_name_for_architecture(LUMA_CONTEXT_ARCHITECTURE),"Eye RGB+Luma");
+        assert_eq!(display_name_for_architecture("unknown"),"Student missing");
+        for architecture in [RAW_ARCHITECTURE,ARCHITECTURE,LUMA_CONTEXT_ARCHITECTURE,"unknown"] {
+            assert!((6+display_name_for_architecture(architecture).len())*24<=520);
+        }
+    }
+}
+
+fn luma_context_contract() -> serde_json::Value {
+    serde_json::json!({"shape":[2,16,24],"source":"current RGB input only",
+        "channels":["block_mean_luma","block_luma_standard_deviation"],
+        "luma_weights":[0.25,0.5,0.25],"block_side":16,
+        "meaning":"appearance context, not measured physical illumination"})
+}
+
+fn known_architecture_manifest(meta: &serde_json::Value) -> bool {
+    meta["architecture"] == ARCHITECTURE
+        || (meta["architecture"] == RAW_ARCHITECTURE && meta["raw_input"] == raw::contract())
+        || (meta["architecture"] == LUMA_CONTEXT_ARCHITECTURE
+            && meta["derived_context"] == luma_context_contract())
+}
+
 pub fn default_model_path() -> PathBuf {
     std::env::var_os("BUTTERCUP_EYE_STUDENT_MODEL")
         .map(PathBuf::from)
@@ -25,10 +138,13 @@ pub fn validate_model(model: &Path) -> Result<serde_json::Value, String> {
         &std::fs::read(metadata_path(model)).map_err(|e| format!("student manifest: {e}"))?,
     )
     .map_err(|e| e.to_string())?;
-    if meta["architecture"] != ARCHITECTURE
-        || meta["input_shape"] != serde_json::json!([3, FRAME_HEIGHT, FRAME_WIDTH])
+    let raw_native=meta["architecture"]==RAW_ARCHITECTURE;
+    let shape=if raw_native {serde_json::json!([raw::CHANNELS,raw::HEIGHT,raw::WIDTH])}
+        else {serde_json::json!([3,FRAME_HEIGHT,FRAME_WIDTH])};
+    if !known_architecture_manifest(&meta)
+        || meta["input_shape"] != shape
         || meta["prompts"] != serde_json::json!(SEMANTIC_PROMPT_LABELS)
-        || meta["preprocess"] != PreprocessRegime::configured_live()?.label()
+        || meta["preprocess"] != if raw_native {raw::CONTRACT} else {PreprocessRegime::configured_live()?.label()}
     {
         return Err("eye student manifest/shape/preprocessing does not match this runtime".into());
     }
@@ -42,6 +158,14 @@ mod cuda {
     use std::fs::{File, OpenOptions};
     use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
     use tch::{nn, nn::Module, nn::OptimizerConfig, Device, Kind, Tensor};
+    use sha2::{Digest,Sha256};
+
+    fn verify_source(row:&Value,bytes:&[u8])->Result<(),String> {
+        let expected=row["raw_sha256"].as_str().ok_or("missing RAW hash")?;
+        if format!("{:x}",Sha256::digest(bytes))!=expected {return Err("RAW source hash mismatch".into());}
+        if row["frame"]["pixel_format"]!="RAW10_LE40_1X1" {return Err("source readout is not declared native Quad Bayer RAW10_LE40_1X1".into());}
+        Ok(())
+    }
 
     /// No pose regression, completed-ellipse raster, or future-frame input.
     /// Separate sigmoid heads preserve overlapping outer disk/pupil masks.
@@ -54,6 +178,8 @@ mod cuda {
         up2: nn::Sequential,
         up1: nn::Sequential,
         head: nn::Conv2D,
+        luma_context: Option<nn::Sequential>,
+        raw_native: bool,
     }
     fn block(p: nn::Path, input: i64, output: i64, stride: i64) -> nn::Sequential {
         nn::seq()
@@ -85,12 +211,18 @@ mod cuda {
     }
     impl Net {
         pub fn new(p: &nn::Path) -> Self {
+            Self::with_luma_context(p, false)
+        }
+        pub fn with_luma_context(p: &nn::Path, enabled: bool) -> Self {
+            Self::with_input(p,enabled,false)
+        }
+        pub fn with_input(p: &nn::Path, enabled: bool, raw_native: bool) -> Self {
             Self {
-                stem: block(p / "stem", 3, 12, 2),
+                stem: block(p / "stem", if raw_native {16} else {3}, 12, if raw_native {1} else {2}),
                 down1: block(p / "down1", 12, 24, 2),
                 down2: block(p / "down2", 24, 48, 2),
                 bottom: block(p / "bottom", 48, 72, 2),
-                up2: block(p / "up2", 72 + 48, 48, 1),
+                up2: block(p / "up2", 72 + 48 + if enabled { 8 } else { 0 }, 48, 1),
                 up1: block(p / "up1", 48 + 24, 24, 1),
                 head: nn::conv2d(
                     p / "head",
@@ -99,15 +231,42 @@ mod cuda {
                     1,
                     Default::default(),
                 ),
+                luma_context: enabled.then(|| {
+                    let config = nn::ConvConfig {
+                        padding: 1,
+                        ..Default::default()
+                    };
+                    nn::seq()
+                        .add(nn::conv2d(p / "luma_context" / "a", 2, 8, 3, config))
+                        .add_fn(Tensor::silu)
+                        .add(nn::conv2d(p / "luma_context" / "b", 8, 8, 3, config))
+                        .add_fn(Tensor::silu)
+                }),
+                raw_native,
             }
         }
     }
+
+    /// One small map per current exposure, before any fitted-center or gaze
+    /// input. The original image remains present. This is not a Retinex
+    /// decomposition or measured incident light; anatomy also affects luma.
+    fn coarse_luma_context(rgb: &Tensor) -> Tensor {
+        let y = rgb.narrow(1, 0, 1) * 0.25 + rgb.narrow(1, 1, 1) * 0.5 + rgb.narrow(1, 2, 1) * 0.25;
+        let pool = |value: &Tensor| value.avg_pool2d([16, 16], [16, 16], [0, 0], false, true, None);
+        let mean = pool(&y);
+        let variance = (pool(&(&y * &y)) - &mean * &mean).clamp_min(0.0);
+        Tensor::cat(&[mean, variance.sqrt()], 1)
+    }
     impl Module for Net {
         fn forward(&self, input: &Tensor) -> Tensor {
-            let a = self.stem.forward(&(input.to_kind(Kind::Float) / 255.0));
+            let rgb = input.to_kind(Kind::Float) / if self.raw_native {1.0} else {255.0};
+            let a = self.stem.forward(&rgb);
             let b = self.down1.forward(&a);
             let c = self.down2.forward(&b);
-            let d = self.bottom.forward(&c);
+            let mut d = self.bottom.forward(&c);
+            if let Some(context) = &self.luma_context {
+                d = Tensor::cat(&[d, context.forward(&coarse_luma_context(&rgb))], 1);
+            }
             let up = |x: &Tensor, y: &Tensor| {
                 x.upsample_bilinear2d([y.size()[2], y.size()[3]], false, None, None)
             };
@@ -121,17 +280,27 @@ mod cuda {
     pub struct Model {
         pub store: nn::VarStore,
         pub net: Net,
+        pub raw_native: bool,
     }
     impl Model {
         pub fn load(path: &Path) -> Result<Self, String> {
-            validate_model(path)?;
-            let mut store = nn::VarStore::new(Device::Cuda(0));
-            let net = Net::new(&store.root());
+            Self::load_on_device(path, runtime::student_inference_device()?)
+        }
+        pub fn load_on_device(path: &Path, device: Device) -> Result<Self, String> {
+            let metadata = validate_model(path)?;
+            let mut store = nn::VarStore::new(device);
+            let raw_native=metadata["architecture"]==RAW_ARCHITECTURE;
+            let net = Net::with_input(
+                &store.root(),
+                metadata["architecture"] == LUMA_CONTEXT_ARCHITECTURE,
+                raw_native,
+            );
             store.load(path).map_err(|e| format!("load student: {e}"))?;
             store.freeze();
-            Ok(Self { store, net })
+            Ok(Self { store, net, raw_native })
         }
         pub fn infer(&self, image: &[u8]) -> Result<Tensor, String> {
+            if self.raw_native {return Err("RAW student rejects display RGB input".into());}
             if image.len() != FRAME_WIDTH * FRAME_HEIGHT * 3 {
                 return Err("invalid student image shape".into());
             }
@@ -143,9 +312,39 @@ mod cuda {
                 ))
             })
         }
+
+        /// The live worker and offline evaluation use this exact preparation.
+        /// Synchronization is opt-in for stage benchmarks (whole device, so
+        /// claims must disclose other CUDA work); normal workers synchronize
+        /// their own stream through existing mask materialization.
+        pub fn infer_source(&self, source:&Arc<RawFrame>, timing:bool)->Result<(Tensor,[f64;3]),String> {
+            let start=Instant::now();
+            let input=if self.raw_native {
+                let values=prepare_raw(source)?;
+                Tensor::from_slice(&values).reshape([1,16,raw::HEIGHT as i64,raw::WIDTH as i64])
+            } else {
+                let mut values=vec![0;3*FRAME_HEIGHT*FRAME_WIDTH];
+                write_preprocessed_filmstrip(std::slice::from_ref(source),PreprocessRegime::configured_live()?,&mut values)?;
+                Tensor::from_slice(&values).reshape([1,3,FRAME_HEIGHT as i64,FRAME_WIDTH as i64])
+            };
+            let prepare_ms=start.elapsed().as_secs_f64()*1000.;
+            let start=Instant::now();
+            let input=input.to_device(self.store.device());
+            if timing {if let Device::Cuda(index)=self.store.device(){tch::Cuda::synchronize(index as i64);}}
+            let transfer_ms=start.elapsed().as_secs_f64()*1000.;
+            let start=Instant::now();
+            let logits=tch::no_grad(||self.net.forward(&input));
+            if timing {if let Device::Cuda(index)=self.store.device(){tch::Cuda::synchronize(index as i64);}}
+            Ok((logits,[prepare_ms,transfer_ms,start.elapsed().as_secs_f64()*1000.]))
+        }
+    }
+    pub(crate) fn prepare_raw(source:&RawFrame)->Result<Vec<f32>,String> {
+        raw::prepare(raw::Source {samples:&source.pixels,width:source.width,height:source.height,
+            sensor_x:source.sensor_x,sensor_y:source.sensor_y,pixel_format:"RAW10_LE40_1X1"})
     }
     pub(crate) struct TeacherSample {
         pub image: Vec<u8>,
+        pub raw_image: Vec<f32>,
         pub masks: Vec<u8>,
         pub weights: Vec<f32>,
         pub report: Value,
@@ -173,6 +372,7 @@ mod cuda {
             }
             let mut bytes = vec![0; length];
             file.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+            verify_source(&row,&bytes)?;
             let f = &row["frame"];
             let width = integer(f, "width")? as usize;
             let height = integer(f, "height")? as usize;
@@ -223,18 +423,47 @@ mod cuda {
     fn write_json(path: &Path, value: &Value) -> Result<(), String> {
         serde_json::to_writer_pretty(new_writer(path)?, value).map_err(|e| e.to_string())
     }
+    fn hash_file(path:&Path)->Result<String,String> {
+        let mut file=File::open(path).map_err(|e|e.to_string())?;
+        let mut hash=Sha256::new();let mut buffer=vec![0;1024*1024];
+        loop {let n=file.read(&mut buffer).map_err(|e|e.to_string())?;if n==0 {break;}hash.update(&buffer[..n]);}
+        Ok(format!("{:x}",hash.finalize()))
+    }
+
+    fn export_preflight(index:&Path,model:&Path,out:&Path)->Result<Value,String> {
+        let source=bootstrap::current_source(Path::new("."))?;
+        let prompt=prompt_bundle_path(model);
+        let mut nodes=vec![json!({"id":"source","kind":"source","sha256":source.tree_sha256,"dependencies":[]})];
+        for (id,kind,path) in [("raw-index","raw",index),("sam3","sam3",model),("prompts","sam3",prompt.as_path())] {
+            nodes.push(json!({"id":id,"kind":kind,"sha256":hash_file(path)?,"dependencies":[]}));
+        }
+        nodes.push(json!({"id":"teacher","kind":"derived_data","planned":true,"sha256":null,
+            "dependencies":["source","raw-index","sam3","prompts"]}));
+        let graph=json!({"schema":bootstrap::SCHEMA,"source":source,"targets":["teacher"],"nodes":nodes});
+        let parsed=bootstrap::parse(&serde_json::to_vec(&graph).map_err(|e|e.to_string())?).map_err(|e|format!("{e:?}"))?;
+        let certificate=bootstrap::validate(&parsed,&source).map_err(|e|format!("{e:?}"))?;
+        write_json(&out.join("bootstrap-graph.json"),&graph)?;
+        write_json(&out.join("bootstrap-preflight.json"),&json!({"certificate":certificate,
+            "raw_inventory":index,"verification":"every native RAW byte hash checked before teacher execution",
+            "sam3_graph":model,"sam3_prompts":prompt,"scope":"fresh SAM-derived cache; no custom-model ancestry"}))?;
+        Ok(graph)
+    }
     fn export(index: &Path, out: &Path) -> Result<(), String> {
         runtime_output(out)?;
         std::fs::create_dir(out).map_err(|e| e.to_string())?;
         let mut images = new_writer(&out.join("images.u8"))?;
+        let mut raw_images = new_writer(&out.join("raw-images.f32le"))?;
         let mut masks = new_writer(&out.join("masks.u8"))?;
         let mut records = new_writer(&out.join("records.jsonl"))?;
         let model = std::env::var_os("BUTTERCUP_SAM31_MODEL")
             .map(PathBuf::from)
             .unwrap_or_else(super::super::default_model_path);
+        let graph=export_preflight(index,&model,out)?;
         let count =
             runtime::export_student_teacher(&model, source_frames(index)?, |row, sample| {
                 images.write_all(&sample.image).map_err(|e| e.to_string())?;
+                let raw_bytes:Vec<_>=sample.raw_image.iter().flat_map(|v|v.to_le_bytes()).collect();
+                raw_images.write_all(&raw_bytes).map_err(|e|e.to_string())?;
                 masks.write_all(&sample.masks).map_err(|e| e.to_string())?;
                 serde_json::to_writer(
                     &mut records,
@@ -245,11 +474,18 @@ mod cuda {
                 Ok(())
             })?;
         images.flush().map_err(|e| e.to_string())?;
+        raw_images.flush().map_err(|e| e.to_string())?;
         masks.flush().map_err(|e| e.to_string())?;
         records.flush().map_err(|e| e.to_string())?;
+        let source_after=bootstrap::current_source(Path::new("."))?;
         write_json(
             &out.join("manifest.json"),
-            &json!({"schema":"buttercup-eye-student-teacher-v1",
+            &json!({"schema":"buttercup-eye-student-teacher-v2",
+            "raw_input":raw::contract(),"raw_images":"raw-images.f32le",
+            "source_before":graph["source"],"source_after":source_after,
+            "payload_hashes":{"images.u8":hash_file(&out.join("images.u8"))?,
+                "raw-images.f32le":hash_file(&out.join("raw-images.f32le"))?,"masks.u8":hash_file(&out.join("masks.u8"))?,
+                "records.jsonl":hash_file(&out.join("records.jsonl"))?},
             "count":count,"input_shape":[3,FRAME_HEIGHT,FRAME_WIDTH],"prompts":SEMANTIC_PROMPT_LABELS,
             "preprocess":PreprocessRegime::configured_live()?.label(),"teacher_model":model,
             "index":index,"supervision":"SAM masks, never completed ellipses or 3D ground truth"}),
@@ -263,11 +499,20 @@ mod cuda {
         manifest: Value,
     }
     impl Dataset {
-        fn load(path: &Path) -> Result<Self, String> {
+        fn load(path: &Path, raw_native:bool) -> Result<Self, String> {
             let manifest: Value = serde_json::from_reader(
                 File::open(path.join("manifest.json")).map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?;
+            if manifest["schema"]=="buttercup-eye-student-teacher-v2" {
+                let current=serde_json::to_value(bootstrap::current_source(Path::new("."))?).map_err(|e|e.to_string())?;
+                if manifest["source_before"]!=manifest["source_after"] || manifest["source_after"]!=current {
+                    return Err("teacher cache was not generated on the unchanged current source; regenerate export".into());
+                }
+                for name in ["images.u8","raw-images.f32le","masks.u8","records.jsonl"] {
+                    if manifest["payload_hashes"][name]!=hash_file(&path.join(name))? {return Err(format!("teacher cache hash mismatch: {name}"));}
+                }
+            }
             let rows =
                 BufReader::new(File::open(path.join("records.jsonl")).map_err(|e| e.to_string())?)
                     .lines()
@@ -280,10 +525,13 @@ mod cuda {
             if n == 0 || n > 100_000 || manifest["count"].as_u64() != Some(n as u64) {
                 return Err("invalid dataset count".into());
             }
-            let images = std::fs::read(path.join("images.u8")).map_err(|e| e.to_string())?;
+            if raw_native && (manifest["raw_input"]!=raw::contract() || manifest["schema"]!="buttercup-eye-student-teacher-v2") {
+                return Err("RAW dataset contract missing or incompatible; regenerate teacher export".into());
+            }
+            let images = std::fs::read(path.join(if raw_native {"raw-images.f32le"}else {"images.u8"})).map_err(|e| e.to_string())?;
             let masks = std::fs::read(path.join("masks.u8")).map_err(|e| e.to_string())?;
             let plane = FRAME_HEIGHT * FRAME_WIDTH;
-            if images.len() != n * 3 * plane || masks.len() != n * SEMANTIC_PROMPT_COUNT * plane {
+            if images.len() != n * if raw_native {raw::VALUES*4}else {3*plane} || masks.len() != n * SEMANTIC_PROMPT_COUNT * plane {
                 return Err("dataset payload length mismatch".into());
             }
             let mut weights = Vec::new();
@@ -325,12 +573,16 @@ mod cuda {
                 }
             }
             Ok(Self {
-                images: Tensor::from_slice(&images).reshape([
+                images: if raw_native {
+                    let values:Vec<_>=images.chunks_exact(4).map(|v|f32::from_le_bytes(v.try_into().unwrap())).collect();
+                    if values.iter().any(|v|!v.is_finite() || !(0.0..=1.0).contains(v)) {return Err("invalid RAW cache values".into());}
+                    Tensor::from_slice(&values).reshape([n as i64,16,raw::HEIGHT as i64,raw::WIDTH as i64])
+                } else {Tensor::from_slice(&images).reshape([
                     n as i64,
                     3,
                     FRAME_HEIGHT as i64,
                     FRAME_WIDTH as i64,
-                ]),
+                ])},
                 masks: Tensor::from_slice(&masks).reshape([
                     n as i64,
                     SEMANTIC_PROMPT_COUNT as i64,
@@ -367,18 +619,133 @@ mod cuda {
         }
     }
     fn loss(logits: &Tensor, truth: &Tensor, weights: &Tensor) -> Tensor {
+        loss_with_valid_pixels(logits, truth, weights, None)
+    }
+
+    fn loss_with_valid_pixels(
+        logits: &Tensor,
+        truth: &Tensor,
+        weights: &Tensor,
+        valid: Option<&Tensor>,
+    ) -> Tensor {
         let axes = [2i64, 3];
         let p = logits.sigmoid();
-        let bce = (logits.clamp_min(0.0) - logits * truth + (-logits.abs()).exp().log1p())
-            .mean_dim(axes.as_slice(), false, Kind::Float);
-        let intersection = (&p * truth).sum_dim_intlist(axes.as_slice(), false, Kind::Float);
-        let total = (&p + truth).sum_dim_intlist(axes.as_slice(), false, Kind::Float);
+        let per_pixel = logits.clamp_min(0.0) - logits * truth + (-logits.abs()).exp().log1p();
+        let (bce, intersection, total) = if let Some(valid) = valid {
+            let sum = |value: Tensor| value.sum_dim_intlist(axes.as_slice(), false, Kind::Float);
+            (
+                sum(per_pixel * valid) / sum(valid.shallow_clone()).clamp_min(1.0),
+                sum(&p * truth * valid),
+                sum((&p + truth) * valid),
+            )
+        } else {
+            (
+                per_pixel.mean_dim(axes.as_slice(), false, Kind::Float),
+                (&p * truth).sum_dim_intlist(axes.as_slice(), false, Kind::Float),
+                (&p + truth).sum_dim_intlist(axes.as_slice(), false, Kind::Float),
+            )
+        };
         let dice: Tensor = 1.0 - (intersection * 2.0 + 1.0) / (total + 1.0);
         let priority =
             Tensor::from_slice(&[3.0f32, 0.5, 2.0, 0.5, 0.5, 0.5]).to_device(logits.device());
         let weights = weights * priority;
         ((bce + dice) * &weights).sum(Kind::Float) / weights.sum(Kind::Float).clamp_min(1.0)
     }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TrainingAugmentation {
+        Legacy,
+        ShadowCrop,
+        MixedShadowCrop,
+    }
+
+    impl TrainingAugmentation {
+        fn parse(label: &str) -> Result<Self, String> {
+            match label {
+                "legacy" => Ok(Self::Legacy),
+                "shadow-crop-v1" => Ok(Self::ShadowCrop),
+                "mixed-shadow-crop-v1" => Ok(Self::MixedShadowCrop),
+                _ => Err(format!("unknown Student training augmentation: {label}")),
+            }
+        }
+        fn label(self) -> &'static str {
+            match self {
+                Self::Legacy => "legacy",
+                Self::ShadowCrop => "shadow-crop-v1",
+                Self::MixedShadowCrop => "mixed-shadow-crop-v1",
+            }
+        }
+    }
+
+    fn training_luma_context(label: &str) -> Result<bool, String> {
+        match label {
+            "rgb" => Ok(false),
+            "luma-context-v2" => Ok(true),
+            _ => Err(format!("unknown Student training architecture: {label}")),
+        }
+    }
+
+    fn soft_shadow_field(
+        height: i64,
+        width: i64,
+        angle: &Tensor,
+        offset: &Tensor,
+        softness: &Tensor,
+        depth: &Tensor,
+    ) -> Tensor {
+        let options = (Kind::Float, angle.device());
+        let x = Tensor::linspace(-1.0, 1.0, width, options).reshape([1, 1, 1, width]);
+        let y = Tensor::linspace(-1.0, 1.0, height, options).reshape([1, 1, height, 1]);
+        let ramp =
+            ((x * angle.cos() + y * angle.sin() - offset) / softness.clamp_min(0.02)).sigmoid();
+        1.0 - depth.clamp(0.0, 0.75) * ramp
+    }
+
+    fn augment_spatial_shadow(image: &Tensor) -> Tensor {
+        let shape = [image.size()[0], 1, 1, 1];
+        let random = || Tensor::rand(shape, (Kind::Float, image.device()));
+        let angle = random() * std::f64::consts::TAU;
+        let offset = (random() - 0.5) * 1.2;
+        let softness = random() * 0.25 + 0.05;
+        // Keep half the examples as unshadowed controls. This changes only
+        // appearance, never the segmentation truth or boundary visibility.
+        let depth = (random() * 0.5 + 0.2) * random().ge(0.5).to_kind(Kind::Float);
+        let field = soft_shadow_field(
+            image.size()[2],
+            image.size()[3],
+            &angle,
+            &offset,
+            &softness,
+            &depth,
+        );
+        // RGB-space diagnostic augmentation, not calibrated RAW sensor noise.
+        (image * field + Tensor::randn_like(image) * random() * 1.5).clamp(0.0, 255.0)
+    }
+
+    fn resample_training_pair(
+        image: &Tensor,
+        truth: &Tensor,
+        grid: &Tensor,
+        exclude_unknown: bool,
+    ) -> (Tensor, Tensor, Option<Tensor>) {
+        let valid = exclude_unknown.then(|| {
+            // Replicated context outside the native crop is not a known
+            // negative label. Only fully observed pixels vote in the loss.
+            Tensor::ones(
+                [image.size()[0], 1, image.size()[2], image.size()[3]],
+                (Kind::Float, image.device()),
+            )
+            .grid_sampler(grid, 0, 0, false)
+            .ge(0.999)
+            .to_kind(Kind::Float)
+        });
+        (
+            image.grid_sampler(grid, 0, 1, false),
+            truth.grid_sampler(grid, 0, 0, false),
+            valid,
+        )
+    }
+
     fn score(net: &Net, data: &Dataset, ids: &[i64], device: Device) -> (f64, Value) {
         tch::no_grad(|| {
             let mut sums = [0.0; SEMANTIC_PROMPT_COUNT];
@@ -423,11 +790,37 @@ mod cuda {
         if epochs == 0 || epochs > 2000 {
             return Err("epochs must be 1..2000".into());
         }
+        let augmentation = TrainingAugmentation::parse(
+            &std::env::var("BUTTERCUP_EYE_STUDENT_TRAIN_AUGMENTATION")
+                .unwrap_or_else(|_| "legacy".into()),
+        )?;
+        let architecture=std::env::var("BUTTERCUP_EYE_STUDENT_TRAIN_ARCHITECTURE").unwrap_or_else(|_|"rgb".into());
+        let raw_native=architecture=="raw16-v1";
+        let luma_context=if raw_native {false} else {training_luma_context(&architecture)?};
+        let initial_model =
+            std::env::var_os("BUTTERCUP_EYE_STUDENT_TRAIN_INITIAL_MODEL").map(PathBuf::from);
         runtime::student_cuda_init()?;
         tch::set_num_threads(2);
         tch::manual_seed(17091);
         let device = Device::Cuda(0);
-        let data = Dataset::load(data_path)?;
+        let data = Dataset::load(data_path,raw_native)?;
+        if data.manifest["schema"]!="buttercup-eye-student-teacher-v2" {
+            return Err("training requires a fresh hash-verified current-checkout teacher export".into());
+        }
+        if initial_model.is_some() {
+            return Err("this cold RAW/RGB experiment must start from seeded initialization, not an unproven custom ancestor".into());
+        }
+        let mut graph:Value=serde_json::from_reader(File::open(data_path.join("bootstrap-graph.json")).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+        for node in graph["nodes"].as_array_mut().ok_or("missing graph nodes")? {
+            if node["id"]=="teacher" {node["planned"]=json!(false);node["sha256"]=json!(hash_file(&data_path.join("manifest.json"))?);}
+        }
+        graph["nodes"].as_array_mut().unwrap().push(json!({"id":"model","kind":"custom_model","planned":true,
+            "sha256":null,"dependencies":["teacher","source"]}));
+        graph["targets"]=json!(["model"]);
+        let parsed=bootstrap::parse(&serde_json::to_vec(&graph).map_err(|e|e.to_string())?).map_err(|e|format!("{e:?}"))?;
+        let source=bootstrap::current_source(Path::new("."))?;
+        let certificate=bootstrap::validate(&parsed,&source).map_err(|e|format!("{e:?}"))?;
+        write_json(&model_path.with_extension("bootstrap.json"),&json!({"graph":graph,"certificate":certificate}))?;
         let mut train = data.indices("train");
         let validation = data.indices("validation");
         let test = data.indices("test");
@@ -435,7 +828,23 @@ mod cuda {
             return Err("need train/validation/test sessions with at least 16/4/4 frames".into());
         }
         let mut store = nn::VarStore::new(device);
-        let net = Net::new(&store.root());
+        let net = Net::with_input(&store.root(), luma_context,raw_native);
+        if let Some(path) = initial_model.as_ref() {
+            let initial = validate_model(path)?;
+            let architecture = if raw_native { RAW_ARCHITECTURE } else if luma_context {
+                LUMA_CONTEXT_ARCHITECTURE
+            } else {
+                ARCHITECTURE
+            };
+            if initial["architecture"] != architecture
+                || initial["preprocess"] != if raw_native {json!(raw::CONTRACT)}else {data.manifest["preprocess"].clone()}
+            {
+                return Err("Student warm start architecture/preprocessing mismatch".into());
+            }
+            store
+                .load(path)
+                .map_err(|e| format!("Student warm start: {e}"))?;
+        }
         let parameters: usize = store.trainable_variables().iter().map(Tensor::numel).sum();
         let mut optimizer = nn::AdamW::default()
             .build(&store, 1e-3)
@@ -455,9 +864,14 @@ mod cuda {
             for i in (1..train.len()).rev() {
                 train.swap(i, (random_u() as usize) % (i + 1));
             }
+            let (minimum_lr, lr_span) = if initial_model.is_some() {
+                (0.00002, 0.00018)
+            } else {
+                (0.00005, 0.00095)
+            };
             optimizer.set_lr(
-                0.00005
-                    + 0.00095
+                minimum_lr
+                    + lr_span
                         * 0.5
                         * (1.0 + (std::f64::consts::PI * epoch as f64 / epochs as f64).cos()),
             );
@@ -465,6 +879,8 @@ mod cuda {
             let mut batches = 0;
             for ids in train.chunks(12) {
                 let (mut image, mut truth, weights) = data.batch(ids, device);
+                // RAW channels are registered continuous fields, not a Bayer
+                // mosaic. Their channel identity survives spatial transforms.
                 if random_u() % 2 == 0 {
                     image = image.flip([3]);
                     truth = truth.flip([3]);
@@ -472,10 +888,18 @@ mod cuda {
                 // Same affine for image and labels; never a completed-ellipse target.
                 let n = ids.len() as i64;
                 let angles = (Tensor::rand([n], (Kind::Float, device)) - 0.5) * 0.25;
-                let scales = Tensor::rand([n], (Kind::Float, device)) * 0.20 + 0.90;
+                let spatial = augmentation == TrainingAugmentation::ShadowCrop
+                    || (augmentation == TrainingAugmentation::MixedShadowCrop
+                        && random_u() % 4 == 0);
+                let scales = Tensor::rand([n], (Kind::Float, device))
+                    * if spatial { 0.4 } else { 0.2 }
+                    + if spatial { 0.8 } else { 0.9 };
                 let c = angles.cos() * &scales;
                 let s = angles.sin() * scales;
-                let shift = (Tensor::rand([n, 2], (Kind::Float, device)) - 0.5) * 0.16;
+                // +/- half the normalized grid means +/- one quarter ROI:
+                // covers the observed 70px vertical reframe in a 280px ROI.
+                let shift = (Tensor::rand([n, 2], (Kind::Float, device)) - 0.5)
+                    * if spatial { 1.0 } else { 0.16 };
                 let theta = Tensor::stack(
                     &[
                         Tensor::stack(&[c.shallow_clone(), -&s, shift.select(1, 0)], 1),
@@ -483,14 +907,27 @@ mod cuda {
                     ],
                     1,
                 );
-                let grid = Tensor::affine_grid_generator(&theta, image.size(), false);
-                image = image.grid_sampler(&grid, 0, 1, false);
-                truth = truth.grid_sampler(&grid, 0, 0, false);
-                let gain = Tensor::rand([n, 3, 1, 1], (Kind::Float, device)) * 0.35 + 0.80;
+                let grid = Tensor::affine_grid_generator(&theta, truth.size(), false);
+                let valid;
+                if raw_native {
+                    let input_grid=Tensor::affine_grid_generator(&theta,image.size(),false);
+                    image=image.grid_sampler(&input_grid,0,1,false);
+                    let (_, warped_truth, mask)=resample_training_pair(&truth,&truth,&grid,true);
+                    truth=warped_truth; valid=mask;
+                }else{(image, truth, valid) = resample_training_pair(&image, &truth, &grid, spatial);}
+                let mut gain = Tensor::rand([n,3,1,1],(Kind::Float,device))*0.35+0.80;
+                if raw_native {
+                    let colors:Vec<i64>=(0..16).map(|c|match (c/4<2,c%4<2) {(true,true)=>0,(false,false)=>2,_=>1}).collect();
+                    gain=gain.index_select(1,&Tensor::from_slice(&colors).to_device(device));
+                }
                 image = (image * gain
-                    + (Tensor::rand([n, 1, 1, 1], (Kind::Float, device)) - 0.5) * 12.0)
-                    .clamp(0.0, 255.0);
-                let value = loss(&net.forward(&image), &truth, &weights);
+                    + (Tensor::rand([n, 1, 1, 1], (Kind::Float, device)) - 0.5) * if raw_native {12./1023.}else{12.0})
+                    .clamp(0.0, if raw_native {1.0}else{255.0});
+                if spatial {
+                    image = if raw_native {augment_spatial_shadow(&(image*255.))/255.}else{augment_spatial_shadow(&image)};
+                }
+                let value =
+                    loss_with_valid_pixels(&net.forward(&image), &truth, &weights, valid.as_ref());
                 let scalar = value.double_value(&[]);
                 if !scalar.is_finite() {
                     return Err("nonfinite student loss".into());
@@ -517,10 +954,21 @@ mod cuda {
         store.load(model_path).map_err(|e| e.to_string())?;
         let (_, test_report) = score(&net, &data, &test, device);
         let (_, validation_report) = score(&net, &data, &validation, device);
+        if bootstrap::current_source(Path::new("."))? != source {
+            return Err("source changed during training; weights are uncertified experimental output, not a completed cold bootstrap".into());
+        }
         write_json(
             &metadata_path(model_path),
-            &json!({"architecture":ARCHITECTURE,"input_shape":[3,FRAME_HEIGHT,FRAME_WIDTH],
-            "prompts":SEMANTIC_PROMPT_LABELS,"preprocess":data.manifest["preprocess"],"parameters":parameters,
+            &json!({"architecture":if raw_native {RAW_ARCHITECTURE}else if luma_context {LUMA_CONTEXT_ARCHITECTURE} else {ARCHITECTURE},
+            "display_name":if raw_native {RAW_DISPLAY_NAME}else{"Eye Student RGB"},
+            "raw_input":if raw_native {raw::contract()}else{Value::Null},
+            "training_source":source,"weights_sha256":hash_file(model_path)?,
+            "derived_context":if luma_context {luma_context_contract()} else {Value::Null},
+            "training_augmentation":augmentation.label(),"training_seed":17091,
+            "initial_model":initial_model,
+            "learning_rate_range":if initial_model.is_some() {json!([0.00002,0.0002])} else {json!([0.00005,0.001])},
+            "input_shape":if raw_native {json!([16,raw::HEIGHT,raw::WIDTH])}else{json!([3,FRAME_HEIGHT,FRAME_WIDTH])},
+            "prompts":SEMANTIC_PROMPT_LABELS,"preprocess":if raw_native {json!(raw::CONTRACT)}else{data.manifest["preprocess"].clone()},"parameters":parameters,
             "training_dataset":data_path,"training_frames":train.len(),"validation_frames":validation.len(),"test_frames":test.len(),
             "best_epoch":best_epoch,"epochs":epochs,"validation":validation_report,"test":test_report,
             "elapsed_seconds":started.elapsed().as_secs_f64(),"history":history,"experimental":true,
@@ -531,17 +979,13 @@ mod cuda {
         runtime_output(output)?;
         runtime::student_cuda_init()?;
         tch::set_num_threads(2);
-        let data = Dataset::load(data_path)?;
         let model = Model::load(model_path)?;
+        let data = Dataset::load(data_path,model.raw_native)?;
         let mut rows = new_writer(output)?;
         for (i, row) in data.rows.iter().enumerate() {
             let raw = source_frames_from_row(row["input"].clone())?;
-            let image = data.images.get(i as i64).contiguous();
-            let mut bytes = vec![0; image.numel()];
-            let count = bytes.len();
-            image.copy_data(&mut bytes, count);
             let started = Instant::now();
-            let logits = model.infer(&bytes)?;
+            let logits=tch::no_grad(||model.net.forward(&data.images.get(i as i64).unsqueeze(0).to_device(model.store.device())));
             let sample = runtime::student_evaluation(&raw, &logits)?;
             let elapsed = started.elapsed().as_secs_f64() * 1000.0;
             serde_json::to_writer(&mut rows,&json!({"input":row["input"],"teacher":row["teacher"],"student":sample,"student_ms":elapsed})).map_err(|e|e.to_string())?;
@@ -557,10 +1001,13 @@ mod cuda {
             .map_err(|e| e.to_string())?;
         file.seek(SeekFrom::Start(integer(&row, "raw_offset")?))
             .map_err(|e| e.to_string())?;
-        let mut bytes = vec![0; integer(&row, "raw_length")? as usize];
+        let length = integer(&row, "raw_length")?;
+        if length > 64 * 1024 * 1024 { return Err("oversized RAW frame".into()); }
+        let mut bytes = vec![0; length as usize];
         file.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+        verify_source(&row,&bytes)?;
         Ok(Arc::new(RawFrame {
-            eye_index: integer(f, "eye_id")? as usize - 1,
+            eye_index: integer(f, "eye_id")?.checked_sub(1).filter(|v| *v < 2).ok_or("invalid eye")? as usize,
             sequence: integer(f, "sequence")?,
             timestamp_ns: integer(f, "timestamp_ns")?,
             sensor_x: integer(f, "sensor_x")? as u32,
@@ -597,7 +1044,7 @@ mod cuda {
                     .map(|mask| mask.score)
             })
         });
-        json!({"selected_query":fit.map(|_|0),
+        let mut record = json!({"selected_query":fit.map(|_|0),
             "candidates":[{"query":0,"semantic_score":score,
                 "baseline_raw_admitted":admitted,
                 "baseline_ellipse":fit.map(|f|ellipse_json(f.ellipse)),
@@ -606,7 +1053,9 @@ mod cuda {
                 "baseline_censored":fit.map(|f|f.flat_tire_points.as_ref()),
                 "outline":[],
                 "scope":"selected live proposal; only measured retained arcs, no synthetic completed rim"}],
-            "pupil_void":proposal.inner_pupil_fit.map(|p|json!({"ellipse":ellipse_json(p.ellipse)}))})
+            "pupil_void":proposal.inner_pupil_fit.map(|p|json!({"ellipse":ellipse_json(p.ellipse)}))});
+        proposal.export_boundary_logits(&mut record);
+        record
     }
 
     fn source_groups(rows: Vec<Value>, paired: bool) -> Result<Vec<Vec<Value>>, String> {
@@ -751,6 +1200,8 @@ mod cuda {
                 }
                 let mut record = conic_replay_evidence(p, result.is_some());
                 let measurements = json!({"input":row,"backend":backend,"accepted":result.is_some(),
+                "student_stages_ms":status.student_stages_ms,
+                "stage_order":["prepare_cpu","h2d_synchronized","forward_synchronized","mask_materialization","remaining_downstream"],
                 "elapsed_ms":status.last_elapsed_ms,"encode_ms":status.last_encode_ms,"track_ms":status.last_track_ms,
                 "queue_ms":status.last_queue_ms,"state":status.state,"detail":status.detail,
                 "source_identity_verified":true,"source_group_roi_count":p.source_group_roi_count,
@@ -798,6 +1249,196 @@ mod cuda {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn raw_student_manifest_is_explicit_and_cannot_be_loaded_as_rgb() {
+            let mut meta=json!({"architecture":RAW_ARCHITECTURE,"raw_input":raw::contract()});
+            assert!(known_architecture_manifest(&meta));
+            meta["raw_input"]["cfa"]=json!("RGGB");
+            assert!(!known_architecture_manifest(&meta));
+            meta["raw_input"]=Value::Null;
+            assert!(!known_architecture_manifest(&meta));
+        }
+
+        #[test]
+        fn raw_student_keeps_the_six_full_crop_masks_and_small_parameter_budget() {
+            tch::set_num_threads(2);
+            let store=nn::VarStore::new(Device::Cpu);
+            let net=Net::with_input(&store.root(),false,true);
+            let parameters:usize=store.trainable_variables().iter().map(Tensor::numel).sum();
+            assert_eq!(parameters,214566);
+            let output=tch::no_grad(||net.forward(&Tensor::ones([1,16,128,192],(Kind::Float,Device::Cpu))));
+            assert_eq!(output.size(),[1,6,256,384]);
+            assert_eq!(output.isfinite().all().int64_value(&[]),1);
+        }
+
+        #[test]
+        fn raw_student_source_hash_and_readout_must_match_before_any_teacher_use() {
+            let bytes=[1u8,2,3,4,5];
+            let mut row=json!({"raw_sha256":format!("{:x}",Sha256::digest(bytes)),"frame":{"pixel_format":"RAW10_LE40_1X1"}});
+            verify_source(&row,&bytes).unwrap();
+            assert!(verify_source(&row,&[1,2,3,4,6]).is_err());
+            row["frame"]["pixel_format"]=json!("GRAY10");
+            assert!(verify_source(&row,&bytes).is_err());
+        }
+
+        #[test]
+        fn versioned_context_manifest_keeps_legacy_models_and_rejects_unknown_context() {
+            assert!(known_architecture_manifest(
+                &json!({"architecture":ARCHITECTURE})
+            ));
+            let mut meta = json!({"architecture":LUMA_CONTEXT_ARCHITECTURE,
+                                  "derived_context":luma_context_contract()});
+            assert!(known_architecture_manifest(&meta));
+            meta["derived_context"]["shape"] = json!([2, 24, 16]);
+            assert!(!known_architecture_manifest(&meta));
+            assert!(!known_architecture_manifest(
+                &json!({"architecture":LUMA_CONTEXT_ARCHITECTURE})
+            ));
+            assert!(!known_architecture_manifest(
+                &json!({"architecture":"guess"})
+            ));
+        }
+
+        #[test]
+        fn training_variants_are_explicit_and_reject_unknown_names() {
+            assert_eq!(
+                TrainingAugmentation::parse("legacy").unwrap(),
+                TrainingAugmentation::Legacy
+            );
+            assert_eq!(
+                TrainingAugmentation::parse("shadow-crop-v1").unwrap(),
+                TrainingAugmentation::ShadowCrop
+            );
+            assert_eq!(
+                TrainingAugmentation::parse("mixed-shadow-crop-v1").unwrap(),
+                TrainingAugmentation::MixedShadowCrop
+            );
+            assert!(TrainingAugmentation::parse("shdaow").is_err());
+            assert!(!training_luma_context("rgb").unwrap());
+            assert!(training_luma_context("luma-context-v2").unwrap());
+            assert!(training_luma_context("auto").is_err());
+        }
+
+        #[test]
+        fn spatial_shadow_is_bounded_directional_and_has_an_identity_control() {
+            let scalar = |v: f32| Tensor::from_slice(&[v]).reshape([1, 1, 1, 1]);
+            let (angle, offset, softness) = (scalar(0.0), scalar(0.0), scalar(0.1));
+            let field = soft_shadow_field(8, 12, &angle, &offset, &softness, &scalar(0.6));
+            assert_eq!(field.size(), [1, 1, 8, 12]);
+            assert!(field.min().double_value(&[]) >= 0.3999);
+            assert!(field.max().double_value(&[]) <= 1.0);
+            assert!(field.double_value(&[0, 0, 3, 0]) > field.double_value(&[0, 0, 3, 11]) + 0.5);
+            assert_eq!(
+                field.double_value(&[0, 0, 0, 5]),
+                field.double_value(&[0, 0, 7, 5])
+            );
+            let control = soft_shadow_field(8, 12, &angle, &offset, &softness, &scalar(0.0));
+            assert_eq!((control - 1.0).abs().max().double_value(&[]), 0.0);
+        }
+
+        #[test]
+        fn cropped_unknown_pixels_never_train_negative_labels() {
+            let logits =
+                Tensor::zeros([1, 6, 4, 4], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+            let truth = Tensor::ones_like(&logits);
+            let weights = Tensor::ones([1, 6], (Kind::Float, Device::Cpu));
+            let valid = Tensor::ones([1, 1, 4, 4], (Kind::Float, Device::Cpu));
+            let _ = valid.narrow(3, 2, 2).fill_(0.0);
+            loss_with_valid_pixels(&logits, &truth, &weights, Some(&valid)).backward();
+            assert_eq!(
+                logits.grad().narrow(3, 2, 2).abs().max().double_value(&[]),
+                0.0
+            );
+            assert!(logits.grad().narrow(3, 0, 2).abs().max().double_value(&[]) > 0.0);
+            let full = Tensor::ones_like(&valid);
+            assert!(
+                (loss(&logits, &truth, &weights).double_value(&[])
+                    - loss_with_valid_pixels(&logits, &truth, &weights, Some(&full))
+                        .double_value(&[]))
+                .abs()
+                    < 1e-6
+            );
+            assert_eq!(
+                loss_with_valid_pixels(&logits, &truth, &weights, Some(&valid.zeros_like()))
+                    .double_value(&[]),
+                0.0
+            );
+        }
+
+        #[test]
+        fn reframing_keeps_image_and_labels_aligned_and_marks_missing_source() {
+            let plane = Tensor::arange(12, (Kind::Float, Device::Cpu))
+                .reshape([1, 1, 1, 12])
+                .repeat([1, 1, 8, 1])
+                / 12.0;
+            let image = plane.repeat([1, 3, 1, 1]) * 255.0;
+            let truth = plane.repeat([1, 6, 1, 1]);
+            let theta = Tensor::from_slice(&[1.0f32, 0.0, 1.0, 0.0, 1.0, 0.0]).reshape([1, 2, 3]);
+            let grid = Tensor::affine_grid_generator(&theta, image.size(), false);
+            let (shifted_image, shifted_truth, valid) =
+                resample_training_pair(&image, &truth, &grid, true);
+            let valid = valid.unwrap();
+            assert_eq!(valid.narrow(3, 0, 6).min().double_value(&[]), 1.0);
+            assert_eq!(valid.narrow(3, 6, 6).max().double_value(&[]), 0.0);
+            assert!(shifted_image.narrow(3, 6, 6).min().double_value(&[]) > 200.0);
+            assert_eq!(shifted_truth.narrow(3, 6, 6).max().double_value(&[]), 0.0);
+            let aligned =
+                (shifted_image.narrow(1, 0, 1) / 255.0 - shifted_truth.narrow(1, 0, 1)) * valid;
+            assert!(aligned.abs().max().double_value(&[]) < 1e-6);
+            assert!(resample_training_pair(&image, &truth, &grid, false)
+                .2
+                .is_none());
+        }
+
+        #[test]
+        fn coarse_luma_map_keeps_sources_separate_and_records_local_contrast() {
+            let rgb = Tensor::zeros(
+                [2, 3, FRAME_HEIGHT as i64, FRAME_WIDTH as i64],
+                (Kind::Float, Device::Cpu),
+            );
+            let _ = rgb.get(0).fill_(0.25);
+            let _ = rgb.get(1).fill_(0.75);
+            let context = coarse_luma_context(&rgb);
+            assert_eq!(context.size(), [2, 2, 16, 24]);
+            assert!((context.double_value(&[0, 0, 5, 7]) - 0.25).abs() < 1e-6);
+            assert!((context.double_value(&[1, 0, 5, 7]) - 0.75).abs() < 1e-6);
+            assert_eq!(context.narrow(1, 1, 1).max().double_value(&[]), 0.0);
+            let _ = rgb.get(0).narrow(2, 0, 8).fill_(0.75);
+            let changed = coarse_luma_context(&rgb);
+            assert!(changed.double_value(&[0, 1, 0, 0]) > 0.24);
+            assert_eq!(
+                (changed.get(1) - context.get(1))
+                    .abs()
+                    .max()
+                    .double_value(&[]),
+                0.0
+            );
+        }
+
+        #[test]
+        fn luma_context_network_preserves_rgb_and_six_mask_contract() {
+            let store = nn::VarStore::new(Device::Cpu);
+            let net = Net::with_luma_context(&store.root(), true);
+            let parameters: usize = store.trainable_variables().iter().map(Tensor::numel).sum();
+            assert!(parameters < 225_000, "{parameters}");
+            let output = tch::no_grad(|| {
+                net.forward(&Tensor::zeros(
+                    [1, 3, FRAME_HEIGHT as i64, FRAME_WIDTH as i64],
+                    (Kind::Uint8, Device::Cpu),
+                ))
+            });
+            assert_eq!(
+                output.size(),
+                [
+                    1,
+                    SEMANTIC_PROMPT_COUNT as i64,
+                    FRAME_HEIGHT as i64,
+                    FRAME_WIDTH as i64
+                ]
+            );
+            assert_eq!(output.isfinite().all().int64_value(&[]), 1);
+        }
 
         #[test]
         fn paired_replay_uses_exact_clocks_and_retains_missing_eyes() {
@@ -901,6 +1542,6 @@ mod cuda {
     }
 }
 #[cfg(feature = "sam31")]
-pub(super) use cuda::TeacherSample;
+pub(super) use cuda::{TeacherSample,prepare_raw};
 #[cfg(feature = "sam31")]
 pub use cuda::{run_cli, Model};

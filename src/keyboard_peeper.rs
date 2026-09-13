@@ -114,7 +114,7 @@ pub fn buttercup_map(virtual_mouse: bool, driving: bool) -> HotkeyMap {
         if virtual_mouse {
             "Lightbox -"
         } else {
-            "Iris min -"
+            "Iris min / lightbox -"
         },
         true,
     );
@@ -123,7 +123,7 @@ pub fn buttercup_map(virtual_mouse: bool, driving: bool) -> HotkeyMap {
         if virtual_mouse {
             "Lightbox +"
         } else {
-            "Iris min +"
+            "Iris min / lightbox +"
         },
         true,
     );
@@ -310,7 +310,7 @@ mod tests {
         assert!(binding(&normal, "B").enabled);
         assert!(!binding(&normal, "T").enabled);
         assert!(binding(&normal, "-").enabled);
-        assert_eq!(binding(&normal, "[").label, "Iris min -");
+        assert_eq!(binding(&normal, "[").label, "Iris min / lightbox -");
         assert_eq!(binding(&normal, "F").label, "Scoped view");
         assert!(binding(&normal, ",").enabled);
         assert_eq!(binding(&normal, ",").label, "Inspector panel");

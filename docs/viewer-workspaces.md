@@ -68,6 +68,77 @@ compositing and source-aligned eye-overlay helpers are reused. The new view
 layer does not claim a stereo solve, fresh observations from held data, or an
 improvement to SN-FEIDA/localization accuracy.
 
+## Stereo solver inspection (September 12)
+
+For **SAM3.1** and **Eye Student**, click **STEREO** in the view toolbar, or use
+**Tab** to reach Linked Views and **F** to select **Stereo solver** (the second
+linked view). The MODEL inspector also has **Open stereo solver**. The control
+socket accepts `VIEW STEREO`; `VIEW STATUS` includes `stereo_solver` diagnostics.
+Changing detector to a non-mask method returns to the compatible contact view.
+
+**Conics / Masks / RAW** select presentation layers from the existing shared
+segmentation outputs. The images use each proposal's original native RAW,
+dimensions, and sensor origin, even if the current ROI has moved or resized.
+Green points are retained, pink points excluded, cyan is the source conic, and
+dashed white is the joint reconstruction when its exact sources match. RAW
+remains available when no limbus fit exists. **V** retains the normal image
+appearance/inheritance controls.
+
+The stereo VIEW inspector also reports each eye's sampled model mass within 15 degrees
+of the chosen ray, with approximate numerical error in percentage points
+(two standard errors). This describes sampling precision under the current
+contours and priors, not measured gaze accuracy or a guarantee that all modes
+were found. It belongs to the same fresh publication as the displayed spread;
+stale or mismatched source frames cannot retain it. This diagnostic does not
+change gaze admission.
+
+The **3 Enable/Disable stereo** button calls the same global second-ROI action
+as the existing **3** hotkey. Browsing the view never enables analysis or changes
+the detector, calibration, focus reference, or preview defaults. Enabling the
+second eye uses the already existing source-aligned joint solver and its normal
+gaze-authority invalidation. The backend now computes a conditional gaze
+distribution and uses its angular support for direction admission. The source
+conics and joint MAP geometry retain their established fit. Training and model
+preprocessing are separate from this mode.
+
+The display distinguishes a two-eye contribution, a one-eye contribution, a
+provisional result waiting for its paired partner, missing/disabled sources,
+search pauses, and held/expired results. A joint
+publication must match both displayed proposal source keys, clocks, crop
+geometry, and solver generation; two visible eyes or equal RAW timestamps alone
+do not establish a stereo solve. Source lag is measured on the sensor clock;
+source receipt age uses the existing exact-source host clock. Unknown receipt
+age or age over the existing 900 ms SAM allowance hides the current solve while
+leaving its RAW images inspectable. This is a presentation liveness bound, not
+an exposure-latency measurement or a new solver gate.
+
+The relative-support bar divides the existing **used arc weights** between the
+eyes. It is not a probability. Used/rejected correlation-group counts and
+weighted RMS residuals retain rejected-fit diagnostics; point count is never
+treated as independent observation count. Displayed sigma is the solver's
+engineering boundary allowance. Target coordinates, competing-hypothesis cost
+gap, direction-sign resolution, and search-bound status come from the existing solve.
+The viewer now also displays **model 90% gaze radius**, per-direction model
+mass, effective sample count and unresolved integration states. Local angular
+sigma describes a single direction basin; the sampled radius includes explored
+competing directions and nuisance eye geometry. These are conditional model
+estimates, not calibrated gaze accuracy. The selected joint gaze is preserved;
+a 90% model radius above 15 degrees, or unresolved sampling, withholds direction
+authority. Existing source, freshness and paired-calibration gates still apply.
+See the probabilistic integration section
+in [joint-conic-solver.md](joint-conic-solver.md) for assumptions and replay results.
+
+The 23 viewer UI tests cover SAM/Student parity, missing sources, source expiry,
+conditional uncertainty and compact/tall layouts. The ten live-adapter tests
+pass; the former cursor-routing fixture now explicitly tests its independent
+sign and exact-source gates instead of assuming its synthetic solve acquired a
+sign. The native-corpus calibration diagnostic is opt-in and was explicitly run on
+the three recent caches and their original target windows. The SAM-enabled
+viewer builds. No new human calibration, inference or training run was
+performed by the stereo work; the concurrent student work is separate. Initial rendering
+artifacts are under `outputs/stereo-ui-review`; current backend/build evidence is
+under `outputs/probabilistic-stereo-20260912`.
+
 ## Global gaze settings versus preview settings
 
 There is one global gaze configuration. **G** selects its detector and **Y**
@@ -239,7 +310,8 @@ over the central 75% of width / 70% of height, two seconds per target (~40 s).
 The targets differ from the nine calibration points. A white dot and spinning
 indicator appear on black; the predicted cursor is hidden to avoid encouraging
 the user to chase it. J need not be on. Backslash or Escape returns to the
-viewer; all camera/model hotkeys are suppressed during the check.
+viewer; camera/model adjustment hotkeys are suppressed during the check.
+B/N lighting and S/H RAW-recording controls remain available.
 
 The test freezes the current cursor mapping and monitor pose. It does not fit,
 recalibrate, or save monitor defaults. Each point gets a 650 ms settling period;
@@ -267,3 +339,118 @@ millimeters or angular degrees. It creates no RAW recording and does not
 alter an existing recording. Accuracy on Rob's eyes remains to be measured by
 running the check; synthetic zero-error/known-offset tests are software tests,
 not an empirical gaze-accuracy result.
+
+
+## Calibration lighting frame
+
+### Calibration target preview
+
+During each stationary **M** target, the eye thumbnail is fully visible through
+250 ms, fades to zero at 500 ms, and stays hidden. One framebuffer pixel at the
+crosshair center cycles red, green, blue, white and black, 200 ms per color;
+the surrounding white crosshair stays fixed. Its rendered color and phase are
+recorded with the target appearance. Calibration results exclude
+this preview: sampling opens only after a successfully submitted hidden buffer,
+then requires the exact observation's original RAW host arrival to be strictly
+later than that submission, as well as the existing 500 ms source-clock settle.
+A delayed redraw therefore extends exclusion; delayed inference cannot turn a
+preview receipt into a fresh sample. Each target, sign relock or source restart
+requires a new hidden submission. Duplicate sources still get only one vote.
+Native RAW recording retains the preview. Scene metadata records opacity and
+the gate; session metadata records the rule and each target's first hidden
+submission elapsed time. The first hidden presentation's scene describes the
+still-closed pre-submit gate; its successful submit bounds establish the opening.
+These host arrival/submission times do not measure sensor exposure or display
+scan-out: transport and display latency remain unknown, so they cannot certify
+physical exposure entirely after the last visible thumbnail.
+
+### Recorded relative-motion stimulus
+
+**Shift+\\** starts a recording-only target session, separate from **M** mouse
+calibration and the unshifted **\\** accuracy check. It does not fit, clear or
+replace the monitor mapping and does not wait for a successful gaze solve.
+It refuses to interrupt another RAW recording or calibration.
+
+The `micro-motion-five-locations-v2` recipe repeats the same micro-motion routine
+at five positions: center, upper-left, upper-right, lower-right and lower-left
+within the light-frame interior. Each position begins with two seconds to settle,
+then uses 200 ms target steps and returns, with horizontal/vertical amplitudes of
+1–5, 0.5 and 0.25 physical framebuffer pixels plus zero-motion controls.
+Total duration is 106 seconds (21.2 seconds per position). A faint tail shows the
+preceding three commands at the current position and clears on relocation.
+The recording identifies each position and its local offsets independently.
+Fractional positions use achromatic area-sampled antialiasing; this
+is not RGB panel-subpixel addressing or proof of subpixel eye-tracking accuracy.
+
+**B**, **N**, **[**, **]** retain the same light-frame toggle, pattern/Auto Cycle
+and width controls. The reusable timed-stimulus session separates a versioned
+target recipe from the common recording, lighting, gaze logging and presentation
+shell; new recipes should use that shell rather than implement their own lights.
+Choose the frame width before starting; changing it during the sequence aborts
+the run so the measurement origin cannot move mid-step. Toggling frame lighting
+or changing its color pattern preserves the target locations.
+Escape stops an active session; once stopped, Escape returns to the viewer.
+Focus loss, resize, a long presentation gap, RAW failure or the recording time
+limit aborts the sequence. The target clock starts only after the writer confirms
+recording. Completion means the sequence and archive finished, not a fit passed.
+
+Recordings use `outputs/calibration-corpus/stimulus-micro-motion-*.tar` and a
+`.session.json` sidecar declaring `purpose: recorded-stimulus`,
+`presentation_type: micro-motion`, recipe/version, planned offsets/durations,
+initial/final lights and outcome. The sidecar is created while arming and finalized
+after the writer finishes. Mouse-calibration sidecars explicitly identify their
+different purpose. Actual presented targets and tails (distinct roles), fractional
+coordinates, lightbox state/phase, predicted gaze and host submission bounds are
+in the existing `metadata.oim1` stream beside native ROIs and thumbnails.
+
+
+Commanded display displacement **is not ground truth eye displacement**. Pursuit
+delay, saccades, fixation drift, camera exposure, display refresh and unknown
+scan-out timing must be modeled before using these recordings for training.
+The saved successful presentations, not every planned step, define what was
+actually submitted. The whole session and both eyes stay together in dataset
+partitions; no subpixel accuracy claim follows from fractional rendering.
+
+**B** toggles the existing lightbox; **N** advances its pattern once per keypress.
+Startup is OFF with **SOLID WHITE** selected. Cycling while OFF only arms the
+selection. From white, the first N selects **CLOCK / 5 HZ** and the second
+selects **AUTO CYCLE / 4S**. Auto Cycle visits all thirteen lighting patterns,
+four seconds each, and repeats; it excludes the separate optical-clock mode.
+Pressing N again leaves auto cycling for the individual manual selections.
+The manual cycle returns to white after warm/cool/red/green/blue solids,
+rotating color, white pulse, color pulse, checker pulse, checker strobe,
+checker horizontal color sweep and checker diagonal color sweep. The current
+selection appears in the viewer inspector and calibration/accuracy footer.
+**[ / ]** retain their frame-width controls in the viewer and M calibration.
+The initial width is 16% of the shorter window dimension; each bracket step
+changes it by four percentage points, from 4% through 44%. In the ordinary
+viewer, enable the frame first so brackets control lighting thickness.
+
+The colored checks have complementary hues and approximately ten tiles across
+the shorter display dimension. Checker pulse uses a 3.2-second brightness cycle;
+checker strobe uses a 1 Hz bright/dim cycle (50% duty, 30% minimum brightness).
+Checker colors rotate over 12 seconds; horizontal and diagonal modes add a
+spatial hue sweep. Pattern selection or B toggle restarts phase; redraws use
+elapsed host time rather than frame counts. Auto Cycle includes the 1 Hz
+checker strobe; neither auto cycling nor strobing is the startup mode.
+B stops the lighting immediately.
+
+The same frame surrounds M calibration and the twenty-target accuracy test.
+B/N remain available during accuracy testing; its frame is capped at 8% of the
+shorter dimension so the existing targets remain inside. Target coordinates,
+progress indicators, calibration schedules and source clocks are unchanged.
+The keyboard guide shows the lighting and RAW recording shortcuts during the test.
+These are display lighting perturbations for recordings, not camera exposure
+controls or evidence that a model has become more robust.
+
+The existing recording scene's calibration metadata includes `lightbox` with
+recipe `lightbox-v2`, enabled state, selected `pattern`, `effective_pattern`,
+effective width and `phase_elapsed_ns` at rendering. Auto cycling additionally
+records `auto_cycle_index`, `auto_cycle_step_ns` and the concrete pattern's
+`effective_phase_elapsed_ns`, so its local animation phase can be reconstructed.
+Older `lightbox-v1` recordings retain their manual-pattern interpretation.
+Phase starts at the last toggle/pattern cycle;
+this is host-render timing, not measured exposure or scan-out. It permits
+sorting recorded presentations by lighting condition and reconstructing the
+pattern phase alongside the existing presentation timestamps. No separate
+recording subsystem or training material is created.

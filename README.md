@@ -16,6 +16,9 @@ and which joint conic/binocular capabilities remain unimplemented.
 The [iris-area validation guide](docs/flat-tire-area-and-motion.md) defines
 scale-normalized frontal-equivalent iris disk area (SN-FEIDA), its uncertainty,
 and the matched corpus checks used to evaluate geometry changes.
+The [bootstrapability contract](bootstrapability.md) requires current-checkout
+retraining from RAW, human labels and pinned SAM3 assets, with explicit model
+ancestry and separate proof for new-user onboarding.
 
 Buttercup expects a compatible external RAW camera service over TCP. Camera
 firmware and device-side control live elsewhere.
@@ -149,23 +152,44 @@ fixation spinner. Status text stays hidden for the first three seconds of each
 point, and paired RAW recording remains automatic during calibration.
 
 Press `Z` in the viewer to start the full-screen optical screen clock. It
-shows a smoothly moving fixation target over a locally balanced chromatic
-frame code and writes a presentation manifest under
+shows a stationary fixation target over a time-coded chromatic field
+and writes a presentation manifest under
 `outputs/screen-reflection-calibration/`. Press `Z`, `Esc`, or `Q` in the
 stimulus to return to the viewer.
 
 While the clock is running, its upper-left readout reports optical recovery
-as `WARMING`, `SEARCHING`, `CHECKED SINGLE FRAME`, or `LOCKED`. Every V3 symbol
-is a session-keyed RM(1,4) `[16,5,8]` word carried by complementary cells and
-four spatial copies. One frame can therefore correct as many as three wrong
-logical symbols; an ambiguous frame is rejected instead of being published.
-The first checked frame immediately shows its individual lag. Agreement over
-time upgrades the status to `LOCKED` and adds the robust median. The interval
-runs from the host's Wayland display commit to arrival of the camera packet
-carrying that recovered code, so it includes display scan-out, exposure,
-camera transport, and packet delivery rather than claiming to be sensor
-exposure latency alone. Rendering is paced by Wayland frame callbacks rather
-than a drifting userspace timer.
+as `WARMING`, `SEARCHING`, or `LOCKED`. The standalone **Z** launcher now uses
+a checked temporal whole-field color sequence, including recovery of an unknown
+reflection polarity. It collects approximately 13 seconds at 5 symbols/second
+before decoding 63-symbol words. Ambiguous, missing and contradictory evidence
+is rejected. The source is native RAW, independent of eye-tracking admission.
+The monitor must be powered on; a window reported as visible on a powered-off
+output cannot supply an optical clock. Rendering normally follows Wayland frame
+callbacks, with a bounded watchdog that checks display availability.
+
+The lag is host display submission to arrival of the camera packet carrying the
+recovered code, **including an unknown position within the 200 ms held symbol**.
+It is not precise display-to-exposure latency or a calibrated sensor/host clock
+transform. The fixed-reflector test acquired live with 41 checked receipts;
+native replay succeeds for both ROIs and rejects powered-off, reversed-time and
+constant-signal controls. A subsequent live eye-ROI trial produced 35 checked
+recoveries. Precise transition recovery and isolating corneal/pupil-only support
+remain open; see [the clock investigation](docs/optical-clock-debugging.md).
+
+For standalone optical debugging, the viewer binary also accepts
+`--screen-clock-stimulus --temporal-code --fixed-target --code-hz 5 --amplitude 0.12
+--duration-seconds 35`. Start a RAW recording in the camera viewer first.
+The older spatial diagnostic remains available using
+`--screen-clock-stimulus --large-cells --fixed-target --code-hz 5 --amplitude 0.12
+--duration-seconds 30`. This keeps the same checked V3 code but draws one 8x4
+tile, with four times the area per cell, instead of four 8x4 copies. Start a
+RAW recording in the camera viewer first. The local snapshot and saved manifest
+declare the layout; the native live/offline decoder uses that actual layout.
+`CLOCK_RAW_DIAGNOSTIC` lines in the camera viewer's log expose witness support,
+proposal score and checked-code results. This is a diagnostic recipe, not a
+claim that optical lock has been validated on a person. At a slower code rate,
+an arrival-minus-first-code-submit value includes the unknown position within
+the held code interval; it is not an exact sensor exposure latency.
 
 For a recoverable camera run, press `S` (or the legacy `H` alias) to begin the
 lossless RAW recording, press `Z` for the stimulus, then stop the stimulus and
@@ -235,6 +259,25 @@ the inspector moves below the images. **F2** explicitly sets the selected ROI
 as the camera autofocus reference. Existing **J**, **M**, and lightbox controls
 remain available; calibration still has its distraction-free screen.
 
+For varied calibration lighting, **B** enables the frame, initially **SOLID
+WHITE**, and each **N** press advances one pattern. Press N twice from white
+for a repeating four-second auto cycle of colored solids, pulses, colored
+checkerboards, and horizontal/diagonal color sweeps. Further N presses select
+individual patterns; **[ / ]** adjust thickness. These controls also work during
+accuracy checks, where the frame is capped at 8% to preserve the targets.
+See [lighting controls](docs/viewer-workspaces.md) for pattern timing and recording metadata.
+
+The shared light frame has an optical **CLOCK / 5 HZ** mode: **B** enables the
+border and **N** cycles `SOLID WHITE → CLOCK → AUTO CYCLE → …`.
+It works in normal viewing, **M** calibration, accuracy checks, and the
+**Shift+\\** small-pixel-movement recording. **[ / ]** adjust border width.
+Clock stays selected continuously (it is excluded from the four-second auto
+rotation); allow about 13 seconds for its checked temporal word. The indicator
+shows warming/searching/checked, not a guessed exposure latency. Existing RAW
+recordings include the emitted symbols, actual host submission bounds, and
+latest checked recovery in `metadata.oim1`, alongside targets and gaze. This
+does not launch a separate window. See [clock validation and limitations](docs/optical-clock-debugging.md#shared-presentation-border-clock).
+
 The **J** cursor and post-calibration cursor use absolute placement: each new
 gaze target is displayed immediately, without cursor or gaze-direction easing.
 Temporal sign validation and scale/geometry admission remain intact; SAM inference
@@ -247,6 +290,10 @@ The local control socket supports `VIEW STATUS`, `VIEW ROI|LINKED|GLOBAL`,
 current ROI/global-object context; `VIEW SEARCH` explicitly starts/stops object
 search (start is only valid in its Global view). `VIEW STATUS` reports the current scope,
 view, selected ROI, autofocus reference, both prompts, and object-search state.
+
+Read-only presence/gaze cooperation must preserve the experimental camera/ROI
+workflow. See [the cooperation boundary](docs/presence-cooperation.md) for source
+freshness, unknown-versus-absent semantics, and the pending peer integration.
 
 # Optional second-eye analysis
 

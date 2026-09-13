@@ -8,7 +8,7 @@
 //! exact display commit that introduced the code.
 
 use crate::screen_reflection_clock::{
-    analyze_whole_raw_roi, detect_optical_activity_onset,
+    analyze_whole_raw_roi_with_layout, detect_optical_activity_onset,
     solve_optical_clock_in_delta_range_with_scheme, ClockWitnessStream, WholeRoiClockWitness,
 };
 use crate::screen_reflection_code::{
@@ -42,6 +42,7 @@ const SINGLE_FRAME_MINIMUM_MARGIN: f64 = 0.08;
 
 #[derive(Clone)]
 pub struct LiveRawClockFrame {
+    pub stream_epoch: String,
     pub sequence: u64,
     pub sensor_timestamp_ns: u64,
     pub host_arrival_unix_ns: u64,
@@ -142,8 +143,11 @@ impl LiveClockModel {
 #[derive(Default)]
 struct DecodeState {
     session_id: String,
+    stream_epoch: String,
+    temporal_samples: VecDeque<crate::screen_reflection_temporal::Sample>,
     observations: VecDeque<LiveClockObservation>,
     valid_frames: usize,
+    required_frames: usize,
     scanned_frames: usize,
     valid_since_fit: usize,
     model_candidate: Option<(LiveClockModel, usize)>,
@@ -171,11 +175,16 @@ impl DecodeState {
         {
             return;
         }
+        let required = if self.required_frames == 0 {
+            TEMPORAL_WITNESSES_REQUIRED
+        } else {
+            self.required_frames
+        };
         let _ = report_recovery_progress(RecoveryProgress {
             session_id: &self.session_id,
             phase,
-            valid_frames: self.valid_frames.min(TEMPORAL_WITNESSES_REQUIRED),
-            required_frames: TEMPORAL_WITNESSES_REQUIRED,
+            valid_frames: self.valid_frames.min(required),
+            required_frames: required,
         });
         self.last_progress = Some(Instant::now());
     }
@@ -229,11 +238,12 @@ fn unwrap_counter_in_plausible_window(
     let modulus = u64::from(scheme.counter_modulus());
     let base = current / modulus * modulus + u64::from(counter_mod);
     [
-        base.saturating_sub(modulus),
-        base,
-        base.saturating_add(modulus),
+        base.checked_sub(modulus),
+        Some(base),
+        base.checked_add(modulus),
     ]
     .into_iter()
+    .flatten()
     .find(|candidate| recovered_index_is_plausible(*candidate, current))
 }
 
@@ -392,8 +402,28 @@ fn process_frame(
     snapshot: &ClockSessionSnapshot,
     frame: LiveRawClockFrame,
 ) {
+    if state.stream_epoch != frame.stream_epoch
+        || state
+            .last_sensor_timestamp_ns
+            .is_some_and(|t| frame.sensor_timestamp_ns > t.saturating_add(4_000_000_000))
+    {
+        state.reset_for(&snapshot.session_id);
+        state.stream_epoch = frame.stream_epoch.clone();
+    }
+    // Retransmissions/late packets cannot add clock evidence. A stream restart
+    // is separately keyed above, even when the sensor timestamp stays monotone.
+    if state
+        .last_sensor_timestamp_ns
+        .is_some_and(|t| frame.sensor_timestamp_ns <= t)
+    {
+        return;
+    }
     state.scanned_frames = state.scanned_frames.saturating_add(1);
     state.last_sensor_timestamp_ns = Some(frame.sensor_timestamp_ns);
+    if snapshot.temporal_code {
+        process_temporal_frame(state, snapshot, &frame);
+        return;
+    }
     let witness = PackedRaw10::new(
         frame.payload.as_slice(),
         frame.width,
@@ -403,13 +433,25 @@ fn process_frame(
         frame.sensor_y,
     )
     .ok()
-    .and_then(analyze_whole_raw_roi);
+    .and_then(|raw| {
+        if snapshot.session_id.contains("-spatial-mono-") {
+            crate::screen_reflection_clock::analyze_whole_raw_roi_with_weights(raw,snapshot.code_layout,[1.;4])
+        } else if snapshot.session_id.contains("-spatial-blue-") {
+            crate::screen_reflection_clock::analyze_whole_raw_roi_with_weights(raw,snapshot.code_layout,[0.,0.,0.,4.])
+        } else {analyze_whole_raw_roi_with_layout(raw, snapshot.code_layout)}
+    });
     let direct_witness = witness
         .as_ref()
         .is_some_and(|witness| witness.valid && witness.supported_cells >= 27);
     let checked_match = witness.as_ref().and_then(|witness| {
         checked_single_frame_match(witness, snapshot, frame.host_arrival_unix_ns)
     });
+    if state.scanned_frames % 10 == 0 || snapshot.session_id.contains("-spatial-") {
+        eprintln!("CLOCK_RAW_DIAGNOSTIC session={} sequence={} timestamp={} scanned={} valid={} cells={} proposal={:.3} repeat={:.3} checked={:?}",
+            state.session_id,frame.sequence,frame.sensor_timestamp_ns,state.scanned_frames,
+            direct_witness,witness.as_ref().map_or(0,|w|w.supported_cells),
+            witness.as_ref().map_or(0.,|w|w.proposal_score),witness.as_ref().map_or(0.,|w|w.repeat_agreement),checked_match);
+    }
     let single_reported = checked_match.is_some_and(|matched| {
         report_recovered_frame(RecoveryReport {
             session_id: &state.session_id,
@@ -479,13 +521,21 @@ fn process_frame(
         }
         return;
     };
-    state.send_progress(RecoveryPhase::Locked, false);
     if !direct_witness {
+        state.send_progress(RecoveryPhase::Searching, false);
         return;
     }
     let Some(recovered) = model.predicted_code(frame.sensor_timestamp_ns) else {
         return;
     };
+    if snapshot.code_scheme == OpticalCodeScheme::ReedMullerV3
+        && !checked_match.is_some_and(|m| m.recovered_code_index == recovered)
+    {
+        // A projected clock is not an optically decoded exposure. Publish a
+        // verified V3 report only when this frame independently checks too.
+        state.send_progress(RecoveryPhase::Searching, false);
+        return;
+    }
     let packet_time_code = display_code_near_host_time(snapshot, frame.host_arrival_unix_ns);
     if !recovered_index_is_plausible(recovered, packet_time_code)
         || state
@@ -507,12 +557,111 @@ fn process_frame(
         confidence_margin: model.confidence_margin,
         verified: true,
     }) {
-        Ok(()) => state.last_reported_code = Some(recovered),
+        Ok(()) => {
+            state.last_reported_code = Some(recovered);
+            state.send_progress(RecoveryPhase::Locked, false);
+        }
         Err(error) if error.contains("transition-window") => {
             // The display ring deliberately expires old epochs. Do not let a
             // delayed worker report pin the monotonic decoder to that epoch.
         }
         Err(_) => {}
+    }
+}
+
+fn process_temporal_frame(
+    state: &mut DecodeState,
+    snapshot: &ClockSessionSnapshot,
+    frame: &LiveRawClockFrame,
+) {
+    use crate::screen_reflection_temporal::{photometry, recover, Sample, PERIOD};
+    state.required_frames = crate::screen_reflection_temporal::WORD_BITS;
+    let raw = PackedRaw10::new(
+        &frame.payload,
+        frame.width,
+        frame.height,
+        frame.stride,
+        frame.sensor_x,
+        frame.sensor_y,
+    );
+    let value = raw.ok().and_then(photometry);
+    let Some(value) = value else {
+        state.send_progress(RecoveryPhase::Searching, false);
+        return;
+    };
+    state.temporal_samples.push_back(Sample {
+        sensor_ns: frame.sensor_timestamp_ns,
+        value,
+    });
+    let horizon_ns = (80. / snapshot.code_hz * 1e9) as u64;
+    while state.temporal_samples.len() > 2048
+        || state
+            .temporal_samples
+            .front()
+            .is_some_and(|s| frame.sensor_timestamp_ns.saturating_sub(s.sensor_ns) > horizon_ns)
+    {
+        state.temporal_samples.pop_front();
+    }
+    if state
+        .last_fit_attempt
+        .is_some_and(|t| t.elapsed() < Duration::from_millis(500))
+    {
+        return;
+    }
+    state.last_fit_attempt = Some(Instant::now());
+    let samples: Vec<_> = state.temporal_samples.iter().copied().collect();
+    let span_ticks = samples.first().map_or(0., |s| {
+        (frame.sensor_timestamp_ns - s.sensor_ns) as f64 / 1e9 * snapshot.code_hz
+    });
+    state.valid_frames = (span_ticks as usize).min(state.required_frames);
+    let fit = recover(&samples, snapshot.code_hz, snapshot.session_tag);
+    eprintln!(
+        "CLOCK_TEMPORAL session={} sequence={} sensor_ns={} samples={} value={value:?} fit={fit:?}",
+        state.session_id,
+        frame.sequence,
+        frame.sensor_timestamp_ns,
+        samples.len()
+    );
+    let Some(fit) = fit else {
+        state.send_progress(
+            if span_ticks < (state.required_frames + 1) as f64 {
+                RecoveryPhase::Warming
+            } else {
+                RecoveryPhase::Searching
+            },
+            false,
+        );
+        return;
+    };
+    let near = display_code_near_host_time(snapshot, frame.host_arrival_unix_ns);
+    let base = near / PERIOD as u64 * PERIOD as u64 + fit.code_mod;
+    let Some(code) = [
+        base.checked_sub(PERIOD as u64),
+        Some(base),
+        base.checked_add(PERIOD as u64),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|code| recovered_index_is_plausible(*code, near)) else {
+        return;
+    };
+    if state.last_reported_code == Some(code) {
+        return;
+    }
+    if report_recovered_frame(RecoveryReport {
+        session_id: &state.session_id,
+        sequence: frame.sequence,
+        host_arrival_unix_ns: frame.host_arrival_unix_ns,
+        recovered_code_index: code,
+        score: fit.correlation,
+        confidence_margin: (fit.runner_errors - fit.bit_errors) as f64 / 63.,
+        verified: true,
+    })
+    .is_ok()
+    {
+        state.last_reported_code = Some(code);
+        state.valid_frames = state.required_frames;
+        state.send_progress(RecoveryPhase::Locked, false);
     }
 }
 
@@ -560,6 +709,8 @@ mod tests {
     #[test]
     fn host_time_projection_is_conservative_across_snapshot_cadence() {
         let snapshot = ClockSessionSnapshot {
+            temporal_code: false,
+            code_layout: crate::screen_reflection_code::SpatialCodeLayout::CURRENT,
             session_id: "test".to_string(),
             session_tag: 3,
             code_hz: 30.0,
@@ -599,8 +750,26 @@ mod tests {
         assert!(!recovered_index_is_plausible(102, 100));
     }
 
+    #[test]
+    fn counter_underflow_never_fabricates_code_zero() {
+        let scheme = OpticalCodeScheme::ReedMullerV3;
+        assert_eq!(unwrap_counter_in_plausible_window(15, 3, scheme), None);
+        assert_eq!(unwrap_counter_in_plausible_window(2, 3, scheme), Some(2));
+        for current in 0..128 {
+            for counter in 0..32 {
+                if let Some(recovered) =
+                    unwrap_counter_in_plausible_window(counter, current, scheme)
+                {
+                    assert_eq!(recovered % 32, u64::from(counter));
+                }
+            }
+        }
+    }
+
     fn checked_snapshot(current_code: u64) -> ClockSessionSnapshot {
         ClockSessionSnapshot {
+            temporal_code: false,
+            code_layout: crate::screen_reflection_code::SpatialCodeLayout::CURRENT,
             session_id: "checked-test".to_string(),
             session_tag: 9,
             code_hz: 30.0,

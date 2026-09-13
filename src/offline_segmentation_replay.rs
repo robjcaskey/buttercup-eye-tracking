@@ -5145,7 +5145,7 @@ mod reframe_replay_tests {
 
 pub(super) fn sam_sequence_eval<I>(mut args: I) -> Result<(), String>
 where I: Iterator<Item = String> {
-    let output = PathBuf::from(args.next().ok_or("expected OUTPUT.json CAPTURE_DIR LABEL [START] [COUNT] [STRIDE] [native|inset-fixed|inset-cycle|inset-step-x|inset-step-y|inset-step-xy]")?);
+    let output = PathBuf::from(args.next().ok_or("expected OUTPUT.json CAPTURE_DIR LABEL [START] [COUNT] [STRIDE] [native|inset-fixed|inset-cycle|inset-step-x|inset-step-y|inset-step-xy] [sam|student]")?);
     let capture = PathBuf::from(args.next().ok_or("missing capture directory")?);
     let label = args.next().ok_or("missing eye label")?;
     let start = parse_usize(args.next(), 0, "start")?;
@@ -5154,6 +5154,12 @@ where I: Iterator<Item = String> {
     let crop_mode = args.next().unwrap_or_else(|| "native".into());
     sequence_replay_crop(&crop_mode, 0, 384, 256)?;
     if stride == 0 { return Err("sequence stride must be positive".into()); }
+    // Diagnostic backend selection only: preserve the identical source-time,
+    // RAW transport, contact tracker and downstream gates for matched replay.
+    let backend = args.next().unwrap_or_else(|| "sam".into());
+    if !matches!(backend.as_str(), "sam" | "student") {
+        return Err("sequence backend must be sam or student".into());
+    }
     if args.next().is_some() { return Err("unexpected sequence argument".into()); }
     if output.exists() { return Err(format!("output already exists: {}", output.display())); }
     let records = fs::read_to_string(capture.join("frames.jsonl")).map_err(|e|e.to_string())?
@@ -5161,15 +5167,23 @@ where I: Iterator<Item = String> {
         .into_iter().filter(|r| r["label"].as_str() == Some(label.as_str()))
         .skip(start).step_by(stride).take(count).collect::<Vec<_>>();
     if records.is_empty() { return Err("empty SAM sequence".into()); }
-    let model = env::var_os("BUTTERCUP_SAM31_MODEL").map(PathBuf::from)
-        .unwrap_or_else(sam31_outer::default_model_path);
+    let model = if backend == "student" {
+        sam31_outer::student::default_model_path()
+    } else {
+        env::var_os("BUTTERCUP_SAM31_MODEL").map(PathBuf::from)
+            .unwrap_or_else(sam31_outer::default_model_path)
+    };
     let render_directory = env::var_os("BUTTERCUP_REPLAY_RENDER_DIR").map(PathBuf::from);
     if let Some(directory) = render_directory.as_ref() {
         if crop_mode != "native" { return Err("showcase export requires native ROI coordinates".into()); }
         if directory.exists() { return Err(format!("render directory already exists: {}", directory.display())); }
         fs::create_dir_all(directory).map_err(|e|e.to_string())?;
     }
-    let client = sam31_outer::Client::start(&model)?;
+    let client = if backend == "student" {
+        sam31_outer::Client::start_student(&model)?
+    } else {
+        sam31_outer::Client::start(&model)?
+    };
     let mut history = VecDeque::new();
     let mut cases = Vec::new();
     let mut outer_summary = ModelAggregate::default();
@@ -5370,6 +5384,7 @@ where I: Iterator<Item = String> {
                 "rotation_coefficient":independent_motion.motion.rotation_coefficient,"support":independent_motion.motion.support,
                 "residual_px":independent_motion.motion.residual},
             "sn_feida_log_step":sn_feida_log_step,
+            "limbus_refinement":proposal.as_ref().and_then(|p|p.limbus_refinement.as_ref()).map(|a|a.diagnostic()),
             "raw_admitted":result.is_some(),"pupil":pupil.map(|p|ellipse_json(p.ellipse)),
             "pupil_support":pupil.map(|p|json!({"score":p.raw_support.score,"positive_fraction":p.raw_support.positive_fraction,"strong_sectors":p.raw_support.strong_sectors})),
             "pupil_radius_ratio":ratio,"post_sam":post,"virtual_contact":json_surface_gaze(contact),
@@ -5397,7 +5412,7 @@ where I: Iterator<Item = String> {
             "distances_px":distances,"contract":"visible human limbus points in original source-frame coordinates; includes proposal-only fits, consult raw_admitted"});
     }
     let report = json!({"schema":"buttercup-sam-sequence-eval-v1","capture":capture,"label":label,
-        "model":model,"configuration":sam31_outer::live_configuration(),
+        "model":model,"backend":backend,"configuration":sam31_outer::live_configuration(),
         "sampling":{"start":start,"maximum_samples":count,"source_frame_stride":stride,"crop_mode":crop_mode},
         "caller_policy":if legacy_caller_crop_reset {"legacy-crop-reset-ablation"} else {"shared-live-roi-continuity"},
         "contract":"production source/session and result-admission policy, video worker, sensor registration and keyed contact tracker; sequential native RAW exposures with no prediction/label seeds; blocking completion cadence, optimistic post-SAM focus, not full UI/AF/calibration publication or accuracy ground truth",

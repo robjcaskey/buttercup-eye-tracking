@@ -1,5 +1,8 @@
 # CUDA eye-mask student
 
+For the separately versioned RAW-native input and stricter cold-training path,
+see [RAW-native Student](raw-native-student.md). RGB weights remain compatible.
+
 `G` now has a separate `eye-student` entry immediately after `sam31`. It is
 experimental and does not replace the SAM default. The detector is a small
 six-head U-Net trained in Rust/LibTorch on CUDA from SAM3 pseudo-labels. It
@@ -65,6 +68,12 @@ mask-outline and pupil-only inspection, alongside compare, contacts and timing.
 
 ## Reproducible training
 
+New training and checkpoint reuse must follow the
+[bootstrapability contract](../bootstrapability.md). SAM3 is an allowed
+bootstrap dependency, but the historical runs below are not an end-to-end
+current-checkout cold-bootstrap certificate. Verify the complete custom-model
+ancestry before reusing their weights or derived targets for further training.
+
 Runtime artifacts stay beneath `data`/`outputs`; none are source-tree assets.
 The initial work directory is `outputs/eye-student.FQGerU`. The selector started
 from `outputs/dual-eye-joint.MiR1Iw/replay-inputs-v2/frames.jsonl`, which addresses
@@ -104,7 +113,9 @@ With the same LibTorch environment as `scripts/run-viewer.sh`:
 
 ```sh
 cargo build --profile live --features sam31 --bin buttercup_eye_student
-python3 scripts/prepare-eye-student.py SOURCE_INDEX.jsonl outputs/RUN/frames.jsonl \
+cargo build --profile live --no-default-features \
+  --bin buttercup_prepare_eye_student --bin buttercup_report_eye_student
+data/target/live/buttercup_prepare_eye_student SOURCE_INDEX.jsonl outputs/RUN/frames.jsonl \
   --per-eye-session 6 --max-sessions 64
 data/target/live/buttercup_eye_student export outputs/RUN/frames.jsonl outputs/RUN/teacher
 data/target/live/buttercup_eye_student train outputs/RUN/teacher outputs/RUN/model.ot 120
@@ -115,14 +126,25 @@ data/target/live/buttercup_eye_student replay outputs/RUN/frames.jsonl sam outpu
 # Same-clock pairs exercise both workers through the actual atomic group API;
 # unmatched eyes remain single-eye submissions, never silently dropped.
 data/target/live/buttercup_eye_student replay-paired outputs/RUN/frames.jsonl student outputs/RUN/paired.jsonl
-python3 scripts/report-eye-student.py outputs/RUN/eval.jsonl \
+data/target/live/buttercup_report_eye_student outputs/RUN/eval.jsonl \
   --replay outputs/RUN/student-live.jsonl --replay outputs/RUN/sam-live.jsonl
 ```
 
 Resource-intensive commands require the host resource-coordination claim.
 Record its predicate, token, and honored status for performance comparisons.
+Run the [native provenance preflight](../bootstrapability.md#machine-checked-dependency-graph)
+before training or reusing derived material. These commands are component
+recipes, not by themselves an end-to-end bootstrap proof.
 Use fresh output paths. Model manifests bind architecture, input shape, fixed
 labels, and preprocessing; incompatible/missing assets fail explicitly.
+
+Preparation and reporting are native CPU-only Rust executables, replacing the
+former Python scripts. They need neither Python nor LibTorch/CUDA at runtime.
+Session partitions, native RAW hashes and same-clock pairing are preserved;
+the reporter also separates eyes, excludes held predictions and states missing
+scale/human-label evidence. Shared Student optimization remains Rust with
+CUDA-capable LibTorch. This is not a per-user adaptation trainer: optional
+user/scenario refinements must train and run on CPU under the contract.
 
 The default model path is `data/models/eye_student_v1.ot`, with a sibling
 `eye_student_v1.json` manifest. Override it with `BUTTERCUP_EYE_STUDENT_MODEL`.
@@ -254,3 +276,146 @@ normalize by either model's fitted radius. Relevant artifacts are
 `labels-score-*.json` beneath the work directory. The scorer's historical `SAM`
 key denotes the input mask reference even when its input is the student; the
 filenames identify the actual backend.
+
+### Shadow/crop experiments, September 12, 2026
+
+The installed `eye_student_v1.ot` is **unchanged**. These are opt-in training
+experiments, not a new default or a change to stereo/gaze authority. Artifacts
+are in `outputs/student-shadow-training.iHFIiw`; the original investigation is
+in `outputs/student-shadow.FkzvzE`.
+
+In `both-eyes-1789218305-631052561.tar`, the subject-left outer mask frequently
+includes the dark upper lid/lash band. Some of that wrong boundary survives
+flat-tire exclusion and pulls the completed ellipse upward and outward. This
+is visible in the mask-stage replay before the joint solver. Angle changes in
+a nearly circular ellipse are not by themselves evidence of a physical gaze
+rotation; the problematic center/radius/retained-contour changes are separate.
+
+The clip contains 129 exact same-clock pairs (258 native 420×280 RAW exposures),
+sequences 4395–4523 over 11.385 sensor seconds. It was **not used in training**.
+Models were trained on the existing 730-exposure qualified teacher cache,
+with the original 574/84/72 source-lineage train/validation/development-test
+partition. All comparisons use source-native coordinates and verified returned
+source receipts, not the latest displayed image or held predictions. Each
+candidate also ran on the 76-exposure canonical-label neighborhood index and
+all 730 pilot exposures. Training/evaluation jobs ran in parallel under shared
+resource claims; their elapsed times are not speed benchmarks.
+
+Two changes were tested together as `shadow-crop-v1`: larger paired affine
+crop translations and spatially varying soft shadows. The normalized sampling
+grid can translate ±0.5 (about ±105/70 native pixels at this ROI size), versus
+the legacy ±0.08, and its scale range is 0.8–1.2 versus 0.9–1.1. Image and mask
+use the same affine. Border-replicated image context is **not** a known negative
+mask target: fully source-supported pixels alone contribute to the masked
+BCE/Dice loss. Half the examples receive a smoothly varying directional shadow;
+the original mild channel gain/offset augmentation remains. This is an RGB
+appearance simulation, not physical lighting, an opaque occluder, or calibrated
+RAW noise. The experiment does not isolate shadow augmentation from crop
+augmentation, so neither alone can be credited with the improvement.
+
+An optional versioned network adds a **2×16×24 coarse brightness/contrast map**
+from the current RGB exposure alone. Each 16×16 block supplies the mean and
+standard deviation of `0.25 R + 0.5 G + 0.25 B`; two small convolutions feed the
+network's coarse stage while retaining the original RGB path. This is not a
+measured illumination map or a reflectance decomposition. It adds 4,192
+parameters (217,354 total), not another detector or a second exposure. It does
+not depend on the fitted center, circularity assumptions, the other eye, gaze,
+or future frames. A radial input centered on an already-wrong ellipse was not
+added: it risks reinforcing precisely the error under investigation.
+
+The four single-seed trials below share the same training source cache.
+Checkpoint selection still uses validation mask IoU, not this new clip or human
+labels. The center column uses the **same 113 commonly admitted left-eye
+exposures across all five models and SAM**. SAM disagreement is not human error.
+Admission counts include all frames, not just that common subset; `outer/pupil`
+means pupils accompanying an admitted outer fit.
+
+| Trial | Left center disagreement with SAM, median px | Clip left outer/pupil / 129 | Validation outer/pupil / 84 | Development test outer/pupil / 72 |
+| --- | ---: | ---: | ---: | ---: |
+| Installed baseline | 17.93 | 121/118 | 38/21 | 40/30 |
+| New RGB training, shadow/crop | 2.22 | 118/118 | 34/16 | 34/25 |
+| New coarse-context training, shadow/crop | 10.97 | 120/120 | 37/20 | 40/33 |
+| Warm start, 25% shadow/crop batches | 19.12 | 122/120 | 36/23 | 41/27 |
+| Warm start, shadow/crop | 2.96 | 122/117 | 39/23 | 39/28 |
+
+The new RGB and context models selected epochs 90 and 25 of 120. The two warm
+starts used the installed weights, a lower learning-rate range (0.0002 down
+to 0.00002), and 60 epochs; validation selected epochs 10 and 1 respectively.
+The gentler **warm-shadow** checkpoint is the preview candidate. Its manifest
+is `warm-shadow.json`, weights `warm-shadow.ot`, SHA-256
+`ec98dfc23b835c45da939088970921467fc68ab43db5bd2e7abf9e16dcbab54b`.
+It retains the original 213,162-parameter RGB architecture. The coarse map
+did not win this bounded comparison and is not enabled automatically.
+
+Comparing only baseline, warm-shadow, and SAM expands their common left-eye
+subset to 118 frames: median center disagreement is **17.90→2.95 px** and
+median radius ratio to SAM is **1.172→1.027**. Mean disagreement is still
+15.21→8.27 px and the candidate maximum is 49.53 px: large disagreements remain. Right-eye
+median center disagreement slightly regresses, 1.78→2.10 px on 119 common
+frames, with unchanged 122/129 outer admissions and pupil count 122→118.
+
+SN-FEIDA uses independent source-associated MediaPipe scale support only, not
+either fitted radius as the scale denominator. On the same 40 adjacent,
+commonly admitted, scale-supported left-eye pairs, mean absolute log-area step
+improves **0.09092→0.03803**; on 41 right-eye pairs it is 0.01171→0.01163.
+Those scale hints are held coarse estimates, not fresh per-exposure metric
+head-distance measurements. At the left ROI's (44,70)-pixel reframe from
+sequence 4474 to 4475, baseline sensor-coordinate center delta is (-1.55,17.11)
+px, candidate (0.64,0.64), and SAM (0.26,1.45). The matched area log-step is
+0.41480→0.01200 (SAM 0.01484). These are observed natural-motion examples,
+not a controlled proof of invariance to arbitrary reframing. Other moves,
+dropouts and missing-scale cases are retained in `report.json`.
+
+Ten of the 16 reviewed canonical labels have exact RAW/dimension/origin matches
+in the 76-exposure neighborhood replay. Baseline and warm-shadow admit the
+same nine; **all nine visible-boundary RMS errors improve**, with equal-frame
+mean 5.719→5.105 native px. Both still reject the difficult sequence-317 crop.
+There are no canonical labels in the new shadow clip. One labeled RAW image
+overlaps pseudo-label training, earlier development reused the pilot holdouts,
+and this is one subject/small pilot, not an untouched population benchmark.
+
+Coverage is not equivalent to accuracy. The warm candidate loses one original
+left-eye admission (sequence 4467, partial lid closure) and gains two unverified
+ones. In the 72-frame development test it loses four outer admissions and gains
+three; in validation it loses one and gains two. Visual review of every held-out
+outer/pupil loss found a mixture: skin/glasses without a visible iris (index
+201580), an upper-lid/crop-edge fit (44119), blurred/off-edge eyes (28229, 1828,
+49853), and pupils with strong reflection or weak/partial contrast. These are
+qualitative inspection categories, **not new human labels or certified false
+positives**. The remaining pupil dropouts must not be hidden by better outer
+fits. `regressions.json` and `warm-shadow-regression-*.png` retain the exact
+sources and both decisions.
+
+To reproduce training after obtaining the resource-coordination claim, use a
+fresh destination and the same LibTorch environment as above:
+
+```sh
+BUTTERCUP_EYE_STUDENT_TRAIN_AUGMENTATION=shadow-crop-v1 \
+BUTTERCUP_EYE_STUDENT_TRAIN_INITIAL_MODEL=data/models/eye_student_v1.ot \
+  data/target/live/buttercup_eye_student train \
+  outputs/eye-student.FQGerU/teacher-v2 outputs/NEW_RUN/model.ot 60
+```
+
+`BUTTERCUP_EYE_STUDENT_TRAIN_ARCHITECTURE=luma-context-v2` selects the separate
+context architecture for a new training run; `rgb` remains the default.
+`BUTTERCUP_EYE_STUDENT_TRAIN_AUGMENTATION=mixed-shadow-crop-v1` selects the
+one-quarter strong-batch ablation; `legacy` remains the training default.
+Unknown variant names and incompatible warm starts fail explicitly. Architecture
+and derived-context metadata govern loading, not a runtime guess or UI switch.
+
+For an explicitly chosen preview session, set `BUTTERCUP_EYE_STUDENT_MODEL` to
+`outputs/student-shadow-training.iHFIiw/warm-shadow.ot` and choose Eye Student
+(`G` or `--segmentation eye-student`). No default model file, pupil-admission
+gate, calibration, UI/stereo file, or camera setting was changed by this work.
+`warm-shadow-comparison.mp4` compares the installed model above the candidate
+on the same RAW frames, with subject-right on the left and subject-left on the
+right. This validates the mask/shared-fit stage only, **not final joint 3D pose,
+sign continuity, monitor calibration, or cursor accuracy**.
+
+The focused Student suite passes all 11 tests, including source pairing,
+observed-arc preservation, network shape/parameter bounds, versioned metadata,
+per-exposure context isolation, paired affine alignment, unknown-pixel loss
+masking and bounded directional shadows. The standalone CUDA build, portable
+no-CUDA check, and source-tree audit pass. Replaying the unchanged installed
+weights with the updated code reproduces all 258 original clip admissions,
+outer fits, pupil observations and retained/censored contour records exactly.

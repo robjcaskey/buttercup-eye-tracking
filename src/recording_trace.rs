@@ -72,6 +72,32 @@ pub(crate) struct Stamp {
 #[derive(Clone)]
 pub(crate) struct Hub(Arc<Mutex<Journal>>);
 
+/// One immutable, exact RAW receipt. Identity and age are captured under the
+/// same journal lock, so reconnects cannot splice an old age onto a new epoch.
+#[derive(Clone, Debug)]
+pub(crate) struct SourceReceipt {
+    key: Value,
+    measured_at: Instant,
+    source_arrival_age: Duration,
+}
+
+impl SourceReceipt {
+    pub fn key(&self) -> &Value {
+        &self.key
+    }
+
+    pub fn measured_at(&self) -> Instant {
+        self.measured_at
+    }
+
+    /// Normalize this source's age to a common snapshot/publication instant.
+    /// Assembly time never renews evidence; backwards time remains unknown.
+    pub fn age_at(&self, now: Instant) -> Option<Duration> {
+        self.source_arrival_age
+            .checked_add(now.checked_duration_since(self.measured_at)?)
+    }
+}
+
 impl Default for Hub {
     fn default() -> Self {
         Self(Arc::new(Mutex::new(Journal {
@@ -285,13 +311,27 @@ impl Hub {
     /// Liveness of an exact RAW source for desktop mouse output, even outside
     /// recording. Do not substitute the newest frame or the solve's ready time.
     pub fn source_arrival_age(&self, eye: u32, timestamp_ns: u64) -> Option<Duration> {
+        self.source_receipt(eye, timestamp_ns)?.age_at(Instant::now())
+    }
+
+    /// Atomically capture the unique source key and its original arrival age.
+    /// Callers assembling multiple observations must use each receipt's
+    /// age_at with their common snapshot instant, not a second source lookup.
+    pub fn source_receipt(&self, eye: u32, timestamp_ns: u64) -> Option<SourceReceipt> {
         let journal = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let mut matches = journal.sources.iter()
             .filter(|(roi, time, _)| *roi == eye && *time == timestamp_ns);
         let (_, _, clock) = matches.next()?;
         if matches.next().is_some() { return None; }
         let elapsed_ns: u64 = clock["host_arrival_monotonic_ns"].as_str()?.parse().ok()?;
-        journal.origin.elapsed().checked_sub(Duration::from_nanos(elapsed_ns))
+        let measured_at = Instant::now();
+        let source_arrival_age = measured_at.checked_duration_since(journal.origin)?
+            .checked_sub(Duration::from_nanos(elapsed_ns))?;
+        Some(SourceReceipt {
+            key: clock["source_key"].clone(),
+            measured_at,
+            source_arrival_age,
+        })
     }
 
     pub fn region(&self, region: Value) {
@@ -354,6 +394,9 @@ impl Hub {
     pub fn presented(&self, presentation: Presentation, before_submit: Stamp) {
         let mut journal = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let after = journal.stamp();
+        let optical_clock = crate::screen_reflection_border::presented(
+            &presentation.scene["calibration"]["lightbox"], presentation.size,
+            &before_submit.unix_ns, &after.unix_ns);
         let id = journal.next_presentation;
         let mut scene_changes = vec![];
         journal.next_presentation = journal.next_presentation.saturating_add(1);
@@ -447,6 +490,7 @@ impl Hub {
         }
         let mut row = base;
         row["event"] = json!("presentation");
+        if !optical_clock.is_null() { row["optical_clock"] = optical_clock; }
         row["active_targets"] = json!(targets);
         row["gaze"] = json!({
             "predicted_normalized": predicted,
@@ -740,6 +784,39 @@ mod tests {
             },
             display: json!({"id":"test"}),
             scene: json!({"geometry":{"units":"inches"},"eyes":[],"roi_states":[]}),
+        }
+    }
+
+    #[test]
+    fn clock_border_records_symbols_and_targets_together_in_existing_oim1() {
+        let hub=Hub::default();
+        let subscription=hub.subscribe();
+        subscription.take(false);
+        let now=Instant::now();
+        let epoch=crate::screen_reflection_border::Epoch::new(now);
+        for mode in ["mouse-calibration","recorded-stimulus"] {
+            let mut p=presentation(Some(0),100);
+            p.mode=mode;
+            p.scene["calibration"]=json!({"lightbox":{"enabled":true,"width_fraction":0.16,
+                "optical_clock":epoch.metadata(now)}});
+            hub.presented(p,hub.stamp());
+        }
+        let emitted=rows(&subscription,false);
+        let mut bytes=Vec::new();
+        for row in emitted.iter().filter(|r|r["event"]=="presentation") {
+            write_metadata(&mut bytes,row).unwrap();
+        }
+        let decoded=decode_metadata(&bytes);
+        assert_eq!(decoded.len(),2);
+        for (row,mode) in decoded.iter().zip(["mouse-calibration","recorded-stimulus"]) {
+            assert_eq!(row["mode"],mode);
+            assert_eq!(row["optical_clock"]["emitted"]["scheme"],crate::screen_reflection_temporal::SCHEME);
+            assert_eq!(row["optical_clock"]["emitted"]["epoch"],epoch.id);
+            assert_eq!(row["active_targets"].as_array().unwrap().len(),1);
+            assert_eq!(row["gaze"]["predicted_normalized"],json!([0.3,1.2]));
+            assert!(!row["host_submit_begin_unix_ns"].is_null());
+            assert!(!row["host_submit_end_unix_ns"].is_null());
+            assert_eq!(row["optical_clock"]["recovery_is_new_camera_observation"],false);
         }
     }
 
@@ -1159,6 +1236,62 @@ mod tests {
         assert!(hub.source_arrival_age(1, 100).unwrap() >= Duration::from_secs(7));
         hub.raw_arrived(key(1, "100", "b"), origin + Duration::from_secs(9), 4);
         assert!(hub.source_arrival_age(1, 100).is_none());
+    }
+
+    #[test]
+    fn atomic_source_receipt_preserves_identity_age_and_assembly_time() {
+        let hub = Hub::default();
+        let origin = Instant::now() - Duration::from_secs(10);
+        hub.0.lock().unwrap().origin = origin;
+        let key = json!({"roi_id":1, "sensor_timestamp_ns":"100",
+            "stream_epoch":"original", "sequence":"17", "region_generation":"3"});
+        let clock = hub.raw_arrived(key.clone(), origin + Duration::from_secs(3), 1);
+        let receipt = hub.source_receipt(1, 100).unwrap();
+        assert_eq!(receipt.key, clock["source_key"]);
+        assert_eq!(receipt.key["sequence"], "17");
+        assert_eq!(receipt.key["region_generation"], "3");
+        let measured_age = receipt.age_at(receipt.measured_at).unwrap();
+        assert!(measured_age >= Duration::from_secs(7));
+        let assembled_at = receipt.measured_at + Duration::from_secs(2);
+        assert_eq!(receipt.age_at(assembled_at), measured_age.checked_add(Duration::from_secs(2)));
+        assert!(receipt.age_at(receipt.measured_at - Duration::from_nanos(1)).is_none());
+
+        // Neither duplicate delivery nor a later reconnect can rewrite a
+        // captured receipt. New ambiguous lookups still fail closed.
+        hub.raw_arrived(key.clone(), origin + Duration::from_secs(9), 2);
+        assert_eq!(hub.source_receipt(1, 100).unwrap().key, receipt.key);
+        let mut reused_timestamp = key;
+        reused_timestamp["stream_epoch"] = json!("reconnected");
+        hub.raw_arrived(reused_timestamp, origin + Duration::from_secs(9), 3);
+        assert!(hub.source_receipt(1, 100).is_none());
+        assert_eq!(receipt.key["stream_epoch"], "original");
+        assert_eq!(receipt.age_at(assembled_at), measured_age.checked_add(Duration::from_secs(2)));
+        assert!(hub.source_receipt(2, 100).is_none());
+        assert!(hub.source_receipt(1, 101).is_none());
+    }
+
+    #[test]
+    fn atomic_receipts_keep_per_roi_age_at_a_common_snapshot_time() {
+        let hub = Hub::default();
+        let origin = Instant::now() - Duration::from_secs(10);
+        hub.0.lock().unwrap().origin = origin;
+        for (roi, seconds) in [(1, 3), (2, 9)] {
+            hub.raw_arrived(json!({"roi_id":roi, "sensor_timestamp_ns":"100",
+                "stream_epoch":"same-read"}), origin + Duration::from_secs(seconds), roi);
+        }
+        let older = hub.source_receipt(1, 100).unwrap();
+        let newer = hub.source_receipt(2, 100).unwrap();
+        let captured_at = newer.measured_at + Duration::from_millis(50);
+        let older_age = older.age_at(captured_at).unwrap();
+        let newer_age = newer.age_at(captured_at).unwrap();
+        assert_eq!(older_age.checked_sub(newer_age), Some(Duration::from_secs(6)));
+
+        // Eviction removes availability, not the identity/time of a receipt
+        // already copied by a consumer. It cannot be looked up as a new frame.
+        hub.0.lock().unwrap().sources.clear();
+        assert!(hub.source_receipt(1, 100).is_none());
+        assert_eq!(older.age_at(captured_at), Some(older_age));
+        assert_eq!(newer.age_at(captured_at), Some(newer_age));
     }
 
     #[test]

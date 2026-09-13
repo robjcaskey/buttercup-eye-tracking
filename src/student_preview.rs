@@ -381,6 +381,8 @@ pub(super) fn draw(
             }
         }
         RoiOverlayMode::SamDeflattenedVirtualContact => layer.contact(frame, p),
+        RoiOverlayMode::SamTweakedContactGeometry => limbus_refiner_view::draw(
+            layer.pixels, layer.width, layer.height, 0, 0, 1, frame),
         RoiOverlayMode::StudentSourceRaw => 0,
         RoiOverlayMode::SamOuterIrisFit
         | RoiOverlayMode::SamConicSegments
@@ -627,12 +629,12 @@ mod tests {
     fn student_cycle_adds_sparse_layers_without_changing_sam() {
         let method = SegmentationMode::EyeStudent;
         let available = RoiOverlayMode::available(method);
-        assert_eq!(available.len(), 11);
+        assert_eq!(available.len(), 12);
         assert_eq!(available.last(), Some(&RoiOverlayMode::FullDiagnostics));
         let mut mode = available[0];
         for (i, expected) in available.iter().enumerate() {
             assert_eq!(mode, *expected);
-            assert_eq!(mode.position_for(method), (i + 1, 11));
+            assert_eq!(mode.position_for(method), (i + 1, 12));
             assert!(!mode.label_for(method).contains("ENTER EDIT"));
             mode = mode.cycled_for(method);
         }

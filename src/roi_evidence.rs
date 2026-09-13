@@ -65,15 +65,57 @@ pub(crate) enum BoundaryKind {
 /// not a calibrated posterior or an independent second vote for the contour.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct BoundaryNormalObservation {
-    pub(crate) unit_outward_roi: [f64;2],
+    pub(crate) unit_outward_roi: [f64; 2],
     pub(crate) angular_sigma_radians: f64,
 }
 
 impl BoundaryNormalObservation {
-    pub(crate) fn valid(self)->bool {
+    pub(crate) fn valid(self) -> bool {
         self.unit_outward_roi.into_iter().all(f64::is_finite)
-            && (self.unit_outward_roi[0].hypot(self.unit_outward_roi[1])-1.0).abs()<1.0e-6
-            && self.angular_sigma_radians.is_finite() && self.angular_sigma_radians>0.0
+            && (self.unit_outward_roi[0].hypot(self.unit_outward_roi[1]) - 1.0).abs() < 1.0e-6
+            && self.angular_sigma_radians.is_finite()
+            && self.angular_sigma_radians > 0.0
+    }
+}
+
+/// Three correlated locations of ONE semantic boundary sample. The nominal
+/// raster contour remains state 1; the two shifts describe sensitivity to
+/// mask-logit levels -1/+1 relative to level zero. States are shared across
+/// all profiled arcs of the same eye/boundary kind, never extra pixel votes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BoundaryLevelSetObservation {
+    pub(crate) unit_normal_roi: [f64; 2],
+    pub(crate) displacement_px: [f64; 3],
+    /// Optional coherent shape modes, bounded by the same measured -1/+1
+    /// level envelope: +cos(2 theta), -cos(2 theta), +sin(2 theta), -sin(2 theta).
+    /// theta is the measured contour-normal angle, never a fitted eye normal.
+    pub(crate) spatial_displacement_px: Option<[f64; 4]>,
+}
+
+impl BoundaryLevelSetObservation {
+    pub(crate) fn valid(self) -> bool {
+        self.unit_normal_roi.into_iter().all(f64::is_finite)
+            && (self.unit_normal_roi[0].hypot(self.unit_normal_roi[1]) - 1.0).abs() < 1e-6
+            && self.displacement_px.into_iter().all(f64::is_finite)
+            && self.displacement_px[1] == 0.0
+            && self.displacement_px[0] * self.displacement_px[2] <= 0.0
+            && self.spatial_displacement_px.is_none_or(|states| states.into_iter().all(|v|
+                v.is_finite() && v >= self.displacement_px[0].min(self.displacement_px[2]) - 1e-12
+                    && v <= self.displacement_px[0].max(self.displacement_px[2]) + 1e-12))
+    }
+    pub(crate) fn varies(self) -> bool {
+        self.displacement_px[0] != 0.0 || self.displacement_px[2] != 0.0
+    }
+
+    /// A declared spatial sensitivity model, not extra observations or
+    /// calibrated mask probabilities. Opposing modes form a coherent field
+    /// across the source contour and never move a point beyond its envelope.
+    pub(crate) fn with_spatial_sensitivity(mut self) -> Self {
+        let angle = 2.0 * self.unit_normal_roi[1].atan2(self.unit_normal_roi[0]);
+        let (sine, cosine) = angle.sin_cos();
+        self.spatial_displacement_px = Some([cosine,-cosine,sine,-sine].map(|level|
+            if level < 0.0 {-level*self.displacement_px[0]} else {level*self.displacement_px[2]}));
+        self
     }
 }
 
@@ -90,6 +132,11 @@ pub(crate) struct BoundaryArcObservation<'a> {
     /// When present, exactly one optional direction per point, before any
     /// downstream decimation. Missing directions supply no angular constraint.
     pub(crate) outward_normals_roi: Option<&'a [Option<BoundaryNormalObservation>]>,
+    pub(crate) level_sets_roi: Option<&'a [Option<BoundaryLevelSetObservation>]>,
+    /// Source-local RAW edge allowance, measured before fitting. Replaces the
+    /// full-ROI optical fallback for this arc only; excludes contour sampling
+    /// and source-time allowances. Engineering sigma, not calibrated coverage.
+    pub(crate) localization_sigma_px: Option<f64>,
     pub(crate) normal_band_half_width_px: Option<f64>,
     pub(crate) detector_score: Option<f64>,
 }
@@ -188,8 +235,12 @@ impl SimilarityMotion {
         let x = point[0] - center[0];
         let y = point[1] - center[1];
         [
-            point[0] + self.translation[0] + self.diagonal_coefficient_delta * x - self.rotation_coefficient * y,
-            point[1] + self.translation[1] + self.rotation_coefficient * x + self.diagonal_coefficient_delta * y,
+            point[0] + self.translation[0] + self.diagonal_coefficient_delta * x
+                - self.rotation_coefficient * y,
+            point[1]
+                + self.translation[1]
+                + self.rotation_coefficient * x
+                + self.diagonal_coefficient_delta * y,
         ]
     }
 }

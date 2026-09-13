@@ -7,7 +7,10 @@ default-run = "buttercup-eye-viewer"
 [dependencies]
 libc = "0.2"
 libloading = "0.8.9"
+libm = "0.2.16"
 serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10.9"
 softbuffer = { version = "0.4.8", default-features = false, features = ["wayland", "wayland-dlopen"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen"] }
 opencv = { version = "0.92.3", optional = true, default-features = false, features = ["clang-runtime", "imgproc", "calib3d"] }
@@ -61,3 +64,7 @@ path = "src/bin/buttercup_sam31_video_graph.rs"
 name = "buttercup-sam31-tracker-bundle"
 path = "src/bin/buttercup_sam31_tracker_bundle.rs"
 required-features = ["sam31"]
+
+[[bin]]
+name = "buttercup-perspective-sign-replay"
+path = "src/bin/buttercup_perspective_sign_replay.rs"

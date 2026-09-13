@@ -15,9 +15,11 @@ use native::{conic_solver,outline_conic_segments,roi_evidence};
 use native::{binocular_coordinator,eye_scene_model};
 #[path="../gaze_target_solver/joint_tracking.rs"] mod joint_tracking;
 #[path="buttercup_stereo_conic_eval/source_order.rs"] mod source_order;
+#[path="../sam31_boundary_logits.rs"] mod mask_boundary_logits;
 use native::eye_scene_model::binocular_pose::{approximate_scene,EyePoseInput};
 use conic_solver::joint::*;
 use outline_conic_segments::sparse_evidence::*;
+use outline_conic_segments::sparse_evidence::uncertainty as raw_optical_uncertainty;
 use outline_conic_segments::partial_outline::{append_unfitted_outline_arcs,OutlineCandidate,PartialOutlineReport};
 use roi_evidence::{BoundaryKind,ExposureKey,RoiId,SourceClock};
 use serde_json::{json,Value};
@@ -46,14 +48,85 @@ fn sample_fingerprint(points:&[(f64,f64)])->String {
     format!("{digest:016x}")
 }
 
+#[derive(Clone,Copy,Default)]
+struct ExtractionPolicy {
+    partial_outlines:bool,
+    outline_directions:bool,
+    raw_uncertainty:bool,
+    raw_outer_spread:bool,
+    raw_outer_position:bool,
+    without_pupil:bool,
+    all_boundary_samples:bool,
+    coherent_pupil_arcs:bool,
+    mask_levels:bool,
+    mask_spatial:bool,
+    raw_outer_candidates:bool,
+    withhold_rejected_outer:bool,
+}
+
 struct Frame {
     input:Value,
+    outer_spread:Option<Vec<raw_optical_uncertainty::OuterSpreadArc>>,
+    outer_position:Option<Vec<raw_optical_uncertainty::OuterPositionArc>>,
+    mask_levels:Option<Value>,
+    outer_candidates:Option<Value>,
+    rejected_outer_ablation:Option<Value>,
     packet:OwnedRoiEvidence,
     pose:EyePoseInput,
     validation:Vec<(usize,u32,BoundaryKind,Vec<(f64,f64)>)>,
     baseline:Option<geometry::Ellipse>,
     selected_raw_admitted:bool,
     partial_outline:PartialOutlineReport,
+    pupil_ablation:Value,
+    all_boundary_samples:bool,
+    coherent_pupil_arcs:bool,
+}
+
+/// Offline causal control. Remove both observed pupil arcs and their search
+/// hints, but keep the already-extracted outer evidence, RAW policy and scale.
+/// Remap surviving hints before training/validation decimation assigns indices.
+fn remove_pupil_evidence(packet:&mut OwnedRoiEvidence)->Value {
+    let mut remap=vec![None;packet.arcs.len()];
+    let mut retained=0;
+    let mut removed_groups=Vec::new();
+    for (index,arc) in packet.arcs.iter().enumerate() {
+        if arc.kind==BoundaryKind::PupillaryBoundary {removed_groups.push(arc.evidence_group);}
+        else {remap[index]=Some(retained);retained+=1;}
+    }
+    packet.arcs.retain(|a|a.kind!=BoundaryKind::PupillaryBoundary);
+    let hints=packet.conics.len();
+    packet.conics.retain(|c|c.kind!=BoundaryKind::PupillaryBoundary);
+    for conic in &mut packet.conics {
+        conic.supporting_arc_indices=conic.supporting_arc_indices.iter()
+            .filter_map(|&index|remap.get(index).copied().flatten()).collect();
+    }
+    json!({"removed_pupil_arc_groups":removed_groups,"removed_pupil_hints":hints-packet.conics.len(),
+        "contract":"Pupil observations and initialization hints removed after shared extraction; all other observations, pose/scale inputs and source identities preserved."})
+}
+
+/// Offline causal control: the existing RAW rejection removes only the outer
+/// observation family. Independently extracted pupil/inner support survives.
+fn remove_outer_evidence(packet:&mut OwnedRoiEvidence)->Value {
+    let mut remap=vec![None;packet.arcs.len()];
+    let mut retained=0;
+    let mut removed_groups=Vec::new();
+    for (index,arc) in packet.arcs.iter().enumerate() {
+        if arc.kind==BoundaryKind::OuterLimbus {removed_groups.push(arc.evidence_group);}
+        else {remap[index]=Some(retained);retained+=1;}
+    }
+    packet.arcs.retain(|a|a.kind!=BoundaryKind::OuterLimbus);
+    let hints=packet.conics.len();
+    packet.conics.retain(|c|c.kind!=BoundaryKind::OuterLimbus);
+    for conic in &mut packet.conics {
+        conic.supporting_arc_indices=conic.supporting_arc_indices.iter()
+            .filter_map(|&index|remap.get(index).copied().flatten()).collect();
+    }
+    json!({"applied":"selected-mask-failed-existing-raw-gate",
+        "removed_outer_arc_groups":removed_groups,"removed_outer_hints":hints-packet.conics.len(),
+        "preserved_arcs":packet.arcs.iter().map(|a|json!({"kind":format!("{:?}",a.kind),
+            "group":a.evidence_group,"points_digest":sample_fingerprint(&a.points_roi_px),
+            "points":a.points_roi_px.len()})).collect::<Vec<_>>(),
+        "contract":"Remove only rejected outer observations and their conic search hints after native extraction. Pupil/inner observations, RAW policy, source identity and original scene initialization stay fixed. The RAW gate is an engineering admission rule, not calibrated anatomical identity."})
 }
 
 fn prepare(row:Value,partial_outlines:bool)->Result<Frame,String> {
@@ -61,6 +134,18 @@ fn prepare(row:Value,partial_outlines:bool)->Result<Frame,String> {
 }
 
 fn prepare_with_directions(row:Value,partial_outlines:bool,outline_directions:bool)->Result<Frame,String> {
+    prepare_with_policy(row,ExtractionPolicy {partial_outlines,outline_directions,..Default::default()})
+}
+
+fn prepare_with_policy(row:Value,policy:ExtractionPolicy)->Result<Frame,String> {
+    let ExtractionPolicy {partial_outlines,outline_directions,raw_uncertainty,raw_outer_spread,raw_outer_position,without_pupil,all_boundary_samples,coherent_pupil_arcs,mask_levels,mask_spatial,raw_outer_candidates,withhold_rejected_outer}=policy;
+    if [raw_outer_candidates,partial_outlines,withhold_rejected_outer].into_iter().filter(|v|*v).count()>1 {
+        return Err("compare RAW outer candidates, partial-mask extraction and outer withholding separately".into());
+    }
+    if mask_spatial && !mask_levels {return Err("spatial sensitivity requires native mask-level evidence".into());}
+    if [raw_uncertainty,raw_outer_spread,raw_outer_position].into_iter().filter(|v|*v).count()>1 {
+        return Err("select one RAW uncertainty experiment".into());
+    }
     let input=row["input"].clone();
     let meta=&input["frame"];
     let eye=integer(meta,"eye_id")?;
@@ -78,7 +163,7 @@ fn prepare_with_directions(row:Value,partial_outlines:bool,outline_directions:bo
     let baseline=selected.and_then(|c|ellipse(&c["baseline_ellipse"]));
     let try_partial=partial_outlines&&(baseline.is_none()||!selected_raw_admitted);
     let pupil=ellipse(&row["pupil_void"]["ellipse"]);
-    let raw=if outline_directions || pupil.is_some() || try_partial {
+    let raw=if raw_uncertainty || raw_outer_spread || raw_outer_position || outline_directions || pupil.is_some() || try_partial || raw_outer_candidates {
         let mut file=File::open(input["raw_file"].as_str().ok_or("missing RAW file")?).map_err(|e|e.to_string())?;
         file.seek(SeekFrom::Start(integer(&input,"raw_offset")?)).map_err(|e|e.to_string())?;
         let mut bytes=vec![0;integer(&input,"raw_length")? as usize];file.read_exact(&mut bytes).map_err(|e|e.to_string())?;
@@ -87,7 +172,15 @@ fn prepare_with_directions(row:Value,partial_outlines:bool,outline_directions:bo
     // A rejected complete conic is not stronger evidence than an incomplete
     // outline. In this explicit experiment, re-extract RAW-supported measured
     // arcs instead of keeping the rejected fit's unchecked sections as well.
+    let mut outer_candidates=None;
     if let Some((selected,baseline))=selected.zip(baseline).filter(|_|!try_partial) {
+      if raw_outer_candidates && !selected_raw_admitted {
+        let report=outline_conic_segments::sparse_evidence::outer_candidates::append(&mut packet,raw.as_deref().unwrap(),baseline,0);
+        outer_candidates=Some(json!({"applied":"selected-mask-failed-existing-raw-gate","report":report,
+            "arcs":packet.arcs.iter().map(|a|json!({"group":a.evidence_group,"points":a.points_roi_px,
+                "band_px":a.normal_band_half_width_px,"raw_contrast":a.detector_score})).collect::<Vec<_>>(),
+            "contract":"Four neighboring ellipse guides locate bounded native RAW searches. Only observed positive edge peaks become outer-iris candidates. Fixed image-angle sectors share alternative budgets. Rejected SAM points and their logit profiles are replaced; independently extracted pupil evidence and original scene initialization remain unchanged. No anatomical identity or calibrated confidence guarantee."}));
+      } else {
         let retained=points(&selected["baseline_retained"]);
         let segments=selected["baseline_retained_segments"].as_array().map(|segments|segments.iter().filter_map(|run| {
             Some(run.as_array()?.iter().filter_map(|i|i.as_u64().map(|i|i as usize)).collect::<Vec<_>>())
@@ -101,12 +194,13 @@ fn prepare_with_directions(row:Value,partial_outlines:bool,outline_directions:bo
         if !selected_raw_admitted {
             for arc in &mut packet.arcs {arc.normal_band_half_width_px=5.0;}
         }
+      }
     }
     let mut partial_outline=PartialOutlineReport::default();
     if let Some(raw)=raw.as_ref() {
         if let Some((pupil,config))=pupil.zip(baseline.and_then(|outer|
             RawArcConfig::for_pupil(&raw,size[0] as usize,size[1] as usize,outer))) {
-            append_raw_ring_arcs(&mut packet,&raw,pupil,BoundaryKind::PupillaryBoundary,100,config);
+            append_raw_ring_arcs_with_cohesion(&mut packet,&raw,pupil,BoundaryKind::PupillaryBoundary,100,config,coherent_pupil_arcs);
         }
         if try_partial {
             let mut ranked=candidates.iter().filter(|c|c["semantic_score"].as_f64().is_some_and(f64::is_finite)).collect::<Vec<_>>();
@@ -116,8 +210,42 @@ fn prepare_with_directions(row:Value,partial_outlines:bool,outline_directions:bo
             partial_outline=append_unfitted_outline_arcs(&mut packet,&raw,&candidates,(size[0] as f64*0.5,size[1] as f64*0.5),200);
         }
     }
-    // The replaced rejected ellipse remains diagnostic output, not a hidden
-    // position constraint after its contour evidence has been discarded.
+    if raw_uncertainty {
+        if let Some(raw)=raw.as_deref() { outline_conic_segments::sparse_evidence::uncertainty::measure(&mut packet,raw); }
+    }
+    let outer_spread=raw_outer_spread.then(||raw_optical_uncertainty::measure_outer_spread(&mut packet,raw.as_deref().unwrap()));
+    let outer_position=raw_outer_position.then(||raw_optical_uncertainty::measure_outer_position(&mut packet,raw.as_deref().unwrap()));
+    let pupil_ablation=if without_pupil {remove_pupil_evidence(&mut packet)} else {Value::Null};
+    let rejected_outer_ablation=(withhold_rejected_outer && baseline.is_some() && !selected_raw_admitted)
+        .then(||remove_outer_evidence(&mut packet));
+    let mask_levels=if mask_levels {
+        Some(if outer_candidates.is_some() {
+            json!({"source_evidence":"replaced-by-native-raw-candidates","attachment":"SAM mask profiles do not belong to the replacement observations"})
+        } else if rejected_outer_ablation.is_some() {
+            json!({"source_evidence":"rejected-outer-withheld","attachment":"No mask profiles attached to removed outer observations"})
+        } else if let Some(value)=row.get("outer_boundary_logits").filter(|v|!v.is_null()) {
+            let evidence:mask_boundary_logits::Evidence=serde_json::from_value(value.clone())
+                .map_err(|error|format!("invalid native mask-boundary evidence: {error}"))?;
+            if selected.and_then(|c|c["query"].as_u64()).is_some_and(|q|q!=evidence.query as u64) {
+                return Err("mask-boundary evidence belongs to a different selected query".into());
+            }
+            let mut report=json!({"source_evidence":"present","attachment":mask_boundary_logits::attach(&mut packet,&evidence,0)?});
+            if mask_spatial {
+                let mut points=0;
+                for arc in packet.arcs.iter_mut().filter(|a|a.kind==BoundaryKind::OuterLimbus) {
+                    for profile in arc.level_sets_roi.iter_mut().flatten().flatten() {
+                        *profile=profile.with_spatial_sensitivity();points+=1;
+                    }
+                }
+                report["spatial_sensitivity"]=json!({"points":points,"modes":4,
+                    "contract":"Coherent +/- cos(2 theta) and +/- sin(2 theta) threshold fields from measured contour-normal angles, bounded by each original logit-level envelope. No new observations or calibrated probabilities."});
+            }
+            report
+        } else {json!({"source_evidence":"absent"})})
+    } else {None};
+    // These outer-observation experiments preserve the original scene prior to
+    // isolate evidence changes. Its baseline-derived center is not independent
+    // anatomical truth. Partial-outline mode separately uses the crop center.
     let center=baseline.filter(|_|!try_partial).map(|e|[e.center.0+origin[0] as f64,e.center.1+origin[1] as f64])
         .unwrap_or([origin[0] as f64+size[0] as f64*0.5,origin[1] as f64+size[1] as f64*0.5]);
     let scale=&input["scale_hint"];
@@ -125,13 +253,14 @@ fn prepare_with_directions(row:Value,partial_outlines:bool,outline_directions:bo
     let pose=EyePoseInput {limbus_center_sensor_px:center,pixels_per_10mm:scale};
     let mut validation=Vec::new();
     for (index,arc) in packet.arcs.iter_mut().enumerate() {
-        if arc.points_roi_px.len()>=6 {
+        if !all_boundary_samples && arc.points_roi_px.len()>=6 {
             validation.push((index,arc.evidence_group,arc.kind,arc.points_roi_px.iter().skip(1).step_by(2).copied().collect()));
             arc.points_roi_px=arc.points_roi_px.iter().step_by(2).copied().collect();
             arc.outward_normals_roi=arc.outward_normals_roi.take().map(|normals|normals.into_iter().step_by(2).collect());
+            arc.level_sets_roi=arc.level_sets_roi.take().map(|levels|levels.into_iter().step_by(2).collect());
         }
     }
-    Ok(Frame {input,packet,pose,validation,baseline,selected_raw_admitted,partial_outline})
+    Ok(Frame {input,outer_spread,outer_position,mask_levels,outer_candidates,rejected_outer_ablation,packet,pose,validation,baseline,selected_raw_admitted,partial_outline,pupil_ablation,all_boundary_samples,coherent_pupil_arcs})
 }
 
 fn heldout(solution:&JointConicSolution,frames:[Option<&Frame>;2])->[Value;2] {
@@ -160,7 +289,10 @@ fn heldout(solution:&JointConicSolution,frames:[Option<&Frame>;2])->[Value;2] {
 fn solution_json(result:Result<JointConicSolution,JointConicUnavailable>,frames:[Option<&Frame>;2],elapsed:f64)->Value {
     match result {
         Err(reason)=>json!({"available":false,"reason":format!("{reason:?}"),"elapsed_ms":elapsed}),
-        Ok(solution)=>json!({"available":true,"target_camera_mm":solution.target_camera_mm,
+        Ok(solution)=> {
+            let mut output=json!({"available":true,"target_camera_mm":solution.target_camera_mm,
+            "local_uncertainty":solution.local_uncertainty.as_ref().map(|u|u.json()),
+            "posterior":solution.posterior.as_ref().map(|p|p.json()),
             "target_search_chart":{"frame":"reference-to-camera-tangent-plane","slopes":solution.target_viewpoint_slopes,
                 "reference_camera_mm":solution.target_reference_camera_mm,
                 "axial_distance_mm":solution.target_viewpoint_axial_distance_mm,"distance_axis":"reference-to-camera",
@@ -185,16 +317,34 @@ fn solution_json(result:Result<JointConicSolution,JointConicUnavailable>,frames:
                 let e=solution.ellipses_roi_px[eye][0]?;
                 Some(std::f64::consts::PI*(e.major_radius/scale).powi(2))
             }),
-        }),
+            });
+            if !solution.mask_level_families.is_empty() {
+                output["mask_level_families"]=json!(solution.mask_level_families);
+                for (value,arc) in output["support"].as_array_mut().unwrap().iter_mut().zip(&solution.arcs) {
+                    if let Some(level)=arc.mask_level {value["mask_level"]=json!(level);}
+                }
+            }
+            if !solution.arc_alternative_marginals.is_empty() {
+                output["arc_alternative_marginals"]=json!(solution.arc_alternative_marginals);
+            }
+            output
+        },
     }
 }
 
 fn evaluate(frames:[Option<Frame>;2],export_sparse:bool)->Value {
+    evaluate_with_distribution(frames,export_sparse,false)
+}
+
+fn evaluate_with_distribution(frames:[Option<Frame>;2],export_sparse:bool,probabilistic:bool)->Value {
     let poses=frames.each_ref().map(|f|f.as_ref().map(|f|f.pose));
     let prepared=frames.each_ref().map(|f|f.as_ref().map(|f|f.packet.prepare()));
     let evidence=prepared.each_ref().map(|e|e.as_ref().map(|p|p.evidence()));
     let camera=PinholeCamera {focal_px:[4000.0,4000.0],principal_px:[4000.0,3000.0]};
     let base=json!({"inputs":frames.each_ref().map(|f|f.as_ref().map(|f|&f.input)),
+        "pupil_ablation":frames.each_ref().map(|f|f.as_ref().map(|f|&f.pupil_ablation)),
+        "all_boundary_samples":frames.each_ref().map(|f|f.as_ref().map(|f|f.all_boundary_samples)),
+        "coherent_pupil_arcs":frames.each_ref().map(|f|f.as_ref().map(|f|f.coherent_pupil_arcs)),
         "baseline_sam_outer":frames.each_ref().map(|f|ellipse_json(f.as_ref().and_then(|f|f.baseline))),
         "raw_admitted":frames.each_ref().map(|f|f.as_ref().map(|f|f.selected_raw_admitted)),
         "observed_arc_groups":frames.each_ref().map(|f|f.as_ref().map(|f|f.packet.arcs.len())),
@@ -202,12 +352,28 @@ fn evaluate(frames:[Option<Frame>;2],export_sparse:bool)->Value {
             "censored_samples":f.partial_outline.censored_samples,"unsupported_samples":f.partial_outline.unsupported_samples,
             "inward_notch_samples":f.partial_outline.inward_notch_samples,
             "emitted_arcs":f.partial_outline.emitted_arcs}))),
-        "contract":"shared latent fixation versus separate monocular optimizations of the SAME training arcs; no averaged gaze; held-out points condition on upstream detector segmentation/search. Neither metric pose nor gaze accuracy is ground truth."});
+        "contract":"shared latent fixation versus separate monocular optimizations of the SAME training arcs; no averaged gaze; held-out points condition on upstream detector segmentation/search and are absent in all-boundary-samples mode. Neither metric pose nor gaze accuracy is ground truth."});
     let mut row=base;
+    if frames.iter().flatten().any(|f|f.outer_spread.is_some()) {
+        row["outer_raw_spread"]=json!(frames.each_ref().map(|f|f.as_ref().map(|f|&f.outer_spread)));
+    }
+    if frames.iter().flatten().any(|f|f.outer_position.is_some()) {
+        row["outer_raw_position"]=json!(frames.each_ref().map(|f|f.as_ref().map(|f|&f.outer_position)));
+    }
+    if frames.iter().flatten().any(|f|f.mask_levels.is_some()) {
+        row["mask_boundary_profiles"]=json!(frames.each_ref().map(|f|f.as_ref().map(|f|&f.mask_levels)));
+    }
+    if frames.iter().flatten().any(|f|f.outer_candidates.is_some()) {
+        row["raw_outer_candidates"]=json!(frames.each_ref().map(|f|f.as_ref().map(|f|&f.outer_candidates)));
+    }
+    if frames.iter().flatten().any(|f|f.rejected_outer_ablation.is_some()) {
+        row["rejected_outer_ablation"]=json!(frames.each_ref().map(|f|f.as_ref().map(|f|&f.rejected_outer_ablation)));
+    }
     if export_sparse {
         row["sparse_evidence"]=json!(frames.each_ref().map(|f|f.as_ref().map(|f|json!({
             "arcs":f.packet.arcs.iter().map(|a|json!({"group":a.evidence_group,"kind":format!("{:?}",a.kind),
                 "points":a.points_roi_px,"band_half_width_px":a.normal_band_half_width_px,
+                "raw_localization_sigma_px":a.localization_sigma_px,
                 "outward_normals":a.outward_normals_roi.as_ref().map(|normals|normals.iter().map(|n|n.map(|n|json!({
                     "unit_outward_roi":n.unit_outward_roi,"angular_sigma_radians":n.angular_sigma_radians}))).collect::<Vec<_>>())})).collect::<Vec<_>>(),
             "seeds":f.packet.conics.iter().map(|c|json!({"kind":format!("{:?}",c.kind),"ellipse":ellipse_json(Some(c.ellipse_roi_px))})).collect::<Vec<_>>()
@@ -218,11 +384,13 @@ fn evaluate(frames:[Option<Frame>;2],export_sparse:bool)->Value {
     row["independent_pixels_per_mm"]=json!(scene.independent_pixels_per_mm);
     for (name,mask) in [("joint",[true,true]),("monocular_right",[true,false]),("monocular_left",[false,true])] {
         let started=Instant::now();
-        let result=solve_joint_conics(JointConicRequest {
+        let request=JointConicRequest {
             eyes:std::array::from_fn(|eye|if mask[eye] {evidence[eye]} else {None}),scene:&scene.prior,
             maximum_hypotheses:16,maximum_refinements:12,maximum_source_skew_ns:0,
             exposure_uncertainty_ns:2_000_000,motion_bound_px_per_second:150.0,
-        });
+        };
+        let result=if probabilistic {solve_joint_conic_distribution(request,1).map(|mut solutions|solutions.remove(0))}
+            else {solve_joint_conics(request)};
         row[name]=solution_json(result,frames.each_ref().map(Option::as_ref),started.elapsed().as_secs_f64()*1000.0);
     }
     row
@@ -233,21 +401,32 @@ fn run()->Result<(),String> {
     let output=PathBuf::from(args.next().ok_or("usage: buttercup_stereo_conic_eval OUTPUT.jsonl SAM_CACHE.jsonl...")?);
     let mut files=Vec::new();
     let mut maximum_frames_per_cache=usize::MAX;
-    let mut partial_outlines=false;
+    let mut extraction=ExtractionPolicy::default();
     let mut export_sparse=false;
     let mut source_order_replay=false;
     let mut export_hypotheses=false;
-    let mut outline_directions=false;
+    let mut probabilistic=false;
     let mut arrival_delay_ns=[0u64;2];
     while let Some(arg)=args.next() {
         if arg=="--max-frames-per-cache" {
             maximum_frames_per_cache=args.next().ok_or("missing frame limit")?.parse::<usize>().map_err(|e|e.to_string())?;
             if maximum_frames_per_cache==0 {return Err("frame limit must be positive".into());}
-        } else if arg=="--partial-outlines" {partial_outlines=true;}
+        } else if arg=="--partial-outlines" {extraction.partial_outlines=true;}
         else if arg=="--export-sparse-evidence" {export_sparse=true;}
         else if arg=="--source-order-replay" {source_order_replay=true;}
         else if arg=="--export-hypotheses" {export_hypotheses=true;}
-        else if arg=="--retained-outline-directions" {outline_directions=true;}
+        else if arg=="--retained-outline-directions" {extraction.outline_directions=true;}
+        else if arg=="--raw-boundary-uncertainty" {extraction.raw_uncertainty=true;}
+        else if arg=="--raw-outer-spread" {extraction.raw_outer_spread=true;}
+        else if arg=="--raw-outer-position" {extraction.raw_outer_position=true;}
+        else if arg=="--raw-outer-candidates" {extraction.raw_outer_candidates=true;}
+        else if arg=="--withhold-rejected-outer" {extraction.withhold_rejected_outer=true;}
+        else if arg=="--probabilistic" {probabilistic=true;}
+        else if arg=="--without-pupil" {extraction.without_pupil=true;}
+        else if arg=="--all-boundary-samples" {extraction.all_boundary_samples=true;}
+        else if arg=="--coherent-pupil-arcs" {extraction.coherent_pupil_arcs=true;}
+        else if arg=="--mask-levels" {extraction.mask_levels=true;}
+        else if arg=="--mask-spatial" {extraction.mask_levels=true;extraction.mask_spatial=true;}
         else if arg=="--arrival-delay-ns" {
             let eye=args.next().ok_or("missing delayed ROI id (1 or 2)")?.parse::<usize>().map_err(|e|e.to_string())?;
             if !(1..=2).contains(&eye) {return Err("delayed ROI id must be 1 or 2".into());}
@@ -260,14 +439,14 @@ fn run()->Result<(),String> {
     if !std::fs::canonicalize(output.parent().ok_or("missing output directory")?).map_err(|e|e.to_string())?.starts_with(allowed) {return Err("output must be under outputs".into());}
     let mut writer=BufWriter::new(OpenOptions::new().create_new(true).write(true).open(output).map_err(|e|e.to_string())?);
     if source_order_replay {
-        return source_order::run(&files,maximum_frames_per_cache,partial_outlines,arrival_delay_ns,export_hypotheses,outline_directions,&mut writer);
+        return source_order::run(&files,maximum_frames_per_cache,extraction,arrival_delay_ns,export_hypotheses,probabilistic,&mut writer);
     }
     if export_hypotheses { return Err("export-hypotheses requires source-order-replay".into()); }
     if arrival_delay_ns!=[0;2] {return Err("arrival-delay-ns requires source-order-replay".into());}
     let mut pending:HashMap<(String,u64),[Option<Frame>;2]>=HashMap::new();
     let mut count=0usize;
     let mut write=|frames|->Result<(),String> {
-        let row=evaluate(frames,export_sparse);serde_json::to_writer(&mut writer,&row).map_err(|e|e.to_string())?;
+        let row=evaluate_with_distribution(frames,export_sparse,probabilistic);serde_json::to_writer(&mut writer,&row).map_err(|e|e.to_string())?;
         writer.write_all(b"\n").map_err(|e|e.to_string())?;count+=1;
         if count%500==0 {writer.flush().map_err(|e|e.to_string())?;eprintln!("stereo evaluation reads={count}");}
         Ok(())
@@ -275,7 +454,7 @@ fn run()->Result<(),String> {
     for path in files {
         for (line_number,line) in BufReader::new(File::open(&path).map_err(|e|e.to_string())?).lines().take(maximum_frames_per_cache).enumerate() {
             let row=serde_json::from_str(&line.map_err(|e|e.to_string())?).map_err(|e|format!("{path}:{}: {e}",line_number+1))?;
-            let frame=prepare_with_directions(row,partial_outlines,outline_directions)?;
+            let frame=prepare_with_policy(row,extraction)?;
             let eye=frame.packet.exposure.roi.0.checked_sub(1).filter(|e|*e<2).ok_or("invalid ROI")? as usize;
             let key=(frame.input["clock_lineage"].as_str().ok_or("missing lineage")?.to_owned(),frame.packet.exposure.timestamp_ns);
             let slot=pending.entry(key.clone()).or_insert_with(||[None,None]);
@@ -329,6 +508,58 @@ mod extraction_tests {
         (fixture,row)
     }
 
+    fn mask_profile_fixture()->(RawFixture,Value) {
+        let (file,mut row)=rejected_outline_fixture(&vec![0;256*192]);
+        row["candidates"][0]["baseline_raw_admitted"]=json!(true);
+        let plane=mask_boundary_logits::Plane {width:256,height:192,values:(0..256*192).map(|i| {
+            (1.0-(((i%256) as f64-128.0)/60.0).hypot(((i/256) as f64-96.0)/46.0)) as f32*32.0
+        }).collect()};
+        let source=mask_boundary_logits::Source {eye_index:0,sequence:10,timestamp_ns:"20".into(),
+            tracking_epoch:7,prompt_generation:3,sensor_origin:(400,800),width:256,height:192};
+        let evidence=mask_boundary_logits::measure(&plane,source,0,0,false,
+            &points(&row["candidates"][0]["baseline_retained"]),&[(0..128).collect()]).unwrap();
+        row["outer_boundary_logits"]=json!(evidence);
+        (file,row)
+    }
+
+    #[test]
+    fn mask_profiles_join_native_samples_before_training_validation_decimation() {
+        let (_file,row)=mask_profile_fixture();
+        let original=prepare_with_policy(row.clone(),ExtractionPolicy::default()).unwrap();
+        let split=prepare_with_policy(row.clone(),ExtractionPolicy {mask_levels:true,..Default::default()}).unwrap();
+        let full=prepare_with_policy(row,ExtractionPolicy {mask_levels:true,all_boundary_samples:true,..Default::default()}).unwrap();
+        assert_eq!(full.mask_levels.as_ref().unwrap()["attachment"]["matched_profiles"],16);
+        assert_eq!(full.mask_levels.as_ref().unwrap()["attachment"]["level_set_points"],16);
+        assert_eq!(original.input,split.input);
+        assert_eq!(format!("{:?}",original.pose),format!("{:?}",split.pose));
+        assert_eq!(original.validation,split.validation);
+        let mut stripped=split.packet.clone();
+        for arc in &mut stripped.arcs {arc.level_sets_roi=None;}
+        assert_eq!(format!("{stripped:?}"),format!("{:?}",original.packet));
+        for (a,b) in split.packet.arcs.iter().zip(&full.packet.arcs) {
+            assert_eq!(a.points_roi_px,b.points_roi_px.iter().step_by(2).copied().collect::<Vec<_>>());
+            assert_eq!(a.level_sets_roi.as_ref().unwrap(),
+                &b.level_sets_roi.as_ref().unwrap().iter().step_by(2).copied().collect::<Vec<_>>());
+        }
+        assert!(full.validation.is_empty());
+    }
+
+    #[test]
+    fn mask_level_experiment_refuses_mismatched_payloads_and_reports_missing_receipts() {
+        let (_file,mut row)=mask_profile_fixture();
+        let original=prepare_with_policy(row.clone(),ExtractionPolicy::default()).unwrap();
+        row["outer_boundary_logits"]["source"]["sequence"]=json!(11);
+        assert!(prepare_with_policy(row.clone(),ExtractionPolicy {mask_levels:true,..Default::default()}).is_err());
+        row["outer_boundary_logits"]=json!("unparseable unused experimental receipt");
+        let off=prepare_with_policy(row.clone(),ExtractionPolicy::default()).unwrap();
+        assert_eq!(format!("{:?}",original.packet),format!("{:?}",off.packet));
+        assert!(off.mask_levels.is_none());
+        row.as_object_mut().unwrap().remove("outer_boundary_logits");
+        let missing=prepare_with_policy(row,ExtractionPolicy {mask_levels:true,..Default::default()}).unwrap();
+        assert_eq!(missing.mask_levels.unwrap()["source_evidence"],"absent");
+        assert_eq!(format!("{:?}",original.packet),format!("{:?}",missing.packet));
+    }
+
     #[test]
     fn a_rejected_complete_fit_cannot_bypass_partial_raw_boundary_checks() {
         let (_fixture,mut row)=rejected_outline_fixture(&vec![0;256*192]);
@@ -354,6 +585,568 @@ mod extraction_tests {
             assert_eq!(a.points_roi_px,b.points_roi_px);assert_eq!(a.evidence_group,b.evidence_group);
         }
         assert_eq!(ordinary.pose.limbus_center_sensor_px,partial.pose.limbus_center_sensor_px);
+    }
+
+    #[test]
+    fn pupil_ablation_keeps_native_outer_probes_pose_and_scale_identical() {
+        let raw=(0..192).flat_map(|y|(0..256).map(move|x| {
+            if ((x as f64-130.0)/20.0).hypot((y as f64-98.0)/15.0)<=1.0 {40}
+            else if ((x as f64-128.0)/60.0).hypot((y as f64-96.0)/46.0)<=1.0 {250} else {600}
+        })).collect::<Vec<_>>();
+        let (_fixture,mut row)=rejected_outline_fixture(&raw);
+        row["candidates"][0]["baseline_raw_admitted"]=json!(true);
+        row["pupil_void"]=json!({"ellipse":{"center":[130.0,98.0],"major_radius":20.0,"minor_radius":15.0,"angle":0.0}});
+        row["input"]["scale_hint"]=json!({"pixels_per_10mm":100.0,"bounds_px_per_10mm":[80.0,120.0]});
+        let full=prepare_with_policy(row.clone(),ExtractionPolicy {outline_directions:true,..Default::default()}).unwrap();
+        let ablated=prepare_with_policy(row.clone(),ExtractionPolicy {outline_directions:true,without_pupil:true,..Default::default()}).unwrap();
+        assert!(full.packet.arcs.iter().any(|a|a.kind==BoundaryKind::PupillaryBoundary));
+        assert!(full.packet.conics.iter().any(|c|c.kind==BoundaryKind::PupillaryBoundary));
+        assert_eq!(full.input,ablated.input);
+        assert_eq!(full.pose.limbus_center_sensor_px,ablated.pose.limbus_center_sensor_px);
+        assert_eq!(full.pose.pixels_per_10mm,ablated.pose.pixels_per_10mm);
+        assert_eq!(full.packet.detail_reliability,ablated.packet.detail_reliability);
+        assert_eq!(full.packet.exposure,ablated.packet.exposure);
+        assert_eq!(full.packet.sensor_origin_px,ablated.packet.sensor_origin_px);
+        assert_eq!(full.packet.dimensions_px,ablated.packet.dimensions_px);
+        let outer=full.packet.arcs.iter().filter(|a|a.kind!=BoundaryKind::PupillaryBoundary).collect::<Vec<_>>();
+        assert_eq!(format!("{outer:?}"),format!("{:?}",ablated.packet.arcs));
+        let probes=full.validation.iter().filter(|a|a.2!=BoundaryKind::PupillaryBoundary).collect::<Vec<_>>();
+        assert_eq!(format!("{probes:?}"),format!("{:?}",ablated.validation));
+        assert!(ablated.packet.conics.iter().all(|c|c.kind!=BoundaryKind::PupillaryBoundary));
+        assert_eq!(ablated.pupil_ablation["removed_pupil_hints"],1);
+        let live=prepare_with_policy(row,ExtractionPolicy {outline_directions:true,all_boundary_samples:true,..Default::default()}).unwrap();
+        assert!(live.validation.is_empty(),"fitted samples must never be advertised as withheld probes");
+        for (index,arc) in live.packet.arcs.iter().enumerate() {
+            let held=full.validation.iter().find(|(i,_,_,_)|*i==index).map(|v|v.3.len()).unwrap_or(0);
+            assert_eq!(arc.points_roi_px.len(),full.packet.arcs[index].points_roi_px.len()+held);
+        }
+    }
+
+    #[test]
+    fn removing_interleaved_pupil_arcs_preserves_other_conic_support_identity() {
+        let (_fixture,row)=rejected_outline_fixture(&vec![0;256*192]);
+        let mut packet=prepare(row,false).unwrap().packet;
+        let original=packet.clone();
+        let mut pupil=packet.arcs[0].clone();
+        pupil.kind=BoundaryKind::PupillaryBoundary;
+        packet.arcs.insert(0,pupil);
+        for c in &mut packet.conics {for index in &mut c.supporting_arc_indices {*index+=1;}}
+        packet.conics.insert(0,OwnedConicHint {kind:BoundaryKind::PupillaryBoundary,
+            ellipse_roi_px:packet.conics[0].ellipse_roi_px,supporting_arc_indices:vec![0]});
+        remove_pupil_evidence(&mut packet);
+        assert_eq!(format!("{packet:?}"),format!("{original:?}"));
+    }
+
+    #[test]
+    fn rejected_outer_withholding_preserves_native_pupil_and_original_scene_inputs() {
+        let raw=(0..192).flat_map(|y|(0..256).map(move|x| {
+            if ((x as f64-130.0)/20.0).hypot((y as f64-98.0)/15.0)<=1.0 {40}
+            else if ((x as f64-128.0)/60.0).hypot((y as f64-96.0)/46.0)<=1.0 {250} else {600}
+        })).collect::<Vec<_>>();
+        let (_fixture,mut row)=rejected_outline_fixture(&raw);
+        row["pupil_void"]=json!({"ellipse":{"center":[130.0,98.0],"major_radius":20.0,"minor_radius":15.0,"angle":0.0}});
+        row["input"]["scale_hint"]=json!({"pixels_per_10mm":100.0,"bounds_px_per_10mm":[80.0,120.0]});
+        for admitted in [false,true] {
+            row["candidates"][0]["baseline_raw_admitted"]=json!(admitted);
+            let policy=ExtractionPolicy {all_boundary_samples:true,mask_levels:true,..Default::default()};
+            let full=prepare_with_policy(row.clone(),policy).unwrap();
+            let candidate=prepare_with_policy(row.clone(),ExtractionPolicy {withhold_rejected_outer:true,..policy}).unwrap();
+            assert!(full.packet.arcs.iter().any(|a|a.kind==BoundaryKind::OuterLimbus));
+            assert!(full.packet.arcs.iter().any(|a|a.kind==BoundaryKind::PupillaryBoundary));
+            assert_eq!(full.input,candidate.input);
+            assert_eq!(full.pose.limbus_center_sensor_px,candidate.pose.limbus_center_sensor_px);
+            assert_eq!(full.pose.pixels_per_10mm,candidate.pose.pixels_per_10mm);
+            assert_eq!(full.packet.exposure,candidate.packet.exposure);
+            assert_eq!(full.packet.sensor_origin_px,candidate.packet.sensor_origin_px);
+            assert_eq!(full.packet.dimensions_px,candidate.packet.dimensions_px);
+            assert_eq!(full.packet.detail_reliability,candidate.packet.detail_reliability);
+            assert!(candidate.validation.is_empty());
+            if admitted {
+                assert_eq!(format!("{:?}",full.packet),format!("{:?}",candidate.packet));
+                assert_eq!(full.mask_levels,candidate.mask_levels);
+                assert!(candidate.rejected_outer_ablation.is_none());
+            } else {
+                let preserved=full.packet.arcs.iter().filter(|a|a.kind!=BoundaryKind::OuterLimbus).collect::<Vec<_>>();
+                assert_eq!(format!("{preserved:?}"),format!("{:?}",candidate.packet.arcs));
+                assert_eq!(candidate.mask_levels.as_ref().unwrap()["source_evidence"],"rejected-outer-withheld");
+                assert!(!candidate.rejected_outer_ablation.as_ref().unwrap()["removed_outer_arc_groups"].as_array().unwrap().is_empty());
+                for hint in &candidate.packet.conics {
+                    assert_ne!(hint.kind,BoundaryKind::OuterLimbus);
+                    assert!(!hint.supporting_arc_indices.is_empty());
+                    assert!(hint.supporting_arc_indices.iter().all(|&i|candidate.packet.arcs[i].kind==hint.kind));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_outer_removal_preserves_interleaved_inner_and_pupil_hint_identity() {
+        let (_fixture,row)=rejected_outline_fixture(&vec![0;256*192]);
+        let mut packet=prepare(row,false).unwrap().packet;
+        let original=packet.arcs[0].clone();
+        let ellipse=packet.conics[0].ellipse_roi_px;
+        packet.arcs=[BoundaryKind::OuterLimbus,BoundaryKind::InnerLimbus,
+            BoundaryKind::OuterLimbus,BoundaryKind::PupillaryBoundary].into_iter()
+            .enumerate().map(|(i,kind)|OwnedBoundaryArc {kind,evidence_group:i as u32,..original.clone()}).collect();
+        packet.conics=packet.arcs.iter().enumerate().map(|(i,a)|OwnedConicHint {
+            kind:a.kind,ellipse_roi_px:ellipse,supporting_arc_indices:vec![i]}).collect();
+        let inner=packet.arcs[1].clone();let pupil=packet.arcs[3].clone();
+        let report=remove_outer_evidence(&mut packet);
+        assert_eq!(report["removed_outer_arc_groups"],json!([0,2]));
+        assert_eq!(report["removed_outer_hints"],2);
+        assert_eq!(format!("{:?}",packet.arcs),format!("{:?}",vec![inner,pupil]));
+        assert_eq!(packet.conics[0].supporting_arc_indices,vec![0]);
+        assert_eq!(packet.conics[1].supporting_arc_indices,vec![1]);
+        assert_eq!(packet.conics[0].kind,BoundaryKind::InnerLimbus);
+        assert_eq!(packet.conics[1].kind,BoundaryKind::PupillaryBoundary);
+    }
+
+    #[test]
+    #[ignore = "requires frozen SAM/Student native caches and RAW archives under outputs; numerical diagnostic, not a gaze accuracy assertion"]
+    fn recorded_posterior_proposal_diagnostic() {
+        use conic_solver::joint::posterior::IntegrationConfig;
+        let seeds=[0xd1b5_4a32_d192_ed03,0x94c5_09a1_814f_753d,0x419b_79df_a2c7_5301];
+        for (cache,sequences) in [
+            ("outputs/student-shadow.FkzvzE/sam-live.jsonl",vec![4396,4430]),
+            ("outputs/student-shadow.FkzvzE/student-live.jsonl",vec![4397,4411,4418]),
+            ("outputs/calibration-provider-fit.cVlx1Z/recent-offered-0-sam.jsonl",vec![329,611]),
+        ] {
+            let mut pending:HashMap<u64,[Option<Frame>;2]>=HashMap::new();
+            for line in BufReader::new(File::open(cache).expect("native corpus cache required")).lines() {
+                let row:Value=serde_json::from_str(&line.unwrap()).unwrap();
+                let sequence=integer(&row["input"]["frame"],"sequence").unwrap();
+                if !sequences.contains(&sequence) {continue;}
+                let frame=prepare_with_policy(row,ExtractionPolicy {all_boundary_samples:true,..Default::default()}).unwrap();
+                let eye=frame.packet.exposure.roi.0 as usize-1;
+                pending.entry(sequence).or_insert_with(||[None,None])[eye]=Some(frame);
+            }
+            for sequence in sequences {
+                let frames=pending.remove(&sequence).unwrap();assert!(frames.iter().all(Option::is_some));
+                let poses=frames.each_ref().map(|f|f.as_ref().map(|f|f.pose));
+                let prepared=frames.each_ref().map(|f|f.as_ref().map(|f|f.packet.prepare()));
+                let evidence=prepared.each_ref().map(|p|p.as_ref().map(|p|p.evidence()));
+                let camera=PinholeCamera {focal_px:[4000.0;2],principal_px:[4000.0,3000.0]};
+                let scene=approximate_scene(camera,poses).unwrap();
+                let request=JointConicRequest {eyes:evidence,scene:&scene.prior,maximum_hypotheses:16,maximum_refinements:12,
+                    maximum_source_skew_ns:0,exposure_uncertainty_ns:2_000_000,motion_bound_px_per_second:150.0};
+                let baseline=solve_joint_conics(request).unwrap();
+                for (budget,early_stop) in [(8192,true),(65536,false)] {
+                  for (adaptive,global_proposal,conditional_nuisance) in [
+                    (false,false,false),(true,false,false),(false,true,false),(true,true,false),(false,false,true),
+                  ] {
+                    for seed in seeds {
+                        let started=Instant::now();
+                        let result=solve_joint_conic_distribution_diagnostic(request,1,
+                            IntegrationConfig {budget,seed,adaptive,global_proposal,conditional_nuisance,early_stop,trace_tail:true,..Default::default()}).unwrap().remove(0);
+                        assert_eq!(result.target_camera_mm,baseline.target_camera_mm);
+                        assert_eq!(result.robust_cost,baseline.robust_cost);
+                        assert_eq!(result.ellipses_roi_px,baseline.ellipses_roi_px);
+                        let posterior=result.posterior.as_ref().unwrap();
+                        assert!(posterior.samples<=budget);
+                        assert!(posterior.feasible_samples<=posterior.samples-posterior.pilot_samples);
+                        eprintln!("posterior-proposal {}",json!({"cache":cache,"sequence":sequence,
+                            "inputs":frames.each_ref().map(|f|f.as_ref().map(|f|&f.input)),
+                            "budget":budget,"adaptive":adaptive,"global_proposal":global_proposal,"conditional_nuisance":conditional_nuisance,"early_stop":early_stop,"seed":seed.to_string(),
+                            "elapsed_ms":started.elapsed().as_secs_f64()*1000.0,"posterior":posterior.json()}));
+                    }
+                  }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires frozen SAM/Student caches and native RAW archive under outputs; independent numerical reference, not measured gaze accuracy"]
+    fn recorded_cross_eye_support_reference_diagnostic() {
+        cross_eye_support_reference(false,false,false);
+    }
+
+    #[test]
+    #[ignore = "million-draw references for the three observed early-stop disagreements; native RAW caches required"]
+    fn recorded_cross_eye_support_tail_reference_diagnostic() {
+        cross_eye_support_reference(true,true,false);
+    }
+
+    #[test]
+    #[ignore = "million-draw joint references for the entire ten-read SAM/Student interval; native RAW caches required"]
+    fn recorded_cross_eye_support_large_reference_diagnostic() {
+        cross_eye_support_reference(true,false,false);
+    }
+
+    #[test]
+    #[ignore = "native SAM/Student comparison of uncertainty in direction mass and stopping/admission decisions"]
+    fn recorded_cross_eye_numerical_admission_diagnostic() {
+        cross_eye_support_reference(false,false,true);
+    }
+
+    #[test]
+    #[ignore = "full native source-order comparison; requires output directory and immutable SAM/Student/recent caches"]
+    fn recorded_numerical_admission_source_replay() {
+        use conic_solver::joint::posterior::{IntegrationConfig,TailProposal};
+        let directory=PathBuf::from(std::env::var("BUTTERCUP_POSTERIOR_REPLAY_DIR").expect("set a new run directory under outputs"));
+        assert!(directory.canonicalize().unwrap().starts_with(PathBuf::from("outputs").canonicalize().unwrap()));
+        let selected=std::env::var("BUTTERCUP_POSTERIOR_REPLAY_COHORT").ok();
+        let proposal=std::env::var("BUTTERCUP_POSTERIOR_REPLAY_PROPOSAL").ok();
+        assert!(proposal.as_deref().is_none_or(|p|[
+            "conditional","adaptive","adaptive-conditional","integrated-inner","integrated-inner-precision",
+            "integrated-inner-paired","integrated-inner-paired-precision",
+            "integrated-inner-global","integrated-inner-global-conditional","integrated-inner-global-adaptive",
+            "integrated-inner-conditional","integrated-inner-adaptive",
+            "integrated-inner-global-conditional-scene",
+            "integrated-inner-global-conditional-scene-precision",
+            "integrated-inner-global-conditional-scene-replicated-original",
+            "integrated-inner-global-conditional-scene-replicated-original-precision",
+            "integrated-inner-global-conditional-precision",
+            "integrated-inner-global-conditional-replicated",
+            "integrated-inner-global-conditional-replicated-precision",
+            "integrated-inner-global-conditional-replicated-original",
+            "integrated-inner-global-conditional-replicated-original-precision",
+            "integrated-inner-global-conditional-tail-pilot-replicated-original-precision",
+            "integrated-inner-global-conditional-tail-recenter-replicated-original-precision",
+            "integrated-inner-global-conditional-tail-refit-replicated-original-precision",
+            "integrated-inner-global-conditional-tail-conditional-refit-replicated-original-precision",
+            "integrated-inner-global-conditional-tail-outlier-refit-replicated-original-precision",
+            "integrated-inner-global-conditional-tail-boundary-refit-replicated-original-precision",
+            "integrated-inner-global-conditional-tail-boundary-defensive-replicated-original-precision",
+            "integrated-inner-global-conditional-tail-profile-affine-replicated-original-precision",
+            "integrated-inner-global-conditional-tail-profile-quadratic-replicated-original-precision",
+        ].contains(&p)));
+        let seed=std::env::var("BUTTERCUP_POSTERIOR_REPLAY_SEED").ok().map(|v|v.parse().unwrap()).unwrap_or(IntegrationConfig::default().seed);
+        let budget=std::env::var("BUTTERCUP_POSTERIOR_REPLAY_BUDGET").ok().map(|v|v.parse().unwrap()).unwrap_or(8192);
+        let early_stop=std::env::var("BUTTERCUP_POSTERIOR_REPLAY_FULL_BUDGET").ok().as_deref()!=Some("1");
+        let mut ran=false;
+        for (cohort,files) in [
+            ("sam",vec!["outputs/student-shadow.FkzvzE/sam-live.jsonl".to_owned()]),
+            ("student",vec!["outputs/student-shadow.FkzvzE/student-live.jsonl".to_owned()]),
+            ("recent",(0..3).map(|i|format!("outputs/calibration-provider-fit.cVlx1Z/recent-offered-{i}-sam.jsonl")).collect()),
+        ] {
+            if selected.as_ref().is_some_and(|name|name!=cohort) {continue;}
+            ran=true;
+            let policies=if proposal.as_deref().is_some_and(|p|p.starts_with("integrated-inner")) {vec![proposal.as_deref().unwrap().ends_with("-precision")]}
+                else if proposal.is_some() {vec![true]} else {vec![false,true]};
+            for numerical_admission in policies {
+                let arm=proposal.as_deref().unwrap_or(if numerical_admission {"precision"} else {"baseline"});
+                let path=directory.join(format!("{cohort}-{arm}-source.jsonl"));
+                let mut writer=BufWriter::new(OpenOptions::new().write(true).create_new(true).open(path).unwrap());
+                source_order::run_with_posterior_diagnostic(&files,
+                    IntegrationConfig {numerical_admission,seed,budget,early_stop,
+                        tail_proposal:match proposal.as_deref() {
+                            Some(p) if p.contains("tail-pilot")=>TailProposal::PilotOnly,
+                            Some(p) if p.contains("tail-recenter")=>TailProposal::Recenter,
+                            Some(p) if p.contains("tail-conditional-refit")=>TailProposal::ConditionalRefit,
+                            Some(p) if p.contains("tail-outlier-refit")=>TailProposal::OutlierRefit,
+                            Some(p) if p.contains("tail-boundary-refit")=>TailProposal::BoundaryRefit,
+                            Some(p) if p.contains("tail-boundary-defensive")=>TailProposal::BoundaryDefensive,
+                            Some(p) if p.contains("tail-profile-affine")=>TailProposal::ProfileAffine,
+                            Some(p) if p.contains("tail-profile-quadratic")=>TailProposal::ProfileQuadratic,
+                            Some(p) if p.contains("tail-refit")=>TailProposal::Refit,
+                            _=>TailProposal::Off,
+                        },
+                        conditional_nuisance:proposal.as_deref().is_some_and(|p|p.contains("conditional")),
+                        adaptive:proposal.as_deref().is_some_and(|p|p.contains("adaptive")),
+                        global_proposal:proposal.as_deref().is_some_and(|p|p.contains("global")),
+                        conditional_global:proposal.as_deref().is_some_and(|p|p.contains("-scene")),
+                        marginalize_unobserved_inner:proposal.as_deref().is_some_and(|p|p.starts_with("integrated-inner")),
+                        preserve_marginal_draws:proposal.as_deref().is_some_and(|p|p.contains("-paired")),
+                        replicas:if proposal.as_deref().is_some_and(|p|p.contains("replicated")) {4} else {1},
+                        preserve_replica_draws:proposal.as_deref().is_some_and(|p|p.contains("replicated-original")),
+                        trace_tail:true,
+                        ..Default::default()},&mut writer).unwrap();
+                writer.flush().unwrap();
+            }
+        }
+        assert!(ran,"unknown corpus name");
+    }
+
+    #[test]
+    #[ignore = "selected large posterior references preserve all native source-order context and MAP seeds"]
+    fn recorded_selected_posterior_reference_replay() {
+        use conic_solver::joint::posterior::IntegrationConfig;
+        let directory=PathBuf::from(std::env::var("BUTTERCUP_POSTERIOR_REPLAY_DIR").expect("set reference output directory"));
+        assert!(directory.canonicalize().unwrap().starts_with(PathBuf::from("outputs").canonicalize().unwrap()));
+        let cohort=std::env::var("BUTTERCUP_POSTERIOR_REPLAY_COHORT").expect("sam, student or recent");
+        let budget=std::env::var("BUTTERCUP_POSTERIOR_REPLAY_BUDGET").ok().map(|v|v.parse().unwrap()).unwrap_or(1048576);
+        let proposal=std::env::var("BUTTERCUP_POSTERIOR_REPLAY_PROPOSAL").ok();
+        assert!(proposal.as_deref().is_none_or(|p|[
+            "integrated-inner","integrated-inner-paired","integrated-inner-global-conditional-scene",
+        ].contains(&p)));
+        let seeds=std::env::var("BUTTERCUP_POSTERIOR_REPLAY_SEED").ok().map(|v|vec![v.parse().unwrap()])
+            .unwrap_or(vec![0xd1b5_4a32_d192_ed03,0x94c5_09a1_814f_753d,0x419b_79df_a2c7_5301]);
+        let selected:Value=serde_json::from_reader(File::open(directory.join("reference-selection-v1.json")).unwrap()).unwrap();
+        let indices=selected[&cohort]["reads"].as_array().unwrap().iter()
+            .map(|row|row["final_event_input_index"].as_u64().unwrap()).collect::<std::collections::HashSet<_>>();
+        assert!(!indices.is_empty());
+        let files=match cohort.as_str() {
+            "sam"=>vec!["outputs/student-shadow.FkzvzE/sam-live.jsonl".to_owned()],
+            "student"=>vec!["outputs/student-shadow.FkzvzE/student-live.jsonl".to_owned()],
+            "recent"=>(0..3).map(|i|format!("outputs/calibration-provider-fit.cVlx1Z/recent-offered-{i}-sam.jsonl")).collect(),
+            _=>panic!("unknown native cohort"),
+        };
+        for seed in seeds {
+            let path=directory.join(format!("{cohort}-reference-{seed}.jsonl"));
+            let mut writer=BufWriter::new(OpenOptions::new().write(true).create_new(true).open(path).unwrap());
+            source_order::run_with_selected_posterior_diagnostic(&files,
+                IntegrationConfig {budget,seed,early_stop:false,marginalize_unobserved_inner:proposal.is_some(),
+                    global_proposal:proposal.as_deref().is_some_and(|p|p.ends_with("-scene")),
+                    conditional_global:proposal.as_deref().is_some_and(|p|p.ends_with("-scene")),
+                    conditional_nuisance:proposal.as_deref().is_some_and(|p|p.ends_with("-scene")),
+                    preserve_marginal_draws:proposal.as_deref().is_some_and(|p|p.contains("-paired")),..Default::default()},&indices,&mut writer).unwrap();
+            writer.flush().unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "exact native factor attribution across frozen SAM3.1/Student source histories"]
+    fn recorded_native_factor_diagnostic() {
+        let directory=PathBuf::from(std::env::var("BUTTERCUP_FACTOR_DIAGNOSTIC_DIR").expect("set a new output directory"));
+        assert!(directory.canonicalize().unwrap().starts_with(PathBuf::from("outputs").canonicalize().unwrap()));
+        let cohorts = [
+            ("sam", vec!["outputs/student-shadow.FkzvzE/sam-live.jsonl".to_owned()]),
+            ("student", vec!["outputs/student-shadow.FkzvzE/student-live.jsonl".to_owned()]),
+            ("recent", (0..3).map(|i|format!("outputs/calibration-provider-fit.cVlx1Z/recent-offered-{i}-sam.jsonl")).collect()),
+        ];
+        for (name, files) in cohorts {
+            let mut writer=BufWriter::new(OpenOptions::new().write(true).create_new(true)
+                .open(directory.join(format!("{name}-native-factors.jsonl"))).unwrap());
+            source_order::run(&files,usize::MAX,ExtractionPolicy {all_boundary_samples:true,..Default::default()},
+                [0;2],true,false,&mut writer).unwrap();
+            writer.flush().unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "same native source-order likelihood with optional coherent-mask proposal conditioning"]
+    fn recorded_mask_state_proposal_replay() {
+        use conic_solver::joint::posterior::IntegrationConfig;
+        let directory=PathBuf::from(std::env::var("BUTTERCUP_MASK_PROPOSAL_DIR").expect("set output directory"));
+        assert!(directory.canonicalize().unwrap().starts_with(PathBuf::from("outputs").canonicalize().unwrap()));
+        let input=std::env::var("BUTTERCUP_MASK_PROPOSAL_INPUT").expect("set frozen profile cache");
+        let mask_levels=std::env::var("BUTTERCUP_MASK_LEVELS").ok().as_deref()==Some("1");
+        let mask_state_proposals=std::env::var("BUTTERCUP_MASK_PROPOSALS").ok().as_deref()==Some("1");
+        let mask_spatial=std::env::var("BUTTERCUP_MASK_SPATIAL").ok().as_deref()==Some("1");
+        let mask_state_refinement=std::env::var("BUTTERCUP_MASK_REFINEMENT").ok().as_deref()==Some("1");
+        let marginalize_arc_alternatives=std::env::var("BUTTERCUP_ARC_MARGINALIZATION").ok().as_deref()==Some("1");
+        let populations=std::env::var("BUTTERCUP_POPULATION_PARTICLES").ok().map(|v|
+            conic_solver::joint::posterior::populations::Config {particles:v.parse().unwrap(),
+                steps:std::env::var("BUTTERCUP_POPULATION_STEPS").expect("set population steps").parse().unwrap(),
+                populations:std::env::var("BUTTERCUP_POPULATION_COUNT").expect("set population count").parse().unwrap()});
+        let seed=std::env::var("BUTTERCUP_MASK_PROPOSAL_SEED").ok().map(|v|v.parse().unwrap())
+            .unwrap_or(IntegrationConfig::live().seed);
+        let reference=std::env::var("BUTTERCUP_MASK_REFERENCE_PATHS").ok().map(|v|
+            conic_solver::joint::posterior::annealed::Config {paths:v.parse().unwrap(),
+                steps:std::env::var("BUTTERCUP_MASK_REFERENCE_STEPS").expect("set annealing steps").parse().unwrap()});
+        let mut writer=BufWriter::new(OpenOptions::new().write(true).create_new(true)
+            .open(directory.join("source.jsonl")).unwrap());
+        source_order::run_with_mask_posterior_diagnostic(&[input],mask_levels,mask_spatial,
+            IntegrationConfig {mask_state_proposals,mask_state_refinement,marginalize_arc_alternatives,populations,seed,annealed_reference:reference,..IntegrationConfig::live()},&mut writer).unwrap();
+        writer.flush().unwrap();
+    }
+
+    #[test]
+    #[ignore = "independent annealed paths on selected native publications, retaining full source history and ordinary posterior"]
+    fn recorded_selected_annealed_reference_replay() {
+        use conic_solver::joint::posterior::{annealed,IntegrationConfig,TailProposal};
+        let directory=PathBuf::from(std::env::var("BUTTERCUP_POSTERIOR_REPLAY_DIR").expect("set output directory"));
+        assert!(directory.canonicalize().unwrap().starts_with(PathBuf::from("outputs").canonicalize().unwrap()));
+        let cohort=std::env::var("BUTTERCUP_POSTERIOR_REPLAY_COHORT").expect("sam, student or recent");
+        let seed=std::env::var("BUTTERCUP_POSTERIOR_REPLAY_SEED").expect("set numerical seed").parse().unwrap();
+        let paths=std::env::var("BUTTERCUP_ANNEALED_PATHS").expect("set path count").parse().unwrap();
+        let steps=std::env::var("BUTTERCUP_ANNEALED_STEPS").expect("set bridge steps").parse().unwrap();
+        let selection:Value=serde_json::from_reader(File::open(directory.join("reference-selection-v1.json")).unwrap()).unwrap();
+        let indices=selection[&cohort]["reads"].as_array().unwrap().iter()
+            .map(|r|r["final_event_input_index"].as_u64().unwrap()).collect::<std::collections::HashSet<_>>();
+        assert!(!indices.is_empty());
+        let files=match cohort.as_str() {
+            "sam"=>vec!["outputs/student-shadow.FkzvzE/sam-live.jsonl".to_owned()],
+            "student"=>vec!["outputs/student-shadow.FkzvzE/student-live.jsonl".to_owned()],
+            "recent"=>(0..3).map(|i|format!("outputs/calibration-provider-fit.cVlx1Z/recent-offered-{i}-sam.jsonl")).collect(),
+            _=>panic!("unknown cohort"),
+        };
+        let path=directory.join(format!("{cohort}-annealed-{steps}-{paths}-{seed}.jsonl"));
+        let mut writer=BufWriter::new(OpenOptions::new().write(true).create_new(true).open(path).unwrap());
+        source_order::run_with_selected_annealed_diagnostic(&files,IntegrationConfig {
+            seed,budget:8192,early_stop:true,tail_proposal:TailProposal::ConditionalRefit,
+            numerical_admission:true,marginalize_unobserved_inner:true,
+            global_proposal:true,conditional_nuisance:true,replicas:4,preserve_replica_draws:true,
+            annealed_reference:Some(annealed::Config {paths,steps}),..Default::default()
+        },&indices,&mut writer).unwrap();
+        writer.flush().unwrap();
+    }
+
+    fn cross_eye_support_reference(large_reference:bool,tail_only:bool,numerical_admission:bool) {
+        use conic_solver::joint::posterior::IntegrationConfig;
+        let seeds=[0xd1b5_4a32_d192_ed03,0x94c5_09a1_814f_753d,0x419b_79df_a2c7_5301];
+        let mut same_source=HashMap::new();
+        for cache in ["outputs/student-shadow.FkzvzE/sam-live.jsonl","outputs/student-shadow.FkzvzE/student-live.jsonl"] {
+            let mut pending:HashMap<u64,[Option<Frame>;2]>=HashMap::new();
+            for line in BufReader::new(File::open(cache).expect("native corpus cache required")).lines() {
+                let row:Value=serde_json::from_str(&line.unwrap()).unwrap();
+                let sequence=integer(&row["input"]["frame"],"sequence").unwrap();
+                if !(4487..=4496).contains(&sequence) {continue;}
+                let frame=prepare_with_policy(row,ExtractionPolicy {all_boundary_samples:true,..Default::default()}).unwrap();
+                assert!(frame.validation.is_empty());
+                assert_eq!(frame.input["clock_attested"],true);
+                assert_eq!(frame.input["clock_lineage"],"stream:3721203-1789217645285126937:19");
+                let eye=frame.packet.exposure.roi.0 as usize-1;
+                if let Some(original)=same_source.insert((sequence,eye),frame.input.clone()) {
+                    assert_eq!(original,frame.input,"both providers must describe the exact same native source");
+                }
+                assert!(pending.entry(sequence).or_insert_with(||[None,None])[eye].replace(frame).is_none());
+            }
+            assert_eq!(pending.len(),10);
+            let mut previous_time=None;
+            for sequence in 4487..=4496 {
+                if tail_only && !((cache.ends_with("/sam-live.jsonl") && sequence==4492)
+                    || (cache.ends_with("/student-live.jsonl") && [4488,4490].contains(&sequence))) {continue;}
+                let frames=pending.remove(&sequence).unwrap();assert!(frames.iter().all(Option::is_some));
+                let sources=frames.each_ref().map(|f|f.as_ref().unwrap().packet.exposure);
+                assert_eq!(sources[0].clock,sources[1].clock);
+                assert_eq!(sources[0].sequence,sources[1].sequence);
+                assert_eq!(sources[0].timestamp_ns,sources[1].timestamp_ns);
+                if let Some(previous)=previous_time {assert!((1..=500_000_000).contains(&(sources[0].timestamp_ns-previous)));}
+                previous_time=Some(sources[0].timestamp_ns);
+                let poses=frames.each_ref().map(|f|f.as_ref().map(|f|f.pose));
+                let prepared=frames.each_ref().map(|f|f.as_ref().map(|f|f.packet.prepare()));
+                let evidence=prepared.each_ref().map(|p|p.as_ref().map(|p|p.evidence()));
+                let camera=PinholeCamera {focal_px:[4000.0;2],principal_px:[4000.0,3000.0]};
+                // Freeze the same coarse scene even when one eye's conic evidence is withheld.
+                let scene=approximate_scene(camera,poses).unwrap();
+                for (arm,mask) in [("joint",[true,true]),("monocular_right",[true,false]),("monocular_left",[false,true])] {
+                    if large_reference && arm!="joint" {continue;}
+                    let request=JointConicRequest {eyes:std::array::from_fn(|eye|if mask[eye] {evidence[eye]} else {None}),
+                        scene:&scene.prior,maximum_hypotheses:16,maximum_refinements:12,
+                        maximum_source_skew_ns:0,exposure_uncertainty_ns:2_000_000,motion_bound_px_per_second:150.0};
+                    let baseline=solve_joint_conics(request).unwrap();
+                    assert_eq!(baseline.modeled_eyes,mask);
+                    assert_eq!(baseline.contributing_eyes,mask);
+                    let budgets=if large_reference {vec![(1048576,false)]} else {vec![(8192,true),(65536,false)]};
+                    for (budget,early_stop) in budgets {
+                        for seed in seeds {
+                            let result=solve_joint_conic_distribution_diagnostic(request,1,
+                                IntegrationConfig {budget,seed,early_stop,numerical_admission,..Default::default()}).unwrap().remove(0);
+                            assert_eq!(result.target_camera_mm,baseline.target_camera_mm);
+                            assert_eq!(result.robust_cost,baseline.robust_cost);
+                            assert_eq!(result.ellipses_roi_px,baseline.ellipses_roi_px);
+                            let posterior=result.posterior.as_ref().unwrap();
+                            for eye in 0..2 {if !mask[eye] {assert!(!posterior.supports_direction(eye));}}
+                            eprintln!("cross-eye-reference {}",json!({"cache":cache,"sequence":sequence,"arm":arm,
+                                "inputs":frames.each_ref().map(|f|f.as_ref().map(|f|&f.input)),
+                                "scale_provenance":scene.scale_provenance.map(|p|p.map(|p|format!("{p:?}"))),
+                                "independent_pixels_per_mm":scene.independent_pixels_per_mm,
+                                "arc_fingerprints":frames.each_ref().map(|f|f.as_ref().map(|f|f.packet.arcs.iter()
+                                    .map(|a|json!({"kind":format!("{:?}",a.kind),"group":a.evidence_group,
+                                        "samples":a.points_roi_px.len(),"fingerprint":sample_fingerprint(&a.points_roi_px)})).collect::<Vec<_>>())),
+                                "budget":budget,"early_stop":early_stop,"seed":seed.to_string(),
+                                "solution":solution_json(Ok(result.clone()),frames.each_ref().map(Option::as_ref),0.0)}));
+                            if budget==65536 && arm!="joint" {
+                                assert_eq!(posterior.status,"estimated-conditional");
+                                assert!(!posterior.supports_direction(0));
+                                assert!(!posterior.supports_direction(1));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(same_source.len(),20);
+    }
+
+    #[test]
+    #[ignore = "requires the immutable recent-offered-0 SAM cache and its native RAW archive under outputs"]
+    fn recorded_pupil_conflict_search_diagnostic() {
+        let cache="outputs/calibration-provider-fit.cVlx1Z/recent-offered-0-sam.jsonl";
+        let mut pending:HashMap<u64,[Option<Frame>;2]>=HashMap::new();
+        for line in BufReader::new(File::open(cache).expect("native corpus cache required")).lines() {
+            let row:Value=serde_json::from_str(&line.unwrap()).unwrap();
+            let sequence=integer(&row["input"]["frame"],"sequence").unwrap();
+            if ![325,329,611].contains(&sequence) {continue;}
+            let frame=prepare_with_policy(row,ExtractionPolicy {all_boundary_samples:true,..Default::default()}).unwrap();
+            let eye=frame.packet.exposure.roi.0 as usize-1;
+            pending.entry(sequence).or_insert_with(||[None,None])[eye]=Some(frame);
+        }
+        assert_eq!(pending.len(),3);
+        for sequence in [325,329,611] {
+            let frames=pending.remove(&sequence).unwrap();assert!(frames.iter().all(Option::is_some));
+            let poses=frames.each_ref().map(|f|f.as_ref().map(|f|f.pose));
+            let prepared=frames.each_ref().map(|f|f.as_ref().map(|f|f.packet.prepare()));
+            let evidence=prepared.each_ref().map(|p|p.as_ref().map(|p|p.evidence()));
+            let camera=PinholeCamera {focal_px:[4000.0;2],principal_px:[4000.0,3000.0]};
+            let scene=approximate_scene(camera,poses).unwrap();
+            for (hypotheses,refinements) in [(16,12),(24,16)] {
+                let request=JointConicRequest {eyes:evidence,scene:&scene.prior,
+                    maximum_hypotheses:hypotheses,maximum_refinements:refinements,
+                    maximum_source_skew_ns:0,exposure_uncertainty_ns:2_000_000,motion_bound_px_per_second:150.0};
+                let result=solve_joint_conics(request);
+                let row=solution_json(result,frames.each_ref().map(Option::as_ref),0.0);
+                eprintln!("pupil-budget {}",json!({"sequence":sequence,"hypotheses":hypotheses,"refinements":refinements,
+                    "available":row["available"],"cost":row["cost"],"areas":row["sn_feida_mm2"],
+                    "ellipses":row["outer_ellipses"],"target":row["target_camera_mm"],"support":row["support"]}));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the immutable recent-offered-0 SAM cache and its native RAW archive under outputs"]
+    fn recorded_dark_clip_pupil_support_suppresses_one_area_spike() {
+        // A real-source diagnostic regression, NOT proof of correct anatomy.
+        // This interval has no human labels or fresh per-frame scale support;
+        // a later interval in the SAME clip regresses with pupil support.
+        let cache=std::env::var("BUTTERCUP_PUPIL_ABLATION_CACHE").unwrap_or_else(|_|
+            "outputs/calibration-provider-fit.cVlx1Z/recent-offered-0-sam.jsonl".to_owned());
+        let path=PathBuf::from("outputs").join(format!("pupil-corpus-case-{}-{}.jsonl",std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut file=OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        let fixture=RawFixture(path);
+        let mut sources=0;
+        for line in BufReader::new(File::open(cache).expect("native corpus cache is required")).lines() {
+            let line=line.unwrap();let row:Value=serde_json::from_str(&line).unwrap();let input=&row["input"];
+            let sequence=integer(&input["frame"],"sequence").unwrap();
+            if input["capture_entry"]!=0 || !(313..=333).contains(&sequence) {continue;}
+            assert_eq!(input["clock_lineage"],"stream:1148508-1788826332876023270:35");
+            assert_eq!(input["clock_attested"],true);
+            file.write_all(line.as_bytes()).unwrap();file.write_all(b"\n").unwrap();sources+=1;
+        }
+        assert_eq!(sources,18,"nine exact source exposures from each eye, including source 329");
+        drop(file);
+        let mut series=Vec::new();
+        for without_pupil in [false,true] {
+            let mut bytes=Vec::new();
+            // Full native boundary points; same real tracker and optimizer.
+            // Posterior sampling does not change MAP geometry or history seeds.
+            source_order::run(&[fixture.0.to_string_lossy().into_owned()],usize::MAX,
+                ExtractionPolicy {without_pupil,all_boundary_samples:true,..Default::default()},[0;2],false,false,&mut bytes).unwrap();
+            let mut values=Vec::new();
+            let mut centers=Vec::new();
+            for line in std::str::from_utf8(&bytes).unwrap().lines() {
+                let row:Value=serde_json::from_str(line).unwrap();
+                if !row["publication_inputs"].as_array().is_some_and(|a|a.iter().all(|i|!i.is_null())) {continue;}
+                assert_eq!(row["duplicate_suppressed"],true);
+                assert_eq!(row["joint"]["withheld_sample_residuals"][0]["points"],0);
+                let time=integer(&row["input"]["frame"],"timestamp_ns").unwrap();
+                let area=row["joint"]["sn_feida_mm2"][0].as_f64().expect("fresh accepted outer boundary and independent scale");
+                let ellipse=&row["joint"]["outer_ellipses"][0];
+                let input=&row["publication_inputs"][0]["frame"];
+                centers.push([ellipse["center"][0].as_f64().unwrap()+integer(input,"sensor_x").unwrap() as f64,
+                    ellipse["center"][1].as_f64().unwrap()+integer(input,"sensor_y").unwrap() as f64]);
+                if !without_pupil {
+                    let used=row["joint"]["support"].as_array().unwrap().iter()
+                        .filter(|g|g["roi"]==1&&g["kind"]=="OuterLimbus"&&g["used"]==true).collect::<Vec<_>>();
+                    assert!(!used.is_empty()&&used.iter().all(|g|g["rms_px"].as_f64().unwrap()<5.0),
+                        "area alone cannot overrule current accepted contour support; this still does not certify the rejected rim");
+                }
+                values.push((time,area));
+            }
+            assert_eq!(values.len(),9,"neither arm may hide a dropout or count a repeated publication");
+            for pair in values.windows(2) {assert!(pair[1].0>pair[0].0&&pair[1].0-pair[0].0<=500_000_000);}
+            assert!(centers.windows(2).all(|p|(p[1][0]-p[0][0]).hypot(p[1][1]-p[0][1])>0.1),
+                "this moving-source fixture must not pass by freezing the ellipse in sensor coordinates");
+            series.push(values);
+        }
+        assert!(series[0].iter().zip(&series[1]).all(|(a,b)|a.0==b.0));
+        let changes=series.iter().map(|values|values.windows(2)
+            .map(|p|(p[1].1/p[0].1).ln().abs()).sum::<f64>()/(values.len()-1) as f64).collect::<Vec<_>>();
+        println!("real clip 0 right eye 313..333, nine fresh frames per arm; mean absolute log SN-FEIDA step with/without pupil={changes:?}");
+        assert!(changes[0]<changes[1]*0.5,"preserve this bounded causal area diagnostic, not a claim of localization accuracy");
     }
 
     #[test]

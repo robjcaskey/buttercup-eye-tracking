@@ -264,11 +264,13 @@ fn live_case(raw:&sam31_outer::RawFrame,proposal:Option<&sam31_outer::ProposalMa
         "baseline_retained":fit.retained_points.as_ref(),"baseline_retained_segments":fit.conic_segments.as_ref(),
         "baseline_censored":fit.flat_tire_points.as_ref(),
         "baseline_raw_admitted":proposal.is_some_and(sam31_outer::proposal_raw_outer_admitted)})]).unwrap_or_default();
-    json!({"sequence":raw.sequence,"timestamp_ns":raw.timestamp_ns,
+    let mut record = json!({"sequence":raw.sequence,"timestamp_ns":raw.timestamp_ns,
         "source_group_roi_count":proposal.map(|p|p.source_group_roi_count),
         "sensor_origin":[raw.sensor_x,raw.sensor_y],"width":raw.width,"height":raw.height,
         "candidates":candidates,"selected_query":fit.map(|_|0),
-        "pupil_void":proposal.and_then(|p|p.inner_pupil_fit).map(|p|json!({"ellipse":ellipse(p.ellipse)}))})
+        "pupil_void":proposal.and_then(|p|p.inner_pupil_fit).map(|p|json!({"ellipse":ellipse(p.ellipse)}))});
+    if let Some(proposal) = proposal { proposal.export_boundary_logits(&mut record); }
+    record
 }
 
 /// Offer one clip at its native sensor cadence, with the production atomic

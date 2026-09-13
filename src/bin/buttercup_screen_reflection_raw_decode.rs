@@ -6,9 +6,11 @@ mod screen_reflection_clock;
 mod screen_reflection_code;
 #[path = "../screen_reflection_raw.rs"]
 mod screen_reflection_raw;
+#[path = "../screen_reflection_temporal.rs"]
+mod screen_reflection_temporal;
 
 use screen_reflection_clock::{
-    analyze_whole_raw_roi, detect_optical_activity_onset,
+    analyze_whole_raw_roi_with_layout, detect_optical_activity_onset,
     solve_optical_clock_in_delta_range_with_scheme, solve_optical_clock_with_scheme,
     ClockWitnessStream, OpticalClockFit, WholeRoiClockWitness,
 };
@@ -295,6 +297,7 @@ struct Presentation {
 
 #[derive(Clone, Debug)]
 struct ScreenManifest {
+    temporal_code: bool,
     session_id: String,
     session_tag: u8,
     code_hz: f64,
@@ -376,6 +379,7 @@ fn load_screen_manifest(path: &Path) -> Result<ScreenManifest, String> {
     let mut code_hz = None;
     let mut code_layout = SpatialCodeLayout::LEGACY;
     let mut code_scheme = OpticalCodeScheme::GrayCrcV1;
+    let mut temporal_code = false;
     let mut presentations = Vec::new();
     for (line_index, line) in BufReader::new(file).lines().enumerate() {
         let line = line.map_err(|error| format!("read {}: {error}", path.display()))?;
@@ -387,16 +391,22 @@ fn load_screen_manifest(path: &Path) -> Result<ScreenManifest, String> {
         })?;
         match value.get("record_type").and_then(Value::as_str) {
             Some("session") => {
-                code_layout = code_layout_from_session(&value)?;
+                temporal_code = value["code"]["symbol_sequence"].as_str()
+                    == Some(screen_reflection_temporal::SCHEME);
+                if !temporal_code {
+                    code_layout = code_layout_from_session(&value)?;
+                }
                 if let Some(symbol_sequence) = value
                     .get("code")
                     .and_then(|code| code.get("symbol_sequence"))
                     .and_then(Value::as_str)
                 {
-                    code_scheme =
-                        OpticalCodeScheme::from_wire_name(symbol_sequence).ok_or_else(|| {
-                            format!("unsupported optical code scheme {symbol_sequence:?}")
-                        })?;
+                    if !temporal_code {
+                        code_scheme = OpticalCodeScheme::from_wire_name(symbol_sequence)
+                            .ok_or_else(|| {
+                                format!("unsupported optical code scheme {symbol_sequence:?}")
+                            })?;
+                    }
                 }
                 session_id = value
                     .get("session_id")
@@ -453,6 +463,7 @@ fn load_screen_manifest(path: &Path) -> Result<ScreenManifest, String> {
         return Err("manifest code_hz is invalid".to_string());
     }
     Ok(ScreenManifest {
+        temporal_code,
         session_id: session_id.ok_or_else(|| "manifest lacks session_id".to_string())?,
         session_tag: session_tag.ok_or_else(|| "manifest lacks session_tag".to_string())? & 0x0f,
         code_hz,
@@ -520,6 +531,7 @@ impl ScreenManifest {
 
 #[derive(Clone, Debug)]
 struct FrameRecord {
+    stream_epoch: Option<String>,
     sequence: u64,
     timestamp_ns: u64,
     host_arrival_unix_ns: Option<u64>,
@@ -573,6 +585,9 @@ fn load_frame_index(bytes: &[u8]) -> Result<Vec<FrameRecord>, String> {
             ));
         }
         frames.push(FrameRecord {
+            stream_epoch: value["source_clock"]["source_key"]["stream_epoch"]
+                .as_str()
+                .map(str::to_string),
             sequence: required_u64(&value, "sequence", line_number)?,
             timestamp_ns: required_u64(&value, "timestamp_ns", line_number)?,
             host_arrival_unix_ns: value.get("host_arrival_unix_ns").and_then(Value::as_u64),
@@ -1213,12 +1228,13 @@ fn run_whole_roi_clock(
     for (index, record) in records.iter().enumerate() {
         let owned = load_owned(source, record)?;
         let raw = owned.raw()?;
-        let witness = analyze_whole_raw_roi(raw).ok_or_else(|| {
-            format!(
-                "whole-ROI native scan failed for {} sequence {}",
-                record.label, record.sequence
-            )
-        })?;
+        let witness =
+            analyze_whole_raw_roi_with_layout(raw, manifest.code_layout).ok_or_else(|| {
+                format!(
+                    "whole-ROI native scan failed for {} sequence {}",
+                    record.label, record.sequence
+                )
+            })?;
         analyzed.push(WholeRoiAnalyzedFrame {
             record: record.clone(),
             witness,
@@ -1721,10 +1737,138 @@ fn run_whole_roi_clock(
     Ok(())
 }
 
+fn run_temporal_clock(
+    config: &Config,
+    manifest: &ScreenManifest,
+    source: &BundleSource,
+    frames: &[FrameRecord],
+) -> Result<(), String> {
+    use screen_reflection_temporal::{photometry, recover, Sample, PERIOD};
+    let label = config.eye.clone();
+    if !frames.iter().any(|r| r.label == label) {
+        return Err(format!("no native frames for {label}"));
+    }
+    let mut output = create_output(config.output.as_deref())?;
+    let mut samples: Vec<Sample> = Vec::new();
+    let mut previous: Option<&FrameRecord> = None;
+    let mut attempts = 0usize;
+    let mut fits = 0usize;
+    let mut reverse_fits = 0usize;
+    let mut constant_fits = 0usize;
+    let mut qualified = 0usize;
+    let mut arrival_lags = Vec::new();
+    let mut transitions = HashMap::new();
+    for p in &manifest.presentations {
+        if let Some(t) = p.commit_unix_ns {
+            transitions.entry(p.code_index).or_insert(t);
+        }
+    }
+    write_json_line(
+        &mut output,
+        &json!({"record_type":"session","scheme":screen_reflection_temporal::SCHEME,
+        "session_id":manifest.session_id,"label":label,"host_time_enters_optical_fit":false,
+        "measurement":"packet arrival minus first host submission of optically recovered held code; not exposure latency",
+        "rate":"nominal display symbol rate; clock drift is not fitted","session_identity":"phase shift only; not independent authentication"}),
+    )?;
+    for (index, record) in frames
+        .iter()
+        .filter(|r| r.label == label)
+        .take(config.maximum_frames.unwrap_or(usize::MAX))
+        .enumerate()
+    {
+        if previous.is_some_and(|p| {
+            p.stream_epoch != record.stream_epoch
+                || record.timestamp_ns <= p.timestamp_ns
+                || record.timestamp_ns - p.timestamp_ns > 4_000_000_000
+                || (p.sensor_x, p.sensor_y, p.width, p.height)
+                    != (
+                        record.sensor_x,
+                        record.sensor_y,
+                        record.width,
+                        record.height,
+                    )
+        }) {
+            samples.clear();
+        }
+        previous = Some(record);
+        let owned = load_owned(source, record)?;
+        let value = photometry(owned.raw()?);
+        let Some(value) = value else {
+            continue;
+        };
+        samples.push(Sample {
+            sensor_ns: record.timestamp_ns,
+            value,
+        });
+        let horizon = (80. / manifest.code_hz * 1e9) as u64;
+        let keep = samples.partition_point(|s| record.timestamp_ns - s.sensor_ns > horizon);
+        samples.drain(..keep);
+        let mut fit = None;
+        let mut lag = None;
+        let mut code_index = None;
+        if index % 10 == 0 {
+            attempts += 1;
+            fit = recover(&samples, manifest.code_hz, manifest.session_tag);
+            let mut control = samples.clone();
+            for (i, s) in control.iter_mut().enumerate() {
+                s.value = samples[samples.len() - 1 - i].value;
+            }
+            reverse_fits +=
+                usize::from(recover(&control, manifest.code_hz, manifest.session_tag).is_some());
+            for s in &mut control {
+                s.value = value;
+            }
+            constant_fits +=
+                usize::from(recover(&control, manifest.code_hz, manifest.session_tag).is_some());
+            if let Some(f) = fit {
+                fits += 1;
+                // Optical identity was already selected from RAW/sensor time.
+                // Only now use the submission log to resolve period and measure lag.
+                if let Some(arrival) = record.host_arrival_unix_ns {
+                    let matching: Vec<_> = transitions
+                        .iter()
+                        .filter(|(code, t)| {
+                            **code % PERIOD as u64 == f.code_mod
+                                && arrival >= **t
+                                && arrival - **t <= 500_000_000
+                        })
+                        .collect();
+                    if matching.len() == 1 {
+                        let (code, t) = matching[0];
+                        code_index = Some(*code);
+                        let ms = (arrival - *t) as f64 / 1e6;
+                        lag = Some(ms);
+                        arrival_lags.push(ms);
+                        qualified += 1;
+                    }
+                }
+            }
+        }
+        write_json_line(
+            &mut output,
+            &json!({"record_type":"temporal_observation","sequence":record.sequence,
+            "sensor_timestamp_ns":record.timestamp_ns,"stream_epoch":record.stream_epoch,
+            "host_arrival_unix_ns":record.host_arrival_unix_ns,"sensor_origin":[record.sensor_x,record.sensor_y],"photometry":value,
+            "samples":samples.len(),"code_index":code_index,"arrival_minus_first_submit_ms":lag,
+            "fit":fit.map(|f|json!({"code_mod":f.code_mod,"polarity":f.polarity,"bit_errors":f.bit_errors,"runner_errors":f.runner_errors,
+                "correlation":f.correlation,"phase_width_ticks":f.phase_width_ticks,"fractional_phase":f.fractional_phase,"levels_span":f.levels_span}))}),
+        )?;
+    }
+    let summary = json!({"record_type":"summary","attempts":attempts,"optical_word_fits":fits,"qualified_in_session":qualified,
+        "reversed_time_fits":reverse_fits,"constant_signal_fits":constant_fits,"median_arrival_minus_first_submit_ms":floating_median(arrival_lags)});
+    write_json_line(&mut output, &summary)?;
+    output.flush().map_err(|e| e.to_string())?;
+    eprintln!("{summary}");
+    Ok(())
+}
+
 fn run(config: Config) -> Result<(), String> {
     let manifest = load_screen_manifest(&config.manifest)?;
     let source = BundleSource::open(&config.bundle)?;
     let frame_index = load_frame_index(&source.read_entry("frames.jsonl")?)?;
+    if manifest.temporal_code {
+        return run_temporal_clock(&config, &manifest, &source, &frame_index);
+    }
     if config.whole_roi_clock {
         return run_whole_roi_clock(&config, &manifest, &source, &frame_index);
     }
@@ -2546,6 +2690,7 @@ mod tests {
             synthetic_raw_frame(width, height, 202, 201, moved, 12, session_tag, 12, layout);
         let post_raw = PackedRaw10::new(&post_payload, width, height, stride, 202, 201).unwrap();
         let manifest = ScreenManifest {
+            temporal_code: false,
             session_id: "crop-follow-relocalization".to_string(),
             session_tag,
             code_hz: 20.0,

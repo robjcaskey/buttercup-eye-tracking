@@ -127,13 +127,39 @@ heuristic bounds, not calibrated probabilities. Contact axes are conic/surface
 normals, not kappa-calibrated visual axes. Missing/unresolved admitted rays remain
 null even when a provisional screen cursor is drawn.
 
-Only the reference eye has the assumed [0,0,0] origin and identity coordinate
-transform. The other eye's metric origin/transform and both anatomical radii
-stay null. Camera optical center and pose are unsolved/null. Available
-checkerboard intrinsics may be exported, explicitly **not used by this gaze
-solve**. Metric head translation is not estimated. Both `visual_axis` fields
-stay null; the binocular solver remains NotImplemented. A cosmetic camera or
-second eyeball must be labeled schematic.
+In the legacy eye-relative representation, only the reference eye has the
+assumed [0,0,0] origin and identity coordinate transform. Unknown metric
+origins, transforms, anatomical radii and `visual_axis` fields remain null;
+do not interpret this legacy block as a measured stereo reconstruction.
+Available checkerboard intrinsics may be exported, explicitly **not used by
+the legacy gaze solve**. Metric head translation is not measured. A cosmetic
+camera or second eyeball must be labeled schematic.
+
+An optional `joint_conics` block is a separate conditional reconstruction in
+`camera-optical-center-mm-v1`: millimeters, sensor-right/down, +Z toward camera;
+visible scene points have negative Z. Its actual supplied intrinsics and their
+provenance are in `intrinsics`. Fitted eye centers, normals, effective pivots
+and `surface_axis_alignment_radians` are model outputs, not independent head
+measurements or clinically calibrated visual axes. Existing source-group and
+posterior fields still decide whether a candidate is admitted.
+
+`joint_conics.source_projected_conics` preserves the actual fitted image conics
+without reconstructing their axes from a gaze vector. `coordinate_frame` is
+`source-roi-pixels`; `boundary_order` is outer limbus, inner limbus, pupillary
+boundary. Each of the two `eyes` entries binds its three optional `ellipses`
+to an exact `source` (ROI, clock domain/epoch, sequence and sensor timestamp),
+`sensor_origin_px` and `dimensions_px`. An ellipse contains `center`,
+`major_radius`, `minor_radius` and `angle_rad`. Missing source placement or
+boundaries remain null. `modeled_eye` and `contributing_eye` retain their
+distinct meanings. Moving the display ROI or redrawing a held answer does not
+rebase these source-native coordinates or give them a new clock.
+
+These conics are conditional joint-fit outputs, not additional independent
+boundary observations. In particular, projected-major-radius area plus a 3D
+normal does not encode minor radius or image-axis angle under general
+perspective. Older archives without this block require an explicitly verified
+reconstruction from their saved full forward-projection geometry, or must
+report that the actual conic is unavailable.
 
 `monitor_intersection` requires a signed usable ray and known/assumed origin.
 Statuses preserve on-screen, off-screen, behind-eye, parallel,

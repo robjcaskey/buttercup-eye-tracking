@@ -5,6 +5,9 @@
 #[path = "../geometry.rs"]
 mod geometry;
 #[cfg(feature = "sam31")]
+#[path = "../limbus_refiner.rs"]
+mod limbus_refiner;
+#[cfg(feature = "sam31")]
 #[path = "../"]
 mod native {
     // Preserve the shared modules' normal child-module directories. Loading

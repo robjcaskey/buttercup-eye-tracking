@@ -1,15 +1,238 @@
 # Experimental optical limbus refinement
 
-SAM3.1 now has **Tweaked Contact Geometry** at ROI `F 6/8`, immediately
-after the original contact view. Linked SAM ROIs also offer it at `F 4/4`.
-It is not in the Eye Student or other detectors' F cycles.
+Training and reuse of model-derived targets are governed by the
+[bootstrapability contract](../bootstrapability.md). The experiments below do
+not yet constitute a current-checkout cold-bootstrap proof or a new-user
+onboarding validation.
+
+**Tweaked Contact Geometry** follows the original contact view: SAM3.1 ROI
+`F 6/8`, Butter Obelisk/Student ROI `F 9/12`; linked SAM `F 5/5`, linked
+Obelisk/Student `F 7/8`. Both use immutable inference-source RAW and dimensions,
+including after a newer ROI crop moves or resizes. Other detectors omit it.
 
 This is a separate trained model with a different purpose from the SAM mask
 student: move already observed limbus samples a small distance along their
 outward normal, while distinguishing the surface landmark from deeper visible
 optical continuation. It does not replace SAM, recover a missing iris, or
-promise a perfect fit. The preview changes **no tracking, calibration, mouse,
-laser, eye-presence, or de-flat-tire authority**.
+promise a perfect fit. Selecting F changes **presentation only**, not tracking,
+calibration, mouse, laser or eye-presence authority.
+
+## Shared geometry plumbing and experimental authority
+
+`--limbus-refinement off|experimental` (environment
+`BUTTERCUP_LIMBUS_REFINEMENT`) selects a startup-only global analysis stage,
+separate from F. **Default is off**: this checkout's model still lacks the
+required cold-bootstrap proof. The switch is experimental comparison plumbing,
+not permission to bypass `bootstrapability.md`; live use of the unverified
+checkpoint requires an explicit experimental exception. No verified/default
+promotion or training was performed for this integration.
+
+When explicitly enabled, the native SAM video and Obelisk workers refine once
+per source before publishing their shared `OuterResult` and `ProposalMasks`.
+The accepted ellipse and corrected retained arc points consequently feed
+tracking, pupil projection, single-eye/stereo conic solving, signed contact
+pose, gaze, calibration, focus-follows-eyes, mouse and laser consumers. There
+is no separate cursor/laser adjustment and the model supplies no signed gaze.
+The independently measured pupil is not moved or replaced by this model.
+
+The CPU-only pass retains the existing flat-tire exclusions and sparse arc
+indices. It requires baseline RAW admission, bounded source-local shifts,
+new candidate RAW admission, and compatibility with any measured pupil.
+Missing weights, unsupported corrections or failed gates preserve the exact
+baseline and its support. These abstentions are not new refined observations.
+The source timestamp, crop origin, prompt generation and epoch are unchanged.
+Legacy three-adapter SAM consensus is not wired to this native-video stage.
+
+The F renderer reuses the worker's immutable decision, including rejection,
+rather than refining the effective ellipse a second time. It labels shared
+versus preview-only geometry. The Model panel reports the selected source's
+refinement status. Recording predictions and sequence replays include source-
+identified decision/status, original/candidate ellipse and CPU time. With
+authority off the renderer can still compute its original preview-only field.
+
+Worker physical context is explicitly unavailable: current proposals do not
+carry independently measured source-aligned scale/focus. Do not substitute
+the fitted radius or a newer UI estimate. Recalibrate when evaluating a changed
+geometry pipeline; an old screen mapping is not evidence of its accuracy.
+
+Matched evaluation uses the ordinary source/session and contact replay, e.g.:
+
+```sh
+BUTTERCUP_LIMBUS_REFINEMENT=off data/target/live/buttercup-eye-viewer \
+  --offline-sam-sequence-eval outputs/RUN/base.json CAPTURE subject-right 200 120 1 native student
+BUTTERCUP_LIMBUS_REFINEMENT=experimental data/target/live/buttercup-eye-viewer \
+  --offline-sam-sequence-eval outputs/RUN/candidate.json CAPTURE subject-right 200 120 1 native student
+data/target/live/buttercup_report_limbus_refiner live outputs/RUN/report.json \
+  outputs/RUN/base.json outputs/RUN/candidate.json
+```
+
+The Rust report rejects mismatched source/crop/clock/motion inputs and compares
+fresh signed coverage, RAW admission, matched human localization when present,
+independently normalized SN-FEIDA steps and ROI-reframe subsets. Gaze-vector
+change is labeled **difference, not target accuracy**. Coordinate streams and
+corpus reports remain runtime data; no checkpoint is copied into Git.
+
+### Shared-path integration check, September 12, 2026
+
+Reports and exact input/report hashes: `outputs/limbus-shared-eval.rSIlhH`.
+No weights were trained, replaced or promoted. Compared the installed refiner
+and RAW Obelisk `outputs/raw-student.DUYOAP/raw.ot` with refinement off/on on
+120 consecutive exposures per eye (indices 200–319) from
+`outputs/micro-clock-compare.G6mlnW/capture`, plus the 37-frame canonical
+triplet subset described below. SAM native-video also ran on the same right-eye
+120 exposures and the same 37 triplet frames. Baseline/candidate jobs ran in
+parallel under shared CPU/GPU coordinator leases (not exclusive benchmarks).
+
+| Matched subset | RAW admissions, off → on | Fresh signed contacts, off → on | Mean absolute SN-FEIDA log step, off → on |
+| --- | --- | --- | --- |
+| Obelisk, right 120 | 120 → 120 | 117 → 117 | 0.02307 → 0.02185; 82 supported pairs |
+| Obelisk, left 120 | 108 → 108 | 104 → 104 | 0.02672 → 0.02493; 68 pairs |
+| SAM, right 120 | 117 → 117 | 113 → 113 | 0.02441 → 0.02231; 81 pairs |
+| Obelisk, 37 labeled-triplet sources | 37 → 37 | 4 → 4 | 0.03533 → 0.03305; 18 pairs |
+| SAM, same 37 sources | 33 → 33 | **7 → 2** | 0.09600 → 0.09430; 14 pairs |
+
+On 14 matched canonical labeled frames Obelisk's equal-frame mean visible-rim
+RMS changed **7.628 → 7.343 px**: eight improved, five regressed, one unchanged.
+The worst increase was +0.220 px at sequence 226. Sequence 10124 remained badly
+localized at 17.85 px; sequence 10206 still had 17.14 px error. SAM's 11 matched
+labeled admissions changed 8.259 → 8.130 px, with a worst increase of +0.529 px.
+These labels overlap development material; this is not held-out accuracy or
+an independent model selection result.
+
+Right-eye reframe comparisons had ten independently scale-supported pairs:
+Obelisk mean absolute area step 0.04060 → 0.03933; SAM 0.03401 → 0.03065.
+No left-eye reframe pairs were available. Left-eye area p95 worsened slightly
+despite the better mean (0.07906 → 0.08023). Scale is a source-timed RAW texture
+similarity estimate, not calibrated millimeters; missing/unsupported scale is
+not filled from the ellipse. Continuous clips have no human limbus labels.
+
+The short SAM low-light sequence lost five signed outputs at sequences 10206,
+10207, 10216, 10217 and 10218, including two unchanged-ellipse abstentions whose
+preceding trajectory had changed. Thus modest localization improvement does
+**not** establish better sign acquisition or justify default authority. The
+five sources had no admitted pupil cue. At 10206, baseline motion residuals
+were [30.240, 20.176] px, exceeding the 5.034 px separation threshold; refined
+residuals were [26.860, 23.885] px, below that same threshold. This is reduced
+sign coverage, not proof the original sign was correct: the baseline's labeled
+rim error on that source was already 15.650 px (refined 16.178 px). Do not lower
+the acquisition threshold or copy the baseline sign merely to restore coverage.
+No target-based accuracy or sign-ground-truth claim was made for those short
+clips. On continuous clips, median
+baseline-to-refined gaze-vector changes were about 0.67–0.80 degrees; these are
+differences, not accuracy improvements.
+
+CPU refinement averaged 1.08–1.33 ms per attempted Obelisk source (p95
+1.42–1.57 ms), excluding model loading, main segmentation and downstream gaze.
+Shared-host contention means these are indicative costs, not latency guarantees.
+One conflicting-pupil correction, unsupported local fields and shape-bound
+failures retained their exact baselines. Source/epoch/prompt identities were
+unchanged; excluded arcs were not reinstated.
+
+Focused publication, fallback, UI, source-render and model-bound tests passed,
+including the real RAW/model Obelisk render fixture and CPU report tests.
+The broader `limbus` name-filter run passed 86 tests, skipped six and failed
+four unrelated Driving/RAW tests because their legacy fixture files are absent.
+It is not reported as a passing full viewer suite.
+
+### Full recorded-target efficacy, September 12, 2026
+
+**Obelisk improves on this recording; SAM has a serious persistent sign
+regression. Neither outcome authorizes default promotion.** Full source-matched
+off/on replays and reports are in `outputs/limbus-target-efficacy.Mf1eGC`, with
+final reports `student-target-v2.json` and `sam-target-v2.json`. Each backend
+processed all 1,094 subject-right exposures from the same 106-second, five-site
+micro-motion/optical-clock recording above. Viewer binary SHA-256 was unchanged
+before and after all four runs:
+`e54dafb5c35c01fdf96fed82b655c21cee1470a24d7f3e7d1d9d52a98ce4ed31`.
+Baseline/candidate pairs ran concurrently under shared coordinator leases;
+SAM and Obelisk pairs ran sequentially. No live camera or training was used.
+
+The new portable Rust `targets` report reads native OIM1 presentations, including
+fractional pixel coordinates and explicit target removal. It retains the
+recording's monitor translation/rotation/size, rejects changed monitor geometry
+or spliced sessions, and verifies each source's sequence/timestamp/clock epoch.
+It does not recalibrate either arm or feed targets into predictions.
+
+```sh
+data/target/live/buttercup_report_limbus_refiner targets outputs/RUN/targets.json \
+  outputs/RUN/base.json outputs/RUN/candidate.json CAPTURE/metadata.oim1 \
+  outputs/micro-clock-compare.G6mlnW/clock-summary.json \
+  outputs/micro-clock-compare.G6mlnW/blink-review.json
+```
+
+Use the clock/blink inputs belonging to the evaluated capture, not these paths
+for arbitrary new recordings. The reporter hashes all input files. The imported
+empirical clock-offset band is 45.058 ms wide, assumes unit clock rate, and is
+**not** a calibrated confidence interval or an independently measured display
+scanout/exposure delay. The first verified in-record optical receipt is source
+2136. The same pre-existing RAW visual blink review is used unchanged for both
+arms, padded by 200 ms before/500 ms after; it is assistant visual review, not
+canonical human blink labels. Large site relocations require one second of
+acquisition across the entire clock band and 0–400 ms response-lag sweep. Tiny
+microsteps remain eligible. Exclusion precedence yields 127 blink, 52 acquisition
+and 91 pre-clock sources, leaving **824** eligible exposures.
+
+These are conditional angular discrepancies between fresh signed gaze and
+commanded targets under the captured fixed-reference-eye monitor model—not
+independent anatomical gaze/visual-axis truth or proof of fixation. The 200 ms
+reference lag is not a fitted physiological latency. Each off/on pair uses the
+intersection of fresh signed sources so missing predictions cannot improve its
+matched score. The two backend intersections differ; the table is **not** a
+same-census SAM-versus-Obelisk ranking.
+
+| Backend | Matched target sources | Mean error, off → on | Median, off → on | p95, off → on |
+| --- | --- | --- | --- | --- |
+| RAW Obelisk | 823 | 3.337° → 2.941° | 3.272° → 2.673° | 6.253° → 5.772° |
+| SAM native video | 798 | 3.023° → 8.151° | 2.325° → 2.678° | 7.402° → 46.612° |
+
+Own-admission eligible counts were Obelisk 823 → 823, SAM 801 → 799. Across the
+entire recording, RAW admissions were unchanged (Obelisk 1,088; SAM 1,052), while
+fresh signed contacts were 1,080 → 1,080 and 1,039 → 1,037 respectively. Obelisk
+mean target error improved at four sites but regressed at site 3
+(4.349° → 4.511°); site 1 p95 also worsened (2.853° → 3.080°). SAM's final site
+mean jumped from 4.383° to 26.853°. Across 0–400 ms reference lags and both clock
+band endpoints, aggregate mean errors varied by less than 0.002° in each arm;
+clock offset within this tested range does not explain the regression. This
+does not establish reliable relative tracking of the 1–5 px microsteps.
+
+The first large SAM off/on directional divergence occurs at **2998**, following
+the reviewed blink at 2995. At 2997 refinement changes the axis ratio from
+0.97439 to 0.99832: the ellipse is nearly circular, so its major-axis direction
+is poorly determined. From 2997 to 2998 the fitted major-axis change falls on
+opposite sides of 90° (baseline 91.17°, refined 88.02°). The sign tracker's
+nearest transported-direction assignment consequently takes opposite branches.
+Both retain branch label 1 and sign epoch 2: this is an implicit physical-
+identity reassignment, **not** an explicit sign vote/epoch change. At 2998 the
+baseline gaze y is −0.347; refined y is +0.388. There are 114 fresh source pairs
+with off/on angular disagreement above 18.19° (dot product below 0.95), continuing
+through the final source 3113. Blink-window exclusion removes affected scores
+near the blink but cannot undo poisoned temporal state afterward. This localizes
+a follow-up sign-association issue; no sign-history policy was changed here.
+
+SN-FEIDA still improved, illustrating why area alone is insufficient:
+
+| Backend | Independently supported area pairs | Mean absolute log step, off → on | Reframe pairs; mean step, off → on |
+| --- | --- | --- | --- |
+| Obelisk | 912 | 0.024295 → 0.023322 | 127; 0.027524 → 0.026269 |
+| SAM | 867 | 0.038814 → 0.034460 | 115; 0.048549 → 0.042947 |
+
+SAM's reframe p95 worsened from 0.14693 to 0.15405. These area statistics use the
+full source census, separate from the target exclusions, with independent RAW
+texture scale and no dropout bridges. This full recording has no canonical
+limbus labels; the labeled localization check remains the small development-
+overlap subset above. The data are Rob-only, with no new-user, held-out or
+stereo-target validation. Completion-paced replay also does not measure live
+queue latency, realtime drop policy or a user's post-refinement recalibration.
+
+The refiner applied on 1,069 Obelisk and 1,010 SAM exposures. Mean CPU pass cost
+was 1.194 / 1.213 ms respectively (p95 1.553 / 1.417 ms), excluding loading and
+the rest of the pipeline; these shared-host observations are not benchmarks.
+The portable report's 15 tests pass, including native metadata truncation,
+session/frame attestation, hidden targets, fractional coordinates, tilted
+monitor geometry, integer clock precision and rejection of held/unsigned gaze.
+A baseline-versus-itself check reproduces the earlier SAM report's 801-source
+mean, median and p95 exactly. Per-site quantile conventions differ from the old
+temporary analyzer (the new report uses midpoint median and nearest-rank p95).
 
 ## Representation and implementation
 
@@ -199,7 +422,9 @@ With the same LibTorch environment used by `scripts/run-viewer.sh`:
 
 ```sh
 cargo build --profile live --features sam31 --bin buttercup_limbus_refiner
-python3 scripts/prepare-limbus-refiner.py INVENTORY.json outputs/NEW_RUN/human
+cargo build --profile live --no-default-features \
+  --bin buttercup_prepare_limbus_refiner --bin buttercup_report_limbus_refiner
+data/target/live/buttercup_prepare_limbus_refiner INVENTORY.json outputs/NEW_RUN/human
 # Generate a label-blind SAM reference with the existing student replay tool:
 data/target/live/buttercup_eye_student replay outputs/NEW_RUN/human/sam-inputs.jsonl sam outputs/NEW_RUN/sam.jsonl
 data/target/live/buttercup_limbus_refiner prepare-aux TEACHER_DIR outputs/NEW_RUN/human/dataset.json outputs/NEW_RUN/aux.json
@@ -209,13 +434,30 @@ data/target/live/buttercup_limbus_refiner evaluate outputs/NEW_RUN/human/dataset
 
 Use `train-all ... EPOCHS` only after choosing a schedule from grouped validation.
 `BUTTERCUP_LIMBUS_ABLATE_CONTEXT=1` is an explicitly reported evaluation ablation.
-The preparation script's `--sequence-area-report` imports existing matched
+The preparation tool's `--sequence-area-report` imports existing matched
 motion evidence into an **evaluation-only** dataset; the trainer refuses it.
-All generated files use new runtime destinations. `report-limbus-refiner.py`
+All generated files use new runtime destinations. `buttercup_report_limbus_refiner`
 has `cv` and `sequence` modes, preserving identity and missingness.
 
-Validation includes Python landmark/clock/area tests, Rust geometry and
-subsurface-exclusion tests, SAM-only UI-cycle tests, portable no-CUDA checks,
+```sh
+data/target/live/buttercup_report_limbus_refiner cv outputs/NEW_RUN/cv-report.json \
+  outputs/NEW_RUN/fold0-eval.json outputs/NEW_RUN/fold1-eval.json
+data/target/live/buttercup_report_limbus_refiner sequence outputs/NEW_RUN/sequence-report.json \
+  outputs/NEW_RUN/sequence-eval.json
+```
+
+Preparation/reporting now share `src/training_refiner_data.rs`, with native
+Rust landmark/clock/area tests replacing the Python equivalents. These tools
+build with `--no-default-features` and do not require Python, LibTorch or CUDA.
+The existing Rust/CUDA patch trainer is shared, offline foundation work, not a
+personal adaptation trainer. Optional user/scenario refinement training and
+inference must be CPU-only. Follow the
+[bootstrapability contract](../bootstrapability.md), including the declared
+DAG preflight, before training or reusing derived material; successful
+component commands alone do not prove cold bootstrapability.
+
+Validation includes native landmark/clock/area tests, Rust geometry and
+subsurface-exclusion tests, SAM/Obelisk UI-cycle tests, portable no-CUDA checks,
 and an opt-in actual-model RAW render test. Set
 `BUTTERCUP_LIMBUS_UI_CORPUS_DIR=outputs/limbus-refiner.3Qc8Ru` for the latter;
 the displayed sign in that offline renderer fixture is synthetic, **not gaze

@@ -3,6 +3,8 @@
 #![recursion_limit = "256"]
 #[path = "../geometry.rs"]
 mod geometry;
+#[path = "../limbus_refiner.rs"]
+mod limbus_refiner;
 #[path = "../raw10.rs"]
 mod raw10;
 #[path = "../roi_continuity.rs"]

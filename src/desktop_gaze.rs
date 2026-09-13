@@ -91,6 +91,35 @@ fn source(frame: &EyeFrame, prompt_generation: u64) -> Result<Source, &'static s
     })
 }
 
+/// Shared pre-projection gaze evidence for desktop output and read-only
+/// telemetry. This is not a screen target and does not require calibration.
+/// The caller must pass the same globally prepared frame used for presentation;
+/// preparation errors, unresolved signs and carried presentation poses all
+/// remain unavailable rather than falling back to a different analysis mode.
+#[derive(Clone, Debug)]
+pub(crate) struct AuthorizedGaze {
+    pub source: Source,
+    pub receipt: crate::recording_trace::SourceReceipt,
+    pub pose: crate::VirtualContactPose,
+}
+
+pub(crate) fn authorized_gaze(
+    frame: &EyeFrame,
+    prompt_generation: u64,
+    trace: &crate::recording_trace::Hub,
+) -> Result<AuthorizedGaze, &'static str> {
+    let source = source(frame, prompt_generation)?;
+    let receipt = trace
+        .source_receipt(frame.eye_id, source.timestamp_ns)
+        .ok_or("paused: unknown or ambiguous source clock")?;
+    let pose = crate::virtual_contact_pose(frame).ok_or("paused: no current virtual contact")?;
+    if pose.authority == VirtualContactAuthority::MotionHeld {
+        return Err("paused: held contact is not a fresh observation");
+    }
+    let pose = crate::pose_for_cursor(frame, pose).ok_or("paused: no current joint gaze ray")?;
+    Ok(AuthorizedGaze { source, receipt, pose })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Selection {
     policy: GlobalGazePolicy,
@@ -135,23 +164,16 @@ fn current_sample(app: &App) -> Result<(Sample, Selection), &'static str> {
         .clone()
         .ok_or("paused: no eye frame")?;
     crate::prepare_current_contact_frame(app, selection.eye, &mut frame, selection.policy);
-    let source = source(&frame, selection.policy.prompt_generation)?;
-    let age = trace
-        .source_arrival_age(frame.eye_id, source.timestamp_ns)
-        .ok_or("paused: unknown or ambiguous source clock")?;
-    let pose = crate::virtual_contact_pose(&frame).ok_or("paused: no current virtual contact")?;
-    if pose.authority == VirtualContactAuthority::MotionHeld {
-        return Err("paused: held contact is not a fresh observation");
-    }
-    let pose=crate::pose_for_cursor(&frame,pose).ok_or("paused: no current joint gaze ray")?;
+    let gaze = authorized_gaze(&frame, selection.policy.prompt_generation, &trace)?;
     let calibration = app
         .calibrated_display
         .and_then(|c| c.for_frame(selection.eye, Some(&frame)));
-    let target = crate::display_gaze_target(pose, calibration, selection.plane)
+    let target = crate::display_gaze_target(gaze.pose, calibration, selection.plane)
         .ok_or("paused: no forward monitor intersection")?;
     Ok((Sample {
-        source,
-        age,
+        source: gaze.source,
+        age: gaze.receipt.age_at(Instant::now())
+            .ok_or("paused: unknown or ambiguous source clock")?,
         target,
     }, selection))
 }
@@ -495,5 +517,30 @@ mod tests {
         frame.surface_gaze = None;
         frame.virtual_contact_surface_gaze = None;
         assert_eq!(source(&frame, 0).unwrap_err(), "paused: no gaze surface");
+    }
+
+    #[test]
+    fn shared_gaze_evidence_preserves_policy_sign_and_source_clock_rejections() {
+        let trace = crate::recording_trace::Hub::default();
+        let mut frame = crate::tests::control_eye_frame(1);
+        frame.eye_identity_present = true;
+        frame.segmentation_mode = SegmentationMode::Native;
+        frame.surface_gaze = Some(surface());
+        frame.gaze_policy_error = Some("paused: waiting for global gaze settings");
+        assert_eq!(authorized_gaze(&frame, 0, &trace).unwrap_err(),
+            "paused: waiting for global gaze settings");
+        frame.gaze_policy_error = None;
+        frame.surface_gaze.as_mut().unwrap().sign_resolved = false;
+        assert_eq!(authorized_gaze(&frame, 0, &trace).unwrap_err(),
+            "paused: unresolved gaze sign");
+        frame.surface_gaze.as_mut().unwrap().sign_resolved = true;
+        assert_eq!(authorized_gaze(&frame, 0, &trace).unwrap_err(),
+            "paused: unknown or ambiguous source clock");
+        for epoch in ["first", "reconnected"] {
+            trace.raw_arrived(serde_json::json!({"roi_id":1,
+                "sensor_timestamp_ns":"100", "stream_epoch":epoch}), Instant::now(), 1);
+        }
+        assert_eq!(authorized_gaze(&frame, 0, &trace).unwrap_err(),
+            "paused: unknown or ambiguous source clock");
     }
 }

@@ -3,7 +3,7 @@
 //! target is only an optimization start, never a new observation or smoothing.
 
 use crate::binocular_coordinator::source_pairing::{PairingUnavailable, SourcePairer};
-use crate::conic_solver::joint::{solve_joint_conic_hypotheses, JointConicRequest, JointConicSolution, JointConicUnavailable, PinholeCamera};
+use crate::conic_solver::joint::{solve_joint_conic_hypotheses, solve_joint_conic_distribution, JointConicRequest, JointConicSolution, JointConicUnavailable, PinholeCamera};
 use crate::eye_scene_model::binocular_pose::{approximate_scene, CoarseBinocularScene, EyePoseInput};
 use crate::outline_conic_segments::sparse_evidence::OwnedRoiEvidence;
 use crate::roi_evidence::{ExposureKey, SourceClock};
@@ -77,8 +77,8 @@ mod tests {
             exposure:ExposureKey {roi:RoiId(eye as u32+1),clock:SourceClock {domain:1,epoch:5},
                 sequence:time/100_000_000+eye as u64*1000,timestamp_ns:time},
             sensor_origin_px:origin,dimensions_px:[420,280],detail_reliability:Some(1.0),
-            arcs:vec![OwnedBoundaryArc {evidence_group:0,kind:BoundaryKind::OuterLimbus,
-                points_roi_px:e.dense_points(32),outward_normals_roi:None,normal_band_half_width_px:1.0,detector_score:None}],
+            arcs:vec![OwnedBoundaryArc { level_sets_roi: None,evidence_group:0,kind:BoundaryKind::OuterLimbus,
+                points_roi_px:e.dense_points(32),outward_normals_roi:None,localization_sigma_px:None,normal_band_half_width_px:1.0,detector_score:None}],
             conics:vec![OwnedConicHint {kind:BoundaryKind::OuterLimbus,ellipse_roi_px:e,supporting_arc_indices:vec![0]}]},
             pose:EyePoseInput {limbus_center_sensor_px:camera().project(center).unwrap(),pixels_per_10mm:Some([4000.0/35.0,100.0,130.0])}}
     }
@@ -335,8 +335,8 @@ mod tests {
                 (p[0]-current.packet.sensor_origin_px[0] as f64,p[1]-current.packet.sensor_origin_px[1] as f64)
             }).collect();
             let ellipse=ProjectedCircle::project(camera(),center,normal,radius,current.packet.sensor_origin_px).unwrap().ellipse().unwrap();
-            current.packet.arcs.push(OwnedBoundaryArc {evidence_group:group,kind,points_roi_px:points,
-                outward_normals_roi:None,normal_band_half_width_px:if group==1 {pupil_band} else {0.0},detector_score:None});
+            current.packet.arcs.push(OwnedBoundaryArc { level_sets_roi: None,evidence_group:group,kind,points_roi_px:points,
+                outward_normals_roi:None,localization_sigma_px:None,normal_band_half_width_px:if group==1 {pupil_band} else {0.0},detector_score:None});
             current.packet.conics.push(OwnedConicHint {kind,ellipse_roi_px:ellipse,supporting_arc_indices:vec![group as usize]});
         }
         (current,normal)
@@ -430,8 +430,8 @@ mod tests {
                     (pixel[0]-frame.packet.sensor_origin_px[0] as f64,pixel[1]-frame.packet.sensor_origin_px[1] as f64)
                 }).collect();
                 let ellipse=ProjectedCircle::project(camera(),center,normal,radius,frame.packet.sensor_origin_px).unwrap().ellipse().unwrap();
-                frame.packet.arcs.push(OwnedBoundaryArc {evidence_group:group,kind,points_roi_px:points,
-                    outward_normals_roi:None,normal_band_half_width_px:0.0,detector_score:None});
+                frame.packet.arcs.push(OwnedBoundaryArc { level_sets_roi: None,evidence_group:group,kind,points_roi_px:points,
+                    outward_normals_roi:None,localization_sigma_px:None,normal_band_half_width_px:0.0,detector_score:None});
                 frame.packet.conics.push(OwnedConicHint {kind,ellipse_roi_px:ellipse,supporting_arc_indices:vec![group as usize]});
             }
             frame
@@ -489,9 +489,17 @@ pub(crate) struct JointTracker {
     /// this time floor and let a delayed historical pair resurrect old gaze.
     newest_observation_ns: [Option<u64>;2],
     retain_diagnostic_hypotheses: bool,
+    probabilistic: bool,
+    #[cfg(test)]
+    posterior_diagnostic: Option<crate::conic_solver::joint::posterior::IntegrationConfig>,
 }
 
 impl JointTracker {
+    pub(crate) fn set_probabilistic(&mut self, enabled: bool) { self.probabilistic=enabled; }
+    #[cfg(test)]
+    pub(crate) fn set_posterior_diagnostic(&mut self, config:crate::conic_solver::joint::posterior::IntegrationConfig) {
+        self.posterior_diagnostic=Some(config);
+    }
     pub(crate) fn retain_diagnostic_hypotheses(&mut self, enabled: bool) {
         self.retain_diagnostic_hypotheses = enabled;
     }
@@ -537,11 +545,20 @@ impl JointTracker {
             .map(|seed|seed.target_camera_mm);
         let prepared=frames.each_ref().map(|f|f.as_ref().map(|f|f.packet.prepare()));
         let evidence=prepared.each_ref().map(|p|p.as_ref().map(|p|p.evidence()));
-        let result=solve_joint_conic_hypotheses(JointConicRequest {eyes:evidence,scene:&scene.prior,
+        let request=JointConicRequest {eyes:evidence,scene:&scene.prior,
             maximum_hypotheses:16,maximum_refinements:12,maximum_source_skew_ns:0,
             // Engineering allowance, not a measured bound on rolling rows.
-            exposure_uncertainty_ns:2_000_000,motion_bound_px_per_second:150.0},
-            if self.retain_diagnostic_hypotheses { 4 } else { 1 });
+            exposure_uncertainty_ns:2_000_000,motion_bound_px_per_second:150.0};
+        let count=if self.retain_diagnostic_hypotheses { 4 } else { 1 };
+        let result=if self.probabilistic {
+            #[cfg(test)]
+            {if let Some(config)=self.posterior_diagnostic {
+                crate::conic_solver::joint::solve_joint_conic_distribution_diagnostic(request,count,config)
+            } else {solve_joint_conic_distribution(request,count)}}
+            #[cfg(not(test))]
+            {solve_joint_conic_distribution(request,count)}
+        }
+            else {solve_joint_conic_hypotheses(request,count)};
         let mut hypotheses=match result {
             Ok(hypotheses)=>hypotheses,
             Err(error)=>{

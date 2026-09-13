@@ -1,6 +1,7 @@
 //! Main-screen information architecture. View navigation is presentation state;
 //! camera acquisition is always a separate, explicit action.
 use super::*;
+mod stereo;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum Scope {
@@ -29,6 +30,7 @@ impl Scope {
 pub(super) enum LinkedView {
     #[default]
     Compare,
+    StereoSolver,
     Timing,
     Contacts,
     TweakedContacts,
@@ -39,9 +41,9 @@ pub(super) enum LinkedView {
 impl LinkedView {
     fn available(method: SegmentationMode) -> &'static [Self] {
         match method {
-            SegmentationMode::Sam31 => &[Self::Compare, Self::Timing, Self::Contacts, Self::TweakedContacts],
-            SegmentationMode::EyeStudent => &[Self::Compare, Self::StudentEllipseOnly,
-                Self::StudentMaskOutline, Self::StudentPupilOnly, Self::Contacts, Self::Timing],
+            SegmentationMode::Sam31 => &[Self::Compare, Self::StereoSolver, Self::Timing, Self::Contacts, Self::TweakedContacts],
+            SegmentationMode::EyeStudent => &[Self::Compare, Self::StereoSolver, Self::StudentEllipseOnly,
+                Self::StudentMaskOutline, Self::StudentPupilOnly, Self::Contacts, Self::TweakedContacts, Self::Timing],
             _ => &[Self::Compare, Self::Timing, Self::Contacts],
         }
     }
@@ -57,6 +59,7 @@ impl LinkedView {
     fn label(self) -> &'static str {
         match self {
             Self::Compare => "COMPARE",
+            Self::StereoSolver => "STEREO SOLVER",
             Self::Timing => "SOURCE TIMING",
             Self::Contacts => "CONTACT GEOMETRY",
             Self::TweakedContacts => "TWEAKED CONTACT GEOMETRY / EXPERIMENTAL",
@@ -160,6 +163,7 @@ pub(super) struct Workspace {
     pub preview_edit_scope: PreviewEditScope,
     preview_overrides: [PreviewOverrides; 2],
     pub linked: LinkedView,
+    stereo_layer: stereo::Layer,
     pub global: GlobalView,
     pub panel: Panel,
     pub scroll: usize,
@@ -175,6 +179,7 @@ impl Default for Workspace {
             preview_edit_scope: PreviewEditScope::default(),
             preview_overrides: [PreviewOverrides::default(); 2],
             linked: LinkedView::default(),
+            stereo_layer: stereo::Layer::default(),
             global: GlobalView::default(),
             panel: Panel::default(),
             scroll: 0,
@@ -244,6 +249,9 @@ impl Workspace {
     }
     pub fn object_view(&self) -> bool {
         self.scope == Scope::Global && self.global == GlobalView::Objects
+    }
+    fn stereo_view(&self) -> bool {
+        self.scope == Scope::Linked && self.linked == LinkedView::StereoSolver
     }
 }
 
@@ -367,9 +375,28 @@ pub(super) enum Action {
     AccuracyCheck,
     TogglePreviewEditScope,
     ResetPreviewOverrides,
+    StereoSolver,
+    ToggleStereo,
+    StereoLayer(stereo::Layer),
 }
 pub(super) fn apply(app: &mut App, action: Action) {
     match action {
+        Action::StereoSolver => {
+            if app.shared.lock().is_ok_and(|s| s.segmentation_mode.uses_mask_geometry()) {
+                app.ui.scope = Scope::Linked;
+                app.ui.linked = LinkedView::StereoSolver;
+                app.ui.panel = Panel::Selection;
+            }
+        }
+        Action::ToggleStereo => {
+            if let Ok(mut s) = app.shared.lock() {
+                if s.segmentation_mode.uses_mask_geometry() {
+                    let enabled = !s.second_roi_enabled;
+                    set_second_roi_analysis(&mut s, enabled);
+                }
+            }
+        }
+        Action::StereoLayer(layer) => app.ui.stereo_layer = layer,
         Action::TogglePreviewEditScope => app.ui.preview_edit_scope = app.ui.preview_edit_scope.next(),
         Action::ResetPreviewOverrides => app.ui.reset_selected_preview(),
         Action::SaveMonitor => {
@@ -607,7 +634,7 @@ fn selection_controls(c: &mut Canvas, ui: &mut Workspace, mut area: Rect, monito
 }
 
 fn detector_label(method: SegmentationMode) -> String {
-    format!("G {}/{} {}",method.ordinal(),SegmentationMode::COUNT,method.label().to_ascii_uppercase())
+    format!("G {}/{} {}",method.ordinal(),SegmentationMode::COUNT,method.display_label().to_ascii_uppercase())
 }
 
 fn detector_scope(second: bool) -> &'static str {
@@ -633,11 +660,11 @@ fn detector_bar(c: &mut Canvas, ui: &mut Workspace, r: Rect, method: Segmentatio
 }
 
 fn roi_method_lines(method: SegmentationMode, frame_method: Option<SegmentationMode>, enabled: bool) -> [String;2] {
-    [format!("G {}",method.label().to_ascii_uppercase()),
+    [format!("G {}",method.display_label().to_ascii_uppercase()),
         if !enabled {"ANALYSIS OFF / 3 TO ENABLE".into()}
         else {match frame_method {
-            Some(frame) if frame!=method=>format!("FRAME: {} / SWITCHING",frame.label().to_ascii_uppercase()),
-            Some(frame)=>format!("FRAME: {}",frame.label().to_ascii_uppercase()),
+            Some(frame) if frame!=method=>format!("FRAME: {} / SWITCHING",frame.display_label().to_ascii_uppercase()),
+            Some(frame)=>format!("FRAME: {}",frame.display_label().to_ascii_uppercase()),
             None=>"WAITING FOR FIRST FRAME".into(),
         }}]
 }
@@ -833,6 +860,7 @@ fn split_pair(r: Rect) -> [Rect; 2] {
 
 #[derive(Clone)]
 struct Snapshot {
+    lightbox_status: String,
     monitor_status:String,
     mouse_output_status: String,
     gaze_focus_status: String,
@@ -852,6 +880,7 @@ struct Snapshot {
     stacks: [EyePresenceStackStatus; 2],
     record: bool,
     eyes: [Option<EyeFrame>; 2],
+    source_arrival_age: [Option<Duration>; 2],
     present: [bool; 2],
     backdrop: Option<Backdrop>,
     editor: Option<String>,
@@ -877,13 +906,14 @@ pub(super) fn render(
             (&s.sam31_prompt_text, &s.sam31_prompt_status)
         };
         Snapshot {
+            lightbox_status: format!("B lightbox {} / N {}", if app.main_lightbox.enabled { "ON" } else { "OFF" }, app.main_lightbox.status_label()),
             monitor_status:s.monitor_location.status.clone(),
             mouse_output_status: s.mouse_output.label(),
             gaze_focus_status: s.gaze_focus.label(),
             gaze_settings_status: presented_eyes[app.focus_eye].as_ref().map_or_else(
                 || "GLOBAL GAZE: WAITING FOR REFERENCE EYE".into(),
                 |frame| frame.gaze_policy_error.map_or_else(
-                    || format!("GLOBAL GAZE: {} / {}",s.segmentation_mode.label(),eye_name(app.focus_eye)),
+                    || format!("GLOBAL GAZE: {} / {}",s.segmentation_mode.display_label(),eye_name(app.focus_eye)),
                     |reason| reason.to_ascii_uppercase())),
             monitor_unsaved:s.monitor_location.unsaved_candidate(),
             method: s.segmentation_mode,
@@ -903,6 +933,11 @@ pub(super) fn render(
                 .as_ref()
                 .is_some_and(|r| r.state == "recording"),
             eyes: presented_eyes.clone(),
+            source_arrival_age: std::array::from_fn(|i| {
+                let f = presented_eyes[i].as_ref()?;
+                let p = f.sam31_proposal_masks.as_ref()?;
+                s.recording_trace.source_arrival_age(f.eye_id, p.source_timestamp_ns)
+            }),
             present: app.eye_identity_present,
             backdrop: app.backdrop.clone(),
             editor: app.sam31_prompt_editor.clone(),
@@ -929,10 +964,12 @@ pub(super) fn render(
             "preview_overrides":app.ui.preview_overrides.map(|r|serde_json::json!({
                 "overlay":r.overlay.map(|o|o.label()),"pixels":r.pixels.map(annotated_view_mode_name)})),
             "global_gaze":{"detector":s.segmentation_mode.label(),"settings_generation":s.segmentation_generation,
+                "detector_display":s.segmentation_mode.display_label(),
                 "reference_eye":eye_name(app.focus_eye),"outputs":"focus / uinput / J cursor / calibration / accuracy"},
             "monitor":s.monitor_location.snapshot(),
             "mouse_output":s.mouse_output.snapshot(),
             "gaze_focus":s.gaze_focus.snapshot(),
+            "stereo_solver":stereo::inspect(&snapshot).json(),
         });
     }
 }
@@ -1014,6 +1051,7 @@ fn render_snapshot(
     snapshot: &Snapshot,
 ) {
     let Snapshot {
+        lightbox_status,
         monitor_status,
         mouse_output_status,
         gaze_focus_status,
@@ -1033,6 +1071,7 @@ fn render_snapshot(
         stacks,
         record,
         eyes,
+        source_arrival_age: _,
         present,
         backdrop,
         editor,
@@ -1106,11 +1145,12 @@ fn render_snapshot(
         Scope::Global=>(if ui.global==GlobalView::Sensor {1}else{2},2),
     };
     let title = format!("F VIEW {position}/{count} / {}",ui.title(method));
+    let stereo_shortcut = method.uses_mask_geometry() && w >= 640 && !ui.stereo_view();
     c.text(
         Rect {
             x: 10,
             y: layout.toolbar.y + 10,
-            w: layout.toolbar.w.saturating_sub(120),
+            w: layout.toolbar.w.saturating_sub(if stereo_shortcut { 224 } else { 120 }),
             h: 16,
         },
         &title,
@@ -1129,6 +1169,10 @@ fn render_snapshot(
         false,
         Action::NextView,
     );
+    if stereo_shortcut {
+        button(&mut c, ui, Rect { x: w - 216, y: layout.toolbar.y + 4, w: 108, h: 28.min(layout.toolbar.h) },
+            "STEREO", false, Action::StereoSolver);
+    }
     let area = layout.canvas.inset(8);
     let mut eyes = eyes;
     for frame in eyes.iter_mut().flatten() {
@@ -1164,6 +1208,9 @@ fn render_snapshot(
                 &checkerboard,
             );
             overview(&mut c, context, backdrop.as_ref(), &eyes);
+        }
+        Scope::Linked if ui.stereo_view() => {
+            stereo::render(&mut c, ui, area, snapshot);
         }
         Scope::Linked => {
             let info_h = 76.min(area.h / 3);
@@ -1205,7 +1252,7 @@ fn render_snapshot(
                 h: info_h,
                 ..area
             };
-            let mut rows = vec![format!("SHARED DETECTOR: {} / ENABLED ROIS",method.label().to_ascii_uppercase())];
+            let mut rows = vec![format!("SHARED DETECTOR: {} / ENABLED ROIS",method.display_label().to_ascii_uppercase())];
             match (&eyes[0], &eyes[1]) {
                 (Some(a), Some(b)) if second => {
                     let delta = a.timestamp_ns.abs_diff(b.timestamp_ns);
@@ -1360,7 +1407,13 @@ fn render_snapshot(
         text_area.h = text_area.h.saturating_sub(32);
     }
     let mut rows = vec![];
-    if ui.panel==Panel::Selection && !ui.object_view() {
+    if ui.panel == Panel::Analysis && method.uses_mask_geometry() {
+        let rect = Rect { h: 28.min(text_area.h), ..text_area };
+        button(&mut c, ui, rect, "OPEN STEREO SOLVER", ui.stereo_view(), Action::StereoSolver);
+        text_area.y += 32.min(text_area.h);
+        text_area.h = text_area.h.saturating_sub(32);
+    }
+    if ui.panel==Panel::Selection && !ui.object_view() && !ui.stereo_view() {
         text_area = selection_controls(&mut c, ui, text_area, monitor_unsaved);
         rows.push(gaze_settings_status.clone());
         rows.push(monitor_status);
@@ -1372,6 +1425,9 @@ fn render_snapshot(
         rows.push("FINE EYE ANALYSIS PAUSED".into());
     }
     match ui.panel {
+        Panel::Selection if ui.stereo_view() => {
+            rows.extend(stereo::inspect(snapshot).rows());
+        }
         Panel::Selection => {
             if ui.scope != Scope::Global {
                 rows.push(format!("PREVIEW: {}", eye_name(ui.selected)));
@@ -1406,7 +1462,7 @@ fn render_snapshot(
                 rows.push("Global-image crop, not native ROI.".into());
             } else if method.uses_mask_geometry() && ui.scope==Scope::Roi {
                 if method==SegmentationMode::EyeStudent {
-                    rows.push("CUDA EYE STUDENT: FIXED EYE LABELS".into());
+                    rows.push(format!("CUDA {}: FIXED EYE LABELS",method.display_label().to_ascii_uppercase()));
                     rows.push("SAM-trained masks; shared RAW + 3D solver".into());
                     rows.push("Experimental; G switches back to SAM".into());
                 } else {
@@ -1425,6 +1481,13 @@ fn render_snapshot(
             rows.push("Y global rough-center source".into());
             rows.push("Same source for focus, mouse, J, M and accuracy.".into());
             rows.push("F/V are previews only, never gaze input.".into());
+            if method.uses_mask_geometry() {
+                rows.push(eyes.get(ui.selected).and_then(|e|e.as_ref())
+                    .and_then(|e|e.sam31_proposal_masks.as_ref())
+                    .and_then(|p|p.limbus_refinement.as_ref())
+                    .map(|a|format!("LIMBUS: {}",a.status))
+                    .unwrap_or_else(||"LIMBUS REFINEMENT: PREVIEW ONLY / NOT APPLIED".into()));
+            }
             rows.push("No per-region analysis overrides.".into());
             rows.push(format!(
                 "3 second ROI {}",
@@ -1455,7 +1518,7 @@ fn render_snapshot(
                 if follow { "PAUSED" } else { "ON" }
             ));
             rows.push("R eye reacquisition enable/disable".into());
-            rows.push("B lightbox / N pattern".into());
+            rows.push(lightbox_status);
             rows.push(checkerboard.one_line());
             rows.push("C camera geometry calibration".into());
             rows.push("X lighthouse / Z optical clock".into());
@@ -1628,7 +1691,7 @@ fn wrapped_lines(rows: &[String], cols: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn example_snapshot() -> Snapshot {
+    pub(super) fn example_snapshot() -> Snapshot {
         let mut frame = crate::tests::control_eye_frame(120);
         frame.width = 384;
         frame.height = 256;
@@ -1673,6 +1736,7 @@ mod tests {
         left.timestamp_ns += 10_000_000;
         left.sensor_x += 1200;
         Snapshot {
+            lightbox_status: "B lightbox OFF / N SOLID WHITE".into(),
             method: SegmentationMode::Sam31,
             mouse_output_status: "MOUSE OFF / Super+Shift+M".into(),
             gaze_focus_status: "GAZE FOCUS OFF / Super+Shift+F".into(),
@@ -1690,6 +1754,7 @@ mod tests {
             stacks: std::array::from_fn(|_| EyePresenceStackStatus::default()),
             record: false,
             eyes: [Some(frame), Some(left)],
+            source_arrival_age: [Some(Duration::from_millis(12)); 2],
             present: [true, false],
             backdrop: Some(Backdrop {
                 width: 400,
@@ -1815,7 +1880,7 @@ mod tests {
 
     #[test]
     fn detector_names_fit_and_identify_the_shared_scope() {
-        assert_eq!(detector_label(SegmentationMode::EyeStudent), "G 3/6 EYE-STUDENT");
+        assert_eq!(detector_label(SegmentationMode::EyeStudent), format!("G 3/6 {}",SegmentationMode::EyeStudent.display_label().to_ascii_uppercase()));
         assert_eq!(detector_scope(true), "GLOBAL GAZE / BOTH ROIS");
         assert_eq!(detector_scope(false), "GLOBAL GAZE / RIGHT ROI");
         let mut method = SegmentationMode::Native;
@@ -1832,15 +1897,17 @@ mod tests {
     #[test]
     fn roi_detector_labels_distinguish_requested_frame_and_disabled_states() {
         let student = SegmentationMode::EyeStudent;
+        let name=student.display_label().to_ascii_uppercase();
+        let requested=format!("G {name}");
         assert_eq!(roi_method_lines(student, Some(SegmentationMode::Sam31), true),
-            ["G EYE-STUDENT", "FRAME: SAM31 / SWITCHING"]);
+            [requested.clone(), "FRAME: SAM31 / SWITCHING".into()]);
         // An enum match is not proof of an accepted pupil/contact solution.
         assert_eq!(roi_method_lines(student, Some(student), true),
-            ["G EYE-STUDENT", "FRAME: EYE-STUDENT"]);
+            [requested.clone(), format!("FRAME: {name}")]);
         assert_eq!(roi_method_lines(student, None, true),
-            ["G EYE-STUDENT", "WAITING FOR FIRST FRAME"]);
+            [requested.clone(), "WAITING FOR FIRST FRAME".into()]);
         assert_eq!(roi_method_lines(student, Some(SegmentationMode::Sam31), false),
-            ["G EYE-STUDENT", "ANALYSIS OFF / 3 TO ENABLE"]);
+            [requested, "ANALYSIS OFF / 3 TO ENABLE".into()]);
     }
 
     #[test]
@@ -1892,10 +1959,11 @@ mod tests {
         }
     }
     #[test]
-    fn tweaked_contact_is_a_sam_only_linked_view() {
+    fn tweaked_contact_is_available_for_both_mask_methods() {
         assert_eq!(LinkedView::Contacts.next(SegmentationMode::Sam31),LinkedView::TweakedContacts);
         assert_eq!(LinkedView::TweakedContacts.next(SegmentationMode::Sam31),LinkedView::Compare);
-        assert_eq!(LinkedView::Contacts.next(SegmentationMode::EyeStudent),LinkedView::Timing);
+        assert_eq!(LinkedView::Contacts.next(SegmentationMode::EyeStudent),LinkedView::TweakedContacts);
+        assert_eq!(LinkedView::TweakedContacts.next(SegmentationMode::EyeStudent),LinkedView::Timing);
         let mut snapshot=example_snapshot();
         snapshot.method=SegmentationMode::Sam31;
         let mut ui=Workspace::default();
@@ -1906,7 +1974,7 @@ mod tests {
         assert_eq!(ui.linked,LinkedView::TweakedContacts);
         snapshot.method=SegmentationMode::EyeStudent;
         render_snapshot(&mut ui,&mut pixels,1200,850,&snapshot);
-        assert_eq!(ui.linked,LinkedView::Contacts);
+        assert_eq!(ui.linked,LinkedView::TweakedContacts);
     }
 
     #[test]
@@ -1915,10 +1983,14 @@ mod tests {
         frame.segmentation_mode=SegmentationMode::Sam31;
         frame.width=420;frame.height=280;
         frame.sam31_proposal_masks=Some(Arc::new(sam31_outer::ProposalMasks {
-            source_width:384,source_height:256,..Default::default()}));
+            eye_index:frame.eye_id as usize - 1,
+            source_width:384,source_height:256,source_raw:Arc::new(vec![100;384*256]),
+            ..Default::default()}));
         assert_eq!(roi_card_source_size(&frame,RoiOverlayMode::SamTweakedContactGeometry),(384,256));
         assert_eq!(roi_card_source_size(&frame,RoiOverlayMode::Clean),(420,280));
         frame.segmentation_mode=SegmentationMode::EyeStudent;
+        assert_eq!(roi_card_source_size(&frame,RoiOverlayMode::SamTweakedContactGeometry),(384,256));
+        Arc::make_mut(frame.sam31_proposal_masks.as_mut().unwrap()).source_raw=Arc::default();
         assert_eq!(roi_card_source_size(&frame,RoiOverlayMode::SamTweakedContactGeometry),(420,280));
     }
 
@@ -2081,7 +2153,7 @@ mod tests {
         assert_eq!(ui.linked, LinkedView::Compare);
         assert_eq!(ui.preview_defaults, original);
         assert_eq!(LinkedView::available(SegmentationMode::Sam31),
-            &[LinkedView::Compare, LinkedView::Timing, LinkedView::Contacts, LinkedView::TweakedContacts]);
+            &[LinkedView::Compare, LinkedView::StereoSolver, LinkedView::Timing, LinkedView::Contacts, LinkedView::TweakedContacts]);
     }
 
     #[test]

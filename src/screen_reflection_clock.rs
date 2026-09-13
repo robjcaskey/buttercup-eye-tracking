@@ -10,7 +10,7 @@
 #![allow(dead_code)]
 
 use crate::screen_reflection_code::{
-    FrameCode, GridTransform, OpticalCodeScheme, PHYSICAL_CELL_COUNT,
+    FrameCode, GridTransform, OpticalCodeScheme, SpatialCodeLayout, PHYSICAL_CELL_COUNT,
 };
 use crate::screen_reflection_raw::{PackedRaw10, ProjectiveQuad, CFA_BANDS};
 
@@ -156,6 +156,7 @@ impl IntegralGrid {
 #[derive(Clone, Copy, Debug)]
 struct RectangleProposal {
     score: f64,
+    contrast_score: f64,
     center_x: usize,
     center_y: usize,
     width: usize,
@@ -211,11 +212,13 @@ fn scan_landscape_rectangle(grid: &CarrierGrid) -> Option<RectangleProposal> {
                     else {
                         continue;
                     };
-                    let score = (inner_mean - outer_mean) / outer_variance.max(9.0).sqrt()
+                    let contrast_score = (inner_mean - outer_mean) / outer_variance.max(9.0).sqrt();
+                    let score = contrast_score
                         - 0.012 * width.abs_diff(11) as f64
                         - 0.010 * height.abs_diff(5) as f64;
                     let proposal = RectangleProposal {
                         score,
+                        contrast_score,
                         center_x,
                         center_y,
                         width,
@@ -329,6 +332,21 @@ fn correlation(left: &[f64], right: &[f64]) -> Option<f64> {
 }
 
 pub fn analyze_whole_raw_roi(raw: PackedRaw10<'_>) -> Option<WholeRoiClockWitness> {
+    analyze_whole_raw_roi_with_layout(raw, SpatialCodeLayout::CURRENT)
+}
+
+pub fn analyze_whole_raw_roi_with_layout(
+    raw: PackedRaw10<'_>,
+    layout: SpatialCodeLayout,
+) -> Option<WholeRoiClockWitness> {
+    analyze_whole_raw_roi_with_weights(raw,layout,OPPONENT_SIGNS)
+}
+
+pub fn analyze_whole_raw_roi_with_weights(
+    raw: PackedRaw10<'_>, layout: SpatialCodeLayout, weights: [f64;4],
+) -> Option<WholeRoiClockWitness> {
+    let columns = layout.display_columns();
+    let rows = layout.display_rows();
     let grid = CarrierGrid::from_raw(raw)?;
     let luminance_median = grid.luminance_median();
     let proposal = scan_landscape_rectangle(&grid)?;
@@ -377,8 +395,8 @@ pub fn analyze_whole_raw_roi(raw: PackedRaw10<'_>) -> Option<WholeRoiClockWitnes
     let band_medians: [f64; CFA_BANDS] = std::array::from_fn(|band| {
         finite_median(band_samples[band].iter().copied()).unwrap_or(0.0)
     });
-    let mut display_sum = [0.0; DISPLAY_CELLS];
-    let mut display_count = [0u16; DISPLAY_CELLS];
+    let mut display_sum = vec![0.0; columns * rows];
+    let mut display_count = vec![0u16; columns * rows];
     let span_x = (absolute_x1 - absolute_x0).max(1) as f64;
     let span_y = (absolute_y1 - absolute_y0).max(1) as f64;
     let band_offsets = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (2.0, 2.0)];
@@ -390,35 +408,34 @@ pub fn analyze_whole_raw_roi(raw: PackedRaw10<'_>) -> Option<WholeRoiClockWitnes
             for band in 0..CFA_BANDS {
                 let sample_x = carrier_x as f64 + band_offsets[band].0 + 1.0;
                 let sample_y = carrier_y as f64 + band_offsets[band].1 + 1.0;
-                let column = ((sample_x - absolute_x0 as f64) / span_x * DISPLAY_COLUMNS as f64)
-                    .floor() as isize;
-                let row = ((sample_y - absolute_y0 as f64) / span_y * DISPLAY_ROWS as f64).floor()
-                    as isize;
-                if !(0..DISPLAY_COLUMNS as isize).contains(&column)
-                    || !(0..DISPLAY_ROWS as isize).contains(&row)
-                {
+                let column =
+                    ((sample_x - absolute_x0 as f64) / span_x * columns as f64).floor() as isize;
+                let row = ((sample_y - absolute_y0 as f64) / span_y * rows as f64).floor() as isize;
+                if !(0..columns as isize).contains(&column) || !(0..rows as isize).contains(&row) {
                     continue;
                 }
-                let display = row as usize * DISPLAY_COLUMNS + column as usize;
+                let display = row as usize * columns + column as usize;
                 let value =
-                    OPPONENT_SIGNS[band] * (values[band].max(1.0).ln_1p() - band_medians[band]);
+                    weights[band] * (values[band].max(1.0).ln_1p() - band_medians[band]);
                 display_sum[display] += value;
                 display_count[display] = display_count[display].saturating_add(1);
             }
         }
     }
-    let display_values = std::array::from_fn::<_, DISPLAY_CELLS, _>(|cell| {
-        if display_count[cell] == 0 {
-            f64::NAN
-        } else {
-            display_sum[cell] / f64::from(display_count[cell])
-        }
-    });
+    let display_values = (0..columns * rows)
+        .map(|cell| {
+            if display_count[cell] == 0 {
+                f64::NAN
+            } else {
+                display_sum[cell] / f64::from(display_count[cell])
+            }
+        })
+        .collect::<Vec<_>>();
     let mut canonical_sum = [0.0; PHYSICAL_CELL_COUNT];
     let mut canonical_count = [0u16; PHYSICAL_CELL_COUNT];
-    for row in 0..DISPLAY_ROWS {
-        for column in 0..DISPLAY_COLUMNS {
-            let display = row * DISPLAY_COLUMNS + column;
+    for row in 0..rows {
+        for column in 0..columns {
+            let display = row * columns + column;
             let canonical = (row % 4) * 8 + column % 8;
             if display_values[display].is_finite() {
                 canonical_sum[canonical] += display_values[display];
@@ -438,17 +455,21 @@ pub fn analyze_whole_raw_roi(raw: PackedRaw10<'_>) -> Option<WholeRoiClockWitnes
         .filter(|value| value.is_finite())
         .count();
     let tile = |repeat_x: usize, repeat_y: usize| {
+        let display_values = &display_values;
         (0..4)
             .flat_map(|row| {
                 (0..8).map(move |column| {
-                    display_values[(repeat_y * 4 + row) * DISPLAY_COLUMNS + repeat_x * 8 + column]
+                    display_values[(repeat_y * 4 + row) * columns + repeat_x * 8 + column]
                 })
             })
             .collect::<Vec<_>>()
     };
-    let tiles = [tile(0, 0), tile(1, 0), tile(0, 1), tile(1, 1)];
+    let tiles = (0..layout.repeat_rows)
+        .flat_map(|y| (0..layout.repeat_columns).map(move |x| (x, y)))
+        .map(|(x, y)| tile(x, y))
+        .collect::<Vec<_>>();
     let mut repeat_correlations = Vec::new();
-    for right in 0..4 {
+    for right in 0..tiles.len() {
         for left in 0..right {
             if let Some(value) = correlation(&tiles[left], &tiles[right]) {
                 repeat_correlations.push(value);
@@ -462,7 +483,10 @@ pub fn analyze_whole_raw_roi(raw: PackedRaw10<'_>) -> Option<WholeRoiClockWitnes
     };
     Some(WholeRoiClockWitness {
         proposal_score: proposal.score,
-        valid: proposal.score > 1.45 && component_valid && supported_cells >= 27,
+        // The size preference ranks proposals; it is not evidence against a
+        // larger, correctly observed screen. Otherwise even an ideal 64x32
+        // reflection is rejected (contrast 1.50 minus size preference = 1.41).
+        valid: proposal.contrast_score > 1.45 && component_valid && supported_cells >= 27,
         quad_roi,
         canonical_cells,
         supported_cells,
@@ -1174,6 +1198,52 @@ mod tests {
         let expected = signs.map(f64::from);
         let code_correlation = correlation(&witness.canonical_cells, &expected).unwrap();
         assert!(code_correlation > 0.25, "{code_correlation} {witness:#?}");
+    }
+
+    #[test]
+    fn large_cells_recover_all_checked_words_from_packed_raw() {
+        use crate::screen_reflection_code::{
+            decode_soft_cells_constrained_with_scheme, DecodeGeometry,
+        };
+        let (width, height) = (160, 96);
+        let layout = SpatialCodeLayout::LEGACY;
+        let scheme = OpticalCodeScheme::ReedMullerV3;
+        for counter in 0..32 {
+            let signs = FrameCode::new(counter, 2).physical_signs_for(scheme);
+            let mut values = vec![100u16; width * height];
+            for y in 32..64 {
+                for x in 48..112 {
+                    let band = match (y % 4 < 2, x % 4 < 2) {
+                        (true, true) => 0,
+                        (true, false) => 1,
+                        (false, true) => 2,
+                        _ => 3,
+                    };
+                    let cell = (y - 32) / 8 * 8 + (x - 48) / 8;
+                    values[y * width + x] =
+                        (300. + 60. * signs[cell] as f64 * OPPONENT_SIGNS[band]) as u16;
+                }
+            }
+            let packed = pack_raw10(&values, width, height);
+            let raw = PackedRaw10::new(&packed, width, height, width / 4 * 5, 0, 0).unwrap();
+            let witness = analyze_whole_raw_roi_with_layout(raw, layout).unwrap();
+            assert!(witness.valid, "counter={counter} {witness:?}");
+            let decoded = decode_soft_cells_constrained_with_scheme(
+                &witness.canonical_cells,
+                2,
+                None,
+                31,
+                DecodeGeometry {
+                    transform: GridTransform::Identity,
+                    polarity: 1,
+                },
+                scheme,
+            )
+            .unwrap();
+            assert_eq!(decoded.counter_mod as u64, counter);
+            assert_eq!(decoded.hard_bit_distance, 0);
+            assert!(decoded.confidence_margin > 0.08);
+        }
     }
 
     fn synthetic_witness(
