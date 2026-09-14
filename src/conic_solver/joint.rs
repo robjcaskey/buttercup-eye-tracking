@@ -255,6 +255,9 @@ pub(crate) struct ArcSupport {
     pub(crate) exposure: ExposureKey,
     pub(crate) evidence_group: u32,
     pub(crate) arc_index: usize,
+    /// Exact bounded residual samples of the selected arc alternative and
+    /// mask level, in this exposure's ROI coordinates. Diagnostic only.
+    pub(crate) points_roi_px: Vec<(f64, f64)>,
     pub(crate) kind: BoundaryKind,
     pub(crate) rms_px: f64,
     pub(crate) sigma_px: f64,
@@ -315,7 +318,78 @@ pub(crate) struct JointConicSolution {
 /// A homogeneous conic evaluated in native ROI pixels. Coefficients are
 /// [x², xy, y², x, y, constant]; xy is the full coefficient, not half.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ProjectedCircle(pub(crate) [f64; 6]);
+pub(crate) struct ProjectedCircle(pub(crate) [f64; 6], Option<EllipseDistance>);
+
+/// Prepared once per projected conic, not once per observation. This is an
+/// offline distance-metric experiment; the live conic still uses Sampson.
+#[derive(Clone, Copy, Debug)]
+struct EllipseDistance {
+    center: (f64, f64),
+    cosine: f64,
+    sine: f64,
+    major: f64,
+    minor: f64,
+}
+
+impl EllipseDistance {
+    fn new(ellipse: Ellipse) -> Self {
+        let (sine, cosine) = ellipse.angle.sin_cos();
+        Self {center: ellipse.center, cosine, sine,
+            major: ellipse.major_radius, minor: ellipse.minor_radius}
+    }
+
+    fn residual_px(self, point: (f64, f64)) -> f64 {
+        let dx = point.0 - self.center.0;
+        let dy = point.1 - self.center.1;
+        let x = (self.cosine * dx + self.sine * dy).abs();
+        let y = (-self.sine * dx + self.cosine * dy).abs();
+        let (a, b) = (self.major, self.minor);
+        if a == b {return x.hypot(y) - a;}
+        let z0 = x / a;
+        let z1 = y / b;
+        let signed_level = z0 * z0 + z1 * z1 - 1.0;
+        if signed_level == 0.0 {return 0.0;}
+        let distance = if y <= 8.0 * f64::EPSILON * a {
+            // An interior major-axis point may be closest to an off-axis
+            // boundary point. The center's distance is the minor radius.
+            let denominator = a * a - b * b;
+            let ratio = a * x / denominator;
+            if ratio < 1.0 {
+                (a * ratio - x).hypot(b * (1.0 - ratio * ratio).sqrt())
+            } else {(a - x).abs()}
+        } else if x == 0.0 {
+            (b - y).abs()
+        } else {
+            // The closest point satisfies the ellipse constraint with one
+            // Lagrange multiplier. Its root is monotone on this bracket,
+            // for both interior and exterior observations. Safeguarded Newton
+            // avoids a quartic solve and retains a finite bisection fallback.
+            let r0 = (a / b).powi(2);
+            let numerator = r0 * z0;
+            let mut lower = z1 - 1.0;
+            let mut upper = if signed_level < 0.0 {0.0}
+                else {numerator.hypot(z1) - 1.0};
+            let mut t = 0.0_f64.clamp(lower, upper);
+            for _ in 0..64 {
+                let u = numerator / (t + r0);
+                let v = z1 / (t + 1.0);
+                let value = u * u + v * v - 1.0;
+                if value.abs() <= 8.0 * f64::EPSILON {break;}
+                if value > 0.0 {lower = t;} else {upper = t;}
+                let derivative = -2.0 * (u * u / (t + r0) + v * v / (t + 1.0));
+                let proposed = t - value / derivative;
+                let next = if proposed > lower && proposed < upper {proposed}
+                    else {0.5 * (lower + upper)};
+                if next == t {break;}
+                t = next;
+            }
+            let closest_x = r0 * x / (t + r0);
+            let closest_y = y / (t + 1.0);
+            (closest_x - x).hypot(closest_y - y)
+        };
+        distance.copysign(signed_level)
+    }
+}
 
 impl ProjectedCircle {
     pub(crate) fn project(
@@ -371,10 +445,16 @@ impl ProjectedCircle {
         coefficients
             .into_iter()
             .all(f64::is_finite)
-            .then_some(Self(coefficients))
+            .then_some(Self(coefficients, None))
+    }
+
+    fn with_exact_distance(mut self, enabled: bool) -> Option<Self> {
+        self.1 = if enabled {Some(EllipseDistance::new(self.ellipse()?))} else {None};
+        Some(self)
     }
 
     pub(crate) fn residual_px(self, point: (f64, f64)) -> f64 {
+        if let Some(distance) = self.1 {return distance.residual_px(point);}
         let [a, b, c, d, e, f] = self.0;
         let (x, y) = point;
         let gradient = (2.0 * a * x + b * y + d).hypot(b * x + 2.0 * c * y + e);
@@ -582,7 +662,7 @@ fn symmetric_eigen_3x3(mut a: [[f64; 3]; 3]) -> Option<([f64; 3], [[f64; 3]; 3])
     Some(([a[0][0], a[1][1], a[2][2]], vectors))
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct SparseArc {
     eye: usize,
     index: usize,
@@ -598,7 +678,57 @@ struct SparseArc {
     weight: f64,
 }
 
+#[derive(Clone, Debug)]
+struct ArcResiduals {
+    position: [f64; MAX_POINTS_PER_ARC],
+    direction: [f64; MAX_POINTS_PER_ARC],
+    mean_cost: f64,
+}
+
+/// Reuse exact arithmetic at an unchanged projected conic. Borrowing the arc
+/// prevents its evidence from changing while the cache exists. Pointer identity
+/// also rejects a selection borrowed from a different/conditioned problem.
+#[derive(Clone, Debug)]
+struct CachedArcResiduals<'a> {
+    arc: &'a SparseArc,
+    conic_bits: [u64; 6],
+    exact_distance: bool,
+    values: ArcResiduals,
+}
+
+impl CachedArcResiduals<'_> {
+    fn at(&self, arc: &SparseArc, conic: ProjectedCircle, level: usize) -> Option<&ArcResiduals> {
+        (level == 1 && std::ptr::eq(self.arc, arc) && self.conic_bits == conic.0.map(f64::to_bits)
+            && self.exact_distance == conic.1.is_some())
+            .then_some(&self.values)
+    }
+}
+
 impl SparseArc {
+    fn evaluated_residuals(&self, conic: ProjectedCircle) -> ArcResiduals {
+        let mut result = ArcResiduals {
+            position: [0.0; MAX_POINTS_PER_ARC],
+            direction: [0.0; MAX_POINTS_PER_ARC],
+            mean_cost: 0.0,
+        };
+        // Keep the original order of operations and summation. This cache is
+        // not an approximate norm, reduced sample budget or changed objective.
+        result.mean_cost = self.points
+            .iter()
+            .zip(&self.quadrature)
+            .enumerate()
+            .map(|(i, (_, &w))| {
+                let p = self.point_at_level(i, 1);
+                let position = robust_residual(conic.residual_px(p) / self.sigma);
+                let direction = self.normal_residual_at_level(conic, i, 1);
+                result.position[i] = position;
+                result.direction[i] = direction;
+                w * (position.powi(2) + direction.powi(2))
+            })
+            .sum();
+        result
+    }
+
     fn point_at_level(&self, index: usize, level: usize) -> (f64, f64) {
         let point = self.points[index];
         if let Some(offset) = self.level_sets[index] {
@@ -763,9 +893,14 @@ struct Problem<'a> {
     upper: Parameters,
     scales: Parameters,
     marginalize_arc_alternatives: bool,
+    exact_conic_distances: bool,
 }
 
 impl<'a> Problem<'a> {
+    fn with_exact_distances(mut self, enabled: bool) -> Self {
+        self.exact_conic_distances = enabled;
+        self
+    }
     fn with_arc_marginalization(mut self, enabled: bool) -> Self {
         self.marginalize_arc_alternatives=enabled;
         self
@@ -843,6 +978,14 @@ impl<'a> Problem<'a> {
                 if arc.points_roi_px.len() < 3 {
                     continue;
                 }
+                if arc.support_length_cap_px.is_some_and(|v| !v.is_finite() || v < 0.0) {
+                    return Err(JointConicUnavailable::InvalidRequest);
+                }
+                if arc.sampling_support_px.is_some_and(|support| {
+                    support.len() != arc.points_roi_px.len()
+                        || support.iter().any(|v| !v.is_finite() || *v < 0.0)
+                        || !support.iter().sum::<f64>().is_finite()
+                }) { return Err(JointConicUnavailable::InvalidRequest); }
                 if arc.outward_normals_roi.is_some_and(|normals| {
                     normals.len() != arc.points_roi_px.len()
                         || normals.iter().flatten().any(|n| !n.valid())
@@ -880,9 +1023,25 @@ impl<'a> Problem<'a> {
                 {
                     continue;
                 }
-                let Some((quadrature, length_px)) = polyline_quadrature(&points) else {
+                let integrated = if let Some(support) = arc.sampling_support_px {
+                    let retained = (0..count).map(|j|
+                        j * (arc.points_roi_px.len()-1) / (count-1)).collect::<Vec<_>>();
+                    let mut weights = crate::roi_evidence::reduce_sampling_support(support, &retained)
+                        .ok_or(JointConicUnavailable::InvalidRequest)?;
+                    let length = weights.iter().sum::<f64>();
+                    if length > 1.0e-9 {
+                        for weight in &mut weights { *weight /= length; }
+                        Some((weights, length))
+                    } else { None }
+                } else { polyline_quadrature(&points) };
+                let Some((quadrature, length_px)) = integrated else {
                     continue;
                 };
+                // A source-local tangent footprint may reduce the amount of
+                // distinct edge support. Preserve positions and quadrature;
+                // radial zigzags must not manufacture extra information mass.
+                let length_px = arc.support_length_cap_px.map_or(length_px, |cap| length_px.min(cap));
+                if length_px <= 1.0e-9 { continue; }
                 let existing = (start..groups.len())
                     .find(|&i| groups[i].alternatives[0].group == arc.evidence_group);
                 if existing.is_none() && groups.len() - start >= MAX_GROUPS_PER_EYE {
@@ -946,6 +1105,7 @@ impl<'a> Problem<'a> {
             upper: [0.0; PARAMETERS],
             scales: [1.0; PARAMETERS],
             marginalize_arc_alternatives: false,
+            exact_conic_distances: false,
         };
         for i in 0..2 {
             p.lower[i] = -scene.maximum_gaze_slope;
@@ -1228,9 +1388,9 @@ impl<'a> Problem<'a> {
         let camera = self.request.scene.camera;
         let origin = self.request.eyes[eye]?.sensor_origin_px;
         let conics = [
-            ProjectedCircle::project(camera, c, n, p[k + 3], origin)?,
-            ProjectedCircle::project(camera, c, n, p[k + 4], origin)?,
-            ProjectedCircle::project(camera, pupil, n, p[k + 5], origin)?,
+            ProjectedCircle::project(camera, c, n, p[k + 3], origin)?.with_exact_distance(self.exact_conic_distances)?,
+            ProjectedCircle::project(camera, c, n, p[k + 4], origin)?.with_exact_distance(self.exact_conic_distances)?,
+            ProjectedCircle::project(camera, pupil, n, p[k + 5], origin)?.with_exact_distance(self.exact_conic_distances)?,
         ];
         let outer = conics[0].ellipse()?;
         if !super::PROVISIONAL_CENTRAL_CAMERA_LIMBUS_ENVELOPE
@@ -1254,7 +1414,8 @@ impl<'a> Problem<'a> {
         Some(conics)
     }
 
-    fn select(&self, conics: &[[Option<ProjectedCircle>; 3]; 2]) -> Selection {
+    fn select(&self, conics: &[[Option<ProjectedCircle>; 3]; 2]) -> Selection<'_> {
+        let mut cached_arcs = Vec::with_capacity(self.groups.len());
         let choices = self.groups
             .iter()
             .map(|g| {
@@ -1263,17 +1424,28 @@ impl<'a> Problem<'a> {
                     .enumerate()
                     .map(|(i, a)| {
                         let c = conics[a.eye][a.boundary].unwrap();
-                        let mean = a.mean_cost(c);
+                        let values = a.evaluated_residuals(c);
+                        let mean = values.mean_cost;
                         let cost = a.weight * mean.min(MAXIMUM_GROUP_COST)
                             + (g.weight - a.weight) * MAXIMUM_GROUP_COST;
-                        (i, cost, mean)
+                        (i, cost, mean, values, c)
                     })
                     .min_by(|a, b| a.1.total_cmp(&b.1).then(a.2.total_cmp(&b.2)))
+                    .map(|(i, _, _, values, conic)| {
+                        cached_arcs.push(CachedArcResiduals {
+                            arc: &g.alternatives[i],
+                            conic_bits: conic.0.map(f64::to_bits),
+                            exact_distance: conic.1.is_some(),
+                            values,
+                        });
+                        i
+                    })
                     .unwrap()
-                    .0
             })
             .collect();
-        mask_levels::select(self, conics, choices)
+        let mut selected = mask_levels::select(self, conics, choices);
+        selected.cached_arcs = cached_arcs;
+        selected
     }
 
     fn residuals(&self, p: &Parameters, selected: &Selection) -> Option<Vec<f64>> {
@@ -1291,7 +1463,13 @@ impl<'a> Problem<'a> {
             .enumerate()
             .map(|(index, (group, &choice))| {
                 let arc = &group.alternatives[choice];
-                arc.mean_cost_at_level(conics[arc.eye][arc.boundary].unwrap(), selected.levels[index]) >= MAXIMUM_GROUP_COST
+                let conic = conics[arc.eye][arc.boundary].unwrap();
+                selected.cached_arcs.get(index)
+                    .and_then(|cache| cache.at(arc, conic, selected.levels[index]))
+                    .map_or_else(
+                        || arc.mean_cost_at_level(conic, selected.levels[index]),
+                        |values| values.mean_cost,
+                    ) >= MAXIMUM_GROUP_COST
             })
             .collect()
     }
@@ -1321,24 +1499,30 @@ impl<'a> Problem<'a> {
             if selected.in_family[group_index] || selected.has_group_mixture(group_index) { continue; }
             let arc = &group.alternatives[choice];
             let conic = conics[arc.eye][arc.boundary]?;
+            let cached = selected.cached_arcs.get(group_index)
+                .and_then(|cache| cache.at(arc, conic, 1));
+            let evaluated = (cached.is_none()
+                && !fixed_rejection.is_some_and(|r| r[group_index]))
+                .then(|| arc.evaluated_residuals(conic));
+            let values = cached.or(evaluated.as_ref());
             let outlier = fixed_rejection.map_or_else(
-                || arc.mean_cost(conic) >= MAXIMUM_GROUP_COST,
+                || values.unwrap().mean_cost >= MAXIMUM_GROUP_COST,
                 |rejected| rejected[group_index],
             );
-            for (index, (&point, &w)) in arc.points.iter().zip(&arc.quadrature).enumerate() {
+            for (index, &w) in arc.quadrature.iter().enumerate() {
                 // Position and measured direction describe ONE correlated
                 // contour, sharing its geometric mass and full outlier cap.
                 // A rejected group has constant cost and zero pulling force.
                 r.push(if outlier {
                     (MAXIMUM_GROUP_COST * arc.weight * w).sqrt()
                 } else {
-                    robust_residual(conic.residual_px(point) / arc.sigma) * (arc.weight * w).sqrt()
+                    values.unwrap().position[index] * (arc.weight * w).sqrt()
                 });
                 if arc.outward_normals[index].is_some() {
                     r.push(if outlier {
                         0.0
                     } else {
-                        arc.normal_residual(conic, index) * (arc.weight * w).sqrt()
+                        values.unwrap().direction[index] * (arc.weight * w).sqrt()
                     });
                 }
             }
@@ -1723,6 +1907,7 @@ impl<'a> Problem<'a> {
                 exposure: self.request.eyes[a.eye]?.exposure,
                 evidence_group: a.group,
                 arc_index: a.index,
+                points_roi_px: (0..a.points.len()).map(|i| a.point_at_level(i, level)).collect(),
                 kind: a.kind,
                 rms_px: rms,
                 sigma_px: a.sigma,
@@ -1916,7 +2101,7 @@ fn solve_hypotheses(
     }
     // Validate the FULL request first. Omitting an unlocalized ROI must never
     // be a way around invalid source clocks, timing bounds or scene inputs.
-    let problem = Problem::new(request)?.with_arc_marginalization(integration.marginalize_arc_alternatives);
+    let problem = Problem::new(request)?.with_arc_marginalization(integration.marginalize_arc_alternatives).with_exact_distances(integration.exact_conic_distances);
     let budget = request.maximum_hypotheses.min(MAX_HYPOTHESES);
     let reserve = if problem.present == [true, true] && budget >= 8 {
         (budget / 4).min(4)
@@ -1973,7 +2158,7 @@ fn solve_hypotheses(
                 maximum_hypotheses: reserve,
                 ..request
             };
-            let model = Problem::new(subrequest)?.with_arc_marginalization(integration.marginalize_arc_alternatives);
+            let model = Problem::new(subrequest)?.with_arc_marginalization(integration.marginalize_arc_alternatives).with_exact_distances(integration.exact_conic_distances);
             let candidates = model.seeds();
             used += candidates.len();
             best = best.min(optimize(&model, &candidates, omitted));
@@ -2003,7 +2188,7 @@ fn solve_hypotheses(
                 eyes: std::array::from_fn(|eye| if modeled[eye] { request.eyes[eye] } else { None }),
                 ..request
             };
-            let model = Problem::new(local_request)?.with_arc_marginalization(integration.marginalize_arc_alternatives);
+            let model = Problem::new(local_request)?.with_arc_marginalization(integration.marginalize_arc_alternatives).with_exact_distances(integration.exact_conic_distances);
             let mut starts: Vec<Parameters> = Vec::new();
             for (p, solution) in &fits {
                 if solution.modeled_eyes == modeled
@@ -2061,7 +2246,7 @@ fn solve_hypotheses(
             ..request
         };
         if let Ok(local_model) = Problem::new(local_request) {
-            solution.local_uncertainty = Some(local_model.with_arc_marginalization(integration.marginalize_arc_alternatives).local_uncertainty(slope));
+            solution.local_uncertainty = Some(local_model.with_arc_marginalization(integration.marginalize_arc_alternatives).with_exact_distances(integration.exact_conic_distances).local_uncertainty(slope));
         }
         if let Some((_, alternate)) = fits
             .iter()
@@ -2088,8 +2273,21 @@ fn solve_hypotheses(
             eyes: std::array::from_fn(|i| if modeled[i] { request.eyes[i] } else { None }),
             ..request
         };
-        let model = Problem::new(local_request)?.with_arc_marginalization(integration.marginalize_arc_alternatives);
+        let model = Problem::new(local_request)?.with_arc_marginalization(integration.marginalize_arc_alternatives).with_exact_distances(integration.exact_conic_distances);
         let distribution = posterior::integrate(&model, &retained, integration);
+        if let Some(selection) = &distribution.supported_mode_selection {
+            let index = selection.retained_index;
+            assert_eq!(retained[index].1.modeled_eyes, modeled);
+            if index != 0 {
+                // Return the actual optimized geometry with its own arcs and
+                // uncertainty. Keep the lower-cost MAP visible as a competitor.
+                let map_target = retained[0].1.target_camera_mm;
+                let map_cost = retained[0].1.robust_cost;
+                retained.swap(0, index);
+                retained[0].1.alternative_target_camera_mm = Some(map_target);
+                retained[0].1.alternative_cost_margin = Some(map_cost-retained[0].1.robust_cost);
+            }
+        }
         retained[0].1.posterior = Some(distribution);
     }
     retained.truncate(maximum_returned.min(4));

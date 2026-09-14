@@ -5,7 +5,8 @@ use crate::conic_solver::joint::PinholeCamera;
 use crate::eye_scene_model::{quantize_frontal_disk_area, SurfaceGazeSample, SurfaceSignDiagnostics, SurfaceSignEvidence};
 use crate::eye_scene_model::binocular_pose::EyePoseInput;
 use crate::gaze_target_solver::joint_tracking::{FrameEvidence, JointTracker, PublishedJoint};
-use crate::outline_conic_segments::sparse_evidence::{append_raw_ring_arcs, append_retained_sam_arcs, OwnedRoiEvidence, RawArcConfig};
+#[cfg(test)]
+use crate::outline_conic_segments::sparse_evidence::OwnedRoiEvidence;
 use crate::roi_evidence::{BoundaryKind, ExposureKey, RoiId, SourceClock};
 use crate::{EyeFrame, RelativeGazeVector, SegmentationMode, SAM31_RESULT_MAX_AGE_NS};
 use serde_json::{json, Value};
@@ -13,6 +14,7 @@ use std::sync::Arc;
 
 #[derive(Default)]
 pub(crate) struct Bridge {
+    camera_mount: crate::eye_scene_model::CameraMount,
     enabled: bool,
     signature: Option<(SourceClock, [u64;2], u64)>,
     generation: u64,
@@ -26,10 +28,19 @@ fn clock(epoch:&str)->SourceClock {
 }
 
 impl Bridge {
+    pub(crate) fn set_camera_mount(&mut self, mode:crate::eye_scene_model::CameraMount) {
+        if self.camera_mount==mode {return;}
+        self.camera_mount=mode;
+        self.signature=None;self.submitted=[None,None];self.last_status=[None,None];
+        self.tracker=JointTracker::default();
+        self.tracker.camera_mount=mode;
+        self.tracker.set_probabilistic(true);
+    }
     pub(crate) fn set_enabled(&mut self, enabled:bool, authority_generations:&mut [u64;2]) {
         if self.enabled==enabled {return;}
         self.enabled=enabled;self.signature=None;self.submitted=[None,None];self.last_status=[None,None];self.tracker=JointTracker::default();
         self.tracker.set_probabilistic(true);
+        self.tracker.camera_mount=self.camera_mount;
         // A monocular-surface calibration is not silently reused for a
         // different observation model, even though both are SAM providers.
         for generation in authority_generations {*generation=generation.wrapping_add(1);}
@@ -57,22 +68,7 @@ impl Bridge {
             let exposure=ExposureKey {roi:RoiId(eye as u32+1),clock:current_clock,
                 sequence:proposal.source_sequence,timestamp_ns:proposal.source_timestamp_ns};
             if self.submitted[eye].is_some_and(|old|old.timestamp_ns>=exposure.timestamp_ns) {return None;}
-            let mut packet=OwnedRoiEvidence {exposure,
-                sensor_origin_px:[proposal.source_sensor_origin.0,proposal.source_sensor_origin.1],
-                dimensions_px:[proposal.source_width as u32,proposal.source_height as u32],
-                arcs:Vec::new(),conics:Vec::new(),detail_reliability:None};
-            if let Some(review)=&proposal.outer_fit {
-                append_retained_sam_arcs(&mut packet,review,0);
-                if !crate::sam31_outer::proposal_raw_outer_admitted(proposal) {
-                    for arc in &mut packet.arcs {arc.normal_band_half_width_px=5.0;}
-                }
-            }
-            if let Some((pupil,config))=proposal.inner_pupil_fit.zip(proposal.outer_fit.as_ref()
-                .and_then(|outer|RawArcConfig::for_pupil(&proposal.source_raw,
-                    proposal.source_width,proposal.source_height,outer.ellipse))) {
-                append_raw_ring_arcs(&mut packet,&proposal.source_raw,pupil.ellipse,
-                    BoundaryKind::PupillaryBoundary,100,config);
-            }
+            let packet=crate::sam31_outer::evidence_stage::joint_evidence(proposal, exposure)?;
             let center=proposal.outer_fit.as_ref().map(|r|[r.ellipse.center.0,r.ellipse.center.1])
                 .unwrap_or([proposal.source_width as f64*0.5,proposal.source_height as f64*0.5]);
             let pose=EyePoseInput {limbus_center_sensor_px:[center[0]+packet.sensor_origin_px[0] as f64,
@@ -262,6 +258,13 @@ pub(crate) fn json(frame:&EyeFrame)->Value {
         "modeled_eyes":s.modeled_eyes,"unlocalized_eye_cost":s.unlocalized_eye_cost,
         "hypotheses":s.hypotheses_evaluated,"hypotheses_by_association":s.hypotheses_by_association,
         "arcs":s.arcs.iter().map(|a|json!({"roi_id":a.exposure.roi.0,"group":a.evidence_group,"kind":format!("{:?}",a.kind),
+            "arc_index":a.arc_index,"points_roi_px":a.points_roi_px,
+            "coordinate_frame":"source-roi-pixels",
+            "point_provenance":"bounded residual samples of selected arc alternative at selected mask level; not full contour or fitted ellipse",
+            "source":{"roi_id":a.exposure.roi.0,"clock_domain":a.exposure.clock.domain.to_string(),
+                "clock_epoch":a.exposure.clock.epoch.to_string(),"sequence":a.exposure.sequence.to_string(),
+                "sensor_timestamp_ns":a.exposure.timestamp_ns.to_string()},
+            "mask_level":a.mask_level,
             "used":a.used,"rms_px":a.rms_px,"sigma_px":a.sigma_px,
             "boundary_normal_samples":a.boundary_normal_samples,"boundary_normal_rms_radians":a.boundary_normal_rms_radians,
             "support_length_px":a.support_length_px,"evidence_weight":a.evidence_weight})).collect::<Vec<_>>(),
@@ -287,7 +290,7 @@ mod tests {
         for (kind,radius,depth,group) in [(BoundaryKind::OuterLimbus,6.0,0.0,0),(BoundaryKind::PupillaryBoundary,2.4,0.6,10)] {
             let center=std::array::from_fn(|i|center[i]-depth*normal[i]);
             let ellipse=ProjectedCircle::project(camera,center,normal,radius,origin).unwrap().ellipse().unwrap();
-            packet.arcs.push(OwnedBoundaryArc { level_sets_roi: None,evidence_group:group,kind,points_roi_px:ellipse.dense_points(32),
+            packet.arcs.push(OwnedBoundaryArc { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,evidence_group:group,kind,points_roi_px:ellipse.dense_points(32),
                 outward_normals_roi:None,localization_sigma_px:None,normal_band_half_width_px:0.0,detector_score:None});
             packet.conics.push(OwnedConicHint {kind,ellipse_roi_px:ellipse,supporting_arc_indices:vec![packet.arcs.len()-1]});
         }
@@ -363,6 +366,39 @@ mod tests {
             "a missing source cannot export the other eye's model as a sourced observation");
         Arc::make_mut(frame.joint_conic.as_mut().unwrap()).sensor_origins_px[0]=None;
         assert!(json(&frame)["source_projected_conics"]["eyes"][0].is_null());
+    }
+
+    #[test]
+    fn recorded_conic_segments_keep_exact_source_points_and_rejection_status() {
+        let time=1_000_000_000;
+        let camera=PinholeCamera {focal_px:[4000.0;2],principal_px:[4000.0,3000.0]};
+        let originals=[evidence(0,time),evidence(1,time)];
+        let mut tracker=JointTracker::default();tracker.begin(clock("test:1"),15);
+        tracker.observe(evidence(0,time),camera).unwrap();
+        let publication=tracker.observe(evidence(1,time),camera).unwrap().unwrap();
+        let mut frame=crate::tests::control_eye_frame(1);
+        frame.joint_gaze_active=true;frame.joint_conic=Some(publication);
+        // Mark one diagnostic rejected: its coordinates must remain available.
+        Arc::make_mut(frame.joint_conic.as_mut().unwrap()).solution.arcs[0].used=false;
+        let report=json(&frame);
+        let arcs=report["arcs"].as_array().unwrap();
+        assert!(!arcs.is_empty());assert_eq!(arcs[0]["used"],false);
+        for a in arcs {
+            let eye=a["roi_id"].as_u64().unwrap() as usize-1;
+            let packet=&originals[eye].packet;
+            let original=&packet.arcs[a["arc_index"].as_u64().unwrap() as usize].points_roi_px;
+            let points=a["points_roi_px"].as_array().unwrap();
+            assert!(points.len()>=3 && points.len()<=original.len());
+            for (i,p) in points.iter().enumerate() {
+                let expected=original[i*(original.len()-1)/(points.len()-1)];
+                assert_eq!(*p,json!([expected.0,expected.1]));
+            }
+            assert_eq!(a["source"]["sequence"],packet.exposure.sequence.to_string());
+            assert_eq!(a["source"]["sensor_timestamp_ns"],time.to_string());
+            assert_eq!(a["coordinate_frame"],"source-roi-pixels");
+        }
+        frame.sensor_x+=200;frame.timestamp_ns+=500_000_000;
+        assert_eq!(json(&frame)["arcs"],report["arcs"],"presentation changes cannot relocate source segments");
     }
 
     #[test]
@@ -547,6 +583,51 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires recorded worker ellipse cache; conditional branch diagnostic, no ground truth"]
+    fn camera_mount_recorded_branch_trial() {
+        use std::io::{BufRead,Write};
+        use std::time::{Instant,Duration};
+        use crate::eye_scene_model::{CameraMount,SurfaceGazeTracker};
+        let input=std::env::var("BUTTERCUP_JOINT_CALIBRATION_CACHE").unwrap();
+        let output=std::env::var("BUTTERCUP_CAMERA_MOUNT_REPORT").unwrap();
+        let modes=[CameraMount::Flexible,CameraMount::BelowEyes,CameraMount::AboveEyes];
+        let mut trackers:[[SurfaceGazeTracker;2];3]=std::array::from_fn(|m|
+            std::array::from_fn(|_|SurfaceGazeTracker {camera_mount:modes[m],..Default::default()}));
+        let now=Instant::now();let mut first=None;let mut seen=[None;2];
+        let mut rows=Vec::new();let mut missing=0;
+        for line in std::io::BufReader::new(std::fs::File::open(&input).unwrap()).lines() {
+            let case:Value=serde_json::from_str(&line.unwrap()).unwrap();
+            let meta=&case["input"]["frame"];let eye=meta["eye_id"].as_u64().unwrap() as usize-1;
+            let time=meta["timestamp_ns"].as_u64().unwrap();
+            if seen[eye].is_some_and(|old|old>=time) {continue;} seen[eye]=Some(time);
+            let Some(c)=replay_selected_candidate(&case) else {missing+=1;continue;};
+            let e=&c["baseline_ellipse"];
+            let Some(major)=e["major_radius"].as_f64() else {missing+=1;continue;};
+            let outer=crate::raw_iris_focus::OuterIrisBoundary {
+                center:(e["center"][0].as_f64().unwrap(),e["center"][1].as_f64().unwrap()),
+                major_radius:major,minor_radius:e["minor_radius"].as_f64().unwrap(),angle:e["angle"].as_f64().unwrap(),
+                points:vec![crate::raw_iris_focus::OuterIrisPoint::default();8],..Default::default()};
+            let origin=(meta["sensor_x"].as_u64().unwrap() as u32,meta["sensor_y"].as_u64().unwrap() as u32);
+            let at=now+Duration::from_nanos(time-*first.get_or_insert(time));
+            let results:Vec<_>=(0..3).map(|m|trackers[m][eye].observe_keyed_with_global_similarity(time,at,origin,None,&outer,None)
+                .map(|s|json!({"resolved":s.sign_resolved,"gaze":s.relative_gaze.projected(),"area_px2":s.frontal_equivalent_disk_area_px2,
+                    "source_ns":s.source_timestamp_ns,"epoch":s.sign_epoch}))).collect();
+            for result in results.iter().flatten() {assert_eq!(result["source_ns"],json!(time));}
+            if results.iter().all(Option::is_some) {
+                assert_eq!(results[0].as_ref().unwrap()["area_px2"],results[1].as_ref().unwrap()["area_px2"]);
+                assert_eq!(results[0].as_ref().unwrap()["area_px2"],results[2].as_ref().unwrap()["area_px2"]);
+            }
+            rows.push(json!({"eye":eye,"source_ns":time,"modes":results}));
+        }
+        assert!(!rows.is_empty());
+        let counts:Vec<_>=(0..3).map(|m|json!({"mode":modes[m].label(),"resolved":rows.iter().filter(|r|r["modes"][m]["resolved"]==true).count(),
+            "available":rows.iter().filter(|r|!r["modes"][m].is_null()).count()})).collect();
+        let report=json!({"input":input,"rows":rows,"counts":counts,"missing_ellipse":missing,
+            "limitations":"Rob-only recorded contour replay. Identical ellipse inputs, no motion/pupil cues in this ablation. No sign truth, human localization labels or independent scale. Raw FEIDA unchanged is not SN-FEIDA accuracy evidence. Wrong mounting can force the wrong sign."});
+        std::fs::File::create(output).unwrap().write_all(serde_json::to_string_pretty(&report).unwrap().as_bytes()).unwrap();
+    }
+
+    #[test]
     #[ignore = "requires fresh live-worker replay cache and native RAW corpus under outputs"]
     fn recorded_calibration_acquires_from_source_timed_live_worker_evidence() {
         use std::io::{BufRead,Read,Seek,Write};
@@ -561,6 +642,8 @@ mod tests {
         assert!(calibration_eye<2,"calibration eye must be zero-based 0 or 1");
         let mut writer=std::fs::OpenOptions::new().create_new(true).write(true).open(output).unwrap();
         let mut bridge=Bridge::default();let mut generations=[0;2];bridge.set_enabled(true,&mut generations);
+        bridge.set_camera_mount(std::env::var("BUTTERCUP_CAMERA_MOUNT_TRIAL").ok()
+            .and_then(|s|crate::eye_scene_model::CameraMount::parse(&s)).unwrap_or_default());
         match integration_recipe.as_str() {
             "live"=>{},
             "baseline"=>bridge.tracker.set_posterior_diagnostic(

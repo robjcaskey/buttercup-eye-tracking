@@ -5,6 +5,118 @@
 //! boundary. They describe its local optical support under an engineering noise
 //! model; semantic mistakes and circle-model error remain possible.
 use super::{luma, OwnedRoiEvidence};
+use crate::roi_evidence::{BoundaryKind, BoundaryNormalObservation};
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub(crate) struct PupilDirectionReport {
+    pub(crate) samples: usize,
+    pub(crate) measured: usize,
+    pub(crate) angular_sigmas_radians: Vec<f64>,
+    pub(crate) support_caps: Vec<PupilSupportCap>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct PupilSupportCap {
+    pub(crate) group: u32,
+    pub(crate) polyline_length_px: f64,
+    pub(crate) tangent_length_cap_px: f64,
+}
+
+/// Explicit offline weight ablation, not a claim that less RAW was captured.
+/// Reduce only pupil information mass; retain positions, directions, optical
+/// widths, source identity and every other anatomical boundary unchanged.
+pub(crate) fn scale_pupil_information(packet: &mut OwnedRoiEvidence, scale: f64) {
+    assert!(scale.is_finite() && scale > 0.0 && scale <= 1.0);
+    if scale == 1.0 { return; }
+    for arc in packet.arcs.iter_mut().filter(|a|a.kind==BoundaryKind::PupillaryBoundary) {
+        let length=arc.points_roi_px.windows(2).map(|p|
+            (p[1].0-p[0].0).hypot(p[1].1-p[0].1)).sum::<f64>();
+        if length.is_finite() && length>0.0 {
+            arc.support_length_cap_px=Some(arc.support_length_cap_px.map_or(length,|cap|cap.min(length))*scale);
+        }
+    }
+}
+
+/// Bound support by displacement along the RAW edge tangent. Use the largest
+/// projection allowed by either endpoint's +/-2-sigma orientation cone. An
+/// unknown direction keeps the original segment budget. The cone is the same
+/// engineering allowance as the direction residual, not calibrated coverage.
+pub(crate) fn cap_pupil_tangent_support(packet: &mut OwnedRoiEvidence) -> Vec<PupilSupportCap> {
+    let mut report=Vec::new();
+    for arc in packet.arcs.iter_mut().filter(|a|a.kind==BoundaryKind::PupillaryBoundary) {
+        let Some(normals)=&arc.outward_normals_roi else {continue;};
+        if normals.len()!=arc.points_roi_px.len() {continue;}
+        let mut polyline=0.0;let mut tangent=0.0;
+        for (points,ns) in arc.points_roi_px.windows(2).zip(normals.windows(2)) {
+            let d=[points[1].0-points[0].0,points[1].1-points[0].1];let length=d[0].hypot(d[1]);
+            polyline+=length;
+            let cap=if length>1.0e-9 {
+                ns[0].zip(ns[1]).map(|(a,b)| {
+                    [a,b].map(|n| {
+                        let projection=(d[0]*n.unit_outward_roi[1]-d[1]*n.unit_outward_roi[0]).abs()/length;
+                        let angle=projection.clamp(0.0,1.0).acos();
+                        length*(angle-2.0*n.angular_sigma_radians).max(0.0).cos()
+                    }).into_iter().fold(0.0_f64,f64::max)
+                }).unwrap_or(length)
+            } else {length};
+            tangent+=cap;
+        }
+        if !polyline.is_finite() || polyline<=1.0e-9 {continue;}
+        let cap=tangent.min(polyline);
+        arc.support_length_cap_px=Some(arc.support_length_cap_px.map_or(cap,|previous|previous.min(cap)));
+        report.push(PupilSupportCap {group:arc.evidence_group,polyline_length_px:polyline,
+            tangent_length_cap_px:arc.support_length_cap_px.unwrap()});
+    }
+    report
+}
+
+/// Current-image gradient at an observed position, without a conic/tangent
+/// supplied by a fit. The five overlapping stencils are NOT independent votes.
+/// Their full angular scatter widens the engineering allowance; no sqrt(N)
+/// precision gain is claimed. Dark-to-bright RAW polarity sets the direction.
+fn raw_edge_direction(
+    raw: &[u16], width: usize, height: usize, point: (f64, f64), ceiling: f64,
+) -> Option<BoundaryNormalObservation> {
+    let sample = |x, y| luma(raw, width, height, x, y).filter(|v| *v <= ceiling);
+    let mut gradients = [[0.0; 2]; 5];
+    for (g, (dx, dy)) in gradients.iter_mut().zip([(0.0,0.0),(-4.0,0.0),(4.0,0.0),(0.0,-4.0),(0.0,4.0)]) {
+        let (x,y) = (point.0+dx,point.1+dy);
+        *g = [(sample(x+3.0,y)?-sample(x-3.0,y)?)/6.0,
+            (sample(x,y+3.0)?-sample(x,y-3.0)?)/6.0];
+    }
+    let mean = std::array::from_fn::<_,2,_>(|i| gradients.iter().map(|g|g[i]).sum::<f64>()/5.0);
+    let magnitude = mean[0].hypot(mean[1]);
+    if magnitude < 7.0/6.0 { return None; }
+    let normal = [mean[0]/magnitude,mean[1]/magnitude];
+    let transverse_scatter = (gradients.iter().map(|g|
+        (g[0]*normal[1]-g[1]*normal[0]).powi(2)).sum::<f64>()/5.0).sqrt();
+    let sigma = 15.0_f64.to_radians().hypot(transverse_scatter.atan2(magnitude));
+    if sigma > 60.0_f64.to_radians() { return None; }
+    Some(BoundaryNormalObservation {unit_outward_roi:normal,angular_sigma_radians:sigma})
+}
+
+/// Explicit offline pupil-direction experiment. Preserve every measured point,
+/// alternative, source key, positional allowance and evidence group. Unknown or
+/// glint-censored stencils add no direction; they do not delete position data.
+/// No outer/true-inner observations or existing measured directions are changed.
+pub(crate) fn measure_pupil_directions(
+    packet: &mut OwnedRoiEvidence, raw: &[u16], maximum_luma_raw10: Option<f64>,
+) -> PupilDirectionReport {
+    let mut report = PupilDirectionReport::default();
+    let [width,height] = packet.dimensions_px.map(|n|n as usize);
+    let Some(ceiling) = maximum_luma_raw10.filter(|v|v.is_finite() && *v>0.0).map(|v|v.min(990.0)) else {return report;};
+    if width<20 || height<20 || width.checked_mul(height)!=Some(raw.len()) {return report;}
+    for arc in packet.arcs.iter_mut().filter(|a|a.kind==BoundaryKind::PupillaryBoundary && a.outward_normals_roi.is_none()) {
+        report.samples += arc.points_roi_px.len();
+        let directions = arc.points_roi_px.iter().map(|&p|raw_edge_direction(raw,width,height,p,ceiling)).collect::<Vec<_>>();
+        for direction in directions.iter().flatten() {
+            report.measured += 1;
+            report.angular_sigmas_radians.push(direction.angular_sigma_radians);
+        }
+        if directions.iter().any(Option::is_some) {arc.outward_normals_roi=Some(directions);}
+    }
+    report
+}
 
 const UNKNOWN_SIGMA_PX: f64 = 12.0;
 
@@ -282,6 +394,105 @@ pub(crate) fn measure_outer_position(packet:&mut OwnedRoiEvidence,raw:&[u16])->V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pupil_weight_ablation_preserves_raw_and_all_other_boundary_weights() {
+        let mut p=packet();
+        let mut pupil=p.arcs[0].clone();pupil.kind=BoundaryKind::PupillaryBoundary;
+        pupil.evidence_group=100;pupil.support_length_cap_px=Some(40.0);p.arcs.push(pupil);
+        let mut inner=p.arcs[0].clone();inner.kind=BoundaryKind::InnerLimbus;p.arcs.push(inner);
+        let original=p.clone();
+        scale_pupil_information(&mut p,1.0);
+        assert_eq!(format!("{p:?}"),format!("{original:?}"));
+        scale_pupil_information(&mut p,0.75);
+        assert_eq!(p.arcs[1].support_length_cap_px,Some(30.0));
+        p.arcs[1].support_length_cap_px=Some(40.0);
+        assert_eq!(format!("{p:?}"),format!("{original:?}"));
+    }
+
+    #[test]
+    fn pupil_tangent_cap_preserves_clean_support_and_limits_cross_edge_motion() {
+        let mut p = packet();
+        p.arcs[0].kind = BoundaryKind::PupillaryBoundary;
+        p.arcs[0].outward_normals_roi = Some(vec![Some(BoundaryNormalObservation {
+            unit_outward_roi: [1.0, 0.0],
+            angular_sigma_radians: 15.0_f64.to_radians(),
+        }); p.arcs[0].points_roi_px.len()]);
+        let original = p.clone();
+        let clean = cap_pupil_tangent_support(&mut p);
+        assert!((clean[0].polyline_length_px - clean[0].tangent_length_cap_px).abs() < 1e-10);
+        for (i, point) in p.arcs[0].points_roi_px.iter_mut().enumerate() {
+            point.0 += if i % 2 == 0 { 6.0 } else { -6.0 };
+        }
+        p.arcs[0].support_length_cap_px = None;
+        let before = p.clone();
+        let capped = cap_pupil_tangent_support(&mut p);
+        assert!(capped[0].tangent_length_cap_px < 0.8 * capped[0].polyline_length_px);
+        let mut restored = p.clone();
+        restored.arcs[0].support_length_cap_px = None;
+        assert_eq!(format!("{restored:?}"), format!("{before:?}"));
+        // A second application cannot further reduce the same evidence.
+        assert_eq!(cap_pupil_tangent_support(&mut p)[0].tangent_length_cap_px,
+            capped[0].tangent_length_cap_px);
+        p.arcs[0].points_roi_px.reverse();
+        assert!((cap_pupil_tangent_support(&mut p)[0].tangent_length_cap_px
+            - capped[0].tangent_length_cap_px).abs() < 1e-10);
+        // Unknown directions retain the measured span, not invented certainty.
+        p = original;
+        p.arcs[0].outward_normals_roi = Some(vec![None; p.arcs[0].points_roi_px.len()]);
+        let unknown = cap_pupil_tangent_support(&mut p);
+        assert_eq!(unknown[0].polyline_length_px, unknown[0].tangent_length_cap_px);
+        p.arcs[0].kind = BoundaryKind::OuterLimbus;
+        assert!(cap_pupil_tangent_support(&mut p).is_empty());
+    }
+
+    #[test]
+    fn pupil_raw_direction_follows_image_polarity_and_not_polyline_order() {
+        let width=128;let height=128;
+        for angle in [0.0_f64,0.4,1.2,2.3] {
+            for polarity in [-1.0,1.0] {
+                let n=[angle.cos()*polarity,angle.sin()*polarity];
+                let raw=(0..height).flat_map(|y|(0..width).map(move |x| {
+                    let signed=(x as f64-63.5)*n[0]+(y as f64-63.5)*n[1];
+                    (300.0+100.0*(signed/3.0).tanh()).round() as u16
+                })).collect::<Vec<_>>();
+                let direction=raw_edge_direction(&raw,width,height,(63.5,63.5),800.0).unwrap();
+                assert!(direction.valid());
+                assert!(direction.unit_outward_roi[0]*n[0]+direction.unit_outward_roi[1]*n[1]>0.99);
+                assert!(direction.angular_sigma_radians>=15.0_f64.to_radians());
+            }
+        }
+        for raw in [vec![300;128*128],vec![1023;128*128]] {
+            assert!(raw_edge_direction(&raw,128,128,(63.5,63.5),800.0).is_none());
+        }
+    }
+
+    #[test]
+    fn pupil_direction_attachment_preserves_positions_other_boundaries_and_source() {
+        let mut p=packet();
+        let outer=p.arcs[0].clone();
+        let mut pupil=outer.clone();pupil.kind=BoundaryKind::PupillaryBoundary;pupil.evidence_group=100;
+        pupil.points_roi_px=vec![(63.5,54.0),(63.5,64.0),(63.5,74.0)];
+        p.arcs.push(pupil);let before=p.clone();
+        let raw=(0..128*128).map(|i| (300.0+100.0*((i%128) as f64/3.0-63.5/3.0).tanh()).round() as u16).collect::<Vec<_>>();
+        let report=measure_pupil_directions(&mut p,&raw,Some(800.0));
+        assert_eq!(report.measured,3);assert_eq!(report.samples,3);
+        assert_eq!(p.exposure,before.exposure);assert_eq!(p.detail_reliability,before.detail_reliability);
+        assert_eq!(format!("{:?}",p.arcs[0]),format!("{:?}",before.arcs[0]));
+        let mut restored=p.clone();restored.arcs[1].outward_normals_roi=None;
+        assert_eq!(format!("{restored:?}"),format!("{before:?}"));
+        let normals=p.arcs[1].outward_normals_roi.clone();
+        // Neither a made-up ellipse hint nor reversed arc order changes RAW polarity.
+        p.conics.clear();p.arcs[1].points_roi_px.reverse();p.arcs[1].outward_normals_roi=None;
+        measure_pupil_directions(&mut p,&raw,Some(800.0));
+        let mut reversed=normals.unwrap();reversed.reverse();
+        assert_eq!(p.arcs[1].outward_normals_roi.as_ref(),Some(&reversed));
+        let mut unknown=before.clone();
+        assert_eq!(measure_pupil_directions(&mut unknown,&raw,None).measured,0);
+        assert_eq!(format!("{unknown:?}"),format!("{before:?}"));
+        assert_eq!(measure_pupil_directions(&mut unknown,&[0;4],Some(800.0)).measured,0);
+        assert_eq!(format!("{unknown:?}"),format!("{before:?}"));
+    }
     use crate::outline_conic_segments::sparse_evidence::OwnedBoundaryArc;
     use crate::roi_evidence::{BoundaryKind, ExposureKey, RoiId, SourceClock};
 
@@ -300,7 +511,7 @@ mod tests {
             sensor_origin_px: [0, 0],
             conics: vec![],
             detail_reliability: None,
-            arcs: vec![OwnedBoundaryArc { level_sets_roi: None,
+            arcs: vec![OwnedBoundaryArc { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,
                 evidence_group: 0,
                 kind: BoundaryKind::OuterLimbus,
                 points_roi_px: (0..16).map(|i| (64.0, 32.0 + 4.0 * i as f64)).collect(),

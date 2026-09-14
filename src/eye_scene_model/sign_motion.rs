@@ -184,6 +184,41 @@ mod tests {
     }
 
     #[test]
+    fn camera_mount_requires_fresh_support_and_preserves_area_and_antipodes() {
+        use crate::eye_scene_model::{CameraMount,SurfaceSignEvidence};
+        assert_eq!(CameraMount::Flexible.next().next().next(),CameraMount::Flexible);
+        assert_eq!(CameraMount::BelowEyes.branch([0.01,-0.01]),None);
+        assert_eq!(CameraMount::AboveEyes.branch([f64::NAN,0.0]),None);
+        let now=Instant::now();
+        let mut up=SurfaceGazeTracker {camera_mount:CameraMount::BelowEyes,..Default::default()};
+        let mut down=SurfaceGazeTracker {camera_mount:CameraMount::AboveEyes,..Default::default()};
+        let mut baseline=SurfaceGazeTracker::default();
+        for frame in 0..20 {
+            let (origin,outer,_)=bootstrap_input(frame,1.0,0.3);
+            let at=now+Duration::from_millis(frame*100);
+            let source=1+frame*100_000_000;
+            let a=up.observe_keyed_with_global_similarity(source,at,origin,None,&outer,None).unwrap();
+            let b=down.observe_keyed_with_global_similarity(source,at,origin,None,&outer,None).unwrap();
+            let base=baseline.observe_keyed_with_global_similarity(source,at,origin,None,&outer,None).unwrap();
+            assert_eq!(a.frontal_equivalent_disk_area_px2,base.frontal_equivalent_disk_area_px2);
+            assert_eq!(a.frontal_equivalent_disk_area_px2,b.frontal_equivalent_disk_area_px2);
+            assert_eq!(a.sign_resolved,frame>=3);
+            assert_eq!(b.sign_resolved,frame>=3);
+            if frame>=3 {
+                assert!(a.relative_gaze.down < -0.05 && b.relative_gaze.down > 0.05);
+                assert!((a.relative_gaze.down+b.relative_gaze.down).abs()<1e-9);
+                assert_eq!(a.sign_diagnostics.unwrap().evidence,SurfaceSignEvidence::MountingAssumption);
+            }
+            let votes=up.mount_votes;
+            for _ in 0..8 {up.observe_keyed_with_global_similarity(source,at,origin,None,&outer,None);}
+            assert_eq!(up.mount_votes,votes,"redraws must not acquire a sign");
+        }
+        let (origin,outer,_)=bootstrap_input(21,1.0,0.01);
+        let a=up.observe_keyed_with_global_similarity(2_100_000_001,now+Duration::from_millis(2100),origin,None,&outer,None).unwrap();
+        assert!(!a.sign_resolved,"near-frontal mounting must remain ambiguous");
+    }
+
+    #[test]
     fn later_same_branch_pupil_anchors_validate_a_motion_seed_without_changing_epoch() {
         let now=Instant::now(); let mut tracker=SurfaceGazeTracker::default();
         let (origin,outer,_)=bootstrap_input(0,1.0,0.4);

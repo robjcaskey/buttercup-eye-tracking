@@ -1,5 +1,5 @@
 //! Persistent physical monitor pose. Gaze-provider/sign epochs and the
-//! eye-specific affine are intentionally session-local, never restored here.
+//! eye-specific affine are stored separately in gaze-calibration.json by the viewer.
 use crate::gaze_target_solver::{display_plane_geometry_plausible, VirtualDisplayPlane};
 use serde_json::{json, Value};
 use std::io::Write;

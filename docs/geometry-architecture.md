@@ -7,6 +7,41 @@ live adapter now exist; their corpus validation is in progress. See
 live routing, evaluated scope and known failures. The default single-ROI
 route retains the established monocular surface tracker.
 
+## Shared pipeline migration: user-visible consistency
+
+The purpose of this refactor is to make an analysis improvement reach every
+applicable consumer without separate implementations for individual views.
+Share stages according to their inputs and meaning, not just similar code.
+Calibration may require fresher, settled evidence than a drawable held contact;
+that is a consumer policy, not permission to compute a different gaze solution.
+Debug comparisons and backends that do not use a stage remain explicit exceptions.
+
+The first extraction is `eye_evidence_stage.rs`, exposed through
+`sam31_outer::evidence_stage` to retain the existing binary/library module roots.
+SAM video and Butter Obelisk both supply `DetectorEvidence`; the shared finalizer
+owns model-to-native conversion, the single source-local refinement attempt,
+boundary-logit diagnostics and the existing RAW admission decision. Its return
+value separates the immutable proposal from the admitted detector result, so a
+rejection retains inspectable evidence without granting tracking authority.
+The worker owns queue publication. The stereo bridge delegates construction of
+`OwnedRoiEvidence` to the same module, after validating the exact recorded source.
+The bridge still owns source-clock coordination and the solver invocation.
+
+| Consumer/path | Current sharing | Remaining migration |
+| --- | --- | --- |
+| SAM video / Butter Obelisk | Same evidence finalizer and proposal/result geometry | Replace legacy request and SAM-named transport types incrementally |
+| Stereo live bridge | Shared proposal-to-sparse-evidence construction | Carry an explicitly source-stamped optional physical context |
+| Contact, laser, calibration, mouse | Receive worker-published refined geometry through existing routing | Consolidate repeated gaze-selection and source/sign eligibility checks |
+| Experimental F preview | Reuses an existing worker refinement decision when present | Preview-only inference/cache still lives in rendering; schedule it separately |
+| Offline/replay | Existing shared worker entry points where used | Consolidate event orchestration; retain explicit diagnostic policies |
+| Legacy three-adapter `process_batch` | No call sites found in this checkout | Retire or explicitly adapt after checking supported tooling |
+
+This extraction does not change the joint objective or monocular sign algorithm.
+In particular, it does not repair the recorded SAM post-blink sign regression.
+Do not claim corpus accuracy improvements from moving code. Subsequent changes
+need matched source/event comparisons, plus tests that shared improvements reach
+all applicable consumers and that preview/held results cannot become authority.
+
 ## Responsibilities
 
 | Module | Existing functionality now owned here | Still missing |
@@ -20,8 +55,8 @@ route retains the established monocular surface tracker.
 | `geometry` | Shared ellipse shape, image-axis helpers and small numerical/vector routines | Further coordinate-safe primitives as callers migrate |
 
 The live SAM route now calls the extracted outline and conic modules, then
-the scene/surface and target geometry. SAM still owns inference, model/native
-coordinate conversion, semantic candidate selection and RAW publication gates.
+the scene/surface and target geometry. Detector adapters own inference and semantic candidate selection; the shared
+evidence stage owns model/native conversion and RAW admission gates.
 The native RAW detector and motion extractor remain observation backends.
 The viewer owns mode authority, calibration admission/state, held overlays,
 rendering and camera-service interaction.

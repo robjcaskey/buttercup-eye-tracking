@@ -1035,15 +1035,26 @@ mod cuda {
     /// flat-tire gaps must remain missing evidence for the conic solver.
     fn conic_replay_evidence(proposal: &ProposalMasks, admitted: bool) -> Value {
         let fit = proposal.outer_fit.as_ref();
-        let score = proposal.semantic.as_ref().and_then(|semantic| {
+        let selected_mask = proposal.semantic.as_ref().and_then(|semantic| {
             semantic.selected_query.and_then(|selected| {
                 semantic
                     .masks
                     .iter()
                     .find(|mask| mask.query == selected)
-                    .map(|mask| mask.score)
+                    .map(|mask| (semantic, mask))
             })
         });
+        let score = selected_mask.map(|(_, mask)| mask.score);
+        // Keep the original ordered mask boundary even when a complete fit
+        // was rejected. This is diagnostic segmentation evidence, not an
+        // admitted limbus and not a rim synthesized from the fitted ellipse.
+        let outline = selected_mask
+            .filter(|(semantic, _)| semantic.prompt_index == OUTER_IRIS_PROMPT)
+            .map(|(semantic, mask)| native_outline_points(
+                &mask.pixels, semantic.width, semantic.height,
+                proposal.source_width, proposal.source_height,
+            ))
+            .unwrap_or_default();
         let mut record = json!({"selected_query":fit.map(|_|0),
             "candidates":[{"query":0,"semantic_score":score,
                 "baseline_raw_admitted":admitted,
@@ -1051,8 +1062,8 @@ mod cuda {
                 "baseline_retained":fit.map(|f|f.retained_points.as_ref()),
                 "baseline_retained_segments":fit.map(|f|f.conic_segments.as_ref()),
                 "baseline_censored":fit.map(|f|f.flat_tire_points.as_ref()),
-                "outline":[],
-                "scope":"selected live proposal; only measured retained arcs, no synthetic completed rim"}],
+                "outline":outline,
+                "scope":"selected live proposal; original ordered mask outline is unfiltered diagnostic evidence; retained arcs preserve fit censorship; no synthetic completed rim"}],
             "pupil_void":proposal.inner_pupil_fit.map(|p|json!({"ellipse":ellipse_json(p.ellipse)}))});
         proposal.export_boundary_logits(&mut record);
         record
@@ -1488,6 +1499,55 @@ mod cuda {
             assert_eq!(candidate["baseline_raw_admitted"], false);
             assert_eq!(candidate["outline"], json!([]));
             assert!(record["pupil_void"].is_null());
+        }
+
+        #[test]
+        fn conic_replay_retains_selected_mask_outline_when_complete_fit_is_missing() {
+            let mut pixels = vec![0; 64 * 64];
+            for y in 12..48 {
+                for x in 10..50 { pixels[y * 64 + x] = 1; }
+            }
+            let mut proposal = ProposalMasks {
+                source_width: 420,
+                source_height: 280,
+                semantic: Some(SemanticProposalMasks {
+                    prompt_index: OUTER_IRIS_PROMPT,
+                    width: 64,
+                    height: 64,
+                    selected_query: Some(7),
+                    masks: vec![
+                        ProposalMask { query: 0, score: 0.99,
+                            pixels: Arc::new(vec![0; 64 * 64]),
+                            boundary_pixels: Arc::new(Vec::new()) },
+                        ProposalMask { query: 7, score: 0.8,
+                            pixels: Arc::new(pixels),
+                            boundary_pixels: Arc::new(Vec::new()) },
+                    ],
+                }),
+                ..ProposalMasks::default()
+            };
+            let record = conic_replay_evidence(&proposal, false);
+            let candidate = &record["candidates"][0];
+            assert!(record["selected_query"].is_null());
+            assert!(candidate["baseline_ellipse"].is_null());
+            assert!(candidate["baseline_retained"].is_null());
+            assert_eq!(candidate["baseline_raw_admitted"], false);
+            let outline = candidate["outline"].as_array().unwrap();
+            assert_eq!(outline.len(), 256);
+            // Native pixel centers, including the rectangular corners. An
+            // ellipse completion would not preserve all four mask edges.
+            let bounds = [(68.40625, 324.34375), (54.1875, 207.3125)];
+            for (axis, (lo, hi)) in bounds.into_iter().enumerate() {
+                let values = outline.iter().map(|p| p[axis].as_f64().unwrap()).collect::<Vec<_>>();
+                assert!((values.iter().copied().fold(f64::INFINITY, f64::min) - lo).abs() < 0.1);
+                assert!((values.iter().copied().fold(f64::NEG_INFINITY, f64::max) - hi).abs() < 0.1);
+            }
+            proposal.semantic.as_mut().unwrap().selected_query = None;
+            assert_eq!(conic_replay_evidence(&proposal, false)["candidates"][0]["outline"], json!([]));
+            let semantic = proposal.semantic.as_mut().unwrap();
+            semantic.selected_query = Some(7);
+            semantic.prompt_index = OUTER_IRIS_PROMPT + 1;
+            assert_eq!(conic_replay_evidence(&proposal, false)["candidates"][0]["outline"], json!([]));
         }
         #[test]
         fn student_network_is_small_finite_and_preserves_the_six_head_contract() {

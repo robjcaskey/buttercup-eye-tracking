@@ -73,7 +73,7 @@ pub(crate) fn solve_joint_gaze_target(
     })
 }
 
-// Allow a coarse initial calibration from the central 20% target field.
+// Retain the established coarse-initial-calibration residual allowances.
 // Coverage, affine conditioning, physical geometry and shared model support
 // remain mandatory; these tolerances are fractions of the full screen.
 pub(crate) const VIRTUAL_MOUSE_PLANE_INLIER_RESIDUAL: f64 = 0.10;
@@ -84,10 +84,9 @@ pub(crate) const VIRTUAL_MOUSE_MODEL_MAX_DISAGREEMENT: f64 = 0.08;
 pub(crate) const VIRTUAL_MOUSE_AFFINE_MIN_SINGULAR_GAIN: f64 = 0.05;
 pub(crate) const VIRTUAL_MOUSE_AFFINE_MAX_SINGULAR_GAIN: f64 = 40.0;
 pub(crate) const VIRTUAL_MOUSE_AFFINE_MAX_CONDITION: f64 = 30.0;
-// Keep all fixation centers inside the display's central 20%. This reduces
-// eyelid occlusion and extreme-angle SAM foreshortening during calibration;
-// the fitted 3D plane/affine still maps gaze across the full display.
-pub(crate) const VIRTUAL_MOUSE_CALIBRATION_INSET: f64 = 0.40;
+// Sample most of the visible display, leaving a 10% margin for the reticle.
+// Drawing, fitting, coverage checks and recording share these exact targets.
+pub(crate) const VIRTUAL_MOUSE_CALIBRATION_INSET: f64 = 0.10;
 pub(crate) const VIRTUAL_MOUSE_CALIBRATION_TARGETS: [(f64, f64); 9] = [
     (
         VIRTUAL_MOUSE_CALIBRATION_INSET,
@@ -120,6 +119,47 @@ pub(crate) const NOMINAL_DISPLAY_ASPECT_HEIGHT: f64 = 9.0;
 pub(crate) struct GazeAffine {
     pub(crate) x: [f64; 3],
     pub(crate) y: [f64; 3],
+}
+
+/// The affine's coordinates must travel with its coefficients. Unit-direction
+/// XY is the historical mapping; a wide, oblique fixation field can require
+/// perspective projection before its small screen-space correction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum GazeAffineInput {
+    #[default]
+    ProjectedDirection,
+    DisplayIntersection,
+}
+
+impl GazeAffineInput {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ProjectedDirection => "projected-direction",
+            Self::DisplayIntersection => "display-intersection",
+        }
+    }
+
+    pub(crate) fn parse(label: &str) -> Option<Self> {
+        match label {
+            "projected-direction" => Some(Self::ProjectedDirection),
+            "display-intersection" => Some(Self::DisplayIntersection),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn target(
+        self, affine: GazeAffine, plane: VirtualDisplayPlane, gaze: RelativeGazeVector,
+    ) -> Option<(f64, f64)> {
+        // Both forms require a forward physical intersection. Keep calibration,
+        // drawing, accuracy checks and desktop output on this same mapping.
+        let intersection = plane.target(gaze)?;
+        let feature = match self {
+            Self::ProjectedDirection => gaze.projected(),
+            Self::DisplayIntersection => intersection,
+        };
+        let target = affine.map(feature);
+        (target.0.is_finite() && target.1.is_finite()).then_some(target)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -213,16 +253,26 @@ pub(crate) fn calibration_models_have_shared_support(
     affine: GazeAffine,
     observations: &[((f64, f64), (f64, f64))],
 ) -> bool {
+    calibration_mapping_has_shared_support(
+        plane, affine, GazeAffineInput::ProjectedDirection, observations,
+    )
+}
+
+pub(crate) fn calibration_mapping_has_shared_support(
+    plane: VirtualDisplayPlane,
+    affine: GazeAffine,
+    input: GazeAffineInput,
+    observations: &[((f64, f64), (f64, f64))],
+) -> bool {
     if !gaze_affine_linear_geometry_plausible(affine) {
         return false;
     }
     let shared_targets = observations
         .iter()
         .filter_map(|observation| {
-            let plane_prediction =
-                RelativeGazeVector::from_projected(observation.0 .0, observation.0 .1)
-                    .and_then(|gaze| plane.target(gaze))?;
-            let affine_prediction = affine.map(observation.0);
+            let gaze = RelativeGazeVector::from_projected(observation.0 .0, observation.0 .1)?;
+            let plane_prediction = plane.target(gaze)?;
+            let affine_prediction = input.target(affine, plane, gaze)?;
             let plane_residual = (plane_prediction.0 - observation.1 .0)
                 .hypot(plane_prediction.1 - observation.1 .1);
             let affine_residual = (affine_prediction.0 - observation.1 .0)
@@ -236,6 +286,33 @@ pub(crate) fn calibration_models_have_shared_support(
         })
         .collect::<Vec<_>>();
     calibration_targets_have_required_coverage(shared_targets)
+}
+
+pub(crate) fn fit_calibrated_gaze_mapping(
+    plane: VirtualDisplayPlane,
+    observations: &[((f64, f64), (f64, f64))],
+) -> Option<(GazeAffine, GazeAffineInput)> {
+    // Preserve an already adequate historical fit. If unit-vector XY cannot
+    // support a linear screen map, account for perspective using the accepted
+    // metric plane before fitting the affine. This is not independent evidence
+    // for that plane: coverage, residuals and correction size are consistency
+    // checks on the SAME fixation observations, not calibrated probabilities.
+    for input in [GazeAffineInput::ProjectedDirection, GazeAffineInput::DisplayIntersection] {
+        let transformed = observations.iter().map(|&(feature, target)| {
+            let gaze = RelativeGazeVector::from_projected(feature.0, feature.1)?;
+            let feature = match input {
+                GazeAffineInput::ProjectedDirection => feature,
+                GazeAffineInput::DisplayIntersection => plane.target(gaze)?,
+            };
+            Some((feature, target))
+        }).collect::<Option<Vec<_>>>()?;
+        let Some(affine) = fit_robust_gaze_affine(&transformed) else { continue; };
+        if calibration_mapping_has_shared_support(plane, affine, input, observations) {
+            eprintln!("mouse calibration mapping input={}", input.label());
+            return Some((affine, input));
+        }
+    }
+    None
 }
 
 /// Intersect the eye-relative gaze ray with the uncalibrated physical display

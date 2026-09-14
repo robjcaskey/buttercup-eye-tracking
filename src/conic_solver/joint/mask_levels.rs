@@ -42,15 +42,16 @@ pub(super) struct FamilyActivity {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct Selection {
+pub(super) struct Selection<'a> {
     pub(super) choices: Vec<usize>,
     pub(super) levels: Vec<usize>,
     pub(super) in_family: Vec<bool>,
     pub(super) families: Vec<FamilyActivity>,
     pub(super) group_mixtures: Vec<Option<ArcMixture>>,
+    pub(super) cached_arcs: Vec<CachedArcResiduals<'a>>,
 }
 
-impl Selection {
+impl Selection<'_> {
     pub(super) fn has_group_mixture(&self, index: usize) -> bool {
         self.group_mixtures.get(index).is_some_and(Option::is_some)
     }
@@ -59,16 +60,16 @@ impl Selection {
     }
 }
 
-impl std::ops::Deref for Selection {
+impl std::ops::Deref for Selection<'_> {
     type Target = [usize];
     fn deref(&self) -> &Self::Target { &self.choices }
 }
-impl<'a> IntoIterator for &'a Selection {
+impl<'a, 'model> IntoIterator for &'a Selection<'model> {
     type Item = &'a usize;
     type IntoIter = std::slice::Iter<'a, usize>;
     fn into_iter(self) -> Self::IntoIter { self.choices.iter() }
 }
-impl IntoIterator for Selection {
+impl IntoIterator for Selection<'_> {
     type Item = usize;
     type IntoIter = std::vec::IntoIter<usize>;
     fn into_iter(self) -> Self::IntoIter { self.choices.into_iter() }
@@ -129,13 +130,13 @@ fn activity(model: &Problem<'_>, conics: &[[Option<ProjectedCircle>;3];2],
     result
 }
 
-pub(super) fn select(model: &Problem<'_>, conics: &[[Option<ProjectedCircle>; 3]; 2],
-    choices: Vec<usize>) -> Selection
+pub(super) fn select<'a>(model: &'a Problem<'_>, conics: &[[Option<ProjectedCircle>; 3]; 2],
+    choices: Vec<usize>) -> Selection<'a>
 {
     let mut selected = Selection { levels: vec![1; choices.len()],
         in_family: vec![false; choices.len()],
         group_mixtures:if model.marginalize_arc_alternatives {vec![None;choices.len()]} else {Vec::new()},
-        choices, families: Vec::new() };
+        choices, families: Vec::new(), cached_arcs: Vec::new() };
     let mut memberships: [Vec<usize>; 6] = std::array::from_fn(|_| Vec::new());
     for (index, group) in model.groups.iter().enumerate() {
         if group.alternatives.iter().any(|arc| arc.level_sets.iter().flatten().any(|p| p.varies())) {

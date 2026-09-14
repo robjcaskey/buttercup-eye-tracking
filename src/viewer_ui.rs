@@ -2,6 +2,7 @@
 //! camera acquisition is always a separate, explicit action.
 use super::*;
 mod stereo;
+pub(super) use stereo::draw_stereo_segments;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum Scope {
@@ -31,6 +32,7 @@ pub(super) enum LinkedView {
     #[default]
     Compare,
     StereoSolver,
+    StereoSegments,
     Timing,
     Contacts,
     TweakedContacts,
@@ -41,8 +43,8 @@ pub(super) enum LinkedView {
 impl LinkedView {
     fn available(method: SegmentationMode) -> &'static [Self] {
         match method {
-            SegmentationMode::Sam31 => &[Self::Compare, Self::StereoSolver, Self::Timing, Self::Contacts, Self::TweakedContacts],
-            SegmentationMode::EyeStudent => &[Self::Compare, Self::StereoSolver, Self::StudentEllipseOnly,
+            SegmentationMode::Sam31 => &[Self::Compare, Self::StereoSolver, Self::StereoSegments, Self::Timing, Self::Contacts, Self::TweakedContacts],
+            SegmentationMode::EyeStudent => &[Self::Compare, Self::StereoSolver, Self::StereoSegments, Self::StudentEllipseOnly,
                 Self::StudentMaskOutline, Self::StudentPupilOnly, Self::Contacts, Self::TweakedContacts, Self::Timing],
             _ => &[Self::Compare, Self::Timing, Self::Contacts],
         }
@@ -60,6 +62,7 @@ impl LinkedView {
         match self {
             Self::Compare => "COMPARE",
             Self::StereoSolver => "STEREO SOLVER",
+            Self::StereoSegments => "STEREO SEGMENTS / FITTING SUPPORT",
             Self::Timing => "SOURCE TIMING",
             Self::Contacts => "CONTACT GEOMETRY",
             Self::TweakedContacts => "TWEAKED CONTACT GEOMETRY / EXPERIMENTAL",
@@ -251,7 +254,7 @@ impl Workspace {
         self.scope == Scope::Global && self.global == GlobalView::Objects
     }
     fn stereo_view(&self) -> bool {
-        self.scope == Scope::Linked && self.linked == LinkedView::StereoSolver
+        self.scope == Scope::Linked && matches!(self.linked, LinkedView::StereoSolver | LinkedView::StereoSegments)
     }
 }
 
@@ -377,6 +380,8 @@ pub(super) enum Action {
     ResetPreviewOverrides,
     StereoSolver,
     ToggleStereo,
+    ToggleLimbusRefinement,
+    CycleCameraMount,
     StereoLayer(stereo::Layer),
 }
 pub(super) fn apply(app: &mut App, action: Action) {
@@ -388,15 +393,38 @@ pub(super) fn apply(app: &mut App, action: Action) {
                 app.ui.panel = Panel::Selection;
             }
         }
-        Action::ToggleStereo => {
-            if let Ok(mut s) = app.shared.lock() {
-                if s.segmentation_mode.uses_mask_geometry() {
-                    let enabled = !s.second_roi_enabled;
-                    set_second_roi_analysis(&mut s, enabled);
+        Action::CycleCameraMount => {
+            if let Ok(mut s)=app.shared.lock() {
+                let next=s.camera_mount.next();
+                if let Err(error)=set_camera_mount(&mut s,next) {
+                    s.monitor_location.status=format!("CAMERA MOUNT SAVE FAILED: {error}");
+                    eprintln!("CAMERA MOUNT SAVE FAILED: {error}");
                 }
             }
         }
-        Action::StereoLayer(layer) => app.ui.stereo_layer = layer,
+        Action::ToggleLimbusRefinement => {
+            if let Ok(mut s)=app.shared.lock() {
+                if s.segmentation_mode.uses_mask_geometry() {
+                    use sam31_outer::limbus_refinement::{self,Mode};
+                    let next=if limbus_refinement::mode()==Mode::Off {Mode::Experimental} else {Mode::Off};
+                    set_limbus_refinement(&mut s,next);
+                }
+            }
+        }
+        Action::ToggleStereo => {
+            if let Ok(mut s) = app.shared.lock() {
+                if s.segmentation_mode.uses_mask_geometry() {
+                    let enabled = !s.stereo_solver_enabled;
+                    set_stereo_solver(&mut s, enabled);
+                }
+            }
+        }
+        Action::StereoLayer(layer) => {
+            app.ui.stereo_layer = layer;
+            if app.ui.linked == LinkedView::StereoSegments && layer != stereo::Layer::Segments {
+                app.ui.linked = LinkedView::StereoSolver;
+            }
+        },
         Action::TogglePreviewEditScope => app.ui.preview_edit_scope = app.ui.preview_edit_scope.next(),
         Action::ResetPreviewOverrides => app.ui.reset_selected_preview(),
         Action::SaveMonitor => {
@@ -598,7 +626,7 @@ fn button(c: &mut Canvas, ui: &mut Workspace, r: Rect, label: &str, active: bool
     ui.hits.push((r, action));
 }
 
-fn selection_controls(c: &mut Canvas, ui: &mut Workspace, mut area: Rect, monitor_unsaved: bool) -> Rect {
+fn selection_controls(c: &mut Canvas, ui: &mut Workspace, mut area: Rect, monitor_unsaved: bool, camera_mount: eye_scene_model::CameraMount) -> Rect {
     // A bottom inspector is short but wide. Use one row for its actions so
     // the controls cannot consume the entire scrollable status area.
     let compact = area.w >= 520 && area.h < 180;
@@ -609,13 +637,15 @@ fn selection_controls(c: &mut Canvas, ui: &mut Workspace, mut area: Rect, monito
         (false, false) => "S-TAB: GLOBAL DEFAULTS",
         (false, true) => "S-TAB: PREVIEW OVERRIDE",
     };
+    let mount_label=format!("F8 CAMERA {}",camera_mount.label().to_ascii_uppercase());
     for (index, (label, action, active)) in [
+        (mount_label.as_str(),Action::CycleCameraMount,camera_mount!=eye_scene_model::CameraMount::Flexible),
         (edit_label, Action::TogglePreviewEditScope, overriding),
         (if compact { "SAVE MONITOR" } else { "SAVE MONITOR LOCATION" }, Action::SaveMonitor, monitor_unsaved),
         (if compact { "\\ ACCURACY" } else { "\\ ACCURACY CHECK - 20 TARGETS" }, Action::AccuracyCheck, false),
     ].into_iter().enumerate() {
         let rect = if compact {
-            let column = area.w / 3;
+            let column = area.w / 4;
             Rect { x: area.x + index * column, w: column.saturating_sub(4), h: 28.min(area.h), ..area }
         } else {
             Rect { h: 28.min(area.h), ..area }
@@ -868,6 +898,9 @@ struct Snapshot {
     monitor_unsaved:bool,
     method: SegmentationMode,
     second: bool,
+    stereo: bool,
+    limbus_refinement: bool,
+    camera_mount: eye_scene_model::CameraMount,
     object_running: bool,
     prompt: String,
     prompt_status: String,
@@ -918,6 +951,9 @@ pub(super) fn render(
             monitor_unsaved:s.monitor_location.unsaved_candidate(),
             method: s.segmentation_mode,
             second: s.second_roi_enabled,
+            stereo: s.stereo_solver_enabled,
+            camera_mount: s.camera_mount,
+            limbus_refinement: sam31_outer::limbus_refinement::mode()==sam31_outer::limbus_refinement::Mode::Experimental,
             object_running: s.sam31_object_inspection,
             prompt: prompt.clone(),
             prompt_status: status.clone(),
@@ -965,6 +1001,11 @@ pub(super) fn render(
                 "overlay":r.overlay.map(|o|o.label()),"pixels":r.pixels.map(annotated_view_mode_name)})),
             "global_gaze":{"detector":s.segmentation_mode.label(),"settings_generation":s.segmentation_generation,
                 "detector_display":s.segmentation_mode.display_label(),
+                "stereo_enabled":s.stereo_solver_enabled,
+                "limbus_refinement":sam31_outer::limbus_refinement::mode().label(),
+                "calibration_reloaded":app.calibrated_display.is_some_and(|c|c.restored),
+                "calibration_file":GAZE_CALIBRATION_PATH,
+                "camera_mount":s.camera_mount.label(),"camera_mount_hotkey":"F8",
                 "reference_eye":eye_name(app.focus_eye),"outputs":"focus / uinput / J cursor / calibration / accuracy"},
             "monitor":s.monitor_location.snapshot(),
             "mouse_output":s.mouse_output.snapshot(),
@@ -1017,6 +1058,14 @@ pub(super) fn configure_hotkeys(
         }
     }
     map.bindings.push(keyboard_peeper::Binding {
+        modifiers: 1 << 1, enabled: !editing && !search_running,
+        key: "F", label: "Toggle limbus refinement",
+    });
+    map.bindings.push(keyboard_peeper::Binding {
+        modifiers: 1 << 1, enabled: !editing && !search_running,
+        key: "3", label: "Toggle stereo solver",
+    });
+    map.bindings.push(keyboard_peeper::Binding {
         // KPP/1 uses bit 1 for Shift (independent of winit's bit layout).
         modifiers: 1 << 1,
         enabled: !editing,
@@ -1059,6 +1108,9 @@ fn render_snapshot(
         monitor_unsaved,
         method,
         second,
+        stereo,
+        limbus_refinement,
+        camera_mount,
         object_running,
         prompt,
         prompt_status,
@@ -1145,12 +1197,12 @@ fn render_snapshot(
         Scope::Global=>(if ui.global==GlobalView::Sensor {1}else{2},2),
     };
     let title = format!("F VIEW {position}/{count} / {}",ui.title(method));
-    let stereo_shortcut = method.uses_mask_geometry() && w >= 640 && !ui.stereo_view();
+    let stereo_shortcut = method.uses_mask_geometry() && w >= 640;
     c.text(
         Rect {
             x: 10,
             y: layout.toolbar.y + 10,
-            w: layout.toolbar.w.saturating_sub(if stereo_shortcut { 224 } else { 120 }),
+            w: layout.toolbar.w.saturating_sub(if stereo_shortcut { 468 } else { 120 }),
             h: 16,
         },
         &title,
@@ -1170,10 +1222,31 @@ fn render_snapshot(
         Action::NextView,
     );
     if stereo_shortcut {
-        button(&mut c, ui, Rect { x: w - 216, y: layout.toolbar.y + 4, w: 108, h: 28.min(layout.toolbar.h) },
-            "STEREO", false, Action::StereoSolver);
+        button(&mut c, ui, Rect {x:w-460,y:layout.toolbar.y+4,w:172,h:28.min(layout.toolbar.h)},
+            if limbus_refinement {"LIMBUS ON"} else {"LIMBUS OFF"},limbus_refinement,Action::ToggleLimbusRefinement);
+        button(&mut c, ui, Rect { x: w - 280, y: layout.toolbar.y + 4, w: 172, h: 28.min(layout.toolbar.h) },
+            if stereo { "STEREO ON" } else { "STEREO OFF" }, stereo, Action::ToggleStereo);
     }
-    let area = layout.canvas.inset(8);
+    let mut area = layout.canvas.inset(8);
+    if stereo && method.uses_mask_geometry() && !object_running
+        && matches!(ui.scope, Scope::Roi | Scope::Linked) && !ui.stereo_view()
+        && area.h >= 180 && area.w >= 240
+    {
+        let panel = if area.w >= 900 {
+            let width = (area.w / 3).min(360);
+            let panel = Rect { x: area.x + area.w - width, w: width, ..area };
+            area.w = area.w.saturating_sub(width + 8);
+            panel
+        } else {
+            let height = (area.h / 3).min(200);
+            let panel = Rect { y: area.y + area.h - height, h: height, ..area };
+            area.h = area.h.saturating_sub(height + 8);
+            panel
+        };
+        stereo::render_scene(&mut c, panel, snapshot);
+        ui.hits.push((panel, Action::StereoSolver));
+    }
+
     let mut eyes = eyes;
     for frame in eyes.iter_mut().flatten() {
         frame.eye_laser_enabled = laser && !object_running;
@@ -1210,6 +1283,7 @@ fn render_snapshot(
             overview(&mut c, context, backdrop.as_ref(), &eyes);
         }
         Scope::Linked if ui.stereo_view() => {
+            if ui.linked == LinkedView::StereoSegments { ui.stereo_layer = stereo::Layer::Segments; }
             stereo::render(&mut c, ui, area, snapshot);
         }
         Scope::Linked => {
@@ -1406,7 +1480,7 @@ fn render_snapshot(
         text_area.y += 32.min(text_area.h);
         text_area.h = text_area.h.saturating_sub(32);
     }
-    let mut rows = vec![];
+    let mut rows = vec![format!("F8 CAMERA MOUNT: {} (ASSUMPTION)",camera_mount.label().to_ascii_uppercase())];
     if ui.panel == Panel::Analysis && method.uses_mask_geometry() {
         let rect = Rect { h: 28.min(text_area.h), ..text_area };
         button(&mut c, ui, rect, "OPEN STEREO SOLVER", ui.stereo_view(), Action::StereoSolver);
@@ -1414,7 +1488,7 @@ fn render_snapshot(
         text_area.h = text_area.h.saturating_sub(32);
     }
     if ui.panel==Panel::Selection && !ui.object_view() && !ui.stereo_view() {
-        text_area = selection_controls(&mut c, ui, text_area, monitor_unsaved);
+        text_area = selection_controls(&mut c, ui, text_area, monitor_unsaved, camera_mount);
         rows.push(gaze_settings_status.clone());
         rows.push(monitor_status);
         rows.push(mouse_output_status);
@@ -1742,6 +1816,9 @@ mod tests {
             gaze_focus_status: "GAZE FOCUS OFF / Super+Shift+F".into(),
             gaze_settings_status: "GLOBAL GAZE: SAM31 / SUBJECT RIGHT".into(),
             second: true,
+            stereo: true,
+            limbus_refinement: false,
+            camera_mount: eye_scene_model::CameraMount::Flexible,
             object_running: false,
             prompt: "iris".into(),
             prompt_status: "READY".into(),
@@ -2153,7 +2230,7 @@ mod tests {
         assert_eq!(ui.linked, LinkedView::Compare);
         assert_eq!(ui.preview_defaults, original);
         assert_eq!(LinkedView::available(SegmentationMode::Sam31),
-            &[LinkedView::Compare, LinkedView::StereoSolver, LinkedView::Timing, LinkedView::Contacts, LinkedView::TweakedContacts]);
+            &[LinkedView::Compare, LinkedView::StereoSolver, LinkedView::StereoSegments, LinkedView::Timing, LinkedView::Contacts, LinkedView::TweakedContacts]);
     }
 
     #[test]
@@ -2181,9 +2258,9 @@ mod tests {
         let area = Rect { y: panel.y + 36, h: panel.h.saturating_sub(36), ..panel };
         let mut pixels = vec![0; w * h];
         let mut ui = Workspace::default();
-        let remaining = selection_controls(&mut Canvas { pixels: &mut pixels, w, h }, &mut ui, area, false);
+        let remaining = selection_controls(&mut Canvas { pixels: &mut pixels, w, h }, &mut ui, area, false, eye_scene_model::CameraMount::Flexible);
         assert!(remaining.h >= 20, "at least one status row must remain");
-        assert_eq!(ui.hits.len(), 3);
+        assert_eq!(ui.hits.len(), 4);
         for (rect, _) in &ui.hits {
             assert_eq!(rect.y, area.y);
             assert!(rect.y + rect.h <= remaining.y);

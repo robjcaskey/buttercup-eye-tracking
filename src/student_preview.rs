@@ -368,6 +368,8 @@ pub(super) fn draw(
         height: p.source_height,
     };
     let count = match overlay {
+        RoiOverlayMode::StereoContributions => viewer_ui::draw_stereo_segments(
+            layer.pixels, layer.width, layer.height, frame, p),
         RoiOverlayMode::SamOuterIrisMasks => layer.masks(p, true, false),
         RoiOverlayMode::SamSegmentationOnly => layer.masks(p, false, false),
         RoiOverlayMode::StudentMaskOutline => layer.masks(p, false, true),

@@ -79,6 +79,55 @@ mod segment_tests {
         assert!(supported_conic_runs(&[true,false,true,false]).is_empty());
         assert!(supported_conic_runs(&[]).is_empty());
     }
+
+    #[test]
+    fn observation_domain_censoring_preserves_gaps_and_real_support() {
+        let expected = Ellipse { center: (192.0, 128.0), major_radius: 80.0,
+            minor_radius: 60.0, angle: 0.0 };
+        let contour = expected.dense_points(256);
+        let censored = |point: (f64, f64)| (point.0 - 192.0).abs() < 30.0;
+        let fit = deflattened_mask_fit_with_censoring(
+            contour, expected, None, 1.0, false, censored).unwrap();
+        assert!(fit.retained_points.iter().all(|&p| !censored(p)));
+        assert!(fit.conic_segments.len() >= 2);
+        for run in fit.conic_segments.iter() {
+            let side = (fit.retained_points[run[0]].0 - 192.0).signum();
+            assert!(run.iter().all(|&i| (fit.retained_points[i].0 - 192.0).signum() == side));
+        }
+        assert!((fit.ellipse.major_radius - 80.0).abs() < 1.0);
+        assert!((fit.ellipse.minor_radius - 60.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn artificial_search_arc_cannot_complete_a_shadow_into_a_pupil() {
+        let search = Ellipse { center: (192.0, 128.0), major_radius: 80.0,
+            minor_radius: 60.0, angle: 0.0 };
+        // A dark half-plane intersected with an elliptical search produces a
+        // perfectly curved *artificial* rim and one actual straight shadow edge.
+        let contour = search.dense_points(256).into_iter()
+            .filter(|p| p.1 >= 108.0).collect::<Vec<_>>();
+        assert!(deflattened_mask_fit_with_noise(
+            contour.clone(), search, None, 1.0, false).is_some());
+        assert!(deflattened_mask_fit_with_censoring(
+            contour, search, None, 1.0, false,
+            |p| crate::geometry::ellipse_coordinate(p, search) > 0.98).is_none());
+    }
+
+    #[test]
+    fn conditioning_audit_does_not_reinstate_unretained_samples() {
+        let ellipse = Ellipse { center: (192.0, 128.0), major_radius: 80.0,
+            minor_radius: 60.0, angle: 0.0 };
+        let contour = ellipse.dense_points(256);
+        let samples = censor_occluding_chords(&contour, ellipse).unwrap().samples;
+        let full = inspect_contour_arc_constraints(
+            &contour, ellipse, ellipse, &samples, 4.0, |_| false).unwrap();
+        assert_eq!(full["positional_shape_supported"], true);
+        let partial = inspect_contour_arc_constraints(
+            &contour, ellipse, ellipse, &samples[..24], 4.0, |_| false).unwrap();
+        assert_eq!(partial["positional_shape_supported"], false);
+        assert!(partial["positional_inliers"].as_array().unwrap().iter()
+            .filter(|v| v.as_bool() == Some(true)).count() <= 24);
+    }
 }
 
 pub(crate) fn native_component_contour(
@@ -544,6 +593,63 @@ pub(crate) fn censor_occluding_chords(
         lower_flat_tire:lower.is_some_and(|run|run.side==FlatTireSide::Lower)})
 }
 
+fn contour_tangent_constraints(
+    smoothed: &[(f64, f64)], excluded: &[bool],
+) -> ConicArcConstraints {
+    ConicArcConstraints {
+        tangents: (0..smoothed.len())
+            .filter(|&i| !excluded[i])
+            .map(|i| {
+                let n = smoothed.len();
+                if (-2isize..=2)
+                    .any(|d| excluded[(i as isize + d).rem_euclid(n as isize) as usize])
+                {
+                    return None;
+                }
+                let a = smoothed[(i + n - 2) % n];
+                let b = smoothed[(i + 2) % n];
+                Some((b.0 - a.0, b.1 - a.1))
+            })
+            .collect(),
+    }
+}
+
+/// Offline inspection uses the exact same samples, exclusions and tangents as
+/// the fitter. A supplied ellipse is a hypothesis, never a new observation.
+pub(crate) fn inspect_contour_arc_constraints(
+    contour: &[(f64, f64)], reference: Ellipse, hypothesis: Ellipse,
+    observed_points: &[(f64, f64)], tolerance: f64, censored: impl Fn((f64, f64)) -> bool,
+) -> Option<serde_json::Value> {
+    let ChordCensoredContour {samples, smoothed, mut flat_tire, ..} =
+        censor_occluding_chords(contour, reference)?;
+    for (&point, excluded) in samples.iter().zip(&mut flat_tire) {
+        *excluded |= censored(point);
+    }
+    let constraints = contour_tangent_constraints(&smoothed, &flat_tire);
+    let points = samples.iter().zip(&flat_tire)
+        .filter_map(|(&p, &excluded)| (!excluded).then_some(p)).collect::<Vec<_>>();
+    // A conditioning audit cannot reinstate samples the actual fit discarded.
+    let observed = points.iter().map(|p| observed_points.contains(p)).collect::<Vec<_>>();
+    let positional = points.iter().zip(&observed)
+        .map(|(&p, &kept)| kept && ellipse_residual(p, hypothesis) <= tolerance)
+        .collect::<Vec<_>>();
+    let tangent = points.iter().enumerate()
+        .map(|(i, &p)| constraints.tangent_agrees(i, p, hypothesis)).collect::<Vec<_>>();
+    let combined = positional.iter().zip(&tangent).map(|(&p, &t)| p && t).collect::<Vec<_>>();
+    Some(serde_json::json!({
+        "canonical_points": points,
+        "retained_by_hypothesis_fit": observed,
+        "positional_inliers": positional,
+        "tangent_agrees": tangent,
+        "canonical_tangents": constraints.tangents,
+        "positional_shape_supported": constraints.admits(&points, &positional, hypothesis, tolerance),
+        "tangent_shape_supported": constraints.admits(&points, &combined, hypothesis, tolerance),
+        "tolerance_canonical_px": tolerance,
+        "hypothesis": {"center":hypothesis.center,"major_radius":hypothesis.major_radius,
+            "minor_radius":hypothesis.minor_radius,"angle":hypothesis.angle},
+    }))
+}
+
 pub(crate) fn deflattened_mask_fit_with_noise(
     contour: Vec<(f64, f64)>,
     reference: Ellipse,
@@ -551,8 +657,26 @@ pub(crate) fn deflattened_mask_fit_with_noise(
     pixel_scale: f64,
     constrain_arcs: bool,
 ) -> Option<ContourFitEvidence> {
-    let ChordCensoredContour {samples,smoothed,flat_tire,upper_flat_tire,lower_flat_tire}=
+    deflattened_mask_fit_with_censoring(
+        contour, reference, scale_context, pixel_scale, constrain_arcs, |_| false)
+}
+
+/// Exclude known observation-domain boundaries before fitting. Keep the full
+/// ordered contour for chord detection and split support at every excluded
+/// sample; removing points first would manufacture a closing edge across a gap.
+pub(crate) fn deflattened_mask_fit_with_censoring(
+    contour: Vec<(f64, f64)>,
+    reference: Ellipse,
+    scale_context: Option<OuterContourScaleContext>,
+    pixel_scale: f64,
+    constrain_arcs: bool,
+    censored: impl Fn((f64, f64)) -> bool,
+) -> Option<ContourFitEvidence> {
+    let ChordCensoredContour {samples,smoothed,mut flat_tire,upper_flat_tire,lower_flat_tire}=
         censor_occluding_chords(&contour,reference)?;
+    for (&point, excluded) in samples.iter().zip(&mut flat_tire) {
+        *excluded |= censored(point);
+    }
     let retained_indices = (0..samples.len())
         .filter(|&i| !flat_tire[i])
         .collect::<Vec<_>>();
@@ -563,22 +687,7 @@ pub(crate) fn deflattened_mask_fit_with_noise(
     if retained.len() < 20 {
         return None;
     }
-    let constraints = ConicArcConstraints {
-        tangents: (0..samples.len())
-            .filter(|&i| !flat_tire[i])
-            .map(|i| {
-                let n = samples.len();
-                if (-2isize..=2)
-                    .any(|d| flat_tire[(i as isize + d).rem_euclid(n as isize) as usize])
-                {
-                    return None;
-                }
-                let a = smoothed[(i + n - 2) % n];
-                let b = smoothed[(i + 2) % n];
-                Some((b.0 - a.0, b.1 - a.1))
-            })
-            .collect(),
-    };
+    let constraints = contour_tangent_constraints(&smoothed, &flat_tire);
     let mut random = NumpyPcg64::baseline_fit_stream();
     let robust = constrained_ransac_ellipse(
         &retained,

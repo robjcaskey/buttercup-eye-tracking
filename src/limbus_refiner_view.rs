@@ -64,6 +64,14 @@ fn preview_surface(
     proposal: &sam31_outer::ProposalMasks,
     candidate: geometry::Ellipse,
 ) -> Option<SurfaceGazeSample> {
+    if frame.joint_gaze_active {
+        // F may compare rim candidates, but its contact must use the selected
+        // joint publication, never derive a monocular sign from preview shape.
+        joint_gaze_live::source_ellipse(frame)?;
+        return joint_gaze_live::surface(frame, false)
+            .filter(|s| s.source_timestamp_ns == Some(proposal.source_timestamp_ns)
+                && s.sign_resolved);
+    }
     let mut surface = frame.virtual_contact_surface_gaze?;
     if surface.source_timestamp_ns != Some(proposal.source_timestamp_ns)
         || !surface.sign_resolved

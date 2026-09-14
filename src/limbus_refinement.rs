@@ -50,27 +50,46 @@ impl Attempt {
     }
 }
 
-// Startup-only selection. Merely visiting an F view cannot change this mode.
-pub(super) fn apply(
+// Selection is separate from the lazily loaded model. Each submitted batch
+// snapshots it, so a UI toggle cannot change an already running source's mode.
+static SELECTION: OnceLock<std::sync::atomic::AtomicU8> = OnceLock::new();
+static REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn revision() -> u64 { REVISION.load(std::sync::atomic::Ordering::Acquire) }
+pub fn mode() -> Mode {
+    let value=SELECTION.get_or_init(|| {
+        let value=std::env::var("BUTTERCUP_LIMBUS_REFINEMENT").unwrap_or_else(|_|"off".into());
+        let mode=Mode::parse(&value).unwrap_or_else(|error| {eprintln!("{error}; refinement disabled");Mode::Off});
+        std::sync::atomic::AtomicU8::new(u8::from(mode==Mode::Experimental))
+    }).load(std::sync::atomic::Ordering::Acquire);
+    if value==1 {Mode::Experimental} else {Mode::Off}
+}
+pub fn set_mode(selected: Mode) {
+    let _=mode();
+    let value=u8::from(selected==Mode::Experimental);
+    if SELECTION.get().unwrap().swap(value,std::sync::atomic::Ordering::AcqRel)!=value {
+        REVISION.fetch_add(1,std::sync::atomic::Ordering::Release);
+    }
+}
+
+pub(super) fn apply_mode(
+    selected: Mode,
     source: &RawFrame,
     image: &FloatImage,
     review: &mut OuterMaskFitReview,
     support: &mut RawRingSupport,
     pupil: Option<PupilVoidFitReview>,
 ) -> Option<Attempt> {
-    static MODEL: OnceLock<Result<Option<Model>, String>> = OnceLock::new();
+    if selected==Mode::Off {return None;}
+    static MODEL: OnceLock<Result<Model, String>> = OnceLock::new();
     let model = MODEL.get_or_init(|| {
-        let mode = Mode::parse(&std::env::var("BUTTERCUP_LIMBUS_REFINEMENT").unwrap_or_else(|_| "off".into()))?;
-        if mode == Mode::Off { return Ok(None); }
         eprintln!("LIMBUS_REFINEMENT experimental shared geometry authority; CPU only; bootstrap proof pending");
-        Model::load(&limbus_refiner::default_model_path()).map(Some).map_err(|error| {
+        Model::load(&limbus_refiner::default_model_path()).map_err(|error| {
             eprintln!("LIMBUS_REFINEMENT unavailable; retaining baseline: {error}");
             error
         })
     });
     let model = match model {
-        Ok(None) => return None,
-        Ok(Some(model)) => model,
+        Ok(model) => model,
         Err(error) => return Some(Attempt { baseline:review.clone(),field:None,
             applied:false,status:format!("MODEL UNAVAILABLE: {error}") }),
     };
@@ -147,6 +166,18 @@ pub(super) mod tests {
             samples:vec![],corrected_points:points.iter().map(|p|(p.0+1.0,p.1)).collect(),
             elapsed_ms:0.5,status:"SYNTHETIC TEST FIELD"};
         (source,image,review,Arc::new(field))
+    }
+
+    #[test]
+    fn disabled_source_mode_retains_baseline_without_loading_a_model() {
+        let (source,image,mut review,_)=fixture();
+        let baseline=review.clone();
+        let mut support=raw_ring_support(&image,review.ellipse);
+        let original_support=support;
+        assert!(apply_mode(Mode::Off,&source,&image,&mut review,&mut support,None).is_none());
+        assert_eq!(review.ellipse,baseline.ellipse);
+        assert!(Arc::ptr_eq(&review.retained_points,&baseline.retained_points));
+        assert_eq!(support,original_support);
     }
 
     #[test]

@@ -336,7 +336,7 @@ impl Fixture {
     fn with_request<R>(&self, enabled: [bool;2], budget: usize, apply: impl FnOnce(JointConicRequest<'_>)->R) -> R {
         let arcs = self.arcs.each_ref().map(|arcs| {
             arcs.iter()
-                .map(|a| BoundaryArcObservation { level_sets_roi: None,
+                .map(|a| BoundaryArcObservation { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,
                     evidence_group: a.group,
                     kind: a.kind,
                     points_roi_px: &a.points,
@@ -1066,6 +1066,139 @@ fn perspective_circle_normal_decomposition_recovers_off_axis_planes_and_both_mir
 }
 
 #[test]
+fn conic_residual_cache_is_exact_and_invalidates_at_changed_geometry_or_evidence() {
+    let fixture = Fixture::new([50.0, -150.0, 250.0]);
+    fixture.with_request([true,true],24,|request| {
+        let mut model = Problem::new(request).unwrap();
+        let arc=&mut model.groups[0].alternatives[0];
+        arc.outward_normals.fill(Some(BoundaryNormalObservation {
+            unit_outward_roi:[1.0,0.0],angular_sigma_radians:0.2,
+        }));
+        let p=model.initial;
+        let conics=model.conics(&p).unwrap();
+        let selected=model.select(&conics);
+        let mut uncached=selected.clone();uncached.cached_arcs.clear();
+        for cache in &selected.cached_arcs {
+            let arc=cache.arc;let c=conics[arc.eye][arc.boundary].unwrap();
+            assert_eq!(cache.values.mean_cost.to_bits(),arc.mean_cost(c).to_bits());
+            for (i,&point) in arc.points.iter().enumerate() {
+                assert_eq!(cache.values.position[i].to_bits(),robust_residual(c.residual_px(point)/arc.sigma).to_bits());
+                assert_eq!(cache.values.direction[i].to_bits(),arc.normal_residual(c,i).to_bits());
+            }
+            assert!(cache.at(&arc.clone(),c,1).is_none(),"distinct evidence never reuses an old cache");
+            assert!(cache.at(arc,c,0).is_none(),"mask-level changes require reevaluation");
+            let mut changed=c;changed.0[5]+=1e-6;
+            assert!(cache.at(arc,changed,1).is_none());
+        }
+        let rejected=model.rejected_groups(&conics,&selected);
+        assert_eq!(rejected,model.rejected_groups(&conics,&uncached));
+        for parameter in 0..=PARAMETERS {
+            let mut q=p;
+            if parameter<PARAMETERS {
+                q[parameter]=(q[parameter]+1e-4*model.scales[parameter])
+                    .clamp(model.lower[parameter],model.upper[parameter]);
+            }
+            for frozen in [None,Some(rejected.as_slice())] {
+                assert_eq!(model.residuals_with_rejection(&q,&selected,frozen),
+                    model.residuals_with_rejection(&q,&uncached,frozen),
+                    "cache must preserve every derivative and fresh-trial residual at parameter {parameter}");
+            }
+        }
+    });
+}
+
+#[test]
+fn pupil_fixed_sampling_support_does_not_reward_jagged_measurements() {
+    let fixture = Fixture::new([50.0, -150.0, 250.0]);
+    fixture.with_request([true, true], 24, |request| {
+        let original = request.eyes[0].unwrap();
+        let index = original.arcs.iter().position(|a|a.kind==BoundaryKind::PupillaryBoundary).unwrap();
+        let source = original.arcs[index];
+        let support = vec![2.0; source.points_roi_px.len()];
+        let jagged = source.points_roi_px.iter().enumerate().map(|(i,&(x,y))|
+            (x,y+if i%2==0 {6.0} else {-6.0})).collect::<Vec<_>>();
+        assert!(polyline_quadrature(&jagged).unwrap().1 > polyline_quadrature(source.points_roi_px).unwrap().1);
+        let models = [source.points_roi_px, jagged.as_slice()].map(|points| {
+            let mut arcs = original.arcs.to_vec();
+            arcs[index].points_roi_px = points;
+            arcs[index].sampling_support_px = Some(&support);
+            let eye = RoiConicEvidence {arcs:&arcs, ..original};
+            let model = Problem::new(JointConicRequest {eyes:[Some(eye),request.eyes[1]], ..request}).unwrap();
+            model.groups.iter().flat_map(|g|&g.alternatives).find(|a|a.eye==0 && a.index==index).unwrap().clone()
+        });
+        assert_ne!(models[0].points,models[1].points);
+        assert_eq!(models[0].quadrature,models[1].quadrature);
+        assert_eq!(models[0].length_px,models[1].length_px);
+        assert_eq!(models[0].weight,models[1].weight);
+        assert_eq!(models[0].sigma,models[1].sigma);
+        for invalid in [vec![], vec![1.0;support.len()-1], vec![-1.0;support.len()],
+            vec![f64::NAN;support.len()], vec![f64::MAX;support.len()]] {
+            let mut arcs = original.arcs.to_vec();arcs[index].sampling_support_px=Some(&invalid);
+            let eye=RoiConicEvidence {arcs:&arcs,..original};
+            assert!(matches!(Problem::new(JointConicRequest {eyes:[Some(eye),request.eyes[1]],..request}),
+                Err(JointConicUnavailable::InvalidRequest)));
+        }
+    });
+}
+
+#[test]
+fn pupil_sampling_support_reduction_conserves_the_fixed_domain() {
+    use crate::roi_evidence::reduce_sampling_support;
+    let weights=[1.0,2.0,3.0,4.0,5.0];
+    assert_eq!(reduce_sampling_support(&weights,&[0,1,2,3,4]).unwrap(),weights);
+    assert_eq!(reduce_sampling_support(&weights,&[0,2,4]).unwrap(),[3.0,7.0,5.0]);
+    for n in 3..100 {
+        let support=(0..n).map(|i| (i+1) as f64).collect::<Vec<_>>();
+        let count=n.min(MAX_POINTS_PER_ARC);
+        let indices=(0..count).map(|j|j*(n-1)/(count-1)).collect::<Vec<_>>();
+        let reduced=reduce_sampling_support(&support,&indices).unwrap();
+        assert_eq!(reduced.len(),count);
+        assert_eq!(reduced.iter().sum::<f64>(),support.iter().sum::<f64>());
+    }
+    for indices in [vec![],vec![5],vec![1,1],vec![3,1]] {
+        assert!(reduce_sampling_support(&weights,&indices).is_none());
+    }
+}
+
+#[test]
+fn pupil_support_length_cap_changes_only_information_mass_and_rejects_invalid_caps() {
+    let fixture = Fixture::new([50.0, -150.0, 250.0]);
+    fixture.with_request([true, true], 24, |request| {
+        let baseline = Problem::new(request).unwrap();
+        for cap in [Some(2.0), Some(1e9), None] {
+            let mut arcs = request.eyes[0].unwrap().arcs.to_vec();
+            for arc in &mut arcs {
+                if arc.kind == BoundaryKind::PupillaryBoundary { arc.support_length_cap_px = cap; }
+            }
+            let mut eye = request.eyes[0].unwrap();
+            eye.arcs = &arcs;
+            let candidate = Problem::new(JointConicRequest { eyes: [Some(eye), request.eyes[1]], ..request }).unwrap();
+            assert_eq!(candidate.groups.len(), baseline.groups.len());
+            for (a,b) in candidate.groups.iter().zip(&baseline.groups) {
+                for (a,b) in a.alternatives.iter().zip(&b.alternatives) {
+                    assert_eq!(a.points,b.points);
+                    assert_eq!(a.quadrature,b.quadrature);
+                    assert_eq!(a.sigma,b.sigma);
+                    assert_eq!(a.outward_normals,b.outward_normals);
+                    assert!(a.weight <= b.weight);
+                    if a.eye == 0 && a.kind == BoundaryKind::PupillaryBoundary && cap == Some(2.0) {
+                        assert!(a.weight < b.weight);
+                        assert_eq!(a.length_px,2.0);
+                    } else { assert_eq!(a.weight,b.weight); }
+                }
+            }
+        }
+        for invalid in [-1.0, f64::NAN, f64::INFINITY] {
+            let mut arcs = request.eyes[0].unwrap().arcs.to_vec();
+            arcs[0].support_length_cap_px = Some(invalid);
+            let mut eye = request.eyes[0].unwrap(); eye.arcs = &arcs;
+            assert!(matches!(Problem::new(JointConicRequest {eyes:[Some(eye), request.eyes[1]], ..request}),
+                Err(JointConicUnavailable::InvalidRequest)));
+        }
+    });
+}
+
+#[test]
 fn polyline_information_is_geometric_not_the_number_of_fragments_or_points() {
     let points = [(0.0, 0.0), (10.0, 0.0), (30.0, 0.0), (30.0, 40.0)];
     let (weights, length) = polyline_quadrature(&points).unwrap();
@@ -1121,7 +1254,7 @@ fn matching_points_do_not_override_opposite_measured_boundary_directions() {
         length_px,
         weight: 1.0,
     };
-    let conic = ProjectedCircle([1.0, 0.0, 1.0, 0.0, 0.0, -100.0]);
+    let conic = ProjectedCircle([1.0, 0.0, 1.0, 0.0, 0.0, -100.0], None);
     assert!(arc.mean_cost(conic) < 1.0e-20);
     for normal in arc.outward_normals.iter_mut().flatten() {
         normal.unit_outward_roi = normal.unit_outward_roi.map(|v| -v);
@@ -1172,7 +1305,7 @@ fn uncertain_contour_directions_are_a_compatibility_band_not_a_second_precise_fi
         length_px,
         weight: 1.0,
     };
-    assert!(arc.mean_cost(ProjectedCircle([1.0,0.0,1.0,0.0,0.0,-100.0]))<1.0e-20,
+    assert!(arc.mean_cost(ProjectedCircle([1.0,0.0,1.0,0.0,0.0,-100.0], None))<1.0e-20,
         "contour position and tangent share pixels: do not chase a noisy direction within its two-sigma engineering allowance");
 }
 
@@ -1194,7 +1327,7 @@ fn numerical_linearization_cannot_turn_a_capped_arc_into_a_force() {
         0.5,
         12,
     );
-    let arcs = [BoundaryArcObservation { level_sets_roi: None,
+    let arcs = [BoundaryArcObservation { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,
         evidence_group: 0,
         kind: BoundaryKind::OuterLimbus,
         points_roi_px: &points,
@@ -1305,7 +1438,7 @@ fn capped_negative_position_residuals_cannot_pull_ordinary_live_evidence() {
         0.5,
         12,
     );
-    let arcs = [BoundaryArcObservation { level_sets_roi: None,
+    let arcs = [BoundaryArcObservation { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,
         evidence_group: 0,
         kind: BoundaryKind::OuterLimbus,
         points_roi_px: &points,
@@ -1366,7 +1499,7 @@ fn joint_selection_uses_measured_direction_not_just_equal_point_alternatives() {
         detail_reliability: Some(1.0),
         arcs: fixture.arcs[eye]
             .iter()
-            .map(|a| OwnedBoundaryArc { level_sets_roi: None,
+            .map(|a| OwnedBoundaryArc { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,
                 evidence_group: a.group,
                 kind: a.kind,
                 points_roi_px: a.points.clone(),
@@ -1472,7 +1605,7 @@ fn malformed_or_misaligned_boundary_directions_cannot_be_silently_ignored() {
             points.len()
         ],
     ] {
-        let arcs = [BoundaryArcObservation { level_sets_roi: None,
+        let arcs = [BoundaryArcObservation { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,
             evidence_group: 0,
             kind: BoundaryKind::OuterLimbus,
             points_roi_px: points,
@@ -1823,7 +1956,7 @@ fn a_secondary_circle_seed_carries_its_own_center_and_metric_radius() {
         supporting_arc_indices: &[0],
         residual_px: None,
     });
-    let arcs = [BoundaryArcObservation { level_sets_roi: None,
+    let arcs = [BoundaryArcObservation { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,
         evidence_group: 0,
         kind: BoundaryKind::OuterLimbus,
         points_roi_px: &fixture.arcs[0][0].points,
@@ -1866,7 +1999,7 @@ fn previous_targets_are_competing_initializations_not_averaged_points_or_extra_r
     let targets = [[-100.0, 80.0, 250.0], [150.0, -120.0, 250.0]];
     fixture.scene.target_seed_camera_mm = Some(targets[0]);
     fixture.scene.secondary_target_seed_camera_mm = Some(targets[1]);
-    let arcs = [BoundaryArcObservation { level_sets_roi: None,
+    let arcs = [BoundaryArcObservation { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,
         evidence_group: 0,
         kind: BoundaryKind::OuterLimbus,
         points_roi_px: &fixture.arcs[0][0].points,
@@ -2581,7 +2714,7 @@ fn mask_level_support_cases_diagnostic(mask_state_proposals: bool, spatial_arm: 
                     dimensions_px:[420,280],detail_reliability:Some(fixture.detail[eye]),
                     arcs:fixture.arcs[eye].iter().map(|a| {
                         let outer=a.kind==BoundaryKind::OuterLimbus;
-                        OwnedBoundaryArc {evidence_group:a.group,kind:a.kind,normal_band_half_width_px:a.band,
+                        OwnedBoundaryArc { support_length_cap_px: None, sampling_support_px: None,evidence_group:a.group,kind:a.kind,normal_band_half_width_px:a.band,
                             localization_sigma_px:None,outward_normals_roi:None,detector_score:None,
                             points_roi_px:a.points.iter().map(|&p| {
                                 if !outer || offset==0.0 {p} else {
@@ -2733,7 +2866,7 @@ fn raw_outer_support_cases_diagnostic(position:bool) {
         let packets=std::array::from_fn::<_,2,_>(|eye|OwnedRoiEvidence {
             exposure:fixture.exposures[eye],sensor_origin_px:fixture.origins[eye],dimensions_px:[420,280],
             detail_reliability:Some(fixture.detail[eye]),
-            arcs:fixture.arcs[eye].iter().map(|a|OwnedBoundaryArc { level_sets_roi: None,evidence_group:a.group,kind:a.kind,
+            arcs:fixture.arcs[eye].iter().map(|a|OwnedBoundaryArc { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,evidence_group:a.group,kind:a.kind,
                 points_roi_px:a.points.clone(),normal_band_half_width_px:a.band,outward_normals_roi:None,
                 localization_sigma_px:None,detector_score:None}).collect(),
             conics:fixture.hints[eye].iter().map(|&(kind,ellipse_roi_px)|OwnedConicHint {
@@ -2980,6 +3113,73 @@ fn posterior_batch_diagnostic_preserves_original_samples_and_stopping() {
     }
 }
 
+#[test]
+fn supported_mode_selection_uses_full_mass_and_requires_both_eyes() {
+    let fixture = Fixture::new([70.0, -130.0, 250.0]);
+    let map = fixture.solve_with_integration([true,true],16,
+        Some(posterior::IntegrationConfig::live())).unwrap();
+    let other = Fixture::new([-300.0, 300.0, 250.0]).solve([true,true],16).unwrap();
+    assert!((0..2).all(|eye| dot3(map.eye_gaze_directions[eye].unwrap(),
+        other.eye_gaze_directions[eye].unwrap()) < 30.0_f64.to_radians().cos()));
+    for (alternate_mass, disagree, different_association, draws, expected) in [
+        (0.98,false,false,400,1), (0.50,false,false,400,0),
+        (0.02,false,false,400,0), (0.98,true,false,400,0),
+        (0.98,false,true,400,0), (0.92,false,false,20,0),
+    ] {
+        let mut modes = vec![([0.0;PARAMETERS],map.clone()),([0.0;PARAMETERS],other.clone())];
+        if different_association { modes[1].1.modeled_eyes = [true,false]; }
+        let samples: Vec<_> = (0..draws).map(|i| {
+            let mut directions = if i%2 == 0 { map.eye_gaze_directions } else { other.eye_gaze_directions };
+            if disagree { directions[1] = map.eye_gaze_directions[1]; }
+            ([0.0;3],directions,usize::from(i%2 != 0))
+        }).collect();
+        let weights: Vec<_> = (0..draws).map(|i|
+            2.0/ draws as f64 * if i%2 == 0 {1.0-alternate_mass} else {alternate_mass}).collect();
+        let proposals = vec![0;draws];
+        let replicas: Vec<_> = (0..draws).map(|i|(i/2)%4).collect();
+        let counts: Vec<_> = (0..4).map(|r|replicas.iter().filter(|&&i|i==r).count()).collect();
+        let directions = posterior::DirectionSamples {samples:&samples,weights:&weights,
+            sample_proposals:&proposals,proposals:1,draws,sample_replicas:&replicas,
+            replica_draw_counts:&counts};
+        let mut result = map.posterior.clone().unwrap();
+        result.status = "estimated-conditional";
+        directions.summarize_about(&mut result,&map);
+        let original_mean = result.target_mean_camera_mm;
+        directions.select_supported_mode(&mut result,&modes);
+        assert_eq!(result.supported_mode_selection.as_ref().unwrap().retained_index,expected,
+            "mass={alternate_mass} disagree={disagree} association={different_association} draws={draws}");
+        assert_eq!(result.target_mean_camera_mm,original_mean,"selection never averages geometry");
+        if expected==1 {
+            assert!((0..2).all(|eye|result.supports_direction(eye)));
+            assert!((result.admission_numerics(0).unwrap().mass-alternate_mass).abs()<1e-12,
+                "keep the competing branch's mass in the admission denominator");
+        }
+        result.status = "insufficient-sampling";
+        result.supported_mode_selection = None;
+        directions.select_supported_mode(&mut result,&modes);
+        assert!(result.supported_mode_selection.is_none());
+    }
+}
+
+#[test]
+fn supported_mode_experiment_preserves_a_supported_joint_map_and_current_arcs() {
+    assert!(!posterior::IntegrationConfig::live().select_supported_mode);
+    let fixture = Fixture::new([70.0,-130.0,250.0]);
+    let config = posterior::IntegrationConfig::live();
+    let baseline = fixture.solve_with_integration([true,true],16,Some(config)).unwrap();
+    assert!((0..2).all(|eye|baseline.posterior.as_ref().unwrap().supports_direction(eye)));
+    let candidate = fixture.solve_with_integration([true,true],16,
+        Some(posterior::IntegrationConfig {select_supported_mode:true,..config})).unwrap();
+    assert_eq!(candidate.target_camera_mm,baseline.target_camera_mm);
+    assert_eq!(candidate.eye_gaze_directions,baseline.eye_gaze_directions);
+    assert_eq!(candidate.robust_cost,baseline.robust_cost);
+    assert_eq!(format!("{:?}",candidate.arcs),format!("{:?}",baseline.arcs));
+    let mut json = candidate.posterior.unwrap().json();
+    assert_eq!(json["supported_mode_selection"]["retained_index"],0);
+    json.as_object_mut().unwrap().remove("supported_mode_selection");
+    assert_eq!(json,baseline.posterior.unwrap().json());
+}
+
 fn support_case_posterior_reference(numerical_admission:bool,marginalize_unobserved_inner:bool,conditional_scene:bool,replicated_global:Option<usize>) {
     let annealed_reference=std::env::var("BUTTERCUP_ANNEALED_STEPS").ok().map(|steps|posterior::annealed::Config {
         steps:steps.parse().unwrap(),paths:std::env::var("BUTTERCUP_ANNEALED_PATHS").expect("set path count").parse().unwrap(),
@@ -3128,4 +3328,76 @@ fn support_case_posterior_reference(numerical_admission:bool,marginalize_unobser
             }
         }
     }
+}
+
+
+#[test]
+fn exact_ellipse_distance_matches_independent_quartic_reference() {
+    // Independent stationary-point quartic roots, including interior and
+    // exterior points. These are synthetic coordinates, not corpus labels.
+    let distance = EllipseDistance::new(Ellipse {
+        center: (12.0, -7.0), major_radius: 80.0, minor_radius: 11.0, angle: 0.73,
+    });
+    for (point, expected) in [
+        ((12.0, -7.0), -11.0),
+        ((20.0, -5.0), -7.1089906431778234),
+        ((43.0, 28.0), -3.5315150649280898),
+        ((80.0, -70.0), 81.349766352106258),
+        ((-100.0, 30.0), 94.075840052785509),
+        ((13.0, 101.0), 73.641301678616799),
+        ((200.0, 70.0), 130.30960763051422),
+        ((-3.0, 9.0), 10.926052395012624),
+    ] {
+        let actual = distance.residual_px(point);
+        assert!((actual - expected).abs() < 1.0e-8, "{point:?}: {actual} vs {expected}");
+    }
+}
+
+#[test]
+fn exact_ellipse_distance_preserves_normal_offsets_and_handles_the_center() {
+    for (major, minor, angle) in [(40.0,40.0,0.0), (80.0,11.0,0.73), (17.0,8.0,-0.25)] {
+        let ellipse = Ellipse {center:(12.0,-7.0),major_radius:major,minor_radius:minor,angle};
+        let distance = EllipseDistance::new(ellipse);
+        assert!((distance.residual_px(ellipse.center) + minor).abs() < 1.0e-10);
+        let (sn,cs)=angle.sin_cos();
+        for i in 0..64 {
+            let phase=i as f64*std::f64::consts::TAU/64.0;
+            let (y,x)=phase.sin_cos();
+            let nx=x/major;let ny=y/minor;let norm=nx.hypot(ny);
+            for offset in [-0.2,0.0,0.2,10.0] {
+                let px=major*x+offset*nx/norm;let py=minor*y+offset*ny/norm;
+                let point=(12.0+cs*px-sn*py,-7.0+sn*px+cs*py);
+                assert!((distance.residual_px(point)-offset).abs()<1.0e-8,
+                    "{ellipse:?} phase {phase} offset {offset}: {}",distance.residual_px(point));
+            }
+        }
+    }
+}
+
+#[test]
+fn exact_ellipse_distance_is_an_explicit_offline_metric_and_invalidates_cached_costs() {
+    assert!(!posterior::IntegrationConfig::live().exact_conic_distances);
+    let fixture=Fixture::new([50.0,-150.0,250.0]);
+    fixture.with_request([true,true],24,|request| {
+        let baseline=Problem::new(request).unwrap();
+        let candidate=baseline.clone().with_exact_distances(true);
+        let p=baseline.initial;
+        let a=baseline.conics(&p).unwrap();let b=candidate.conics(&p).unwrap();
+        for (a,b) in a.iter().flatten().flatten().zip(b.iter().flatten().flatten()) {
+            assert_eq!(a.0,b.0);
+            assert!(a.1.is_none() && b.1.is_some());
+        }
+        let selection=baseline.select(&a);
+        for cache in &selection.cached_arcs {
+            let arc=cache.arc;let exact=b[arc.eye][arc.boundary].unwrap();
+            assert!(cache.at(arc,exact,1).is_none(),"a changed metric cannot reuse Sampson costs");
+        }
+        let solution=candidate.solution(&p,0.0).unwrap();
+        for arc in &solution.arcs {
+            let eye=arc.exposure.roi.0 as usize-1;
+            let conic=b[eye][boundary_index(arc.kind).unwrap()].unwrap();
+            let expected=(arc.points_roi_px.iter().map(|&p|conic.residual_px(p).powi(2)).sum::<f64>()/arc.points_roi_px.len() as f64).sqrt();
+            assert!((arc.rms_px-expected).abs()<1.0e-10);
+        }
+    });
 }

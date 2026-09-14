@@ -400,7 +400,7 @@ mod tests {
         let s=source(64,64);
         let points=vec![(32.0,20.0),(32.0,32.0),(32.0,44.0)];
         let evidence=measure(&linear(0.25),s.clone(),0,9,false,&points,&[vec![0,1,2]]).unwrap();
-        let outer=OwnedBoundaryArc {evidence_group:20,kind:BoundaryKind::OuterLimbus,
+        let outer=OwnedBoundaryArc { support_length_cap_px: None, sampling_support_px: None,evidence_group:20,kind:BoundaryKind::OuterLimbus,
             points_roi_px:points,outward_normals_roi:None,level_sets_roi:None,
             localization_sigma_px:Some(2.0),normal_band_half_width_px:1.5,detector_score:Some(0.8)};
         let mut pupil=outer.clone();pupil.kind=BoundaryKind::PupillaryBoundary;pupil.evidence_group=100;

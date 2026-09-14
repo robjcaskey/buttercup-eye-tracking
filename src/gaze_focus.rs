@@ -8,6 +8,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 mod sway;
+pub(crate) use sway::{ViewportCache, WindowViewport};
 #[cfg(test)]
 mod tests;
 

@@ -8,6 +8,7 @@ use crate::roi_evidence::RoiId;
 pub(crate) enum Layer {
     #[default]
     Conics,
+    Segments,
     Masks,
     Raw,
 }
@@ -77,7 +78,7 @@ fn matches_source(
 /// Use one publication as a whole. Matching displayed RAW times alone cannot
 /// join different solver generations, clocks, or independently fitted targets.
 fn current_publication(snapshot: &Snapshot, publication: &PublishedJoint) -> bool {
-    if !snapshot.second || snapshot.object_running || !snapshot.method.uses_mask_geometry() {
+    if !snapshot.stereo || !snapshot.second || snapshot.object_running || !snapshot.method.uses_mask_geometry() {
         return false;
     }
     let mut clock_time = None;
@@ -197,9 +198,9 @@ pub(super) fn inspect(snapshot: &Snapshot) -> Report {
     if !snapshot.method.uses_mask_geometry() {
         report.state = "SELECT SAM OR STUDENT";
         report.reason = "Stereo conics use the SAM3.1 or Eye Student segmentation source.".into();
-    } else if !snapshot.second {
+    } else if !snapshot.stereo || !snapshot.second {
         report.state = "STEREO OFF";
-        report.reason = "Enable stereo (3) to analyze the second eye with the existing joint solver. This changes the global gaze source.".into();
+        report.reason = "Enable stereo (Shift+3) to use the joint solver with either mask detector and any view.".into();
     } else if snapshot.object_running {
         report.state = "EYE ANALYSIS PAUSED";
         report.reason =
@@ -311,10 +312,25 @@ fn number(value: Option<f64>) -> String {
 }
 
 impl Report {
+    // Iris-center separation is an IPD proxy under the current metric priors,
+    // not an independently measured distance between pupil centers.
+    fn ipd_mm(&self) -> Option<f64> {
+        let solution=&self.publication.as_ref()?.solution;
+        if solution.contributing_eyes != [true,true] {return None;}
+        let [Some(a),Some(b)]=solution.eye_centers_camera_mm else {return None;};
+        let distance=(a[0]-b[0]).hypot(a[1]-b[1]).hypot(a[2]-b[2]);
+        (distance.is_finite() && distance>0.0).then_some(distance)
+    }
+    fn ipd_label(&self) -> String {
+        self.ipd_mm().map_or_else(||"IPD EST: --".into(),|v|format!("IPD EST: {v:.1} MM"))
+    }
+
     pub(super) fn json(&self) -> serde_json::Value {
         let solution = self.publication.as_ref().map(|p| &p.solution);
         serde_json::json!({
             "state": self.state, "reason": self.reason,
+            "ipd_estimate_mm": self.ipd_mm(),
+            "ipd_basis": "solved iris-center separation; metric scale prior dependent",
             "target_camera_mm": solution.map(|s| s.target_camera_mm),
             "direction_sign_resolved": self.sign_resolved,
             "probability": null, "target_covariance": null,
@@ -345,6 +361,8 @@ impl Report {
         let mut rows = vec![
             self.state.into(),
             self.reason.clone(),
+            self.ipd_label(),
+            "IPD uses solved iris centers and uncertain metric scale priors.".into(),
             format!(
                 "MASK SOURCE SKEW: {} MS",
                 number(self.skew_ns.map(|v| v as f64 / 1e6))
@@ -521,6 +539,181 @@ fn conic(pixels: &mut [u32], w: usize, h: usize, ellipse: geometry::Ellipse) {
     }
 }
 
+const SEGMENT_LABEL_REFRESH: Duration = Duration::from_millis(250);
+const SEGMENT_LABEL_HOLD: Duration = Duration::from_millis(350);
+
+#[derive(Default)]
+struct SegmentLabels {
+    context: Option<(SegmentationMode,u64,usize,usize)>,
+    clock: Option<crate::roi_evidence::SourceClock>,
+    slots: Vec<SegmentLabel>,
+}
+struct SegmentLabel {
+    key: (u8,u32),
+    source: Option<crate::roi_evidence::ExposureKey>,
+    seen: Instant,
+    refreshed: Instant,
+    value: String,
+}
+impl SegmentLabels {
+    fn slot(&mut self, key:(u8,u32), source:crate::roi_evidence::ExposureKey,
+        value:String, now:Instant) -> Option<usize> {
+        let i=if let Some(i)=self.slots.iter().position(|s|s.key==key) {i} else {
+            // Bounded presentation storage. Slots are never reused within a
+            // detector/source-clock context, so a dropout cannot renumber peers.
+            if self.slots.len()>=20 {return None;}
+            self.slots.push(SegmentLabel {key,source:None,seen:now,refreshed:now,value:value.clone()});
+            self.slots.len()-1
+        };
+        let slot=&mut self.slots[i];
+        if slot.source.is_none_or(|old|source.timestamp_ns>old.timestamp_ns) {
+            slot.source=Some(source);slot.seen=now;
+            if now.saturating_duration_since(slot.refreshed)>=SEGMENT_LABEL_REFRESH {
+                slot.value=value;slot.refreshed=now;
+            }
+        }
+        Some(i)
+    }
+}
+thread_local! {
+    static SEGMENT_LABELS: std::cell::RefCell<[SegmentLabels;2]> =
+        std::cell::RefCell::new(std::array::from_fn(|_|SegmentLabels::default()));
+}
+
+pub(crate) fn draw_stereo_segments(
+    pixels: &mut [u32], width: usize, height: usize,
+    frame: &EyeFrame, p: &sam31_outer::ProposalMasks,
+) -> usize {
+    draw_stereo_segments_at(pixels,width,height,frame,p,true,Instant::now())
+}
+
+/// Display sections of the already solved conic beside its actual observations.
+/// RAW sample joins are not fitted conics: joining noisy radial peaks made the
+/// pupil look concave. This does not refit, smooth, or replace solver evidence.
+/// Each neighboring pair bounds a separate section. Invalid points and large
+/// phase gaps stay disconnected; a missing observation cannot close a ring.
+fn fitted_arc_sections(
+    ellipse: geometry::Ellipse,
+    observations: &[(f64, f64)],
+) -> Vec<((f64, f64), (f64, f64))> {
+    if ![ellipse.center.0, ellipse.center.1, ellipse.major_radius,
+        ellipse.minor_radius, ellipse.angle].into_iter().all(f64::is_finite)
+        || ellipse.minor_radius <= 0.0 || ellipse.major_radius < ellipse.minor_radius
+    {
+        return Vec::new();
+    }
+    let (s, c) = ellipse.angle.sin_cos();
+    let phase = |p: (f64, f64)| {
+        let x = p.0 - ellipse.center.0;
+        let y = p.1 - ellipse.center.1;
+        let u = (c * x + s * y) / ellipse.major_radius;
+        let v = (-s * x + c * y) / ellipse.minor_radius;
+        (u.is_finite() && v.is_finite() && u.hypot(v) > 1.0e-6).then(|| v.atan2(u))
+    };
+    let point = |phase: f64| {
+        let x = ellipse.major_radius * phase.cos();
+        let y = ellipse.minor_radius * phase.sin();
+        (ellipse.center.0 + c * x - s * y, ellipse.center.1 + s * x + c * y)
+    };
+    let mut sections = Vec::new();
+    for pair in observations.windows(2).take(63) {
+        let Some((a, b)) = phase(pair[0]).zip(phase(pair[1])) else { continue; };
+        let delta = (b - a).sin().atan2((b - a).cos());
+        if delta.abs() > std::f64::consts::FRAC_PI_2 { continue; }
+        let steps = (delta.abs() * ellipse.major_radius).ceil().clamp(1.0, 128.0) as usize;
+        for i in 0..steps {
+            sections.push((point(a + delta * i as f64 / steps as f64),
+                point(a + delta * (i + 1) as f64 / steps as f64)));
+        }
+    }
+    sections
+}
+
+fn draw_stereo_segments_at(
+    pixels: &mut [u32], width: usize, height: usize,
+    frame: &EyeFrame, p: &sam31_outer::ProposalMasks, allow_publication:bool, now:Instant,
+) -> usize {
+    let eye=p.eye_index;
+    if eye>=2 {return 0;}
+    let joint=frame.joint_conic.as_deref().filter(|j| allow_publication && frame.joint_gaze_active
+        && matches_source(p,j,eye)
+        && frame.timestamp_ns.saturating_sub(p.source_timestamp_ns)<=900_000_000);
+    let arcs=joint.map(|j|j.solution.arcs.iter().filter(|a|a.exposure.roi==RoiId(eye as u32+1)).collect::<Vec<_>>()).unwrap_or_default();
+    let total=joint.map_or(0.0,|j|j.solution.arcs.iter().filter(|a|a.used).map(|a|a.evidence_weight).sum::<f64>());
+    let palette=[0x005b_def4,0x00ff_8fb8,0x00ff_d36b,0x00a8_ef90];
+    SEGMENT_LABELS.with(|labels| {
+        let mut labels=labels.borrow_mut();let labels=&mut labels[eye];
+        let context=(frame.segmentation_mode,p.prompt_generation,width,height);
+        let clock=joint.and_then(|j|j.exposures[eye]).map(|e|e.clock);
+        if labels.context!=Some(context) || clock.is_some_and(|clock|labels.clock.is_some_and(|old|old!=clock)) {
+            *labels=SegmentLabels {context:Some(context),clock,..Default::default()};
+        }
+        if clock.is_some() {labels.clock=clock;}
+        let mut present=[false;20];
+        let rows=((height.saturating_sub(72))/20).max(1);
+        let position=|i:usize| {
+            let x=if i%2==0 {4} else {width.saturating_sub(104) as i32};
+            (x,(28+(i/2)*20) as i32)
+        };
+        for a in &arcs {
+            let kind=match a.kind {
+                crate::roi_evidence::BoundaryKind::OuterLimbus=>0,
+                crate::roi_evidence::BoundaryKind::InnerLimbus=>1,
+                crate::roi_evidence::BoundaryKind::PupillaryBoundary=>2,
+                _=>3,
+            };
+            let value=if a.used && total>0.0 {format!("{:>5.1}%",100.0*a.evidence_weight/total)} else {"REJECT".into()};
+            let Some(i)=labels.slot((kind,a.evidence_group),a.exposure,value,now) else {continue;};
+            present[i]=true;
+            let color=palette[i%palette.len()];
+            let valid=|p:(f64,f64)|p.0.is_finite() && p.1.is_finite()
+                && p.0>=0.0 && p.1>=0.0 && p.0<width as f64 && p.1<height as f64;
+            if a.used {
+                if let Some(ellipse)=joint.and_then(|j|j.solution.ellipses_roi_px[eye].get(kind as usize).copied().flatten()) {
+                    for (a,b) in fitted_arc_sections(ellipse,&a.points_roi_px) {
+                        draw_line_clipped(pixels,width,height,a.0.round() as i32,a.1.round() as i32,
+                            b.0.round() as i32,b.1.round() as i32,color);
+                    }
+                }
+            }
+            // Keep every measured coordinate visible. Never draw point-to-point
+            // chords as anatomical curves, or put rejected evidence on the fit.
+            for &(x,y) in a.points_roi_px.iter().filter(|p|valid(**p)) {
+                let (x,y)=(x.round() as i32,y.round() as i32);
+                fill_rect(pixels,width,height,x-1,y-1,3,3,0x0011_1820);
+                if a.used {
+                    fill_rect(pixels,width,height,x,y,1,1,color);
+                } else {
+                    draw_line_clipped(pixels,width,height,x-1,y-1,x+1,y+1,color);
+                    draw_line_clipped(pixels,width,height,x-1,y+1,x+1,y-1,color);
+                }
+            }
+            if i/2>=rows {continue;}
+            let Some(anchor)=a.points_roi_px.get(a.points_roi_px.len()/2).copied().filter(|p|valid(*p)) else {continue;};
+            let (x,y)=position(i);let pin=if i%2==0 {x+94} else {x};
+            draw_line_clipped(pixels,width,height,anchor.0 as i32,anchor.1 as i32,pin,y+6,color);
+            fill_rect(pixels,width,height,anchor.0 as i32-2,anchor.1 as i32-2,5,5,color);
+        }
+        // Draw labels last, in permanent slots, so leader lines cannot erase
+        // neighboring text. Retained labels never retain old contour geometry.
+        for (i,slot) in labels.slots.iter().enumerate().filter(|(i,_)|i/2<rows) {
+            let age=now.saturating_duration_since(slot.seen);
+            let held=!present[i] && age<=SEGMENT_LABEL_HOLD;
+            let value=if present[i] || held {slot.value.as_str()} else {"   -- "};
+            let color=if present[i] || held {palette[i%palette.len()]} else {0x007e_8b98};
+            let (x,y)=position(i);
+            fill_rect(pixels,width,height,x,y,100,14,0x0011_1820);
+            draw_text(pixels,width,height,x+2,y+2,&format!("{:>2} {}{}",i+1,value,if held {" H"} else {"  "}),color);
+        }
+    });
+    if joint.is_none() {
+        draw_text(pixels,width,height,4,8,"WAITING FOR MATCHING STEREO SEGMENTS",0x007e_8b98);
+    }
+    draw_text(pixels,width,height,4,height.saturating_sub(24) as i32,"CURVES: FIT / DOTS: MEASURED POINTS",0x00ff_ffff);
+    draw_text(pixels,width,height,4,height.saturating_sub(12) as i32,"FIT WEIGHT / X=REJECT / H=HELD LABEL",0x00ff_ffff);
+    arcs.len()
+}
+
 fn source_image(
     frame: &EyeFrame,
     p: &sam31_outer::ProposalMasks,
@@ -555,6 +748,10 @@ fn source_image(
         mode,
         overlay,
     );
+    if layer == Layer::Segments {
+        let allowed=publication.is_some_and(|j|frame.joint_conic.as_deref().is_some_and(|f|std::ptr::eq(f,j)));
+        draw_stereo_segments_at(&mut pixels,p.source_width,p.source_height,frame,p,allowed,Instant::now());
+    }
     if layer == Layer::Conics {
         if let Some(joint) = publication.filter(|joint| matches_source(p, joint, eye)) {
             for ellipse in joint.solution.ellipses_roi_px[eye].iter().flatten() {
@@ -563,6 +760,70 @@ fn source_image(
         }
     }
     pixels
+}
+
+/// Compact source-matched scene beside normal ROI views. No solver work or
+/// state mutation occurs here; the same publication drives the diagnostic page.
+pub(super) fn render_scene(c: &mut Canvas, area: Rect, snapshot: &Snapshot) {
+    c.fill(area, CARD);
+    let mut body = area.inset(8);
+    c.text(take_row(&mut body, 22), "STEREO SCENE", INK);
+    let report = inspect(snapshot);
+    c.text(take_row(&mut body, 20), if report.publication.is_some() && !report.sign_resolved { "SIGN UNRESOLVED" } else { report.state }, MUTED);
+    c.text(take_row(&mut body, 20), &report.ipd_label(), INK);
+    let Some(publication) = report.publication else { return; };
+    if body.w < 16 || body.h < 16 { return; }
+    let solution = &publication.solution;
+    let target = solution.target_camera_mm;
+    let gaze_ends: [Option<[f64;3]>;2] = std::array::from_fn(|eye| {
+        let center=solution.eye_centers_camera_mm[eye]?;
+        let direction=solution.eye_gaze_directions[eye]?;
+        let distance=center.iter().zip(target).map(|(a,b)|(a-b).powi(2)).sum::<f64>().sqrt();
+        Some(std::array::from_fn(|i|center[i]+direction[i]*distance))
+    });
+    let normal_ends: [Option<[f64;3]>;2] = std::array::from_fn(|eye| {
+        let center=solution.eye_centers_camera_mm[eye]?;
+        let normal=solution.eye_normals[eye]?;
+        Some(std::array::from_fn(|i|center[i]+normal[i]*20.0))
+    });
+    let mut points = vec![[0.0; 3], target];
+    points.extend(gaze_ends.iter().flatten().copied());
+    points.extend(normal_ends.iter().flatten().copied());
+    points.extend(solution.eye_centers_camera_mm.iter().flatten().copied());
+    if points.iter().flatten().any(|v| !v.is_finite()) { return; }
+    // Fixed oblique camera-coordinate overview with a common metric scale.
+    let view = |p: [f64;3]| [0.866*p[0]+0.5*p[2], p[1]+0.25*p[2]];
+    let mut low = [f64::INFINITY;2];
+    let mut high = [f64::NEG_INFINITY;2];
+    for p in points { let p=view(p); for i in 0..2 {low[i]=low[i].min(p[i]);high[i]=high[i].max(p[i]);} }
+    let scale = ((body.w.saturating_sub(24)) as f64/(high[0]-low[0]).max(1.0))
+        .min((body.h.saturating_sub(24)) as f64/(high[1]-low[1]).max(1.0));
+    let project = |p| { let p=view(p); ((body.w as f64/2.0+(p[0]-(low[0]+high[0])/2.0)*scale) as i32,
+        (body.h as f64/2.0+(p[1]-(low[1]+high[1])/2.0)*scale) as i32) };
+    let mut pixels=vec![CARD;body.w*body.h];
+    let mut line=|a:(i32,i32),b:(i32,i32),color| draw_line_clipped(&mut pixels,body.w,body.h,a.0,a.1,b.0,b.1,color);
+    let camera=project([0.0;3]);
+    for (a,b) in [((-7,-5),(7,-5)),((7,-5),(7,5)),((7,5),(-7,5)),((-7,5),(-7,-5)),
+        ((7,-4),(14,-8)),((14,-8),(14,8)),((14,8),(7,4))] {
+        line((camera.0+a.0,camera.1+a.1),(camera.0+b.0,camera.1+b.1),MUTED);
+    }
+    for eye in 0..2 {
+        let Some(center)=solution.eye_centers_camera_mm[eye] else {continue;};
+        let origin=project(center);
+        let color=if solution.contributing_eyes[eye] {if eye==0 {0x70c7ff} else {0xffbf7b}} else {MUTED};
+        for step in 0..24 {
+            let ring=|n:usize| {let a=n as f64*std::f64::consts::TAU/24.0;
+                (origin.0+(6.0*a.cos()) as i32,origin.1+(6.0*a.sin()) as i32)};
+            line(ring(step),ring(step+1),color);
+        }
+        if let Some(end)=gaze_ends[eye] {line(origin,project(end),color);}
+        if let Some(end)=normal_ends[eye] {line(origin,project(end),0xcddc79);}
+
+    }
+    let target=project(target);
+    line((target.0-4,target.1),(target.0+4,target.1),INK);
+    line((target.0,target.1-4),(target.0,target.1+4),INK);
+    c.image(body,&pixels,body.w,body.h);
 }
 
 pub(super) fn render(c: &mut Canvas, ui: &mut Workspace, mut area: Rect, snapshot: &Snapshot) {
@@ -577,12 +838,12 @@ pub(super) fn render(c: &mut Canvas, ui: &mut Workspace, mut area: Rect, snapsho
                 c,
                 ui,
                 toggle,
-                if snapshot.second {
-                    "3 DISABLE STEREO"
+                if snapshot.stereo {
+                    "SHIFT+3 STEREO OFF"
                 } else {
-                    "3 ENABLE STEREO"
+                    "SHIFT+3 STEREO ON"
                 },
-                snapshot.second,
+                snapshot.stereo,
                 Action::ToggleStereo,
             );
         }
@@ -601,12 +862,12 @@ pub(super) fn render(c: &mut Canvas, ui: &mut Workspace, mut area: Rect, snapsho
             c,
             ui,
             toggle,
-            if snapshot.second {
-                "3 DISABLE STEREO"
+            if snapshot.stereo {
+                "SHIFT+3 STEREO OFF"
             } else {
-                "3 ENABLE STEREO"
+                "SHIFT+3 STEREO ON"
             },
-            snapshot.second,
+            snapshot.stereo,
             Action::ToggleStereo,
         );
     }
@@ -621,13 +882,14 @@ pub(super) fn render(c: &mut Canvas, ui: &mut Workspace, mut area: Rect, snapsho
     };
     for (i, (label, layer)) in [
         ("CONICS", Layer::Conics),
+        ("SEGMENTS", Layer::Segments),
         ("MASKS", Layer::Masks),
         ("RAW", Layer::Raw),
     ]
     .into_iter()
     .enumerate()
     {
-        let w = layers.w / 3;
+        let w = layers.w / 4;
         if layers.h > 0 {
             button(
                 c,
@@ -654,6 +916,7 @@ pub(super) fn render(c: &mut Canvas, ui: &mut Workspace, mut area: Rect, snapsho
             MUTED
         },
     );
+    c.text(take_row(&mut area, 22), &report.ipd_label(), INK);
     let info_h = if area.h >= 340 { 150 } else { 0 };
     let cards = split_pair(Rect {
         h: area.h.saturating_sub(info_h),
@@ -875,6 +1138,7 @@ mod tests {
                 exposure: exposures[eye].unwrap(),
                 evidence_group: arcs.len() as u32,
                 arc_index: arcs.len(),
+                points_roi_px: vec![],
                 kind: BoundaryKind::OuterLimbus,
                 rms_px: rms,
                 sigma_px: 2.0,
@@ -944,6 +1208,7 @@ mod tests {
             let snapshot = fixture(method);
             let report = inspect(&snapshot);
             assert_eq!(report.state, "BOTH EYES CONTRIBUTE");
+            assert_eq!(report.ipd_mm(), Some(64.0));
             assert_eq!(
                 report.skew_ns,
                 Some(0),
@@ -1006,6 +1271,7 @@ mod tests {
                 replicate_direction_numerics: [None, None],
                 mask_state_proposals: vec![],
                 population_integration: None,
+                supported_mode_selection: None,
             });
             let publication = Arc::new(publication);
             for frame in snapshot.eyes.iter_mut().flatten() {
@@ -1198,6 +1464,116 @@ mod tests {
     }
 
     #[test]
+    fn fitted_sections_show_the_solved_conic_without_moving_noisy_observations() {
+        let ellipse=geometry::Ellipse {center:(180.0,130.0),major_radius:36.0,minor_radius:18.0,angle:0.4};
+        let (s,c)=ellipse.angle.sin_cos();
+        let p=|phase:f64,noise:f64| {
+            let x=(ellipse.major_radius+noise)*phase.cos();
+            let y=(ellipse.minor_radius+noise)*phase.sin();
+            (ellipse.center.0+c*x-s*y,ellipse.center.1+s*x+c*y)
+        };
+        // Noisy, non-convex sample joins across the +/-PI phase boundary.
+        let samples=vec![p(3.02,2.0),p(3.10,-3.0),p(3.18,4.0),p(3.26,-2.0)];
+        let saved=samples.clone();
+        let sections=fitted_arc_sections(ellipse,&samples);
+        assert!(!sections.is_empty());
+        assert_eq!(samples,saved,"the display must not replace measured evidence");
+        let length=sections.iter().map(|&(a,b)|(a.0-b.0).hypot(a.1-b.1)).sum::<f64>();
+        assert!(length<20.0,"phase wrap must not draw the long way around");
+        for &(a,b) in &sections {
+            for (x,y) in [a,b] {
+                let (x,y)=(x-ellipse.center.0,y-ellipse.center.1);
+                let r=((c*x+s*y)/ellipse.major_radius).powi(2)+((-s*x+c*y)/ellipse.minor_radius).powi(2);
+                assert!((r-1.0).abs()<1.0e-10,"curve endpoints belong to the solved ellipse");
+            }
+        }
+        assert!(fitted_arc_sections(ellipse,&[p(0.0,0.0),p(2.0,0.0)]).is_empty());
+        assert!(fitted_arc_sections(ellipse,&[p(0.0,0.0),(f64::NAN,0.0),p(0.2,0.0)]).is_empty());
+        assert!(fitted_arc_sections(ellipse,&[p(0.0,0.0)]).is_empty());
+    }
+
+    #[test]
+    fn segment_labels_reserve_slots_throttle_values_and_do_not_renew_held_sources() {
+        let now=Instant::now();let mut labels=SegmentLabels::default();
+        let source=crate::roi_evidence::ExposureKey {roi:RoiId(1),
+            clock:crate::roi_evidence::SourceClock {domain:1,epoch:1},sequence:1,timestamp_ns:1};
+        assert_eq!(labels.slot((0,0),source,"10.0%".into(),now),Some(0));
+        assert_eq!(labels.slot((2,103),source,"20.0%".into(),now),Some(1));
+        let next=crate::roi_evidence::ExposureKey {sequence:2,timestamp_ns:100_000_001,..source};
+        // First arc missing, second remains in the same numbered/color slot.
+        assert_eq!(labels.slot((2,103),next,"90.0%".into(),now+Duration::from_millis(100)),Some(1));
+        assert_eq!(labels.slots[1].value,"20.0%");
+        assert_eq!(labels.slot((0,7),next,"5.0%".into(),now+Duration::from_millis(100)),Some(2));
+        // Repainting an old source must not keep it fresh or update its value.
+        labels.slot((2,103),next,"99.0%".into(),now+Duration::from_secs(1));
+        assert_eq!(labels.slots[1].seen,now+Duration::from_millis(100));
+        assert_eq!(labels.slots[1].value,"20.0%");
+        assert!(now.saturating_duration_since(labels.slots[0].seen)<=SEGMENT_LABEL_HOLD);
+        assert!((now+Duration::from_secs(1)).saturating_duration_since(labels.slots[0].seen)>SEGMENT_LABEL_HOLD);
+        let newer=crate::roi_evidence::ExposureKey {sequence:3,timestamp_ns:300_000_001,..source};
+        assert_eq!(labels.slot((0,0),newer,"30.0%".into(),now+Duration::from_millis(300)),Some(0));
+        assert_eq!(labels.slots[0].value,"30.0%");
+        labels.slot((0,0),source,"1.0%".into(),now+Duration::from_secs(2));
+        assert_eq!(labels.slots[0].value,"30.0%");
+        for group in 0..100 {labels.slot((1,group),newer,"1.0%".into(),now);}
+        assert_eq!(labels.slots.len(),20);
+    }
+
+    #[test]
+    fn stereo_segment_pins_use_source_points_and_refuse_mismatched_pixels() {
+        for method in [SegmentationMode::Sam31,SegmentationMode::EyeStudent] {
+            let mut snapshot=fixture(method);
+            let frame=snapshot.eyes[1].as_mut().unwrap();
+            let publication=Arc::make_mut(frame.joint_conic.as_mut().unwrap());
+            for (i,a) in publication.solution.arcs.iter_mut().filter(|a|a.exposure.roi==RoiId(2)).enumerate() {
+                a.points_roi_px=vec![(150.0,110.0+i as f64*20.0),(160.0,115.0+i as f64*20.0),(170.0,110.0+i as f64*20.0)];
+            }
+            let p=source(frame,method,1).unwrap();
+            let mut pixels=vec![0;420*280];
+            assert_eq!(draw_stereo_segments(&mut pixels,420,280,frame,p),2);
+            assert!(pixels.contains(&0x005b_def4));assert!(pixels.contains(&0x00ff_8fb8));
+            let before=joint_gaze_live::json(frame);
+            assert_eq!(draw_stereo_segments(&mut pixels,420,280,frame,p),2);
+            assert_eq!(joint_gaze_live::json(frame),before);
+            Arc::make_mut(frame.sam31_proposal_masks.as_mut().unwrap()).source_sequence+=1;
+            let p=source(frame,method,1).unwrap();pixels.fill(0);
+            assert_eq!(draw_stereo_segments(&mut pixels,420,280,frame,p),0);
+            assert_eq!(pixels[110*420+150],0,"a retained label must not retain stale segment geometry");
+        }
+    }
+
+    #[test]
+    fn stereo_scene_follows_solver_selection_without_changing_roi_views() {
+        for method in [SegmentationMode::Sam31, SegmentationMode::EyeStudent] {
+            let mut snapshot=fixture(method);
+            let before=joint_gaze_live::json(snapshot.eyes[0].as_ref().unwrap());
+            for scope in [Scope::Roi,Scope::Linked,Scope::Global] {
+                for enabled in [false,true] {
+                    snapshot.stereo=enabled;
+                    let mut ui=Workspace {scope,linked:LinkedView::Compare,..Default::default()};
+                    let overlays=[ui.roi_view(0).overlay,ui.roi_view(1).overlay];
+                    let mut pixels=vec![0;1200*850];
+                    render_snapshot(&mut ui,&mut pixels,1200,850,&snapshot);
+                    let canvas=Layout::new(1200,850).canvas;
+                    let scene=ui.hits.iter().any(|(r,a)| matches!(a,Action::StereoSolver)
+                        && r.y>=canvas.y && r.y<canvas.y+canvas.h);
+                    assert_eq!(scene,enabled && scope!=Scope::Global);
+                    assert_eq!(ui.scope,scope);
+                    assert_eq!([ui.roi_view(0).overlay,ui.roi_view(1).overlay],overlays);
+                    if enabled && scope==Scope::Roi && method==SegmentationMode::EyeStudent {
+                        if let Ok(path)=std::env::var("BUTTERCUP_STEREO_SCENE_PPM") {
+                            let mut ppm=b"P6\n1200 850\n255\n".to_vec();
+                            for pixel in &pixels {ppm.extend_from_slice(&[(pixel>>16) as u8,(pixel>>8) as u8,*pixel as u8]);}
+                            std::fs::write(path,ppm).unwrap();
+                        }
+                    }
+                }
+            }
+            assert_eq!(joint_gaze_live::json(snapshot.eyes[0].as_ref().unwrap()),before);
+        }
+    }
+
+    #[test]
     fn stereo_ui_layout_layers_and_pending_states_render_without_changing_analysis() {
         for method in [SegmentationMode::Sam31, SegmentationMode::EyeStudent] {
             let snapshot = fixture(method);
@@ -1210,7 +1586,7 @@ mod tests {
                 (800, 1200),
                 (904, 2048),
             ] {
-                for layer in [Layer::Conics, Layer::Masks, Layer::Raw] {
+                for layer in [Layer::Conics, Layer::Segments, Layer::Masks, Layer::Raw] {
                     let mut ui = Workspace {
                         scope: Scope::Linked,
                         linked: LinkedView::StereoSolver,

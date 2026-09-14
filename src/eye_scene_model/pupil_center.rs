@@ -763,7 +763,10 @@ impl PupilCenterStateTracker {
             ));
             let next_canonical = projection
                 .and_then(|projection| pupil_projection_canonical_point(projection, center));
-            if regime == PupilCenterMotionRegime::SmoothPursuit {
+            // A forecast may transport the center briefly, but it is not a
+            // measured velocity. Relearning from that held center would
+            // refresh the pursuit clock on every missing-ring frame.
+            if regime == PupilCenterMotionRegime::SmoothPursuit && !transported_hold {
                 let observed_velocity = confirmed_pursuit_velocity.or_else(|| {
                     previous_canonical_center
                         .zip(next_canonical)
@@ -1018,5 +1021,56 @@ mod tests {
             )
             .is_none());
         assert_eq!(tracker.last_supported, None);
+    }
+
+    #[test]
+    fn unmeasured_pursuit_expires_from_its_last_observation() {
+        let now = Instant::now();
+        let global_motion = SimilarityMotion::default();
+        let layer = MotionLayerStatus::default();
+        let coupled = CoupledMotionStatus::default();
+        let motion = PupilCenterMotionEvidence {
+            global_motion: &global_motion,
+            global_layer: &layer,
+            pupil_layer: &layer,
+            coupled_motion: &coupled,
+        };
+        let projection = projection_at((190.0, 128.0));
+        let mut tracker = admitted_tracker(now, motion);
+        // Start from an observed pursuit velocity; subsequent images supply
+        // no usable ring. A forecast is allowed briefly but cannot become
+        // its own new velocity observation or extend its lifetime.
+        let velocity = (0.20, 0.0);
+        tracker.pursuit_velocity_canonical_per_second = Some(velocity);
+        tracker.pursuit_supported_at = Some(now);
+        for tick in 1..=3 {
+            let at = now + Duration::from_millis(tick * 100);
+            let prediction = tracker
+                .begin_frame(at, (3800, 3500), (384, 256), Some(projection), None, motion)
+                .unwrap();
+            assert!(prediction.pursuit_predicted);
+            assert!(tracker
+                .assimilate(at, (3800, 3500), Some(projection), prediction, None, None, motion)
+                .is_some());
+            assert!(tracker.diagnostics().transported_hold);
+            assert_eq!(tracker.last_supported, Some(now));
+            assert_eq!(tracker.pursuit_supported_at, Some(now));
+            assert_eq!(tracker.pursuit_velocity_canonical_per_second, Some(velocity));
+        }
+        let last_center = tracker.diagnostics().published_center.unwrap();
+        let expired = tracker
+            .begin_frame(
+                now + PUPIL_CENTER_PURSUIT_MAX_AGE + Duration::from_millis(1),
+                (3800, 3500),
+                (384, 256),
+                Some(projection),
+                None,
+                motion,
+            )
+            .unwrap();
+        assert!(!expired.pursuit_predicted);
+        assert_eq!(tracker.pursuit_velocity_canonical_per_second, None);
+        assert_eq!(tracker.pursuit_supported_at, None);
+        assert!((expired.center.0 - last_center.0).hypot(expired.center.1 - last_center.1) < 1.0e-9);
     }
 }

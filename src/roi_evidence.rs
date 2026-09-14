@@ -129,6 +129,19 @@ pub(crate) struct BoundaryArcObservation<'a> {
     pub(crate) evidence_group: u32,
     pub(crate) kind: BoundaryKind,
     pub(crate) points_roi_px: &'a [(f64, f64)],
+    /// Optional integration footprint per sample, in native pixels, fixed by
+    /// the source's sampling design before measuring edge displacement. This
+    /// replaces measured-polyline quadrature; a noisy radial zigzag cannot
+    /// increase its own budget. These are neither observed boundary positions
+    /// nor independent scale or probabilities. Missing uses the legacy path.
+    pub(crate) sampling_support_px: Option<&'a [f64]>,
+    /// Optional source-measured cap on contour support length, in native pixels.
+    /// It can reduce information mass when localization noise zigzags across an
+    /// edge; it cannot move points, sharpen their sigma or increase support.
+    /// Missing means the legacy measured-polyline budget. Zero supplies no mass.
+    // Offline ablations may also reduce this budget, with an explicit receipt;
+    // such a reduction does not claim a different observed physical length.
+    pub(crate) support_length_cap_px: Option<f64>,
     /// When present, exactly one optional direction per point, before any
     /// downstream decimation. Missing directions supply no angular constraint.
     pub(crate) outward_normals_roi: Option<&'a [Option<BoundaryNormalObservation>]>,
@@ -139,6 +152,26 @@ pub(crate) struct BoundaryArcObservation<'a> {
     pub(crate) localization_sigma_px: Option<f64>,
     pub(crate) normal_band_half_width_px: Option<f64>,
     pub(crate) detector_score: Option<f64>,
+}
+
+/// Numerically reduce a fixed integration domain onto retained samples. The
+/// nearest retained source index receives each cell; ties go to the earlier
+/// sample. No discarded measurement coordinates enter the new weights.
+pub(crate) fn reduce_sampling_support(support: &[f64], retained: &[usize]) -> Option<Vec<f64>> {
+    if support.is_empty() || retained.is_empty()
+        || support.iter().any(|v| !v.is_finite() || *v < 0.0)
+        || retained.iter().any(|&i| i >= support.len())
+        || retained.windows(2).any(|p| p[0] >= p[1])
+    { return None; }
+    let mut result = vec![0.0; retained.len()];
+    let mut nearest = 0;
+    for (i, &mass) in support.iter().enumerate() {
+        while nearest+1 < retained.len()
+            && i.abs_diff(retained[nearest+1]) < i.abs_diff(retained[nearest])
+        { nearest += 1; }
+        result[nearest] += mass;
+    }
+    result.iter().all(|v| v.is_finite()).then_some(result)
 }
 
 /// A supported partial/full conic is not interchangeable with raw samples.

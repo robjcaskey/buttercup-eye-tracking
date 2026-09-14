@@ -279,7 +279,7 @@ pub(crate) fn append_unfitted_outline_arcs(
             let samples = (0..count)
                 .map(|i| run[i * (run.len() - 1) / (count - 1)])
                 .collect::<Vec<_>>();
-            packet.arcs.push(OwnedBoundaryArc { level_sets_roi: None,
+            packet.arcs.push(OwnedBoundaryArc { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,
                 evidence_group: group_base + sector as u32,
                 kind: BoundaryKind::OuterLimbus,
                 points_roi_px: samples.iter().map(|s| s.point).collect(),

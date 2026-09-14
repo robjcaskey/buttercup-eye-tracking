@@ -72,6 +72,12 @@ pub(crate) struct IntegrationConfig {
     #[cfg(test)]
     pub(crate) annealed_reference: Option<annealed::Config>,
     pub(crate) early_stop: bool,
+    /// Offline experiment: retain an optimized mode supported by the full
+    /// conditional posterior when the MAP direction is unsupported.
+    pub(crate) select_supported_mode: bool,
+    /// Offline metric experiment; all conic position factors use exact signed
+    /// point-to-ellipse distance. No live default or uncertainty prior changes.
+    pub(crate) exact_conic_distances: bool,
 }
 
 // Keep the original integration as an explicit comparison control. Production
@@ -99,6 +105,8 @@ impl Default for IntegrationConfig {
             #[cfg(test)]
             annealed_reference: None,
             early_stop: true,
+            select_supported_mode: false,
+            exact_conic_distances: false,
         }
     }
 }
@@ -122,6 +130,14 @@ impl IntegrationConfig {
 pub(crate) struct PosteriorMode {
     pub(crate) target_camera_mm: [f64; 3],
     pub(crate) model_mass: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SupportedModeSelection {
+    pub(crate) retained_index: usize,
+    pub(crate) map_target_camera_mm: [f64; 3],
+    pub(crate) map_robust_cost: f64,
+    pub(crate) selected_robust_cost: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -151,6 +167,7 @@ pub(crate) struct ModelPosterior {
     pub(crate) replicate_direction_numerics: [Option<ReplicateNumerics>; 2],
     pub(crate) mask_state_proposals: Vec<serde_json::Value>,
     pub(crate) population_integration: Option<serde_json::Value>,
+    pub(crate) supported_mode_selection: Option<SupportedModeSelection>,
 }
 
 impl ModelPosterior {
@@ -246,6 +263,19 @@ impl ModelPosterior {
             json["replicate_contract"] = json["direction_numerics_contract"].clone();
             json["direction_support_rule"] = serde_json::json!("at least eight effective independent populations, maximum population normalizer share at most 25%, 90% model angular radius at most 15 degrees, and mass minus twice the between-population error at least 90%; engineering admission only");
             json["effective_samples_unit"] = serde_json::json!("independent population normalizer shares, not resampled particles");
+        }
+        if let Some(selection) = &self.supported_mode_selection {
+            json["supported_mode_selection"] = serde_json::json!({
+                "retained_index":selection.retained_index,
+                "map_target_camera_mm":selection.map_target_camera_mm,
+                "map_robust_cost":selection.map_robust_cost,
+                "selected_robust_cost":selection.selected_robust_cost,
+                "selected_minus_map_cost":selection.selected_robust_cost-selection.map_robust_cost,
+                "contract":"Experimental selection among already optimized modes of the same ROI association. Preserve a supported MAP; otherwise require existing direction gates for every modeled eye using the complete shared posterior, without renormalizing one branch or averaging geometry. Conditional model support is not measured gaze accuracy."
+            });
+            if selection.retained_index != 0 {
+                json["selected_fit"] = serde_json::json!("optimized retained mode supported by the full conditional posterior; posterior mean is diagnostic only");
+            }
         }
         json
     }
@@ -366,6 +396,80 @@ fn indicator_numerics(
 }
 
 type PosteriorSample = ([f64; 3], [Option<[f64; 3]>; 2], usize);
+
+/// Every candidate is assessed with exactly the same global importance weights.
+/// Selecting a mode must not condition away its competing mirror branch.
+pub(super) struct DirectionSamples<'a> {
+    pub(super) samples: &'a [PosteriorSample],
+    pub(super) weights: &'a [f64],
+    pub(super) sample_proposals: &'a [usize],
+    pub(super) proposals: usize,
+    pub(super) draws: usize,
+    pub(super) sample_replicas: &'a [usize],
+    pub(super) replica_draw_counts: &'a [usize],
+}
+
+impl DirectionSamples<'_> {
+    fn numerically_decided(&self, solution: &JointConicSolution, replicas: usize) -> bool {
+        let precision = direction_numerics(solution, self.samples, self.weights,
+            self.sample_proposals, self.proposals, self.draws);
+        let replicated = replicate_direction_numerics(solution, self.samples, self.weights,
+            self.sample_replicas, self.replica_draw_counts);
+        (0..2).filter(|&eye| solution.modeled_eyes[eye]).all(|eye| {
+            precision[eye].is_some_and(|mut n| {
+                if replicas > 1 {
+                    let Some(r) = &replicated[eye] else { return false; };
+                    n.standard_error = n.standard_error.max(r.standard_error);
+                }
+                n.mass - 2.0 * n.standard_error >= 0.9
+                    || n.mass + 2.0 * n.standard_error < 0.9
+            })
+        })
+    }
+
+    pub(super) fn summarize_about(&self, result: &mut ModelPosterior, solution: &JointConicSolution) {
+        result.direction_numerics = direction_numerics(solution, self.samples, self.weights,
+            self.sample_proposals, self.proposals, self.draws);
+        result.replicate_direction_numerics = if result.replicas > 1 {
+            replicate_direction_numerics(solution, self.samples, self.weights,
+                self.sample_replicas, self.replica_draw_counts)
+        } else { [None, None] };
+        result.gaze_radius_90_degrees = std::array::from_fn(|eye| {
+            let axis = solution.eye_gaze_directions[eye]?;
+            quantile(self.samples.iter().zip(self.weights).filter_map(|(s, w)| {
+                Some((dot3(axis, s.1[eye]?).clamp(-1.0, 1.0).acos().to_degrees(), *w))
+            }).collect(), 0.9)
+        });
+    }
+
+    pub(super) fn select_supported_mode(&self, result: &mut ModelPosterior,
+        modes: &[(Parameters, JointConicSolution)]) {
+        if result.status != "estimated-conditional" { return; }
+        let supported = |p: &ModelPosterior| (0..2).filter(|&eye| p.modeled_eyes[eye])
+            .all(|eye| p.supports_direction(eye));
+        let mut selected_index = 0;
+        if !supported(result) {
+            // Cost order provides a deterministic tie break. Never switch ROI
+            // association using a posterior conditional on a different one.
+            for (index, (_, solution)) in modes.iter().enumerate().skip(1) {
+                if solution.modeled_eyes != result.modeled_eyes { continue; }
+                let mut candidate = result.clone();
+                self.summarize_about(&mut candidate, solution);
+                if supported(&candidate) {
+                    *result = candidate;
+                    selected_index = index;
+                    break;
+                }
+            }
+        }
+        result.supported_mode_selection = Some(SupportedModeSelection {
+            retained_index: selected_index,
+            map_target_camera_mm: modes[0].1.target_camera_mm,
+            map_robust_cost: modes[0].1.robust_cost,
+            selected_robust_cost: modes[selected_index].1.robust_cost,
+        });
+    }
+}
 
 fn direction_numerics(
     best: &JointConicSolution,
@@ -784,6 +888,7 @@ impl Proposal {
             upper: model.upper,
             scales: model.scales,
             marginalize_arc_alternatives: model.marginalize_arc_alternatives,
+        exact_conic_distances: model.exact_conic_distances,
         };
         let mut mean = model.initial;
         mean[0] = 0.0;
@@ -1015,6 +1120,7 @@ pub(super) fn with_relaxed_proposal_groups<'a>(
         upper: model.upper,
         scales: model.scales,
         marginalize_arc_alternatives: model.marginalize_arc_alternatives,
+        exact_conic_distances: model.exact_conic_distances,
     };
     Some((relaxed, omitted))
 }
@@ -1040,6 +1146,7 @@ pub(super) fn conditional_refined_center(
         upper: model.upper,
         scales: model.scales,
         marginalize_arc_alternatives: model.marginalize_arc_alternatives,
+        exact_conic_distances: model.exact_conic_distances,
     };
     conditional.lower[..TARGET_PARAMETERS].copy_from_slice(&p[..TARGET_PARAMETERS]);
     conditional.upper[..TARGET_PARAMETERS].copy_from_slice(&p[..TARGET_PARAMETERS]);
@@ -1291,6 +1398,8 @@ pub(super) fn integrate(
     assert!((1..=4).contains(&config.replicas), "bounded replica count");
     assert!(!config.adaptive || config.tail_proposal == TailProposal::Off,
         "compare per-basin moment adaptation and tail refinement separately");
+    assert!(!config.select_supported_mode || (config.populations.is_none() && config.numerical_admission),
+        "supported-mode experiment requires importance integration and numerical admission");
     let mut result = ModelPosterior {
         status: "proposal-unavailable",
         samples: 0,
@@ -1314,6 +1423,7 @@ pub(super) fn integrate(
         replicate_direction_numerics: [None, None],
         mask_state_proposals: Vec::new(),
         population_integration: None,
+        supported_mode_selection: None,
     };
     let integrated_inner = if config.marginalize_unobserved_inner {
         IntegratedInner::new(model)
@@ -1609,6 +1719,7 @@ pub(super) fn integrate(
                 if effective >= 48.0 && weights.iter().all(|w| *w <= 0.1) {
                     #[allow(unused_mut)]
                     let mut settled = true;
+                    let mut map_supported = true;
                     if config.numerical_admission {
                         let precision = direction_numerics(
                             best,
@@ -1633,10 +1744,21 @@ pub(super) fn integrate(
                                     };
                                     n.standard_error = n.standard_error.max(r.standard_error);
                                 }
-                                n.mass - 2.0 * n.standard_error >= 0.9
+                                let supported = n.mass - 2.0 * n.standard_error >= 0.9;
+                                map_supported &= supported;
+                                supported
                                     || n.mass + 2.0 * n.standard_error < 0.9
                             })
                         });
+                    }
+                    if config.select_supported_mode && settled && !map_supported {
+                        let directions = DirectionSamples {samples: &samples, weights: &weights,
+                            sample_proposals: &sample_proposals, proposals: proposals.len(), draws: index,
+                            sample_replicas: &sample_replicas, replica_draw_counts: &replica_draw_counts};
+                        // A clearly unsupported MAP must not stop integration
+                        // before an alternative's existing numerical gate resolves.
+                        settled = modes.iter().skip(1).filter(|(_, s)| s.modeled_eyes == model.present)
+                            .all(|(_, s)| directions.numerically_decided(s, config.replicas));
                     }
                     if settled {
                         break;
@@ -1770,6 +1892,12 @@ pub(super) fn integrate(
                 0.9,
             );
         }
+    }
+    if config.select_supported_mode {
+        DirectionSamples {samples: &samples, weights: &weights,
+            sample_proposals: &sample_proposals, proposals: proposals.len(),
+            draws: result.samples-result.pilot_samples, sample_replicas: &sample_replicas,
+            replica_draw_counts: &replica_draw_counts}.select_supported_mode(&mut result, modes);
     }
     result
 }

@@ -402,6 +402,7 @@ impl Hub {
         journal.next_presentation = journal.next_presentation.saturating_add(1);
         let configuration = json!({"display": presentation.display, "mapping": presentation.gaze.mapping,
             "gaze_basis": presentation.gaze.source_basis,
+            "camera_mount_assumption": presentation.scene["camera_mount_assumption"],
             "geometry": presentation.scene["geometry"], "calibration": presentation.scene["calibration"]});
         if configuration != journal.configuration {
             journal.config_revision += 1;
@@ -785,6 +786,32 @@ mod tests {
             display: json!({"id":"test"}),
             scene: json!({"geometry":{"units":"inches"},"eyes":[],"roi_states":[]}),
         }
+    }
+
+    #[test]
+    fn camera_mount_is_preserved_and_revision_bound_in_recorded_configuration() {
+        let hub=Hub::default();let subscription=hub.subscribe();subscription.take(false);
+        for mode in ["flexible","below-eyes","above-eyes"] {
+            let mut p=presentation(Some(0),100);
+            p.scene["camera_mount_assumption"]=json!(mode);
+            hub.presented(p,hub.stamp());
+        }
+        let emitted=subscription.take(false).batches.into_iter().flat_map(|batch|match batch {
+            Batch::Rows(rows)|Batch::Scene(rows)=>rows.as_ref().clone(),
+            _=>Vec::new(),
+        }).collect::<Vec<_>>();
+        let mut bytes=Vec::new();
+        for row in &emitted {write_metadata(&mut bytes,row).unwrap();}
+        let decoded=decode_metadata(&bytes);
+        let configs=decoded.iter().filter(|r|r["event"]=="configuration_changed").collect::<Vec<_>>();
+        let presented=decoded.iter().filter(|r|r["event"]=="presentation").collect::<Vec<_>>();
+        assert_eq!(configs.len(),3);assert_eq!(presented.len(),3);
+        for ((config,presented),mode) in configs.iter().zip(presented).zip(["flexible","below-eyes","above-eyes"]) {
+            assert_eq!(config["data"]["camera_mount_assumption"],mode);
+            assert_eq!(config["configuration_revision"],presented["configuration_revision"]);
+        }
+        let journal=hub.0.lock().unwrap();
+        assert_eq!(journal.configuration["camera_mount_assumption"],"above-eyes");
     }
 
     #[test]

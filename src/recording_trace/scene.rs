@@ -12,6 +12,8 @@ pub(crate) const FRAME: &str = "viewer-eye-reference-inches-v1";
 /// A change-cached host metadata snapshot; no filesystem reads on normal redraws.
 #[derive(Default)]
 pub(crate) struct HostMetadata {
+    viewport_cache: crate::gaze_focus::ViewportCache,
+    viewport: Option<crate::gaze_focus::WindowViewport>,
     display_key: String,
     physical_size: Option<(f64, f64)>,
     intrinsics_key: String,
@@ -19,11 +21,15 @@ pub(crate) struct HostMetadata {
 }
 
 impl HostMetadata {
+    pub(crate) fn window_target(&self, target:(f64,f64))->Option<(f64,f64)> {
+        self.viewport.as_ref()?.window_target(target)
+    }
     pub fn observe(
         &mut self,
         window: &winit::window::Window,
         checker: &crate::checkerboard_calibration::StatusSnapshot,
     ) -> (Value, Value) {
+        self.viewport=self.viewport_cache.observe(window);
         let monitor = window.current_monitor();
         let name = monitor.as_ref().and_then(|m| m.name());
         let key = format!("{name:?}");
@@ -66,6 +72,7 @@ impl HostMetadata {
             "monitor_desktop_origin_px": monitor.as_ref().map(|m| [m.position().x, m.position().y]),
             "viewport_desktop_origin_px": window.inner_position().ok().map(|p| [p.x, p.y]),
             "viewport_origin_unavailable_on_some_wayland_hosts": true,
+            "reticle_viewport_transform":self.viewport.as_ref().map(|v|v.json()),
             "window_scale_factor": window.scale_factor(),
             "monitor_scale_factor": monitor.as_ref().map(|m| m.scale_factor()),
             "physical_size_inches": self.physical_size,
@@ -234,6 +241,7 @@ pub fn snapshot(
         .max_by_key(|f|f.joint_conic.as_ref().and_then(|p|p.exposures.iter().flatten().map(|e|e.timestamp_ns).max()))
         .map(crate::joint_gaze_live::json).unwrap_or_else(||json!({"target":null,"status":"joint-conics-inactive-or-unavailable"}));
     json!({"geometry": geometry(input.plane,input.reference_eye,input.camera), "calibration": input.calibration,
+        "camera_mount_assumption":shared.lock().ok().map(|s|s.camera_mount.label()),
         "eyes":samples,"roi_states":states,"fused":fused})
 }
 

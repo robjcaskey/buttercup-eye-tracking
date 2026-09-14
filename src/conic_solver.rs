@@ -639,6 +639,17 @@ impl ConicArcConstraints {
         ellipse: Ellipse,
         tolerance: f64,
     ) -> bool {
+        Self::positional_shape_supported(points, inliers, ellipse, tolerance)
+    }
+
+    /// Shared positional coverage/conditioning check. Tangent agreement is a
+    /// separate observation filter applied by the caller, not an extra vote.
+    pub(crate) fn positional_shape_supported(
+        points: &[(f64, f64)],
+        inliers: &[bool],
+        ellipse: Ellipse,
+        tolerance: f64,
+    ) -> bool {
         let mut phases = points
             .iter()
             .zip(inliers)

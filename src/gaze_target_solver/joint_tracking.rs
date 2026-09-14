@@ -77,10 +77,33 @@ mod tests {
             exposure:ExposureKey {roi:RoiId(eye as u32+1),clock:SourceClock {domain:1,epoch:5},
                 sequence:time/100_000_000+eye as u64*1000,timestamp_ns:time},
             sensor_origin_px:origin,dimensions_px:[420,280],detail_reliability:Some(1.0),
-            arcs:vec![OwnedBoundaryArc { level_sets_roi: None,evidence_group:0,kind:BoundaryKind::OuterLimbus,
+            arcs:vec![OwnedBoundaryArc { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,evidence_group:0,kind:BoundaryKind::OuterLimbus,
                 points_roi_px:e.dense_points(32),outward_normals_roi:None,localization_sigma_px:None,normal_band_half_width_px:1.0,detector_score:None}],
             conics:vec![OwnedConicHint {kind:BoundaryKind::OuterLimbus,ellipse_roi_px:e,supporting_arc_indices:vec![0]}]},
             pose:EyePoseInput {limbus_center_sensor_px:camera().project(center).unwrap(),pixels_per_10mm:Some([4000.0/35.0,100.0,130.0])}}
+    }
+
+    #[test]
+    fn camera_mount_filters_whole_optimized_stereo_hypotheses() {
+        use crate::eye_scene_model::CameraMount;
+        let time=1_000_000_000;
+        for mode in [CameraMount::Flexible,CameraMount::BelowEyes,CameraMount::AboveEyes] {
+            let mut tracker=JointTracker::default();tracker.camera_mount=mode;
+            tracker.begin(frame(0,time).packet.exposure.clock,1);
+            for eye in 0..2 {
+                match tracker.observe(frame(eye,time),camera()) {
+                    Ok(Some(publication))=> {
+                        assert!(publication.solution.eye_normals.iter().flatten().all(|n|mode.supports(n[1])));
+                        assert_eq!(publication.exposures[eye].unwrap().timestamp_ns,time);
+                    }
+                    Err(TrackingUnavailable::MountingAssumptionConflict)=> {
+                        assert_ne!(mode,CameraMount::Flexible);
+                        assert!(tracker.latest(eye,frame(eye,time).packet.exposure.clock,time,1).is_none());
+                    }
+                    other=>panic!("unexpected mounting solve: {other:?}"),
+                }
+            }
+        }
     }
 
     #[test]
@@ -335,7 +358,7 @@ mod tests {
                 (p[0]-current.packet.sensor_origin_px[0] as f64,p[1]-current.packet.sensor_origin_px[1] as f64)
             }).collect();
             let ellipse=ProjectedCircle::project(camera(),center,normal,radius,current.packet.sensor_origin_px).unwrap().ellipse().unwrap();
-            current.packet.arcs.push(OwnedBoundaryArc { level_sets_roi: None,evidence_group:group,kind,points_roi_px:points,
+            current.packet.arcs.push(OwnedBoundaryArc { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,evidence_group:group,kind,points_roi_px:points,
                 outward_normals_roi:None,localization_sigma_px:None,normal_band_half_width_px:if group==1 {pupil_band} else {0.0},detector_score:None});
             current.packet.conics.push(OwnedConicHint {kind,ellipse_roi_px:ellipse,supporting_arc_indices:vec![group as usize]});
         }
@@ -430,7 +453,7 @@ mod tests {
                     (pixel[0]-frame.packet.sensor_origin_px[0] as f64,pixel[1]-frame.packet.sensor_origin_px[1] as f64)
                 }).collect();
                 let ellipse=ProjectedCircle::project(camera(),center,normal,radius,frame.packet.sensor_origin_px).unwrap().ellipse().unwrap();
-                frame.packet.arcs.push(OwnedBoundaryArc { level_sets_roi: None,evidence_group:group,kind,points_roi_px:points,
+                frame.packet.arcs.push(OwnedBoundaryArc { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,evidence_group:group,kind,points_roi_px:points,
                     outward_normals_roi:None,localization_sigma_px:None,normal_band_half_width_px:0.0,detector_score:None});
                 frame.packet.conics.push(OwnedConicHint {kind,ellipse_roi_px:ellipse,supporting_arc_indices:vec![group as usize]});
             }
@@ -476,11 +499,13 @@ pub(crate) struct PublishedJoint {
 pub(crate) enum TrackingUnavailable {
     Pairing(PairingUnavailable),
     NoSceneSupport,
+    MountingAssumptionConflict,
     Conic(JointConicUnavailable),
 }
 
 #[derive(Default)]
 pub(crate) struct JointTracker {
+    pub(crate) camera_mount: crate::eye_scene_model::CameraMount,
     lineage: Option<(SourceClock,u64)>,
     pairing: SourcePairer<FrameEvidence>,
     latest: [Option<Arc<PublishedJoint>>;2],
@@ -549,7 +574,8 @@ impl JointTracker {
             maximum_hypotheses:16,maximum_refinements:12,maximum_source_skew_ns:0,
             // Engineering allowance, not a measured bound on rolling rows.
             exposure_uncertainty_ns:2_000_000,motion_bound_px_per_second:150.0};
-        let count=if self.retain_diagnostic_hypotheses { 4 } else { 1 };
+        let count=if self.camera_mount!=crate::eye_scene_model::CameraMount::Flexible {16}
+            else if self.retain_diagnostic_hypotheses { 4 } else { 1 };
         let result=if self.probabilistic {
             #[cfg(test)]
             {if let Some(config)=self.posterior_diagnostic {
@@ -566,6 +592,15 @@ impl JointTracker {
                 return Err(TrackingUnavailable::Conic(error));
             }
         };
+        // Select a genuinely optimized compatible solution; never mirror a
+        // fitted stereo normal after solving or inflate its posterior support.
+        if self.camera_mount!=crate::eye_scene_model::CameraMount::Flexible {
+            hypotheses.retain(|h|h.eye_normals.iter().flatten().all(|n|self.camera_mount.supports(n[1])));
+            if hypotheses.is_empty() {
+                self.clear_current_sources(exposures);
+                return Err(TrackingUnavailable::MountingAssumptionConflict);
+            }
+        }
         let solution=hypotheses.remove(0);
         let diagnostic_hypotheses = if self.retain_diagnostic_hypotheses {
             let mut all=vec![solution.clone()];all.extend(hypotheses);all

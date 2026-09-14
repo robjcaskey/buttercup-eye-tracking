@@ -58,6 +58,10 @@ This repository owns host-side eye analysis and presentation only.
   corpus evaluation alongside synthetic/unit tests. Run independent evaluations
   in parallel when practical, then inspect and explain the results, including
   regressions; merely launching a replay is not validation.
+- Inspect actual source-matched RAW overlays, neighboring exposures and native
+  3D solves frequently between bounded implementation steps. Do not spend long
+  stretches refactoring without visual inspection. Keep measured points distinct
+  from fitted curves, and use the pictures to challenge aggregate scores.
 - Pair area stability with human-label localization error, coverage/dropouts,
   source-time/motion alignment and independent scale support. Never normalize by
   the candidate's own radius, count held predictions as fresh observations, or

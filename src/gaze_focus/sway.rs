@@ -98,6 +98,100 @@ fn request(socket: &std::path::Path, kind: u32, payload: &str) -> Result<Value, 
     send().map_err(|e| format!("Sway focus connection failed: {e}"))
 }
 
+/// Desktop geometry in one coordinate system (Sway logical units or native
+/// physical pixels). Client content excludes compositor borders/title bars.
+#[derive(Clone, Debug)]
+pub(crate) struct WindowViewport {
+    output: String,
+    monitor: Rect,
+    content: Rect,
+    scale: f64,
+}
+impl WindowViewport {
+    pub(crate) fn window_target(&self, target:(f64,f64)) -> Option<(f64,f64)> {
+        if ![target.0,target.1,self.scale].into_iter().all(f64::is_finite) || self.scale<=0.0 {return None;}
+        let pixel=1.0/self.scale;
+        let extent=(self.content.w-pixel,self.content.h-pixel);
+        if extent.0<=0.0 || extent.1<=0.0 {return None;}
+        let local=((self.monitor.x+target.0*(self.monitor.w-pixel)-self.content.x)/extent.0,
+            (self.monitor.y+target.1*(self.monitor.h-pixel)-self.content.y)/extent.1);
+        [local.0,local.1].into_iter().all(|v|v.is_finite() && (-1e-12..=1.0+1e-12).contains(&v))
+            .then_some((local.0.clamp(0.0,1.0),local.1.clamp(0.0,1.0)))
+    }
+    pub(crate) fn json(&self) -> Value {
+        serde_json::json!({"output":self.output,"monitor_rect":[self.monitor.x,self.monitor.y,self.monitor.w,self.monitor.h],
+            "client_rect":[self.content.x,self.content.y,self.content.w,self.content.h],"pixels_per_unit":self.scale,
+            "mapping":"monitor UV -> desktop pixel center -> client UV; outside client hidden"})
+    }
+}
+
+fn viewer_viewport(tree:&Value,pid:u32)->Option<WindowViewport> {
+    fn visit(node:&Value,output:Option<&Value>,pid:u32)->Option<WindowViewport> {
+        let output=if node["type"]=="output" {Some(node)} else {output};
+        if node["pid"].as_u64()==Some(pid as u64) && node["visible"]==true {
+            let output=output?;
+            let monitor=rect(output)?;
+            let outer=rect(node)?;
+            let client=rect(&serde_json::json!({"rect":node["window_rect"]}))?;
+            let scale=output["scale"].as_f64()?;
+            if !scale.is_finite() || scale<=0.0 {return None;}
+            return Some(WindowViewport {output:output["name"].as_str()?.into(),monitor,
+                content:Rect{x:outer.x+client.x,y:outer.y+client.y,w:client.w,h:client.h},scale});
+        }
+        children(node,"nodes").iter().chain(children(node,"floating_nodes"))
+            .find_map(|child|visit(child,output,pid))
+    }
+    visit(tree,None,pid)
+}
+
+/// Read-only geometry requests run away from the rendering/camera threads.
+/// A moved/resized client gets fresh compositor geometry, not a guessed origin.
+#[derive(Default)]
+pub(crate) struct ViewportCache {
+    pending: Option<std::sync::mpsc::Receiver<(std::time::Instant,Option<WindowViewport>)>>,
+    latest: Option<(std::time::Instant,WindowViewport)>,
+    requested: Option<std::time::Instant>,
+}
+impl ViewportCache {
+    pub(crate) fn observe(&mut self,window:&winit::window::Window)->Option<WindowViewport> {
+        let monitor=window.current_monitor()?;
+        let size=window.inner_size();
+        let name=monitor.name().unwrap_or_default();
+        let physical=WindowViewport {output:name.clone(),scale:1.0,
+            monitor:Rect{x:monitor.position().x as f64,y:monitor.position().y as f64,
+                w:monitor.size().width as f64,h:monitor.size().height as f64},
+            content:Rect{x:monitor.position().x as f64,y:monitor.position().y as f64,
+                w:size.width as f64,h:size.height as f64}};
+        if window.fullscreen().is_some() && size==monitor.size() {return Some(physical);}
+        if let Ok(origin)=window.inner_position() {
+            return Some(WindowViewport {content:Rect{x:origin.x as f64,y:origin.y as f64,..physical.content},..physical});
+        }
+        let now=std::time::Instant::now();
+        if let Some(receiver)=&self.pending {
+            match receiver.try_recv() {
+                Ok((requested,value))=>{self.latest=value.map(|v|(requested,v));self.pending=None;},
+                Err(std::sync::mpsc::TryRecvError::Disconnected)=>{self.latest=None;self.pending=None;},
+                Err(std::sync::mpsc::TryRecvError::Empty)=>{},
+            }
+        }
+        if self.pending.is_none() && self.requested.is_none_or(|t|now.duration_since(t)>=Duration::from_millis(100)) {
+            self.requested=Some(now);
+            if let Some(socket)=std::env::var_os("SWAYSOCK").map(PathBuf::from) {
+                let (sender,receiver)=std::sync::mpsc::channel();self.pending=Some(receiver);
+                std::thread::spawn(move || {
+                    let value=request(&socket,4,"").ok().and_then(|tree|viewer_viewport(&tree,std::process::id()));
+                    let _=sender.send((now,value));
+                });
+            }
+        }
+        self.latest.as_ref().filter(|(time,v)|now.duration_since(*time)<=Duration::from_millis(500)
+            && v.output==name
+            && (v.content.w-size.width as f64/window.scale_factor()).abs()<=2.0
+            && (v.content.h-size.height as f64/window.scale_factor()).abs()<=2.0)
+            .map(|(_,value)|value.clone())
+    }
+}
+
 impl Sway {
     pub(super) fn connect() -> Result<Self, String> {
         let socket = std::env::var_os("SWAYSOCK")
@@ -272,6 +366,44 @@ impl Backend for Sway {
 pub(super) mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn reticle_maps_monitor_pixels_into_half_windows_at_fractional_scale() {
+        for scale in [1.0,1.5,2.0] {
+            let monitor=Rect{x:-1700.0,y:300.0,w:1600.0,h:900.0};
+            for content in [monitor,Rect{x:-1700.0,y:300.0,w:800.0,h:900.0},
+                Rect{x:-900.0,y:300.0,w:800.0,h:900.0},Rect{x:-1537.0,y:424.0,w:601.0,h:417.0}] {
+                let viewport=WindowViewport{output:"DP-3".into(),monitor,content,scale};
+                for local in [(0.0,0.0),(0.5,0.5),(1.0,1.0)] {
+                    let pixel=1.0/scale;
+                    let target=((content.x+local.0*(content.w-pixel)-monitor.x)/(monitor.w-pixel),
+                        (content.y+local.1*(content.h-pixel)-monitor.y)/(monitor.h-pixel));
+                    let mapped=viewport.window_target(target).unwrap();
+                    assert!((mapped.0-local.0).abs()<1e-12 && (mapped.1-local.1).abs()<1e-12);
+                }
+                assert!(viewport.window_target((f64::NAN,0.5)).is_none());
+                assert!(viewport.window_target((10.0,0.5)).is_none());
+            }
+            let right=WindowViewport{output:"DP-3".into(),monitor,
+                content:Rect{x:-900.0,y:300.0,w:800.0,h:900.0},scale};
+            assert!(right.window_target((0.25,0.5)).is_none(),"gaze in another window must not clamp to the edge");
+        }
+    }
+
+    #[test]
+    fn reticle_uses_client_borders_output_offset_and_visibility() {
+        let mut tree=tree();
+        tree["nodes"][0]["scale"]=json!(1.5);
+        tree["nodes"][0]["nodes"][0]["nodes"][0]["window_rect"]=
+            json!({"x":3,"y":24,"width":494,"height":473});
+        let v=viewer_viewport(&tree,100).unwrap();
+        assert_eq!(v.content,Rect{x:103.0,y:24.0,w:494.0,h:473.0});
+        assert_eq!(v.scale,1.5);
+        assert_eq!(v.monitor.x,100.0);
+        assert!(viewer_viewport(&tree,999).is_none());
+        tree["nodes"][0]["nodes"][0]["nodes"][0]["visible"]=json!(false);
+        assert!(viewer_viewport(&tree,100).is_none());
+    }
+
     fn view(id: u64, x: f64, visible: bool, focused: bool) -> Value {
         json!({"id":id,"pid":100,"visible":visible,"focused":focused,"type":"con",
             "rect":{"x":x,"y":0,"width":500,"height":500},"nodes":[],"floating_nodes":[]})

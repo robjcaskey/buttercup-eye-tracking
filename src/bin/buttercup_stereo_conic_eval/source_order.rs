@@ -75,6 +75,13 @@ pub(super) fn run(files:&[String],limit:usize,extraction:ExtractionPolicy,delay:
 }
 
 #[cfg(test)]
+pub(super) fn run_with_supported_mode_diagnostic(files:&[String],extraction:ExtractionPolicy,
+    config:conic_solver::joint::posterior::IntegrationConfig,writer:&mut impl Write)->Result<(),String> {
+    run_with_tracker(files,usize::MAX,extraction,[0;2],true,true,writer,
+        |tracker,_|tracker.set_posterior_diagnostic(config))
+}
+
+#[cfg(test)]
 pub(super) fn run_with_posterior_diagnostic(files:&[String],config:conic_solver::joint::posterior::IntegrationConfig,
     writer:&mut impl Write)->Result<(),String> {
     run_with_tracker(files,usize::MAX,ExtractionPolicy {all_boundary_samples:true,..Default::default()},
@@ -188,11 +195,24 @@ fn run_with_tracker(files:&[String],limit:usize,extraction:ExtractionPolicy,dela
             "pupil_ablation":frame.pupil_ablation,
             "all_boundary_samples":extraction.all_boundary_samples,
             "coherent_pupil_arcs":extraction.coherent_pupil_arcs,
+            "shape_pupil_arcs":extraction.shape_pupil_arcs,
+            "optical_pupil_arcs":extraction.optical_pupil_arcs,
             "retained_outline_direction_experiment":extraction.outline_directions,
             "generation":generation,"arrival_delay_ns":delay.map(|v|v.to_string()),
             "logical_arrival_timestamp_ns":(source.timestamp_ns+delay[eye]).to_string(),
             "source_now_ns":newest.to_string(),"native_roi_reframe":reframe,
             "contract":"Fresh native evidence through JointTracker. Delays are synthetic scheduling stress, not measured latency. Repeated publications are not additional RAW exposures."});
+        if let Some(report)=&frame.pupil_directions {output["pupil_raw_directions"]=json!(report);}
+        if frame.conic_pupil_paths {output["conic_pupil_paths"]=json!(true);}
+        if frame.augmented_pupil_paths {output["augmented_pupil_paths"]=json!(true);}
+        if frame.pupil_profile_footprint {output["pupil_profile_footprint"]=json!(true);}
+        if frame.subpixel_pupil_peaks {output["subpixel_pupil_peaks"]=json!(true);}
+        if frame.connected_pupil_width {output["connected_pupil_width"]=json!(true);}
+        if frame.reject_weak_pupil_core {output["pupil_core_support"]=json!(frame.pupil_core_support);}
+        if let Some(report)=&frame.semantic_pupil_contour {output["semantic_pupil_contour"]=report.clone();}
+        if let Some(radius)=frame.pupil_search_radius_px {output["pupil_search_radius_px"]=json!(radius);}
+        if frame.sliding_pupil_luma {output["sliding_pupil_luma"]=json!(true);}
+        if let Some(scale)=frame.pupil_weight_scale {output["pupil_weight_scale"]=json!(scale);}
         if let Some(report)=&frame.outer_spread {output["outer_raw_spread"]=json!(report);}
         if let Some(report)=&frame.outer_position {output["outer_raw_position"]=json!(report);}
         if let Some(report)=&frame.mask_levels {output["mask_boundary_profiles"]=report.clone();}

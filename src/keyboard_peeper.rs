@@ -109,6 +109,7 @@ pub fn buttercup_map(virtual_mouse: bool, driving: bool) -> HotkeyMap {
     add("M", "Mouse mode", true);
     add("\\", "Accuracy check (20 targets)", !virtual_mouse);
     add("B", "Lightbox", true);
+    add("F8", "Camera mounting assumption", true);
     add(
         "[",
         if virtual_mouse {

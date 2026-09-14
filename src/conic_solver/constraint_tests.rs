@@ -270,7 +270,7 @@ impl EyeFixture {
         let arcs: Vec<_> = self
             .arcs
             .iter()
-            .map(|a| BoundaryArcObservation { level_sets_roi: None,
+            .map(|a| BoundaryArcObservation { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,
                 evidence_group: a.group,
                 kind: a.kind,
                 points_roi_px: &a.points,

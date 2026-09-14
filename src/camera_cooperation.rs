@@ -124,18 +124,33 @@ impl Dir {
         Ok(dir)
     }
     fn read(&self, name: &str) -> io::Result<(Vec<u8>, fs::Metadata)> {
-        let file = self.open_file(name, libc::O_RDONLY | libc::O_NONBLOCK)?;
-        private(&file, false)?;
-        let meta = file.metadata()?;
-        if meta.len() > LIMIT {
-            return Err(err("oversized UPC file"));
+        self.read_snapshot(name, |_| {})
+    }
+    fn read_snapshot(&self, name: &str, mut after_open: impl FnMut(&File)) -> io::Result<(Vec<u8>, fs::Metadata)> {
+        for _ in 0..4 {
+            let mut file = self.open_file(name, libc::O_RDONLY | libc::O_NONBLOCK)?;
+            after_open(&file);
+            let meta = file.metadata()?;
+            // Atomic publication may unlink the old inode after openat but
+            // before fstat. Never authorize from that retired snapshot: open
+            // the new publication and repeat every ownership/content check.
+            // This exception applies ONLY to read-only publications, never
+            // the retained camera directory or exclusive control.lock.
+            if meta.nlink()==0 && meta.is_file() && meta.uid()==unsafe {libc::geteuid()}
+                && meta.mode() & 0o777 == 0o600 {continue;}
+            private_metadata(&meta, false).map_err(|e|err(&format!("{name}: {e}")))?;
+            if meta.len() > LIMIT {return Err(err("oversized UPC file"));}
+            let mut bytes = Vec::new();
+            (&mut file).take(LIMIT + 1).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > LIMIT {return Err(err("oversized UPC file"));}
+            // Also catch replacement during the read, before returning any
+            // bytes to descriptor/owner/TTL validation.
+            let after=file.metadata()?;
+            if after.nlink()==0 {continue;}
+            private_metadata(&after, false).map_err(|e|err(&format!("{name}: {e}")))?;
+            return Ok((bytes, meta));
         }
-        let mut bytes = Vec::new();
-        file.take(LIMIT + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > LIMIT {
-            return Err(err("oversized UPC file"));
-        }
-        Ok((bytes, meta))
+        Err(err(&format!("UPC publication kept changing during read: {name}")))
     }
     fn fresh(&self, name: &str) -> io::Result<Value> {
         let (bytes, meta) = self.read(name)?;
@@ -200,12 +215,15 @@ impl Dir {
 }
 fn private(file: &File, directory: bool) -> io::Result<()> {
     let m = file.metadata()?;
+    private_metadata(&m,directory)
+}
+fn private_metadata(m: &fs::Metadata, directory: bool) -> io::Result<()> {
     if m.uid() != unsafe { libc::geteuid() }
         || m.mode() & 0o777 != if directory { 0o700 } else { 0o600 }
         || (directory && !m.is_dir())
         || (!directory && (!m.is_file() || m.nlink() != 1))
     {
-        return Err(err("unsafe UPC ownership, permissions, or file type"));
+        return Err(err(&format!("unsafe UPC ownership, permissions, or file type (uid={} mode={:o} links={} directory={directory})",m.uid(),m.mode() & 0o777,m.nlink())));
     }
     Ok(())
 }

@@ -32,6 +32,8 @@ pub use crate::conic_solver::OuterContourScaleContext;
 #[allow(unused_imports)]
 pub use crate::conic_solver::fit_trusted_arc_points;
 pub use crate::outline_conic_segments::ContourFitEvidence as OuterMaskFitReview;
+#[path = "eye_evidence_stage.rs"]
+pub(crate) mod evidence_stage;
 #[path = "limbus_refinement.rs"]
 pub mod limbus_refinement;
 use crate::geometry::ellipse_coordinate;
@@ -44,7 +46,8 @@ use crate::conic_solver::{
 };
 use crate::outline_conic_segments::{
     native_component_contour, sample_closed_contour,
-    deflattened_mask_fit_with_context, deflattened_mask_fit_with_noise,
+    deflattened_mask_fit_with_context, deflattened_mask_fit_with_censoring,
+    inspect_contour_arc_constraints,
 };
 #[cfg(test)]
 use crate::outline_conic_segments::deflattened_mask_fit;
@@ -108,7 +111,7 @@ fn startup_assets_available(model: &Path, prompts: &Path, tracker: &Path) -> boo
 pub fn live_configuration() -> serde_json::Value {
     serde_json::json!({
         "parallel_eye_workers": enabled_env_flag("BUTTERCUP_SAM31_PARALLEL_EYES", true),
-        "limbus_refinement": std::env::var("BUTTERCUP_LIMBUS_REFINEMENT").unwrap_or_else(|_|"off".into()),
+        "limbus_refinement": limbus_refinement::mode().label(),
         "preprocess": PreprocessRegime::configured_live().ok().map(PreprocessRegime::label),
         "stable_photometry_enabled": enabled_env_flag("BUTTERCUP_SAM31_STABLE_PHOTOMETRY", false),
         "photometry_policy": if enabled_env_flag("BUTTERCUP_SAM31_STABLE_PHOTOMETRY", false) {
@@ -1325,6 +1328,7 @@ impl ArbitrationExpectation {
 }
 
 struct Batch {
+    refinement_mode: limbus_refinement::Mode,
     submitted_at: Instant,
     target: Target,
     semantic_prompt: usize,
@@ -1621,6 +1625,7 @@ impl Client {
         };
         let Ok(prompt_bundle) = self.prompt_bundle.lock() else { return SubmitOutcome::Invalid; };
         match request.try_send(WorkerRequest::Batch(Batch {
+            refinement_mode: limbus_refinement::mode(),
             submitted_at: Instant::now(),
             target,
             semantic_prompt: semantic_prompt.min(SEMANTIC_PROMPT_COUNT - 1),
@@ -1679,8 +1684,9 @@ impl Client {
         let Ok(bundle)=self.prompt_bundle.lock() else {return SubmitOutcome::Invalid;};
         let claimed=Arc::new(AtomicBool::new(false));let submitted_at=Instant::now();
         let mut motion=motion.into_iter();
+        let refinement_mode=limbus_refinement::mode();
         let requests=frames.into_iter().enumerate().map(|(eye_index,frame)|WorkerRequest::Batch(Batch {
-            submitted_at,target,semantic_prompt:semantic_prompt.min(SEMANTIC_PROMPT_COUNT-1),
+            refinement_mode,submitted_at,target,semantic_prompt:semantic_prompt.min(SEMANTIC_PROMPT_COUNT-1),
             prompt_generation,tracking_epoch:tracking_epochs[eye_index],eye_index,
             frames:vec![frame],motion:motion.next().unwrap(),prompt_bundle:bundle.clone(),
             source_group_claimed:Some(Arc::clone(&claimed)),
@@ -2039,6 +2045,12 @@ fn outer_limbus_candidate_supersedes(
 }
 
 fn pupil_ellipse_plausible(pupil: Ellipse, outer: Ellipse) -> bool {
+    pupil_ellipse_plausible_with_shape(pupil, outer, false)
+}
+
+fn pupil_ellipse_plausible_with_shape(
+    pupil: Ellipse, outer: Ellipse, independent_pupil_shape: bool,
+) -> bool {
     let radius_ratio = (pupil.major_radius * pupil.minor_radius
         / (outer.major_radius * outer.minor_radius).max(1.0))
     .sqrt();
@@ -2049,7 +2061,8 @@ fn pupil_ellipse_plausible(pupil: Ellipse, outer: Ellipse) -> bool {
         && pupil.major_radius >= 7.0
         && pupil.minor_radius >= 5.0
         && pupil.minor_radius / pupil.major_radius.max(1.0) >= 0.30
-        && pupil_rectified_axis_ratio(pupil, outer).is_some_and(|ratio| ratio <= 1.65)
+        && (independent_pupil_shape
+            || pupil_rectified_axis_ratio(pupil, outer).is_some_and(|ratio| ratio <= 1.65))
         && (0.09..=0.72).contains(&radius_ratio)
         && ellipse_coordinate(pupil.center, outer) <= 0.58
         && pupil
@@ -2257,12 +2270,30 @@ fn deflattened_pupil_component(
     height: usize,
     reference: Ellipse,
 ) -> Option<Ellipse> {
+    deflattened_pupil_component_diagnostic(component, width, height, reference, None, false, false, false, None)
+}
+
+fn deflattened_pupil_component_diagnostic(
+    component: &[usize],
+    width: usize,
+    height: usize,
+    reference: Ellipse,
+    search_outer: Option<Ellipse>,
+    constrain_arcs: bool,
+    audit_arc_constraints: bool,
+    position_support: bool,
+    mut diagnostic: Option<&mut serde_json::Value>,
+) -> Option<Ellipse> {
     if reference.major_radius < 7.0 || reference.minor_radius < 5.0 {
         return None;
     }
     let scale = 80.0 / reference.major_radius;
     let origin = (FRAME_WIDTH as f64 * 0.5, FRAME_HEIGHT as f64 * 0.5);
-    let contour = native_component_contour(component, width, height)
+    let native_contour = native_component_contour(component, width, height);
+    if let Some(diagnostic) = diagnostic.as_deref_mut() {
+        diagnostic["native_contour"] = serde_json::json!(native_contour);
+    }
+    let contour: Vec<_> = native_contour
         .into_iter()
         .map(|point| {
             (
@@ -2271,24 +2302,78 @@ fn deflattened_pupil_component(
             )
         })
         .collect();
-    let review = deflattened_mask_fit_with_noise(
-        contour,
-        Ellipse {
-            center: origin,
-            major_radius: reference.major_radius * scale,
-            minor_radius: reference.minor_radius * scale,
-            angle: reference.angle,
-        },
-        None,
-        (0.5 * scale).max(1.0),
-        // The joint-arc conditioning policy is validated on limbus labels.
-        // Small glint-fragmented pupils keep their existing flat-tire gates
-        // until pupil-specific evidence can validate equivalent constraints.
-        false,
+    let to_native = |point: &(f64, f64)| (
+        reference.center.0 + (point.0 - origin.0) / scale,
+        reference.center.1 + (point.1 - origin.1) / scale,
+    );
+    let canonical_reference = Ellipse {
+        center: origin,
+        major_radius: reference.major_radius * scale,
+        minor_radius: reference.minor_radius * scale,
+        angle: reference.angle,
+    };
+    let pixel_scale = (0.5 * scale).max(1.0);
+    let censored = |point| search_outer.is_some_and(|outer| {
+            let point = to_native(&point);
+            // Component owners and interpolated contour samples have a
+            // one-native-pixel neighborhood. If it crosses the observation
+            // domain, the boundary could have been created by the search mask.
+            [-1.0, 0.0, 1.0].into_iter().any(|dy|
+                [-1.0, 0.0, 1.0].into_iter().any(|dx| {
+                    let p = (point.0 + dx, point.1 + dy);
+                    p.0 < 0.0 || p.1 < 0.0 || p.0 >= width as f64 || p.1 >= height as f64
+                        || ellipse_coordinate(p, outer) > 0.74
+                }))
+        });
+    // This additional solve is confined to an explicitly requested offline
+    // experiment. Diagnose the same unconstrained hypothesis against the
+    // shared fitter's actual positional/tangent gates, including failures.
+    if constrain_arcs || audit_arc_constraints {
+        if let Some(diagnostic) = diagnostic.as_deref_mut() {
+            if let Some(unconstrained) = deflattened_mask_fit_with_censoring(
+                contour.clone(), canonical_reference, None, pixel_scale, false, &censored)
+            {
+                diagnostic["arc_constraint_audit"] = inspect_contour_arc_constraints(
+                    &contour, canonical_reference, unconstrained.ellipse,
+                    &unconstrained.retained_points, 4.0 * pixel_scale, &censored)
+                    .unwrap_or(serde_json::Value::Null);
+                diagnostic["canonical_mapping"] = serde_json::json!({
+                    "native_origin":reference.center,"canonical_origin":origin,"scale":scale});
+            }
+        }
+    }
+    let review = deflattened_mask_fit_with_censoring(
+        contour, canonical_reference, None, pixel_scale,
+        // The limbus's joint-arc policy remains opt-in for pupil diagnostics.
+        constrain_arcs, censored,
     )?;
-    // A tiny surviving arc is insufficient to distinguish a pupil from a
-    // shadow. Require substantial direct support after chord exclusion.
-    if review.retained_points.len() < 48 {
+    if let Some(diagnostic) = diagnostic.as_deref_mut() {
+        diagnostic["retained_points_native"] = serde_json::json!(
+            review.retained_points.iter().map(to_native).collect::<Vec<_>>());
+        diagnostic["flat_tire_points_native"] = serde_json::json!(
+            review.flat_tire_points.iter().map(to_native).collect::<Vec<_>>());
+        diagnostic["retained_runs"] = serde_json::json!(
+            review.conic_segments.iter().cloned().collect::<Vec<_>>());
+    }
+    // The offline policy tests actual positional coverage/conditioning in
+    // place of a count floor. A contour/guide is still only a hypothesis;
+    // the existing geometry and untouched-RAW gates remain downstream.
+    let supported = if position_support {
+        let supported = crate::conic_solver::ConicArcConstraints::positional_shape_supported(
+            &review.retained_points, &vec![true; review.retained_points.len()],
+            review.ellipse, 4.0 * pixel_scale,
+        );
+        if let Some(diagnostic) = diagnostic.as_deref_mut() {
+            diagnostic["position_support"] = serde_json::json!({
+                "retained_points":review.retained_points.len(), "admitted":supported,
+                "tolerance_canonical_px":4.0 * pixel_scale});
+        }
+        supported
+    } else {
+        // Preserve the historical live policy pending matched validation.
+        review.retained_points.len() >= 48
+    };
+    if !supported {
         return None;
     }
     let fitted = review.ellipse;
@@ -2313,13 +2398,55 @@ pub struct PupilFitDiagnostics {
     accepted: usize,
     competing_component_rejected: bool,
     detailed: bool,
+    // Offline experiment until native corpus validation supports promotion.
+    censor_search_boundary: bool,
+    constrain_arcs: bool,
+    independent_pupil_shape: bool,
+    position_support: bool,
     candidates: Vec<serde_json::Value>,
 }
 
 pub fn inspect_pupil_fit(frame: Arc<RawFrame>, outer: Ellipse) -> serde_json::Value {
+    inspect_pupil_fit_with_search_censoring(frame, outer, false)
+}
+
+pub fn inspect_pupil_fit_with_search_censoring(
+    frame: Arc<RawFrame>, outer: Ellipse, censor_search_boundary: bool,
+) -> serde_json::Value {
+    inspect_pupil_fit_with_constraints(frame, outer, censor_search_boundary, false)
+}
+
+pub fn inspect_pupil_fit_with_constraints(
+    frame: Arc<RawFrame>, outer: Ellipse, censor_search_boundary: bool, constrain_arcs: bool,
+) -> serde_json::Value {
+    inspect_pupil_fit_with_shape(frame, outer, censor_search_boundary, constrain_arcs, false)
+}
+
+/// Offline guide experiment: retain native geometry/RAW gates while exposing
+/// component shapes that the limbus-relative aspect assumption would reject.
+/// The caller must evaluate the exported retained-support conditioning; this
+/// is neither a production pupil policy nor an anatomical identity assertion.
+pub fn inspect_pupil_fit_with_shape(
+    frame: Arc<RawFrame>, outer: Ellipse, censor_search_boundary: bool,
+    constrain_arcs: bool, independent_pupil_shape: bool,
+) -> serde_json::Value {
+    inspect_pupil_fit_with_position_support(frame, outer, censor_search_boundary,
+        constrain_arcs, independent_pupil_shape, false)
+}
+
+/// Explicit offline comparison of pupil component sample count versus the
+/// shared positional conic conditioning rule. Does not enable a live policy.
+pub fn inspect_pupil_fit_with_position_support(
+    frame: Arc<RawFrame>, outer: Ellipse, censor_search_boundary: bool,
+    constrain_arcs: bool, independent_pupil_shape: bool, position_support: bool,
+) -> serde_json::Value {
     let image = raw_luma(&[frame]);
     let mut diagnostics = PupilFitDiagnostics::default();
     diagnostics.detailed = true;
+    diagnostics.censor_search_boundary = censor_search_boundary;
+    diagnostics.constrain_arcs = constrain_arcs;
+    diagnostics.independent_pupil_shape = independent_pupil_shape;
+    diagnostics.position_support = position_support;
     let fitted = fit_inner_pupil_void_diagnostic(&image[0], outer, None, &mut diagnostics);
     serde_json::json!({
         "glare_ceiling": diagnostics.glare_ceiling,
@@ -2459,18 +2586,57 @@ fn fit_inner_pupil_void_conditioned(
             diagnostics
                 .candidates
                 .push(serde_json::json!({"area":component.len(),
-                "center":ellipse.center,"radii":[ellipse.major_radius,ellipse.minor_radius]}));
+                "center":ellipse.center,"radii":[ellipse.major_radius,ellipse.minor_radius],
+                "threshold":threshold,"search_radius_fraction":0.74,
+                "search_outer":{"center":outer.center,"major_radius":outer.major_radius,
+                    "minor_radius":outer.minor_radius,"angle":outer.angle}}));
         }
-        let Some(ellipse) =
+        let fitted = if diagnostics.detailed {
+            let candidate = diagnostics.candidates.last_mut().unwrap();
+            let fitted = deflattened_pupil_component_diagnostic(
+                &component, image.width, image.height, ellipse,
+                diagnostics.censor_search_boundary.then_some(outer), diagnostics.constrain_arcs,
+                diagnostics.independent_pupil_shape,
+                diagnostics.position_support,
+                Some(candidate));
+            // Record actual native component owners, including search-domain
+            // contacts. These flags describe censoring, not a pupil label.
+            let contacts = candidate["native_contour"].as_array().into_iter().flatten()
+                .map(|point| {
+                    let x = point[0].as_f64().unwrap() as isize;
+                    let y = point[1].as_f64().unwrap() as isize;
+                    let mut domain_contact = false;
+                    let mut dark_outside = false;
+                    for (dx, dy) in [(0, -1), (1, 0), (0, 1), (-1, 0)] {
+                        let (nx, ny) = (x + dx, y + dy);
+                        if nx < 0 || ny < 0 || nx >= image.width as isize || ny >= image.height as isize {
+                            domain_contact = true;
+                        } else if ellipse_coordinate((nx as f64, ny as f64), outer) > 0.74 {
+                            domain_contact = true;
+                            dark_outside |= image.data[ny as usize * image.width + nx as usize][0] <= threshold;
+                        }
+                    }
+                    serde_json::json!({"domain_contact":domain_contact,"dark_continues_outside":dark_outside})
+                }).collect::<Vec<_>>();
+            candidate["contour_search_contacts"] = serde_json::json!(contacts);
+            fitted
+        } else {
             deflattened_pupil_component(&component, image.width, image.height, ellipse)
+        };
+        let Some(ellipse) = fitted
         else {
             diagnostics.contour_fit_rejected += 1;
             continue;
         };
+        if diagnostics.detailed {
+            diagnostics.candidates.last_mut().unwrap()["contour_ellipse"] = serde_json::json!({
+                "center":ellipse.center,"major_radius":ellipse.major_radius,
+                "minor_radius":ellipse.minor_radius,"angle":ellipse.angle});
+        }
         // Unprompted acquisition must not pick a distant lid/shadow just
         // because its dark contour is strong. Explicit operator component
         // seeds retain their existing wider anatomical corridor.
-        if !pupil_ellipse_plausible(ellipse, outer)
+        if !pupil_ellipse_plausible_with_shape(ellipse, outer, diagnostics.independent_pupil_shape)
             || (component_seed.is_none()
                 && ellipse_coordinate(ellipse.center, outer) > MAX_UNPROMPTED_PUPIL_CENTER_OFFSET)
         {
@@ -2489,7 +2655,7 @@ fn fit_inner_pupil_void_conditioned(
                 minor_radius: ellipse.minor_radius * scale,
                 ..ellipse
             };
-            if !pupil_ellipse_plausible(candidate, outer)
+            if !pupil_ellipse_plausible_with_shape(candidate, outer, diagnostics.independent_pupil_shape)
                 || prior.is_some_and(|prior|!prior.admits(candidate,outer)) {
                 continue;
             }
@@ -2504,6 +2670,13 @@ fn fit_inner_pupil_void_conditioned(
         let Some((objective, ellipse, support)) = aligned else {
             continue;
         };
+        if diagnostics.detailed {
+            diagnostics.candidates.last_mut().unwrap()["raw_aligned_ellipse"] = serde_json::json!({
+                "center":ellipse.center,"major_radius":ellipse.major_radius,
+                "minor_radius":ellipse.minor_radius,"angle":ellipse.angle});
+            diagnostics.candidates.last_mut().unwrap()["raw_support_accepted"] =
+                serde_json::json!(pupil_raw_support_is_sufficient(support));
+        }
         if !pupil_raw_support_is_sufficient(support) {
             diagnostics.raw_support_rejected += 1;
             continue;
@@ -6639,13 +6812,7 @@ mod runtime {
         fit_mask_component_review(&wide, wide_width, height, HISTORY_FRAMES - 1)
     }
 
-    struct LiveTemporalOuterProposal {
-        semantic: SemanticProposalMasks,
-        outer_fit: Option<OuterMaskFitReview>,
-        outer_logits: Option<boundary_logits::Plane>,
-        outer_support: RawRingSupport,
-        pupil_fit: Option<PupilVoidFitReview>,
-    }
+    use super::evidence_stage::DetectorEvidence as LiveTemporalOuterProposal;
 
     fn capture_outer_logits(logits: &Tensor, enabled: bool)
         -> Result<Option<boundary_logits::Plane>, String>
@@ -7254,6 +7421,17 @@ mod runtime {
     fn select_pupil_observation_from_masks(pupil_inference: Option<&InferenceOutput>, semantic_requested: bool,
         current_luma: &FloatImage, source: &RawFrame, outer: Ellipse, pupil_prior: Option<PupilFitPrior>, selected_query:&mut Option<usize>)
         -> Option<(PupilVoidFitReview, bool)> {
+        let audit = std::env::var_os("BUTTERCUP_SAM31_PUPIL_CANDIDATE_AUDIT").is_some();
+        let audit_source = audit.then(|| {
+            use sha2::{Digest, Sha256};
+            let mut hash = Sha256::new();
+            for pixel in source.pixels.iter() { hash.update(pixel.to_le_bytes()); }
+            serde_json::json!({"eye_index":source.eye_index,"sequence":source.sequence,
+                "timestamp_ns":source.timestamp_ns.to_string(),
+                "sensor_origin":[source.sensor_x,source.sensor_y],
+                "dimensions":[source.width,source.height],
+                "native_u16le_sha256":format!("{:x}",hash.finalize())})
+        });
         let semantic_pupil = if let Some(pupil_output) = pupil_inference {
             let glare_ceiling = pupil_iris_luma_ceiling(current_luma, outer);
             let mut best = None::<PupilVoidFitReview>;
@@ -7267,18 +7445,43 @@ mod runtime {
                     mask[my*pupil_output.mask_width+mx] != 0
                         && ellipse_coordinate((x as f64,y as f64),outer)<=0.92
                 }).collect::<Vec<_>>();
-                if component.len()<100 { continue; }
-                let points=component.iter().map(|&i|((i%source.width) as f64,(i/source.width) as f64)).collect::<Vec<_>>();
-                let Some(reference)=moments_ellipse(&points) else {continue;};
-                let Some(ellipse)=deflattened_pupil_component(&component,source.width,source.height,reference) else {continue;};
-                if std::env::var_os("BUTTERCUP_SAM31_PUPIL_CANDIDATE_AUDIT").is_some() {
+                let reference = (component.len() >= 100).then(|| {
+                    let points=component.iter().map(|&i|((i%source.width) as f64,(i/source.width) as f64)).collect::<Vec<_>>();
+                    moments_ellipse(&points)
+                }).flatten();
+                let mut contour_diagnostic = serde_json::json!({});
+                let ellipse = reference.and_then(|reference| {
+                    if audit {
+                        // Expose the same native fitter's retained observations;
+                        // a diagnostic must not refit or complete another rim.
+                        deflattened_pupil_component_diagnostic(&component,source.width,source.height,
+                            reference,None,false,false,false,Some(&mut contour_diagnostic))
+                    } else {
+                        deflattened_pupil_component(&component,source.width,source.height,reference)
+                    }
+                });
+                if audit {
+                    let support=ellipse.map(|ellipse|
+                        raw_ring_support_below_ceiling(current_luma,ellipse,Some(glare_ceiling)));
                     eprintln!("SAM31_PUPIL_CANDIDATE {}",serde_json::json!({
+                        "schema":"buttercup-semantic-pupil-contour-diagnostic-v1",
+                        "source":audit_source,"prompt":PUPIL_DISK_PROMPT,
                         "sequence":source.sequence,"query":query,"semantic_score":pupil_output.scores[query],
-                        "ellipse":{"center":ellipse.center,"major_radius":ellipse.major_radius,
-                            "minor_radius":ellipse.minor_radius,"angle":ellipse.angle},
-                        "geometry_admitted":pupil_ellipse_plausible(ellipse,outer),
-                        "raw_support":format!("{:?}",raw_ring_support_below_ceiling(current_luma,ellipse,Some(glare_ceiling)))}));
+                        "ellipse":ellipse_diagnostic(ellipse),
+                        "outer_guide":ellipse_diagnostic(Some(outer)),
+                        "mask_outline_native":native_outline_points(mask,pupil_output.mask_width,
+                            pupil_output.mask_height,source.width,source.height),
+                        "clipped_component_pixels":component.len(),
+                        "clipped_component_fit":contour_diagnostic,
+                        "geometry_admitted":ellipse.is_some_and(|e|pupil_ellipse_plausible(e,outer)),
+                        "center_admitted":ellipse.is_some_and(|e|source.pupil_component_seed.is_some()
+                            || ellipse_coordinate(e.center,outer)<=MAX_UNPROMPTED_PUPIL_CENTER_OFFSET),
+                        "history_admitted":ellipse.is_some_and(|e|pupil_prior.is_none_or(|p|p.admits(e,outer))),
+                        "raw_support":support.map(|s|format!("{s:?}")),
+                        "raw_admitted":support.is_some_and(pupil_raw_support_is_sufficient),
+                        "contract":"Original model-mask outline and native clipped-component fit, including rejected candidates. These are segmentation predictions, not anatomical labels or new RAW observations."}));
                 }
+                let Some(ellipse)=ellipse else {continue;};
                 if !pupil_ellipse_plausible(ellipse,outer)
                     || (source.pupil_component_seed.is_none()
                         && ellipse_coordinate(ellipse.center,outer)>MAX_UNPROMPTED_PUPIL_CENTER_OFFSET)
@@ -7309,9 +7512,19 @@ mod runtime {
         let recovered = if semantic_pupil.is_some() { None } else {
             pupil_prior.and_then(|prior|refit_pupil_from_prior(current_luma,outer,prior))
         };
-        choose_pupil_observation(
+        let selection = choose_pupil_observation(
             semantic_requested, semantic_pupil, component, recovered, outer, pupil_prior,
-        )
+        );
+        if audit {
+            eprintln!("SAM31_PUPIL_SELECTION {}",serde_json::json!({
+                "source":audit_source,"semantic_requested":semantic_requested,
+                "semantic_query":*selected_query,
+                "selected_ellipse":ellipse_diagnostic(selection.map(|(p,_)|p.ellipse)),
+                "independent_observation":selection.map(|(_,independent)|independent),
+                "semantic_fit_present":semantic_pupil.is_some(),
+                "raw_component_present":component.is_some(),"prior_recovery_present":recovered.is_some()}));
+        }
+        selection
     }
 
 
@@ -8574,7 +8787,8 @@ mod runtime {
         video_outer: Option<LiveTemporalOuterProposal>,
     ) -> Result<OuterResult, String> {
         process_video_frame_with_refiner(batch, proposal_publisher, current_luma,
-            video_outer, limbus_refinement::apply)
+            video_outer, |source,image,review,support,pupil|
+                limbus_refinement::apply_mode(batch.refinement_mode,source,image,review,support,pupil))
     }
 
     fn process_video_frame_with_refiner(
@@ -8585,132 +8799,11 @@ mod runtime {
         refine: impl FnOnce(&RawFrame, &FloatImage, &mut OuterMaskFitReview,
             &mut RawRingSupport, Option<PupilVoidFitReview>) -> Option<limbus_refinement::Attempt>,
     ) -> Result<OuterResult, String> {
-        let source = batch
-            .frames
-            .last()
-            .ok_or_else(|| "SAM31 video tracker received no source frame".to_string())?;
-        let LiveTemporalOuterProposal {
-            semantic,
-            outer_fit,
-            outer_logits,
-            outer_support,
-            pupil_fit,
-        } = video_outer
-            .ok_or_else(|| "SAM31 video tracker produced no current-frame mask".to_string())?;
-        if semantic.prompt_index!=OUTER_IRIS_PROMPT {
-            return Err("SAM31 video geometry requires the mandatory outer-iris prompt".into());
-        }
-        let mut outer_fit = outer_fit.map(|fit|model_review_in_source(fit, source.width));
-        let mut outer_support = outer_support;
-        let limbus_refinement = outer_fit.as_mut().zip(current_luma).and_then(|(review, image)|
-            refine(source, image, review, &mut outer_support, pupil_fit));
-        let outer_boundary_logits = outer_logits.as_ref().zip(outer_fit.as_ref())
-            .zip(semantic.selected_query).map(|((plane, fit), query)| {
-                boundary_logits::measure(plane, boundary_logits::Source {
-                    eye_index: source.eye_index, sequence: source.sequence,
-                    timestamp_ns: source.timestamp_ns.to_string(),
-                    tracking_epoch: batch.tracking_epoch,
-                    prompt_generation: batch.prompt_generation,
-                    sensor_origin: (source.sensor_x, source.sensor_y),
-                    width: source.width, height: source.height,
-                }, semantic.prompt_index, query,
-                    limbus_refinement.as_ref().is_some_and(|attempt| attempt.applied),
-                    &fit.retained_points, &fit.conic_segments).map(Arc::new)
-            }).transpose()?;
-        let quality = semantic
-            .selected_query
-            .and_then(|selected| semantic.masks.iter().find(|mask| mask.query == selected))
-            .map(|mask| f64::from(mask.score))
-            .unwrap_or_default();
-        let outer_ellipse = outer_fit.as_ref().map(|fit|fit.ellipse);
-        // Always retain the same-exposure RAW pupil void alongside an outer
-        // proposal.  Virtual contact needs this private cue to choose between
-        // the two antipodal surface normals even when the operator has not
-        // selected SAM as the public rough-center provider.  Target selection
-        // below still controls whether the pupil is published as a normal Y
-        // product; this review-only fit cannot silently change that mode.
-        let proposal_pupil_fit = pupil_fit;
-        let proposal_masks = Arc::new(ProposalMasks {
-            tracking_epoch: batch.tracking_epoch,
-            prompt_generation: batch.prompt_generation,
-            eye_index: batch.eye_index,
-            source_sequence: source.sequence,
-            source_timestamp_ns: source.timestamp_ns,
-            source_group_roi_count: if batch.source_group_claimed.is_some() { 2 } else { 1 },
-            source_sensor_origin: (source.sensor_x, source.sensor_y),
-            source_width: source.width,
-            source_height: source.height,
-            source_raw: Arc::clone(&source.pixels),
-            semantic: Some(semantic),
-            outer_fit,
-            outer_boundary_logits,
-            limbus_refinement,
-            inner_pupil_fit: proposal_pupil_fit,
-            adapters: Vec::new(),
-        });
-        // Publish the exact attempted mask even when the independent RAW gate
-        // rejects it, so the operator can inspect the rejected proposal.
-        let _ = proposal_publisher.try_send(Arc::clone(&proposal_masks));
-
-        let outer_ellipse=outer_ellipse
-            .ok_or_else(|| "SAM31 video tracker mask had no plausible limbus fit; current source proposal published without conditioning memory".to_string())?;
-        if current_luma.is_none() {
-            return Err("SAM31 video tracker could not construct current RAW luma".to_string());
-        }
-        if !live_detector_raw_gate_passes(outer_support) {
-            return Err(format!(
-                "SAM31 video outer RAW ring support {:.3} from {} samples and {} strong sectors is below {:.3}",
-                outer_support.score,
-                outer_support.points,
-                outer_support.strong_sectors,
-                MIN_RAW_RING_SUPPORT_SCORE,
-            ));
-        }
-        let pupil_fit = matches!(
-            batch.target,
-            Target::InnerPupilVoid | Target::OuterLimbusAndInnerPupilVoid
-        )
-        .then(|| proposal_pupil_fit.map(|review| (review.ellipse, review.raw_support)))
-        .flatten();
-        let (target_ellipse, target_support, pupil_ellipse) =
-            select_target_products(batch.target, outer_ellipse, outer_support, pupil_fit)?;
-        let to_sensor = |mut ellipse: Ellipse| {
-            ellipse.center.0 += source.sensor_x as f64;
-            ellipse.center.1 += source.sensor_y as f64;
-            ellipse
-        };
-        let source_registration_anchor_sensor = source.registration_anchor.map(|center| {
-            (
-                center.0 + source.sensor_x as f64,
-                center.1 + source.sensor_y as f64,
-            )
-        });
-        Ok(OuterResult {
-            tracking_epoch: batch.tracking_epoch,
-            prompt_generation: batch.prompt_generation,
-            target: batch.target,
-            eye_index: batch.eye_index,
-            source_sequence: source.sequence,
-            source_timestamp_ns: source.timestamp_ns,
-            source_sensor_origin: (source.sensor_x, source.sensor_y),
-            source_registration_anchor_sensor,
-            sensor_ellipse: to_sensor(target_ellipse),
-            sensor_outer_ellipse: to_sensor(outer_ellipse),
-            sensor_pupil_ellipse: pupil_ellipse.map(to_sensor),
-            agreeing_adapters: 0,
-            quality,
-            raw_ring_support_score: outer_support.score,
-            raw_ring_support_points: outer_support.points,
-            raw_ring_positive_fraction: outer_support.positive_fraction,
-            raw_ring_strong_sectors: outer_support.strong_sectors,
-            raw_target_support_score: target_support.score,
-            raw_target_support_points: target_support.points,
-            raw_target_positive_fraction: target_support.positive_fraction,
-            raw_target_strong_sectors: target_support.strong_sectors,
-            elapsed_ms: 0,
-            video_tracked: true,
-            proposal_masks,
-        })
+        let finalized = evidence_stage::finalize(batch, current_luma, video_outer, refine)?;
+        // Rejected detector geometry remains inspectable and available to the
+        // joint evidence policy; rejection never grants monocular authority.
+        let _ = proposal_publisher.try_send(Arc::clone(&finalized.proposal));
+        finalized.admitted
     }
 
     #[cfg(test)]
@@ -8820,7 +8913,7 @@ mod runtime {
         }
 
         fn batch()->Batch {
-            Batch {submitted_at:Instant::now(),target:Target::OuterLimbus,semantic_prompt:OUTER_IRIS_PROMPT,
+            Batch {refinement_mode:limbus_refinement::Mode::Off,submitted_at:Instant::now(),target:Target::OuterLimbus,semantic_prompt:OUTER_IRIS_PROMPT,
                 prompt_generation:7,tracking_epoch:9,eye_index:1,
                 frames:vec![Arc::new(RawFrame {eye_index:1,sequence:456,timestamp_ns:123_456_789,
                     sensor_x:400,sensor_y:800,width:12,height:8,pixels:Arc::new(vec![17;96]),
@@ -9582,6 +9675,7 @@ mod tests {
     #[test]
     fn latest_mailbox_protects_scene_and_prompt_epoch_binding() {
         let batch = |sequence, epoch, revision| WorkerRequest::Batch(Batch {
+            refinement_mode: limbus_refinement::Mode::Off,
             submitted_at: Instant::now(), target: Target::OuterLimbus, semantic_prompt: 0,
             prompt_generation: revision, tracking_epoch: epoch, eye_index: 0,
             frames: vec![Arc::new(RawFrame { eye_index: 0, sequence, timestamp_ns: sequence*100,
@@ -10371,6 +10465,22 @@ mod tests {
     }
 
     #[test]
+    fn pupil_independent_shape_diagnostic_keeps_finite_size_and_containment_gates() {
+        let outer = Ellipse {center:(192.0,128.0),major_radius:100.0,minor_radius:80.0,angle:0.0};
+        let pupil = Ellipse {major_radius:36.0,minor_radius:16.0,..outer};
+        assert!(!pupil_ellipse_plausible(pupil,outer));
+        assert!(pupil_ellipse_plausible_with_shape(pupil,outer,true));
+        for invalid in [
+            Ellipse {minor_radius:4.0,..pupil},
+            Ellipse {major_radius:90.0,minor_radius:70.0,..pupil},
+            Ellipse {center:(260.0,128.0),..pupil},
+            Ellipse {angle:f64::NAN,..pupil},
+        ] {
+            assert!(!pupil_ellipse_plausible_with_shape(invalid,outer,true),"{invalid:?}");
+        }
+    }
+
+    #[test]
     fn pupil_continuity_rejects_size_flashes_but_not_head_translation_or_scale() {
         let outer=Ellipse {center:(192.0,128.0),major_radius:100.0,minor_radius:80.0,angle:0.1};
         let pupil=Ellipse {center:(197.0,130.0),major_radius:30.0,minor_radius:24.0,angle:0.1};
@@ -10599,6 +10709,35 @@ mod tests {
     }
 
     #[test]
+    fn pupil_position_support_locates_noisy_clipped_disks() {
+        let expected=Ellipse {center:(192.0,128.0),major_radius:25.0,minor_radius:21.0,angle:0.0};
+        let mut located=0;
+        for clip in [117.0,120.0,123.0,126.0] {
+            for amplitude in [1.0,1.5,2.0] {
+                let component=(0..FRAME_WIDTH*FRAME_HEIGHT).filter(|&i| {
+                    let p=((i%FRAME_WIDTH) as f64,(i/FRAME_WIDTH) as f64);
+                    let phase=((p.1-expected.center.1)/expected.minor_radius)
+                        .atan2((p.0-expected.center.0)/expected.major_radius);
+                    let noise=amplitude*(11.0*phase).sin()+0.5*(23.0*phase).cos();
+                    ellipse_coordinate(p,expected)<=1.0+noise/expected.major_radius && p.1>=clip
+                }).collect::<Vec<_>>();
+                let points=component.iter().map(|&i|((i%FRAME_WIDTH) as f64,(i/FRAME_WIDTH) as f64)).collect::<Vec<_>>();
+                let reference=moments_ellipse(&points).unwrap();
+                let mut diagnostic=serde_json::json!({});
+                let candidate=deflattened_pupil_component_diagnostic(&component,FRAME_WIDTH,FRAME_HEIGHT,
+                    reference,None,false,false,true,Some(&mut diagnostic));
+                if let Some(fit)=candidate {
+                    let rms=(expected.dense_points(96).into_iter().map(|p|
+                        crate::conic_solver::ellipse_residual(p,fit).powi(2)).sum::<f64>()/96.0).sqrt();
+                    assert!(rms<3.0,"fit must locate the known full pupil: {rms}, {fit:?}");
+                    located+=1;
+                }
+            }
+        }
+        assert!(located>0,"the policy must not abstain on every known curved pupil");
+    }
+
+    #[test]
     fn pupil_flat_tire_rejects_a_polygonal_shadow_without_curved_support() {
         let component: Vec<_> = (110..140)
             .flat_map(|y| (170..220).map(move |x| y * FRAME_WIDTH + x))
@@ -10614,6 +10753,8 @@ mod tests {
             moments_ellipse(&points).unwrap()
         )
         .is_none());
+        assert!(deflattened_pupil_component_diagnostic(&component,FRAME_WIDTH,FRAME_HEIGHT,
+            moments_ellipse(&points).unwrap(),None,false,false,true,None).is_none());
     }
 
     #[test]

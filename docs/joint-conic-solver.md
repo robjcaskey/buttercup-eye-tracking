@@ -4611,3 +4611,677 @@ checks pass. The frozen evaluator SHA256 is
 This diagnostic changes the next investigation toward joint uncertainty and
 source-timed anatomical support; it does not justify a live association change
 or complete the requested robust gaze recovery.
+
+### September 13 pupil-chain investigation and display correction
+
+The live stereo segment display previously joined the selected residual samples
+with straight lines. Those measured RAW points need not form a smooth convex
+polygon: independently contrast-ranked profile peaks can swap physical edges,
+and native sampling adds position noise. The solver fits one smooth projected
+conic per eye/boundary; it does not fit a separate conic to every colored group.
+The F support view now draws sections of that solved conic plus the **unchanged
+measured sample dots**, with crosses for rejected samples. Invalid points and
+large phase gaps do not complete a ring. This is presentation only; no point,
+weight, confidence or gaze output changes.
+
+The investigation evaluated four current recordings (170 exact-source,
+pupil-guide-available exposures), the three September 8 full SAM caches
+(998 offered ROI exposures / 499 paired reads), and the same 129-read frozen
+SAM/Student clip used in earlier work. Two new evaluator flags remain offline:
+`--shape-pupil-arcs` searches observed peak paths with bounded offset/turn
+continuity; `--optical-pupil-arcs` measures a short tangential RAW footprint
+and a bracketed subpixel radial maximum. Neither synthesizes ellipse points
+or holds past observations. They are mutually exclusive with the existing
+`--coherent-pupil-arcs` option. `--extract-only` exports measured packets for
+component inspection; it does not solve or imply anatomical truth.
+
+Both candidates failed promotion criteria despite better-looking chains.
+In the matched Student clip, baseline direction admission 40 right/34 left
+reads becomes shape 16/15 and optical 36/36. Adjacent absolute log SN-FEIDA
+p95 changes from .04468/.26931 to shape .04263/.40784 and optical
+.05030/.33180. In the matched SAM clip, admission changes from 40/40 to
+shape 21/21 and optical 35/35. Contributing-eye counts are unchanged, which
+is insufficient evidence of equally useful gaze. Several alternate branches
+change direction by over 20 degrees; these differences are not measured
+angular errors. The full three-clip SAM right-eye area tail also worsens
+from .12029 to .13309 under shape. Default live extraction remains unchanged.
+
+The companion held-out comparison verifies 1,847 identical outer groups /
+13,590 identical probe coordinates. Outer localization generally changes
+little, with some >1 px group regressions. In an older human-label subset,
+seven of eight accepted visible outer fits are unchanged and one improves;
+two other matched labels still have no accepted fit, and the existing large
+localization errors remain. Those labels do not cover the new pupil conflicts.
+The three current calibration recordings lack recorded outer points and were
+used only for pupil extraction. The current diagnostic contains selected
+solver samples rather than full original alternatives. Current physical
+scale and human pupil labels are missing. Historical area normalization uses
+fixed recorded acquisition hints, not freshly measured physical scale and
+never the candidate's own radius. Repeated publications are deduplicated by
+actual source; unavailable fits break area chains. Direction support remains
+conditional and heuristic, not calibrated accuracy.
+
+Full source identities, assumptions, positive and negative results, before/after
+figures and reproduction commands are in
+`outputs/pupil-path-study-20260913/README.md`. The runtime artifact directory
+contains no training output. The final default extractor matches all 428
+checked current/Student exposures exactly. The viewer and native evaluator
+build, 57 focused test executions and the repository tree audit passed;
+mandatory camera-cooperation assertions and subprocess abort tests remain
+in force.
+
+### Offline pupil association and weight follow-up (2026-09-13)
+
+`outputs/pupil-direction-study-20260913/README.md` records additional matched
+native experiments: RAW gradient directions, a source-tangent support cap,
+bounded whole-pupil conic association of unchanged measured peaks, and the
+requested `--pupil-weight-scale=0.75` ablation. They are evaluator options;
+the live shared evidence stage enables none of them. Support caps default to
+absent and cannot increase information mass or change measured positions.
+The ablation reduces `PupillaryBoundary`, not the distinct `InnerLimbus` factor.
+
+On the same three SAM clips, reduced pupil weight improves held-out outer
+group-RMS p95 from 3.1223/2.6741 to 3.0059/2.6462 px. However, on the matched
+Student clip it worsens the left SN-FEIDA step tail by 27.7% and reduces admitted
+directions from 74 to 57. Association preserves observed coverage and improves
+some admission counts, but has six held-out outer groups regressing by over
+1 px, including one 30.1 px regression. Neither is promoted.
+
+The test-only target replay now exports leave-one-target-out diagnostics:
+each held target and all its frames are excluded from calibration fitting.
+Optional `CALIBRATION_REPLAY_REQUIRE_DIRECTION` requires posterior admission.
+Across 52 matched target folds in three old calibration sessions, 75% pupil
+weight improves unfiltered diagnostic RMS from .094202 to .090680, but worsens
+the direction-admitted diagnostic from .082692 to .094178. The old narrow target
+layouts fail current production coverage gates; the diagnostic least-squares
+fit is not an accepted production calibration. Fixation cues are not independent
+gaze truth, and changed admission can change the frames underlying matched
+target estimates. Source windows, missing scale/labels and failures are recorded
+in the report. The broader stereo-accuracy objective remains unresolved.
+
+### Exact residual reuse and visual regression review (2026-09-13)
+
+The shared solver now reuses nominal point-to-conic residuals between arc
+selection, outlier decisions and residual assembly. The cache borrows immutable
+evidence and requires the same arc identity, mask level and all six conic
+coefficient bits. Changed geometry or evidence recomputes the residuals; a
+derivative affecting one eye can reuse the unchanged other eye's values.
+The arithmetic, summation order, sample budget, robust objective and admission
+rules are preserved. Mask-state and alternative marginalization remain active.
+
+The native probabilistic replay comparison covers 1,546 source/provider inputs:
+998 from three SAM clips, 258 each from matched SAM and Student evidence, and
+32 current diagnostic inputs. A reversed-order repeat adds 258 comparisons.
+Every serialized result matches exactly after removing only measured solver
+elapsed time, including source identity, geometry, support, posterior and
+admission. Canonical JSON hashes also match, including signed zero. Serial
+alternating benchmarks on the shared host reduce total solver time by 10.2–11.8%
+and p95 solve time by 13.1–16.0%. These are native solver timings with frozen
+model evidence, not end-to-end camera/inference latency or an accuracy gain.
+The current joint test filter passes 87 tests; 16 explicit diagnostics remain
+ignored. The SAM viewer builds successfully.
+
+The earlier 251 ms raw-cadence failure was measured by the dedicated packet
+reader before analysis, against a 250 ms limit. This optimization does not prove
+the cause of that ingress gap is fixed, and no cadence or ownership check was
+relaxed. Three subsequent normal viewer launches failed because the advertised
+camera stream endpoint refused the connection; the new build is ready but was
+not running at this report's last check.
+
+Visual inspection accompanies the numerical checks. The runtime report now
+includes `current-solve-visual-check.png` and its PDF/source receipts, showing
+an ordinary paired source and both eyes around the largest reduced-weight
+area-step regression. At Student left-eye source 4433, the 75% pupil-weight
+candidate expands and shifts the ellipse upward relative to the visible edge;
+SN-FEIDA changes from baseline 126.0 to candidate 172.2 mm², and the candidate
+uses only two of six pupil groups instead of six. At source 4434, 91 ms later,
+both return to about 110.7 mm². These difficult crops have reflections and
+occlusion, and are not human-label truth. They explain why a better aggregate
+score alone would not justify promotion. Inspect matched RAW crops, supported
+curve sections and adjacent frames between further geometry changes; retain
+ordinary cases as well as failures. Full metrics, provenance and launch logs
+are in `outputs/pupil-direction-study-20260913/README.md`.
+
+### Current Obelisk masks and visual checks (2026-09-13)
+
+`outputs/pupil-augmentation-study-20260913/README.md` distinguishes the old RGB
+Student checkpoint from the current CPU Butter Obelisk RAW16 checkpoint. Fresh
+RAW16 inference now covers all 1,679 native frames from four recent recordings,
+plus the 258-frame older comparison clip. The original source hashes, clocks,
+ROI origins and missing observations remain explicit. This is diagnostic use
+of an existing checkpoint, not training, model promotion or bootstrap proof.
+
+The shared native evaluator exports every fitted conic and the exact selected
+support points/source identities, allowing contact sheets to show the actual
+solved pupil sections. The Student/Obelisk replay exporter also retains the
+selected outer mask's original ordered outline when a complete fit is missing,
+using the existing SAM contour helper. It does not invent an ellipse or admit
+that outline as limbus. Previously the export always wrote an empty outline,
+concealing segmentation failures in rejected-fit frames. All existing exported
+fit/evidence results and all default native solves remain unchanged on the
+1,679 frames (timing and the added diagnostic outline excluded as documented).
+
+The images include unfiltered temporal middle sources, an explicitly selected
+pupil-supported subset, all ten newly admitted directions from the offline
+partial-outline trial, and both eyes around the largest reduced-weight area
+regression. Several new partial-outline fits land on sclera or the pupil edge;
+others recover plausible partial outer support. Their conditional direction
+admission does not certify anatomical localization. The partial-outline trial
+and additional pupil-path alternatives remain offline. The latter preserves
+original paths but still produces mixed area, held-out localization and target
+diagnostics on the older corpus.
+
+Repeating 75% pupil weight with current RAW16 evidence gives small mixed area
+changes and reduces admitted directions from 252 to 223 across the four recent
+recordings; contributing coverage is unchanged. It is not promoted. Current
+target cross-validation is unavailable: the three failed calibration sessions
+retain respectively 3, 0 and 0 timed target windows out of nine, and none has a
+completed accepted calibration. Missing target intervals cannot be invented.
+The study retains fixed recorded acquisition scale hints, not independent
+fresh physical scale measurements; new pupil/limbus human labels are absent.
+Matched source transitions, additional coverage and diagnostic support are
+reported separately. A stereo-accuracy improvement remains unproven.
+
+### September 13: source-image checks of pupil photometry and weighting
+
+Two additional **offline-only** experiments leave live defaults unchanged.
+`--sliding-pupil-luma` replaces the four-pixel CFA grid with overlapping native
+4×4 windows; its crop-translation photometry test passes, but the matched
+corpus/target results do not justify promotion. `--pupil-profile-footprint`
+passes fixed RAW-profile integration support through the shared evidence
+contract, preventing radial localization zigzags from increasing their own
+quadrature/mass. All measured points and existing gaps remain unchanged.
+This is a sampling-design footprint, not an observed boundary or independently
+measured scale. Both experiments are conditional diagnostics, not calibrated
+probability improvements.
+
+The four current RAW16 recordings (1,679 source frames), matched older
+RAW16/RGB/SAM replay, older SAM sequences and exact native human-label joins
+show mixed area effects and worse held-target diagnostics. The small human
+localization improvement is confined to one older frame; a large existing
+labeled error remains. A particularly bad SAM-contour agreement score looked
+better on RAW because the candidate rejected a likely eyelid/skin contour.
+Other nearly identical 2D fits changed 3D direction by over 60 degrees. These
+findings require inspecting native images and 3D solves alongside numerical
+scores, rather than treating contour agreement or constant area as accuracy.
+
+Full protocols, source hashes, commands, counts, limitations and inspected
+contact sheets are in `outputs/pupil-photometry-study-20260913/README.md` and
+`outputs/pupil-footprint-study-20260913/README.md`. The latter records 28 passing
+pupil tests, 104 passing joint tests, a passing SAM-enabled viewer build and
+exact non-timing default parity across 4,525 overlapping replay events.
+Four additional current native RAW10 targets (851/874, both eyes), with temporal
+context and no predictions, are prepared in the latest capture's
+`annotator/archive`; their canonical human output belongs in `annotator/labels`.
+
+### Completed calibration checks and visual failures (2026-09-13)
+
+Four earlier recordings from the same day have all nine completed target
+windows, unlike the latest failed attempts above. Current RAW16 CPU preview
+inference covers all 2,658 RAW frames / 1,329 stereo pairs. All 20 matched
+baseline/candidate replays completed, with exact source/RAW/freshness audits.
+The recordings include two accepted and two rejected historical calibrations;
+selection did not depend on candidate performance.
+
+Explicit display-submission visibility excludes 158 observations that a
+500 ms source-time delay alone would include while thumbnails remained visible
+or hidden submission was unconfirmed. Host arrival and successful submission
+still do not prove sensor-exposure/scanout alignment or actual fixation.
+The test-only target scorer accepts an exact clock/time/ROI/RAW allowlist;
+targets and visibility never enter native geometry.
+
+Sliding pupil sampling initially improves held-target RMS from 0.165470 to
+0.158015 on 57 common folds, but changes admitted observations. With the same
+653 accepted source observations in both arms, held-target RMS instead worsens
+0.163651 → 0.166257, and frame RMS worsens 0.152594 → 0.153292. Production-gated
+common-fold diagnostics also worsen. Only one capture supplies complete
+accepted calibration models under this evaluation. Fixed footprint, combined
+sampling/footprint and 75% pupil weight likewise do not justify promotion.
+
+Direct RAW checks reveal a closed eyelid accepted as iris/pupil support, and
+similar 2D fits whose selected 3D directions differ by over 100 degrees.
+Ordinary pupil-supported frames and both eyes of the adverse cases were
+inspected alongside their actual native 3D solves. No canonical human labels
+or independent gaze/scale truth are supplied by these images. The accuracy
+goal remains unresolved; live geometry defaults stay unchanged.
+
+The archive audit also found that the recorder discarded the camera-mount
+setting while copying scene configuration. It now preserves that setting and
+its configuration revision; historical missing modes remain unknown. Seventeen
+recording tests, the exact-source scoring regression and the SAM-enabled viewer
+build pass. The complete receipts, limitations and inspected images are in
+`outputs/pupil-completed-calibrations-20260913/README.md`.
+
+### September 13: subpixel peaks and posterior-supported retained modes
+
+`--subpixel-pupil-peaks` isolates quadratic localization within the existing
+three-sample RAW contrast bracket. It adds no tangent smoothing, peak candidates
+or projected measurements. On twelve translated synthetic blurred disks,
+localization RMS improves from 0.3521 to 0.2840 native pixels. Native corpus
+results remain mixed; this option is off by default. Moving the points also
+changes measured-polyline quadrature, so this is not a fixed-information-mass
+experiment. The separate footprint experiment remains off.
+
+Visual inspection of completed recording 0, source 1105, finds nearly unchanged
+2D curves but a roughly 99-degree gaze change under subpixel localization. The
+selected MAP is a narrow mode; most sampled conditional model mass remains near
+the other retained joint fit. The left-eye outer outline is also misplaced in
+both arms. This is a branch-selection failure case, not proof of gaze accuracy.
+
+`IntegrationConfig::select_supported_mode` is an explicit offline experiment.
+It preserves a supported MAP, otherwise considers existing optimized fits of
+the same ROI association. Every modeled eye must pass the existing angular and
+numerical support gates under the **full** importance-weighted distribution.
+There is no branch-local renormalization, posterior-mean geometry, extra fit or
+temporal observation. Alternative precision can consume additional draws within
+the existing budget. The returned fit retains its own arcs and uncertainty;
+its receipt identifies the original MAP and signed cost difference. When the
+selected fit is not MAP, `alternative_cost_margin` is negative for that lower
+cost MAP competitor. The ordinary live configuration keeps this option off.
+
+On source 1105, the combined experiment reduces the subpixel-induced gaze
+change to 0.0087/0.0099 degrees relative to baseline. Both eyes pass numerical
+admission after 1,008 estimation draws instead of 504. This local improvement
+does not generalize to a demonstrated accuracy gain:
+
+- Across four completed RAW16 calibration recordings, direction-gated
+  held-target RMS is 0.165470 baseline and 0.165751 with selection alone on
+  57 matched folds. On 671 identical admitted, thumbnail-hidden source eyes,
+  the 55-fold result is exactly unchanged. Subpixel and combined arms retain
+  the earlier target-coverage/accuracy regression.
+- Three older SAM recordings improve gated RMS from 0.082692 to 0.082029
+  under selection alone, but ungated error slightly worsens. Their narrow
+  layouts yield no production-accepted cross-validation fits.
+- Eight accepted outer fits from ten exact native human-label joins show no
+  localization improvement from selection. These are older outer-limbus labels,
+  not current RAW16 pupil labels or measured gaze truth.
+- The 1,847 identical withheld outer groups include three regressions above
+  one pixel with selection alone. The largest rises from 1.79 to 12.46 pixels
+  at SAM source 322. Its RAW overlay was inspected alongside source 1105,
+  ordinary frames, new admissions and actual 3D solves. SAM contour agreement
+  remains distinct from human localization accuracy.
+
+The complete comparison includes eight current RAW16 recordings, three model
+views of the same older clip, three older SAM sessions and the reviewed-label
+subset. Native bytes and source freshness are verified; 14,214 control events
+match the preceding evaluator except elapsed time and diagnostic hypothesis
+export. No held prediction is counted as fresh evidence. Scale hints are frozen
+acquisition support, not fresh physical measurements. Neither experiment is
+promoted. Reports and inspected contact sheets are in
+`outputs/pupil-subpixel-study-20260913/` and
+`outputs/pupil-supported-mode-study-20260913/README.md`.
+
+### September 13: inspect RAW ridges, blink neighbors and 3D branch changes
+
+Frequent visual inspection accompanies each bounded geometry experiment:
+source-matched RAW overlays, neighboring exposures and actual native 3D solves,
+including ordinary cases and measured regressions. Smooth displayed curves do
+not establish anatomical localization or gaze accuracy. The closed-eyelid false
+pupil and large 3D branch changes remain visible failures.
+
+`--pupil-search-radius=12` widens the existing RAW search from eight pixels but
+also changes its 17-sample pitch from 1 to 1.5 pixels. On 648 identical admitted
+current calibration source eyes, matched held-target RMS worsens from 0.164483
+to 0.171845 screen fractions. The older SAM gated result also worsens; eight
+accepted human-labeled outer fits do not improve. This remains offline.
+
+`--connected-pupil-width` tests measuring each peak's own connected half-height
+interval instead of including disconnected peaks elsewhere in the same scan.
+Both crossings must be observed; censored wings retain the historical band.
+Native extraction preserves every measured point and all other exported
+evidence across 33,385 arcs; 12,094 pupil bands tighten. The apparent gated
+current benefit disappears with the same 680 admitted source eyes: RMS worsens
+0.164932 to 0.165531. Older SAM gated RMS worsens 0.082692 to 0.089500.
+Source 1105 switches roughly 101/97 degrees despite similar 2D outlines; a
+different older SAM frame gains admission after a 72-degree shift. Both RAW
+overlays and actual 3D branches were inspected. The option remains off.
+
+Both studies verify 5,669 distinct native RAW sources, source freshness and
+baseline parity. SN-FEIDA changes are mixed; independent scale is frozen
+acquisition support, not a fresh physical measurement. Older outer-limbus human
+labels remain distinct from current pupil labels or independent gaze truth.
+Complete results, exact-source receipts, limitations and inspected images:
+`outputs/pupil-profile-ridge-study-20260913/README.md` and
+`outputs/pupil-connected-width-study-20260913/README.md`.
+
+### September 13: reuse and visually inspect the existing pupil detector
+
+The existing main-view chronological CPU pupil detector was replayed on the
+same 5,669 native RAW identities. Its publishable center/radii/angle served only
+as a guide for fresh stereo RAW extraction; neither its selected 21 points nor
+its rate-limited ellipse became synthetic stereo observations. This is a frozen
+outer/rough-center diagnostic with optimistically settled focus, not a replay
+of the complete live inference cadence. No production geometry changed.
+
+Forty new per-clock/per-eye native runs, two reused pilot runs and 28 joint
+evaluations complete. All 7,183 control events preserve baseline parity, and
+all contributing publication eyes pass exact-source freshness checks. On 620
+identical admitted, thumbnail-hidden current source eyes, held-target RMS
+improves 0.233272 to 0.226693 across 52 common folds. The older SAM subset
+regresses: admitted directions fall from 395/396 right/left to 231/237, available
+gated folds fall from 52 to 33, and matched gated RMS worsens 0.081501 to
+0.093721. Current recording 2 also has a large ungated regression. These
+coverage and accuracy failures prevent promotion.
+
+RAW overlays, neighboring frames and actual 3D solves were inspected before
+and after the broad replay. The candidate removes false pupil support on
+visibly closed eyelids, but the incorrect outer fit remains. Reflection-heavy
+open eyes reveal displaced search centers and unstable 3D branches despite
+similar outer outlines. In older SAM source 207, the main detector publishes
+21 points in a small ring above the reflection although none of its 63
+alternative peaks passes the existing independent polar RAW-quality gates.
+At current recording 2 source 472, the left-eye transported search origin is
+about 61 pixels from the current limbus transport, and its alternatives fall
+on the upper-left iris/limbus. Local peak quality alone does not establish
+anatomical pupil support either. These are concrete failures to address before
+sharing a published pupil guide across the stereo pipeline.
+
+Eight accepted older human-labeled outer fits remain available: six unchanged,
+one improved and one slightly worse; the existing 38.9px worst fit remains.
+Withheld outer probes include both improvements and regressions, and SN-FEIDA
+is mixed. Acquisition scale remains a frozen hint, not fresh physical scale;
+current pupil labels and independently measured gaze/depth remain unavailable.
+Complete receipts, coverage, target/label results and eleven inspected visual
+artifacts are recorded in
+`outputs/pupil-shared-detector-study-20260913/README.md`.
+
+### September 13: do not renew pursuit support from an unmeasured forecast
+
+The shared pupil-center tracker allowed an unmeasured SmoothPursuit hold to
+update its velocity and support clock from its own forecast. A regression
+demonstrates the clock advancing by 100ms without any pupil measurement.
+Velocity/support updates now require an actually assimilated measurement;
+the existing 350ms expiry and admission thresholds remain intact. Three shared
+tracker tests pass. The SAM-enabled viewer builds, and source/whitespace audits
+pass. The broader library suite has 423 passes, 17 ignored tests, six missing-
+fixture failures and one outer-boundary assertion failure reproduced in the
+earlier frozen test binary; it is not reported as green.
+
+The complete prior baseline census identifies eight affected path entries in
+three cohorts. Replaying those cohorts and an unaffected older-SAM control
+verifies 1,638 native RAW identities; all 282 control eyes remain identical.
+The fix changes 284 subsequent post-detector records and 102 published guides.
+The separate experimental use of those guides for stereo still regresses:
+on 427 identical admitted source eyes from two current recordings, held-target
+RMS worsens 0.100035 to 0.102458. The older SAM model view loses four admitted
+directions per eye. That guide integration remains disabled; this timing
+correction is not presented as the requested stereo accuracy improvement.
+
+Actual RAW neighboring frames, changed 21-ray samples, solved conic sections
+and native 3D branches were inspected. SAM source 4504 still places pupil
+support toward the upper-left limbus and admits both directions after roughly
+103/116-degree changes; its left outer outline is also misplaced. Missing
+current pupil labels and physical gaze/scale truth remain explicit. Results,
+source hashes, failing/passing regression logs and the inspected figures are in
+`outputs/pupil-pursuit-expiry-study-20260913/README.md`.
+
+### September 13: RAW component guides and artificial search boundaries
+
+A bounded four-dataset pilot replaces only an already offered pupil guide with
+the existing accepted stateless RAW component ellipse. Native RAW is sampled
+again; guide ellipses never become synthetic observations. All 2,156 source
+eyes and 8,786 contributing publication-eye records pass native-byte and
+freshness checks. Guide availability is unchanged; 263 guide ellipses differ.
+On 404 identical admitted current target-window source eyes, held-target RMS
+worsens 0.196588 to 0.201564 across 33 folds. Older SAM gated RMS also worsens
+0.082692 to 0.084133. Eight available human-reviewed outer fits remain identical.
+The guide policy is not promoted. Full receipts and limitations are in
+`outputs/pupil-component-guide-study-20260913/README.md`.
+
+Actual RAW/solved-conic sheets show a better small-pupil fit in one control,
+but an oversized pupil and roughly 75-degree native 3D branch changes in an
+older SAM frame. Detailed offline pupil diagnostics now expose the actual
+component contour, retained and excluded native points, the artificial search
+domain, and contacts where RAW darkness continues beyond that domain. These
+are censoring diagnostics, not anatomical labels or a production fitting
+policy change. They support visual investigation before further geometry edits.
+
+The native overlays confirm that retained pupil points can follow the artificial
+search rim while RAW darkness continues outside it. The offline pupil-refit
+option `--censor-search-boundary` excludes samples whose one-native-pixel
+neighborhood crosses that domain before RANSAC. The shared ordered-contour
+fitter preserves gaps and never reinstates excluded samples. Two regressions
+cover false curved search rims and genuine support separated by censored gaps;
+172 relevant geometry/pupil tests pass (16 corpus tests remain ignored).
+
+Fifteen default-path diagnostic cases preserve exact parity. Twenty-two native
+candidate runs verify 2,156 RAW source eyes and 74,818 retained samples inside
+the observation domain. The candidate removes 14 component fits and newly
+accepts four; the good control cohort is unchanged. Five downstream joint runs
+complete, including held-out outer probes. Actual conic and native 3D sheets
+show the earlier 75- and 101-degree flips returning to baseline, but a newly
+selected iris fragment produces roughly 101/100-degree flips at source 1117
+and persists at the next exposure. Outer localization is visibly wrong there.
+
+This still does not justify production promotion: on 406 identical admitted
+current target-window source eyes, 33-fold RMS worsens 0.196588 to 0.201564
+against the original stereo baseline. Older SAM gated RMS worsens 0.082692 to
+0.084360, slightly worse than the uncensored component-guide experiment too.
+Human-reviewed outer fits are unchanged and area stability remains mixed.
+The censored component/guide policy stays offline. Exact-source receipts,
+neighboring RAW overlays and the three-arm native 3D comparison are in
+`outputs/pupil-search-boundary-study-20260913/README.md`.
+
+### September 13: condition existing pupil support before completing a guide
+
+Native RAW inspection distinguishes a false guide completed from a short iris
+fragment from a well-supported small pupil. Directly enabling the existing
+limbus arc-constrained RANSAC rejects both. An offline audit instead checks the
+existing hypothesis using only its retained observations, the same contour
+tangents and the existing half-circumference/five-parameter conditioning gates.
+A regression prevents discarded contour points from being reinstated as audit
+support. Default and search-censored paths retain exact parity on 15 cases each.
+
+The bounded guide-veto pilot preserves original guide availability and the
+existing RAW alignment, replacing 156 guides across 2,156 source eyes. Actual
+RAW, neighboring conic sections and native 3D views confirm removal of the new
+roughly 100-degree flips at sources 1117/1118. No candidate direction differs
+from the original baseline by over 20 degrees in the four pilot datasets.
+This is still insufficient for promotion: matched current calibration RMS on
+407 identical admitted target-window source eyes worsens 0.196588 to 0.201176
+(33 folds), while older SAM gated RMS improves 0.082692 to 0.081261 (52 folds;
+no production-valid affine fits). Area stability remains mixed; eight available
+human-reviewed outer fits are unchanged, including the existing 38.9px failure.
+Current pupil labels and independent gaze/scale truth remain absent.
+
+`--constrain-pupil-arcs` and its retained-support audit are offline diagnostics;
+live pupil policy remains unchanged. Seventy relevant geometry/pupil tests pass
+and the SAM-enabled viewer builds. The full suite is not claimed green.
+Reproducible inputs, numerical results and inspected figures are recorded in
+`outputs/pupil-arc-conditioning-study-20260913/README.md`.
+
+### September 13: independent observed pupil shape and expanded visual checks
+
+The clear source-195 RIGHT pupil has retained contour/tangent support but fails
+the limbus-relative aspect check (1.6677 versus 1.65). The offline
+`--independent-pupil-shape` diagnostic removes only that relative aspect check;
+native aspect, finite size, center, containment, RAW support and search-boundary
+censoring remain. Existing retained position/tangent conditioning qualifies the
+guide without directly constraining RANSAC. Live defaults remain unchanged.
+Twenty baseline and twenty censored native cases retain exact parity against
+the previous frozen binary. Thirteen pupil tests pass and the SAM viewer builds.
+
+The frozen candidate was expanded from four pilot datasets to all thirteen
+datasets in the connected-width manifest: 6,185 source/provider eye records,
+5,669 distinct RAW records, and 373 changed guides with original availability
+preserved. The same RAW through SAM, RGB and Obelisk is not independent corpus
+evidence. All source/publication, native-byte and unchanged-input checks pass.
+On four completed calibration sequences, direction-gated diagnostic RMS improves
+0.165470 to 0.163085 across 57 matched folds, but RMS on 675 identical admitted
+target-window source eyes **worsens** 0.161680 to 0.162233. Older SAM gated RMS
+improves 0.082692 to 0.076675 across 52 folds, with no production-valid affine
+fits. Eight available older human-reviewed outer fits remain unchanged;
+SN-FEIDA stability remains mixed and current pupil truth is missing.
+
+Actual RAW, native conic sections, neighboring frames, same-exposure provider
+views and native 3D solves were inspected between implementation steps. The
+RGB source-4450 LEFT guide moves onto a small patch above a reflection; the
+outer fit also moves, and roughly 51/53-degree direction changes become admitted.
+SAM and Obelisk do not change on the identical RAW. Current source-1024 newly
+admits roughly 67/63-degree changes, and completed source-1969 loses both
+directions. A better-looking pupil at older SAM source347 still worsens an
+identical held-out outer-probe group by 18px. These are unresolved geometry and
+boundary-identity failures, not calibrated evidence of the correct gaze.
+
+The guide policy is not promoted. Shape conditioning checks whether retained
+points constrain an ellipse; it does not establish that those points belong
+to the pupil. Detailed provenance, all per-dataset results, calibration-window
+controls and inspected figures are in
+`outputs/pupil-calibration-coupling-study-20260913/README.md`.
+
+### September 13: exact projected-conic distances and visual counterexamples
+
+An explicit offline metric prepares each projected ellipse and computes signed
+Euclidean nearest distance, using analytic circle/axis cases and a safeguarded
+Newton solve elsewhere. The metric stays with the projected conic throughout
+fitting, posterior integration, uncertainty and fitted residual reporting;
+cached arc costs distinguish the metric. Live defaults retain Sampson distance.
+Three independent numerical/cache controls pass, as do 106 conic tests (sixteen
+explicit corpus tests ignored). The full suite is not claimed green.
+
+The unchanged primary candidate and default controls cover thirteen frozen
+datasets: 6,185 source/provider eye records and 5,669 distinct RAW records.
+Default outputs preserve exact parity for 7,183 events, excluding elapsed time
+and the added hypothesis diagnostic. On four completed calibrations, gated
+target RMS improves 0.165470 to 0.161009, but identical admitted target sources
+give **0.191320 to 0.196579**, worse by 2.75% across 55 folds. The intersection
+contains 661 target-window eye records and reduces the original 57 folds to 55.
+Older SAM gated RMS also worsens, 0.082692 to 0.086029. Confidence remains a
+conditional model diagnostic, not calibrated gaze accuracy.
+
+All 13,590 identical withheld outer probes are fingerprint-checked and scored
+with an independent quartic nearest-point calculation: five groups improve by
+over 1px and eleven worsen. Its p95 changes 2.882721 to 2.946404px. The native
+radial validation metric also remains common across arms; it is separate from
+the fitted residual metric. These are detector-consistency checks, not human
+anatomical truth. Eight older human outer fits change only slightly. SN-FEIDA
+adjacent log-change p95 improves in eleven channels and worsens in twelve;
+three lack transitions, and fresh contribution counts are unchanged.
+
+Twenty-five actual RAW/solver figures were inspected between bounded work
+steps, including neighboring exposures, native 3D solves and withheld-probe
+overlays. Smooth and similar image curves still hide 74–110 degree branch
+changes; reflections and isolated oversized outer fits remain unresolved.
+At recent/source614 the candidate pupil looks more plausible while its outer
+model moves away from an upper cluster of detector observations. At completed
+source1991, only 0.140537 degrees of change appears among regressing target-5
+sources, exposing calibration sensitivity as well as branch ambiguity.
+
+The metric is not promoted. Same-binary diagnostic replay time is a median
+1.95 times baseline, not a measurement of live latency. The SAM-enabled viewer
+builds, but normal startup cannot connect to the camera service. Exact source
+identities, inspected figures, full results and current limitations are in
+`outputs/pupil-euclidean-distance-study-20260913/README.md`.
+
+### Whole-pupil path identity: visual audit before further coupling
+
+The shared RAW measurement loop now supports an explicit ignored native audit
+of the existing whole-pupil candidates and their independently selected sectors.
+Extraction preserves exact order, points, groups, kinds and normal bands against
+the previous frozen evaluator: 41,443 arcs / 331,109 points across both extraction
+arms and 2,338 source/provider eye records from four frozen datasets. All native
+RAW bytes are hash-checked. Twenty-one shared sampling tests pass.
+
+Of 1,660 contributing eyes with generated whole paths, 302 use sectors sharing
+no single generated path; 243 of those directions are admitted. Most conflicts
+differ from the closest whole path at only one or two measured points, with
+median maximum jumps of 7–9 native pixels. This is detector-path compatibility,
+not proof of an anatomical error. Only four of forty native eye-normal changes
+above twenty degrees in the matched baseline/path controls have such a conflict.
+
+Eighteen actual source-checked figures were inspected between bounded steps,
+including enlarged path candidates, neighboring exposures and native 3D solves.
+Jagged points remain within the complete paths themselves. Reflection-adjacent
+false support and an admitted closed-eyelid pupil fit remain; similar 2D curves
+still hide 100–110 degree branch changes. The evidence does not justify a larger
+coupled-path solver refactor or promotion of the existing path policy. No new
+gaze accuracy, human localization or SN-FEIDA improvement is claimed. Commands,
+source identities, memberships and visual observations are preserved in
+`outputs/pupil-whole-path-study-20260913/README.md`.
+
+### Pupil appearance: current-read influence and a bounded rejection pilot
+
+Native current-read ablations on five source-matched examples confirm that a
+false pupil can make a closed eyelid's direction appear supported. Removing it
+also withholds direction in a clear-eye control; deleting all pupil evidence
+is not a general fix. These controls keep the preceding native history and
+scene seeds fixed. Their reconstructed factor costs agree within 5.7e-14.
+
+The shared RAW adapter has an explicit, default-off
+`--reject-weak-pupil-core` evaluator experiment. It requires 48 complete rays
+out of 64, each with two original-guide interior and two surround probes below
+the existing tissue ceiling. A median relative contrast below 5% suppresses
+that guide's pupil arcs and hint. Incomplete/glint-censored rays are unknown.
+The quorum and contrast threshold are fixed engineering assumptions, not
+calibrated probabilities or a pupil/eyelid classifier. Retained observations
+and all outer observations are unchanged.
+
+The pilot covers completed-0, completed-3, recent and sam: 2,338 source/provider
+eye records with verified RAW bytes. Fifty guides lose 351 pupil arcs; 16,515
+other arcs remain exact. Five default control histories, including held-out
+replay, preserve parity across 3,336 events. Twenty-three shared extraction
+tests pass. On 414 identical admitted target-window eye records, current
+calibration RMS changes 0.202084 to 0.202206 across 33 matched folds. Older
+gated RMS is unchanged; ungated diagnostic RMS worsens 13.0% on 51 matched
+folds and loses one evaluable fold. These older fits pass no production gates.
+Across 13,590 identical withheld outer probes, one group improves by over 1px
+and none worsen by that amount, but Euclidean p95 remains 2.882721px.
+Independent-recorded-scale SN-FEIDA uses 1,841 common fresh transitions:
+p95 improves in one channel, worsens in three and is unchanged in eight.
+This is no demonstrated corpus-wide accuracy improvement.
+
+Thirteen candidate figures were actually inspected between work steps,
+including adjacent exposures, native 3D solves and the exact appearance
+probes. Closed-eyelid false pupil support disappears while wrong outer fits
+remain. Open-eye source161 exposes an undersized guide whose surround probes
+still lie inside the real pupil; low guide-relative contrast does not establish
+absence. Removing one eye's pupil also changes the other eye's admission and
+can switch 75–123 degree branches with similar 2D outlines. The experiment is
+not promoted. No new human pupil localization truth or measured 3D gaze is
+available for these examples. Details, counterfactuals and inspected images:
+`outputs/pupil-current-influence-study-20260913/README.md`.
+
+### Pupil guide location: positional support does not establish boundary identity
+
+The native component fitter locates visible pupil contours at completed-3,
+source 161, but its historical 48-sample floor discards 47 right / 40 left
+retained points. The existing positional conditioning predicate accepts them;
+existing tangent conditioning does not. An explicit offline
+`--pupil-position-support` experiment replaces the count floor with that shared
+positional predicate, preserving its bounds and all later geometry, containment,
+tissue-ceiling and RAW gates. Default component fitting is unchanged. A contour
+that constrains an ellipse still need not belong to the pupil.
+
+The planned four-cohort pilot covers 2,156 source eyes and verified RAW byte
+ranges, with 407 offered guides replaced and 4,037 common non-pupil observation
+groups unchanged. The original guide baseline and preceding count-floor component
+control remain separate arms. On 396 identical admitted current target-window
+eye records, 33-fold RMS changes 0.195570 to 0.199883, worse by 2.2%. The accepted
+calibration improves 0.097905 to 0.095271, while the failed calibration worsens
+0.269523 to 0.277498. All 16 production-valid folds come from the accepted
+calibration. Older SAM gated RMS worsens 0.082692 to 0.093175 on 52 matched folds;
+none pass production affine gates. This is not a consistent accuracy improvement.
+
+Independent Euclidean scoring of 13,590 identical held-out outer points gives
+p95 2.882721 to 2.868559px, with ten group improvements and eight regressions
+over 1px. One group worsens 2.017527 to 18.630619px. Eight available older human
+outer-label fits stay identical, including the existing 38.906px failure. On
+1,758 identical fresh SN-FEIDA transitions, channel p95 improves in two channels,
+worsens in five and is unchanged in three. Current pupil labels and measured
+3D gaze truth are still missing.
+
+Sixteen actual RAW, neighboring-conic and native 3D figures were inspected
+between bounded steps. A recovered pupil location leaves wrong outer geometry
+and rejected visible pupil points. At sources 1279–1282, nearly unchanged RAW
+alternates between a small reflection-adjacent guide and a larger guide. Source
+1281 changes native normals by 94.22/85.51 degrees while both arms admit both
+directions. Similar image fits do not certify the selected 3D branch.
+
+The policy is not promoted or expanded to thirteen cohorts. Fourteen pupil and
+106 conic tests pass; sixteen explicit corpus tests remain ignored. Two native
+default replays preserve all 286 diagnostic results after resolving relative
+versus absolute input-path spelling. The SAM-enabled viewer builds; no live
+camera performance claim is made. The initial synthetic-fixture assertion and
+audit-script filename failures are retained with their corrections. Protocols,
+full numerical results, binary/input hashes and inspected figures are in
+`outputs/pupil-guide-location-study-20260913/README.md`.

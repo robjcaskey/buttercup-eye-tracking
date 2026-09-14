@@ -249,6 +249,8 @@ mod tests {
             Some("paused: waiting for global gaze prompt"));
         frame.gaze_authority_sam_prompt_generation = Some(1);
         state.second_roi_enabled = true;
+        assert_eq!(GlobalGazePolicy::from_shared(&state).frame_error(&frame), None);
+        state.stereo_solver_enabled = true;
         assert_eq!(GlobalGazePolicy::from_shared(&state).frame_error(&frame),
             Some("paused: waiting for global stereo setting"));
         frame.joint_gaze_active = true;
@@ -265,6 +267,8 @@ mod tests {
         let mut frame = crate::tests::control_eye_frame(1);
         frame.surface_gaze = Some(surface());
         let calibration = crate::CalibratedDisplay {
+            gaze_affine_input: crate::GazeAffineInput::ProjectedDirection,
+            restored: false,
             eye: 0,
             segmentation_mode: frame.segmentation_mode,
             sam_prompt_generation: None,
@@ -403,11 +407,77 @@ mod tests {
     }
 
     #[test]
+    fn saved_calibration_retains_perspective_basis_and_migrates_legacy_coordinates() {
+        let original = crate::CalibratedDisplay {
+            restored: false, eye: 0, segmentation_mode: crate::SegmentationMode::EyeStudent,
+            sam_prompt_generation: None, gaze_authority_generation: 0, sign_epoch: 0,
+            plane: crate::VirtualDisplayPlane::development_default(),
+            gaze_affine: crate::GazeAffine { x: [1.0,0.0,0.0], y: [0.0,1.0,0.0] },
+            gaze_affine_input: crate::GazeAffineInput::DisplayIntersection,
+        };
+        let ray = crate::RelativeGazeVector::from_projected(-0.1,-0.5).unwrap();
+        let restored = crate::CalibratedDisplay::from_json(&original.json()).unwrap();
+        assert_eq!(restored.gaze_affine_input, original.gaze_affine_input);
+        assert_eq!(restored.target(ray), original.plane.target(ray));
+        let mut legacy = original.json();
+        legacy["schema"] = serde_json::json!("buttercup-gaze-calibration-v1");
+        legacy["gaze_affine"].as_object_mut().unwrap().remove("input");
+        let restored = crate::CalibratedDisplay::from_json(&legacy).unwrap();
+        assert_eq!(restored.gaze_affine_input, crate::GazeAffineInput::ProjectedDirection);
+        assert_eq!(restored.target(ray), Some(ray.projected()));
+        for input in [serde_json::Value::Null, serde_json::json!("unknown-space")] {
+            let mut invalid = original.json(); invalid["gaze_affine"]["input"] = input;
+            assert!(crate::CalibratedDisplay::from_json(&invalid).is_err());
+        }
+        let mut backward = original;
+        backward.plane.center_inches = [0.0,0.0,-24.0];
+        backward.plane.right_axis = [1.0,0.0,0.0];
+        backward.plane.down_axis = [0.0,1.0,0.0];
+        assert_eq!(backward.target(ray), None);
+    }
+
+    #[test]
+    fn saved_gaze_calibration_reloads_without_session_generation_or_prompt_gates() {
+        let mut frame=crate::tests::control_eye_frame(1);
+        frame.surface_gaze=Some(surface());
+        let original=crate::CalibratedDisplay {restored:false,eye:0,
+            gaze_affine_input: crate::GazeAffineInput::ProjectedDirection,
+            segmentation_mode:frame.segmentation_mode,sam_prompt_generation:Some(7),
+            gaze_authority_generation:40,sign_epoch:7,
+            plane:VirtualDisplayPlane::development_default(),
+            gaze_affine:crate::GazeAffine{x:[1.0,0.1,0.4],y:[0.2,1.0,0.6]}};
+        let stamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path=std::path::PathBuf::from(format!("outputs/settings-tests/gaze-{}-{stamp}.json",std::process::id()));
+        original.save(&path).unwrap();
+        let restored=crate::CalibratedDisplay::load(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        for (actual,expected) in restored.plane.center_inches.into_iter()
+            .chain(restored.plane.right_axis).chain(restored.plane.down_axis)
+            .chain([restored.plane.width_inches,restored.plane.height_inches])
+            .zip(original.plane.center_inches.into_iter().chain(original.plane.right_axis)
+                .chain(original.plane.down_axis).chain([original.plane.width_inches,original.plane.height_inches])) {
+            assert!((actual-expected).abs()<1e-12);
+        }
+        assert_eq!(restored.gaze_affine,original.gaze_affine);
+        frame.gaze_authority_generation=900;
+        frame.gaze_authority_sam_prompt_generation=Some(100);
+        assert!(original.for_frame(0,Some(&frame)).is_none());
+        assert!(restored.for_frame(0,Some(&frame)).is_some());
+        assert!(restored.for_frame(1,Some(&frame)).is_none());
+        frame.surface_gaze.as_mut().unwrap().sign_resolved=false;
+        assert!(restored.for_frame(0,Some(&frame)).is_none());
+        let mut bad=original.json();bad["gaze_affine"]["screen_x"]=serde_json::json!([1,2]);
+        assert!(crate::CalibratedDisplay::from_json(&bad).is_err());
+    }
+
+    #[test]
     fn pointer_reuses_monitor_affine_and_calibration_basis_checks() {
         let mut frame = crate::tests::control_eye_frame(1);
         frame.surface_gaze = Some(surface());
         let plane = crate::VirtualDisplayPlane::development_default();
         let cal = crate::CalibratedDisplay {
+            gaze_affine_input: crate::GazeAffineInput::ProjectedDirection,
+            restored: false,
             eye: 0,
             segmentation_mode: frame.segmentation_mode,
             sam_prompt_generation: frame.gaze_authority_sam_prompt_generation,
@@ -460,6 +530,8 @@ mod tests {
         frame.gaze_authority_sam_prompt_generation = Some(3);
         frame.virtual_contact_surface_gaze = Some(surface());
         let cal = crate::CalibratedDisplay {
+            gaze_affine_input: crate::GazeAffineInput::ProjectedDirection,
+            restored: false,
             eye: 0,
             segmentation_mode: SegmentationMode::Sam31,
             sam_prompt_generation: Some(3),

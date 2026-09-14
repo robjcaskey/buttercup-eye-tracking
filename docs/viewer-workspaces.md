@@ -68,10 +68,26 @@ compositing and source-aligned eye-overlay helpers are reused. The new view
 layer does not claim a stereo solve, fresh observations from held data, or an
 improvement to SN-FEIDA/localization accuracy.
 
+## Runtime limbus refinement
+
+**Shift+F** or **LIMBUS ON/OFF** toggles experimental shared limbus refinement.
+Plain **F** continues to select a view. This changes the shared SAM/Butter Obelisk
+geometry stage before either monocular or stereo solving; it is independent of
+preview selection. Default remains off. `LIMBUS ON|OFF|STATUS` is the equivalent
+control-socket interface. The startup environment/CLI setting supplies the initial
+selection; toggling requires no restart and does not promote the model as a default.
+
+Each submitted source snapshots the mode (both eyes of a paired request use one
+snapshot). Changes invalidate pending geometry and gaze history, including a rapid
+off/on cycle between RAW callbacks. The existing source RAW, pupil consistency and
+bounded-correction gates still apply. Missing/rejected refinement retains baseline
+geometry with the existing immutable attempt diagnostics; it is not a successful
+correction. The model remains CPU-only and experimental, without a cold-bootstrap
+proof. Rendering a comparison cannot enable refinement.
+
 ## Stereo solver inspection (September 12)
 
-For **SAM3.1** and **Eye Student**, click **STEREO** in the view toolbar, or use
-**Tab** to reach Linked Views and **F** to select **Stereo solver** (the second
+For **SAM3.1** and **Butter Obelisk**, use **Tab** to reach Linked Views and **F** to select **Stereo solver** (the second
 linked view). The MODEL inspector also has **Open stereo solver**. The control
 socket accepts `VIEW STEREO`; `VIEW STATUS` includes `stereo_solver` diagnostics.
 Changing detector to a non-mask method returns to the compatible contact view.
@@ -84,6 +100,12 @@ dashed white is the joint reconstruction when its exact sources match. RAW
 remains available when no limbus fit exists. **V** retains the normal image
 appearance/inheritance controls.
 
+Both stereo panels show **IPD EST** in millimeters when both eyes contribute to a
+current source-matched publication; otherwise the value is `--`. This is the 3D
+separation of the solved iris centers, a proxy for IPD under uncertain metric scale
+priors, not an independent measurement of pupil-center spacing. The control report
+includes `ipd_estimate_mm` and its basis.
+
 The stereo VIEW inspector also reports each eye's sampled model mass within 15 degrees
 of the chosen ray, with approximate numerical error in percentage points
 (two standard errors). This describes sampling precision under the current
@@ -92,11 +114,23 @@ were found. It belongs to the same fresh publication as the displayed spread;
 stale or mismatched source frames cannot retain it. This diagnostic does not
 change gaze admission.
 
-The **3 Enable/Disable stereo** button calls the same global second-ROI action
-as the existing **3** hotkey. Browsing the view never enables analysis or changes
-the detector, calibration, focus reference, or preview defaults. Enabling the
-second eye uses the already existing source-aligned joint solver and its normal
-gaze-authority invalidation. The backend now computes a conditional gaze
+**Shift+3** or **STEREO ON/OFF** in the toolbar toggles the solver independently
+of **G** (detector) and **F** (view/subview). Both eyes can run monocular analysis:
+**3** still controls second-ROI processing. Enabling stereo enables both ROIs;
+disabling stereo leaves both enabled. Disabling the second ROI also disables
+stereo. `STEREO ON|OFF|STATUS` provides the same control through the socket.
+Switching solvers invalidates stale gaze output and calibration source eligibility.
+Browsing a diagnostic view does not select a solver or change the detector.
+
+A compact **Stereo scene** appears beside normal ROI/linked views while stereo
+is enabled. It shows the source-matched candidate eye centers, fixation rays,
+short surface normals and camera in an oblique metric projection. Unresolved
+solutions remain diagnostics, not accepted gaze. Click the panel to open the
+full stereo inspection view. It is absent from the global sensor view, object
+search, and fullscreen calibration. F refinement comparisons may display a
+candidate rim, but their stereo contact uses the shared solved surface.
+
+The backend now computes a conditional gaze
 distribution and uses its angular support for direction admission. The source
 conics and joint MAP geometry retain their established fit. Training and model
 preprocessing are separate from this mode.
@@ -286,20 +320,19 @@ The same pose is the built-in fallback if the file is absent. Rotation is saved
 as orthonormal axes, preserving pitch/yaw/roll without Euler-angle ambiguity.
 The decorative wireframe viewing orbit is not the monitor's physical rotation.
 
-An accepted recalibration overrides this pose **for the current session**.
-Leaving M retains it, including when a changed gaze binding later invalidates
-the affine cursor map. It does not overwrite the saved startup default.
-After evaluating the result in the normal viewer, optionally click
-**SAVE MONITOR LOCATION** in the VIEW inspector or call `MONITOR SAVE` on the
-existing control socket. `MONITOR STATUS` reports saved and session poses,
-the path, and whether the candidate is unsaved. There is no mandatory save
-prompt, immediate confirmation, or automatic promotion of new calibrations.
+An accepted M calibration saves its cursor mapping to
+`outputs/settings/gaze-calibration.json` and saves the offered monitor pose.
+The mapping reloads at startup; pressing M replaces it after a successful new
+calibration. Its input coordinate space is persisted with the coefficients.
+Monitor pose controls remain separately available through **SAVE MONITOR
+LOCATION** in the VIEW inspector or `MONITOR SAVE` on the existing control
+socket. `MONITOR STATUS` reports saved and session poses, the path, and whether
+an offered candidate is unsaved.
 
-Saving validates the physical pose and atomically replaces the settings file.
-It never persists an eye's affine, provider generation, sign epoch, or a claim
-that gaze is calibrated in a new session. A valid session calibration still
-uses its affine and physical plane; otherwise the cursor intersects the session
-or saved physical pose. The status labels distinguish these cases. These are
+The separate monitor-save operation validates the physical pose and atomically
+replaces the monitor settings file; it does not replace the eye's saved affine.
+A loaded or newly accepted eye calibration uses its affine and physical plane;
+otherwise the cursor intersects the session or saved physical pose. The status labels distinguish these cases. These are
 model estimates, not independently measured anatomical/display geometry.
 
 ## Twenty-target accuracy check
@@ -454,3 +487,110 @@ this is host-render timing, not measured exposure or scan-out. It permits
 sorting recorded presentations by lighting condition and reconstructing the
 pattern phase alongside the existing presentation timestamps. No separate
 recording subsystem or training material is created.
+
+## Windowed J reticle coordinates
+
+The J reticle uses the calibrated monitor prediction, converted into the client
+window's desktop rectangle. Resizing or tiling the window does not rescale the
+monitor into it. Predictions outside the client remain available to recording
+and desktop gaze consumers, but are not drawn at a false clamped window edge.
+
+On Sway, a bounded asynchronous read-only IPC query supplies the logical output
+and client rectangles, including borders and fractional output scaling. Rendering
+and camera ingest do not wait for IPC. Resized, missing or stale geometry hides
+the reticle until the next matching snapshot; fullscreen mapping stays direct.
+Native desktop window positions are used where the windowing backend supplies
+them. Unsupported windowed compositors no longer assume a fullscreen origin.
+Recording metadata distinguishes monitor predictions from window-local drawing
+and includes the transform. Existing monitor calibration/solver math is unchanged.
+
+## Automatic gaze calibration save/reload
+
+An accepted M calibration automatically saves its monitor plane and six affine
+coefficients to `outputs/settings/gaze-calibration.json`, atomically replacing the
+previous accepted result. Startup reloads it if present and selects its reference
+eye (enabling that ROI). No mandatory validation targets or repeat calibration
+are required. Run M again when the mapping is inaccurate or the camera has moved.
+A cancelled, refused, or failed M attempt preserves the previous saved mapping.
+The system mouse cursor is hidden in calibration and accuracy screens and returns
+when the normal viewer resumes.
+
+Restored mappings retain their training metadata but do not depend on old
+process-local authority or prompt-generation numbers. Existing same-eye/detector
+routing and current-source/resolved-gaze requirements still apply. Reloading the
+mapping does not turn held or unresolved geometry into fresh tracking evidence.
+The independent monitor-location save remains available for the physical pose.
+
+## Camera mounting assumption trial
+
+**F8** cycles **Flexible → Below eyes → Above eyes → Flexible** without key-repeat
+cycling. The Selection panel also has a button, and the inspector shows the
+current assumption. Each successful change is atomically saved to
+`outputs/settings/camera-mount.json` and restored at startup. A missing setting
+starts Flexible. `CAMERA MOUNT FLEXIBLE|BELOW|ABOVE|NEXT|STATUS` exposes the same
+setting through the viewer control socket.
+
+This is an upright, screen-facing shortcut, not a measured camera pose. Below
+favours a screen above the camera optical axis (sensor-up normal); Above favours
+sensor-down. Physical camera height alone does not imply this gaze direction:
+roll, pitch, looking elsewhere, or a different screen arrangement can make the
+assumption wrong. Flexible retains the existing evidence-based sign selection.
+
+Monocular geometry selects a whole antipodal normal after four fresh source
+observations; duplicate/held frames cannot vote. Absolute vertical normal
+component at or below 0.05 remains unresolved under this assumption. Selection
+is labelled `mounting-assumption`, including during calibration acquisition;
+it is conditional permission to use the chosen sign, not independent pupil or
+motion evidence. Switching modes clears sign history and invalidates current
+output settings. All normal gaze consumers use the shared result.
+
+Stereo considers the existing bounded set of optimized hypotheses and selects
+a compatible candidate for both contributing eyes. It never flips a fitted
+normal after solving and never upgrades posterior confidence. No compatible
+candidate produces an unavailable result; stricter stereo dropouts are possible.
+Recordings include the active mounting assumption. Limbus fitting and area
+estimation do not change merely because a monocular sign is selected.
+
+M calibration uses a nine-point grid spanning 10%–90% of the visible screen in
+both dimensions, including the center. The 10% edge margin keeps the reticle
+visible; target rendering, recorded coordinates and fit coverage checks use the
+same layout. Existing saved calibrations still reload; run M to fit the wider grid.
+
+The wider M grid holds each target for at least 2.5 seconds, retaining the latest
+12 fresh samples and the existing stability/fit acceptance checks. Routine
+automatic exposure adjustments and focus/exposure status polling run through a
+single bounded camera-maintenance worker. Slow control responses cannot block
+RAW ingest; no stale adjustment backlog is queued. All camera sockets still use
+the mandatory cooperation boundary, and the 350 ms RAW limit remains in force.
+
+The F cycle includes **STEREO SEGMENTS / FITTING SUPPORT** for SAM3.1 and Butter Obelisk, in both preview and linked views. The stereo page also offers a SEGMENTS layer. It draws smooth sections of the selected solver conic on its exact inference-source RAW pixels, with separate dots at the unchanged bounded residual samples. Crosses mark rejected samples; rejected evidence is never drawn onto the fitted conic. Alternating colors and numbered callouts distinguish segments. The curves are model output, not smoothed or substituted observations; the UI does not refit anything or change gaze authority. Callout percentages and the eye total divide accepted evidence weights by the sum across both eyes. They are contour-support shares, not causal gaze influence or calibrated probabilities. Viewing this layer does not enable stereo automatically; Shift+3 remains the independent solver toggle.
+
+Recorded `joint_conics.arcs` now retain `points_roi_px`, `arc_index`, `mask_level`, and a full source key. Points include the selected mask-level displacement and remain available for rejected groups. The existing source-projected-conic records provide ROI origins and dimensions. Older archives cannot recover exact segment pins from their full fitted ellipses alone.
+
+Live segment callouts reserve their position, number and color by boundary kind and recorded evidence-group ID within each detector/source-clock context. These are diagnostic group IDs, not claims of tracked anatomical identity. Percentages refresh at most four times per second from advancing sources. A missing segment retains only its label for up to 350 ms with `H`; afterward its reserved slot shows `--`. Old segments and leader lines are never held. Callout storage is bounded to 20 slots per eye and resets on detector, prompt, dimensions or source-clock changes.
+
+
+## Wide-field M calibration mapping
+
+M still collects nine source-bound fixation clusters over 80% of the visible
+screen. It first fits the metric display plane. A supported historical affine
+on projected unit-direction XY keeps its existing behavior. When that linear
+map cannot explain the wider, oblique field, calibration projects the ray onto
+the accepted display plane and fits a small affine correction in screen UV.
+Both forms retain the existing center/three-corner coverage, seven-target
+minimum, residual, affine-conditioning and shared-support/correction limits.
+The plane and its correction use the same data; their agreement is a consistency
+check, not independent validation or a calibrated confidence probability.
+
+`GazeAffineInput::target` is shared by completed calibration, the viewer cursor,
+accuracy checks and desktop mouse/focus output. Recording metadata includes the
+affine input space. New saved mappings use `buttercup-gaze-calibration-v2` and
+require `gaze_affine.input`; v1 files retain projected-direction coordinates.
+Missing or unknown input spaces in v2 are rejected instead of reinterpreting
+coefficients. A ray without a forward monitor intersection remains unavailable.
+
+The September 13 diagnostic uses six completed sessions from the current live
+run, including one accepted session, three 2D-affine failures and two display
+pose failures. Runtime reports and source-matched RAW reviews are under
+`outputs/calibration-affine-20260913`. Centroid fit residuals are not held-out
+accuracy; leave-one-target-out reports keep both failed folds and outliers.

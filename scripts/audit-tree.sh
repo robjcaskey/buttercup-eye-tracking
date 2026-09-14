@@ -72,6 +72,7 @@ mapfile -t unexpected_files < <(
       ./src/limbus_refiner_train.rs \
       ./src/limbus_refiner_view.rs \
       ./src/limbus_refinement.rs \
+      ./src/eye_evidence_stage.rs \
       ./src/refinement_target_report.rs \
       ./src/display_pose_wireframe.rs \
       ./src/monitor_location.rs \
@@ -114,6 +115,7 @@ mapfile -t unexpected_files < <(
       ./src/eye_scene_model.rs \
       ./src/eye_scene_model/limbus_scale.rs \
       ./src/eye_scene_model/binocular_pose.rs \
+      ./src/eye_scene_model/camera_mount.rs \
       ./src/eye_scene_model/pupil_center.rs \
       ./src/eye_scene_model/pupil_projection.rs \
       ./src/eye_scene_model/pupil_size.rs \

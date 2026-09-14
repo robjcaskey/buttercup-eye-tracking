@@ -229,6 +229,7 @@ pub(crate) enum SurfaceSignEvidence {
     MotionWindow,
     KinematicCorrection,
     JointConics,
+    MountingAssumption,
 }
 
 impl SurfaceSignEvidence {
@@ -240,12 +241,16 @@ impl SurfaceSignEvidence {
             Self::MotionWindow => "motion-window",
             Self::KinematicCorrection => "kinematic-correction",
             Self::JointConics => "joint-conics",
+            Self::MountingAssumption => "mounting-assumption",
         }
     }
     pub(crate) fn sustained_acquisition_support(self) -> bool {
-        matches!(self, Self::PupilAnchor | Self::MotionWindow | Self::JointConics)
+        matches!(self, Self::PupilAnchor | Self::MotionWindow | Self::JointConics | Self::MountingAssumption)
     }
 }
+
+mod camera_mount;
+pub(crate) use camera_mount::CameraMount;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SurfaceSignDiagnostics {
@@ -274,6 +279,9 @@ pub(crate) enum SignAcquisitionPolicy {
 
 #[derive(Debug, Default)]
 pub(crate) struct SurfaceGazeTracker {
+    pub(crate) camera_mount: CameraMount,
+    pub(crate) mount_vote: Option<usize>,
+    pub(crate) mount_votes: u8,
     pub(crate) acquisition_policy: SignAcquisitionPolicy,
     pub(crate) reliable_motion_observations: u16,
     pub(crate) sign_evidence: SurfaceSignEvidence,
@@ -559,6 +567,8 @@ impl SurfaceGazeTracker {
     pub(crate) fn clear_floating_point(&mut self) {
         self.motion_sign_window.clear();
         self.sign_evidence = SurfaceSignEvidence::Unresolved;
+        self.mount_vote = None;
+        self.mount_votes = 0;
         self.same_sign_anchor_support = 0;
         self.reliable_motion_observations = 0;
         self.floating_center_sensor = None;
@@ -1006,6 +1016,7 @@ impl SurfaceGazeTracker {
                 .then(|| usize::from(updated[1].residual_ema < updated[0].residual_ema));
             let window_can_acquire = matches!(self.acquisition_policy,
                 SignAcquisitionPolicy::MotionWindowFallback | SignAcquisitionPolicy::MotionWindowOnly);
+            if self.camera_mount == CameraMount::Flexible {
             if let Some(decision) = motion_decision.filter(|_| self.sign_resolved || window_can_acquire) {
                 self.sign_evidence = SurfaceSignEvidence::MotionWindow;
                 motion_window_supported = true;
@@ -1056,6 +1067,7 @@ impl SurfaceGazeTracker {
             } else {
                 self.pending_sign_hypothesis = None;
                 self.pending_sign_frames = 0;
+            }
             }
         } else {
             self.motion_sign_window.observe(source_timestamp_ns, now, None, quantized_frontal_disk_radius_px, 0.0);
@@ -1122,7 +1134,7 @@ impl SurfaceGazeTracker {
         } else {
             self.selected_sign_hypothesis
         };
-        let kinematic_switch_committed = sign_correction.resolved
+        let kinematic_switch_committed = self.camera_mount == CameraMount::Flexible && sign_correction.resolved
             && !motion_window_supported
             && self.sign_resolved
             && global_similarity.is_some_and(|global| global.reliable)
@@ -1137,6 +1149,39 @@ impl SurfaceGazeTracker {
         {
             self.pending_kinematic_sign_hypothesis = None;
             self.pending_kinematic_sign_frames = 0;
+        }
+        // This explicit operator assumption chooses between whole antipodal
+        // normals, never an independent Y flip. The source-key guard above
+        // ensures these votes are new sensor observations, not redraws.
+        if self.camera_mount != CameraMount::Flexible {
+            let candidate=self.contact_sign_hypotheses.and_then(|hypotheses|
+                self.camera_mount.branch(hypotheses.map(|h|
+                    (h.near_surface_sensor_px.1-center_sensor.1)/quantized_frontal_disk_radius_px)));
+            if let Some(candidate)=candidate {
+                if self.mount_vote==Some(candidate) {self.mount_votes=self.mount_votes.saturating_add(1);}
+                else {self.mount_vote=Some(candidate);self.mount_votes=1;}
+                // Contradicting evidence must not leak the excluded branch
+                // while the mounting vote is acquiring.
+                self.sign_resolved=false;
+                if self.mount_votes>=CONTACT_SIGN_CONFIRMATION_UPDATES {
+                    if self.selected_sign_hypothesis!=candidate {
+                        self.selected_sign_hypothesis=candidate;
+                        self.sign_epoch=self.sign_epoch.wrapping_add(1);
+                        self.kinematic_history.clear();
+                        self.floating_center_sensor=None;
+                        self.floating_near_point_sensor=None;
+                        reset_projection_smoothing=true;
+                    }
+                    self.sign_resolved=true;
+                    self.sign_evidence=SurfaceSignEvidence::MountingAssumption;
+                }
+            } else {
+                self.mount_vote=None;self.mount_votes=0;
+                if self.sign_evidence==SurfaceSignEvidence::MountingAssumption {
+                    self.sign_resolved=false;
+                    self.sign_evidence=SurfaceSignEvidence::Unresolved;
+                }
+            }
         }
         // Publish only the persistent branch. A provisional kinematic vote is
         // diagnostics, not an output sign; on the commit frame this lookup

@@ -146,3 +146,39 @@ fn waiting_request_is_renewed_without_changing_fifo_identity() {
         assert!(session.check(None).is_ok());
     });
 }
+
+#[test]
+fn atomic_publication_replacement_reopens_instead_of_trusting_an_unlinked_snapshot() {
+    let f=Fixture::new();let dir=f.setup();
+    let mut opens=0;
+    let (bytes,meta)=dir.read_snapshot("descriptor.json",|old| {
+        opens+=1;
+        if opens==1 {
+            let mut next:Value=serde_json::from_slice(&dir.read("descriptor.json").unwrap().0).unwrap();
+            next["publisher_instance"]=json!("publisher-refreshed");
+            dir.publish("descriptor.json",&next).unwrap();
+            assert_eq!(old.metadata().unwrap().nlink(),0);
+            assert!(private(old,false).is_err(),"the former reader would reject this normal refresh");
+        }
+    }).unwrap();
+    assert_eq!(opens,2);assert_eq!(meta.nlink(),1);
+    assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["publisher_instance"],"publisher-refreshed");
+}
+
+#[test]
+fn atomic_publication_retry_still_rejects_unsafe_or_missing_replacement_and_is_bounded() {
+    for kind in ["unsafe","missing","churn"] {
+        let f=Fixture::new();let dir=f.setup();let mut opens=0;
+        let result=dir.read_snapshot("descriptor.json",|_| {
+            opens+=1;
+            if opens==1 || kind=="churn" {
+                let next:Value=serde_json::from_slice(&dir.read("descriptor.json").unwrap().0).unwrap();
+                dir.publish("descriptor.json",&next).unwrap();
+                if kind=="unsafe" {fs::set_permissions(f.root().join("cameras/test-camera/descriptor.json"),fs::Permissions::from_mode(0o644)).unwrap();}
+                if kind=="missing" {dir.remove("descriptor.json").unwrap();}
+            }
+        });
+        assert!(result.is_err(),"{kind}");assert!(opens<=4);
+        if kind=="churn" {assert_eq!(opens,4);}
+    }
+}

@@ -9,7 +9,7 @@
     pub(crate) mod outline_conic_segments;
     pub(crate) mod roi_evidence;
     pub(crate) mod binocular_coordinator;
-    pub(crate) mod eye_scene_model {pub(crate) mod binocular_pose;}
+    pub(crate) mod eye_scene_model {pub(crate) mod binocular_pose;pub(crate) mod camera_mount;pub(crate) use camera_mount::CameraMount;}
 }
 use native::{conic_solver,outline_conic_segments,roi_evidence};
 use native::{binocular_coordinator,eye_scene_model};
@@ -52,12 +52,26 @@ fn sample_fingerprint(points:&[(f64,f64)])->String {
 struct ExtractionPolicy {
     partial_outlines:bool,
     outline_directions:bool,
+    pupil_raw_directions:bool,
+    pupil_tangent_support:bool,
+    conic_pupil_paths:bool,
+    augmented_pupil_paths:bool,
+    sliding_pupil_luma:bool,
+    pupil_profile_footprint:bool,
+    subpixel_pupil_peaks:bool,
+    connected_pupil_width:bool,
+    reject_weak_pupil_core:bool,
+    semantic_pupil_contours:bool,
+    pupil_search_radius_px:Option<f64>,
+    pupil_weight_scale:Option<f64>,
     raw_uncertainty:bool,
     raw_outer_spread:bool,
     raw_outer_position:bool,
     without_pupil:bool,
     all_boundary_samples:bool,
     coherent_pupil_arcs:bool,
+    shape_pupil_arcs:bool,
+    optical_pupil_arcs:bool,
     mask_levels:bool,
     mask_spatial:bool,
     raw_outer_candidates:bool,
@@ -66,6 +80,18 @@ struct ExtractionPolicy {
 
 struct Frame {
     input:Value,
+    conic_pupil_paths:bool,
+    augmented_pupil_paths:bool,
+    sliding_pupil_luma:bool,
+    pupil_profile_footprint:bool,
+    subpixel_pupil_peaks:bool,
+    connected_pupil_width:bool,
+    reject_weak_pupil_core:bool,
+    pupil_core_support:Option<PupilCoreSupport>,
+    semantic_pupil_contour:Option<Value>,
+    pupil_search_radius_px:Option<f64>,
+    pupil_weight_scale:Option<f64>,
+    pupil_directions:Option<raw_optical_uncertainty::PupilDirectionReport>,
     outer_spread:Option<Vec<raw_optical_uncertainty::OuterSpreadArc>>,
     outer_position:Option<Vec<raw_optical_uncertainty::OuterPositionArc>>,
     mask_levels:Option<Value>,
@@ -80,6 +106,8 @@ struct Frame {
     pupil_ablation:Value,
     all_boundary_samples:bool,
     coherent_pupil_arcs:bool,
+    shape_pupil_arcs:bool,
+    optical_pupil_arcs:bool,
 }
 
 /// Offline causal control. Remove both observed pupil arcs and their search
@@ -137,8 +165,76 @@ fn prepare_with_directions(row:Value,partial_outlines:bool,outline_directions:bo
     prepare_with_policy(row,ExtractionPolicy {partial_outlines,outline_directions,..Default::default()})
 }
 
+/// Accept only the exact selected semantic contour from the native audit.
+/// A recovered guide has no semantic retained-run provenance and uses the
+/// original RAW adapter. Malformed or mismatched supplied evidence is an error.
+fn semantic_pupil_review(row:&Value,raw:&[u16],guide:geometry::Ellipse)
+    -> Result<Option<(outline_conic_segments::ContourFitEvidence,Value)>,String> {
+    let Some(evidence)=row.get("selected_semantic_pupil_contour").filter(|v|!v.is_null()) else {return Ok(None);};
+    let input=&row["input"];let selection=&evidence["selection"];let candidate=&evidence["candidate"];
+    let source=&candidate["source"];let meta=&input["frame"];
+    if &evidence["input"]!=input || &selection["input"]!=input || &candidate["input"]!=input
+        || candidate["schema"]!="buttercup-semantic-pupil-contour-diagnostic-v1"
+        || candidate["prompt"]!=2 || selection["semantic_fit_present"]!=true
+        || selection["independent_observation"]!=true
+        || selection["semantic_query"].as_u64().is_none()
+        || selection["semantic_query"]!=candidate["query"]
+        || candidate["source"]!=selection["source"]
+        || number(&source["eye_index"]).and_then(|v|v.checked_add(1))!=number(&meta["eye_id"])
+        || number(&source["sequence"])!=number(&meta["sequence"])
+        || number(&source["timestamp_ns"])!=number(&meta["timestamp_ns"])
+        || source["sensor_origin"]!=json!([meta["sensor_x"],meta["sensor_y"]])
+        || source["dimensions"]!=json!([meta["width"],meta["height"]])
+        || ["geometry_admitted","center_admitted","history_admitted","raw_admitted"]
+            .iter().any(|k|candidate[*k]!=true)
+        || ellipse(&candidate["ellipse"])!=Some(guide)
+        || ellipse(&selection["selected_ellipse"])!=Some(guide) {
+        return Err("semantic pupil contour is not the source-matched selected guide".into());
+    }
+    use sha2::{Digest,Sha256};
+    let mut digest=Sha256::new();for pixel in raw {digest.update(pixel.to_le_bytes());}
+    if candidate["source"]["native_u16le_sha256"]!=format!("{:x}",digest.finalize()) {
+        return Err("semantic pupil contour has a different native RAW image".into());
+    }
+    let fit=&candidate["clipped_component_fit"];
+    let retained:Vec<(f64,f64)>=serde_json::from_value(fit["retained_points_native"].clone())
+        .map_err(|_|"invalid semantic pupil points")?;
+    let censored:Vec<(f64,f64)>=serde_json::from_value(fit["flat_tire_points_native"].clone())
+        .map_err(|_|"invalid semantic pupil censored points")?;
+    let runs:Vec<Vec<usize>>=serde_json::from_value(fit["retained_runs"].clone())
+        .map_err(|_|"invalid semantic pupil runs")?;
+    let width=integer(&input["frame"],"width")? as f64;
+    let height=integer(&input["frame"],"height")? as f64;
+    let mut used=std::collections::HashSet::new();
+    if retained.len()<3 || runs.is_empty()
+        || retained.iter().chain(&censored).any(|&(x,y)|!x.is_finite()||!y.is_finite()
+            || x<0.0 || y<0.0 || x>=width || y>=height)
+        || runs.iter().flatten().any(|&index|index>=retained.len()||!used.insert(index)) {
+        return Err("semantic pupil contour has invalid bounds or duplicated run support".into());
+    }
+    let report=json!({"selected_query":candidate["query"],"retained_points":retained.len(),
+        "retained_runs":runs.len(),"sample_fingerprint":sample_fingerprint(&retained),
+        "contract":"Selected same-exposure semantic retained runs replace RAW pupil arcs. Model predictions, not human labels or an independent second observation. Excluded points are not reinstated."});
+    Ok(Some((outline_conic_segments::ContourFitEvidence {ellipse:guide,source_component_area_px:0.0,
+        retained_points:Arc::new(retained),conic_segments:Arc::new(runs),
+        flat_tire_points:Arc::new(censored),upper_flat_tire:false,lower_flat_tire:false},report)))
+}
+
 fn prepare_with_policy(row:Value,policy:ExtractionPolicy)->Result<Frame,String> {
-    let ExtractionPolicy {partial_outlines,outline_directions,raw_uncertainty,raw_outer_spread,raw_outer_position,without_pupil,all_boundary_samples,coherent_pupil_arcs,mask_levels,mask_spatial,raw_outer_candidates,withhold_rejected_outer}=policy;
+    let ExtractionPolicy {partial_outlines,outline_directions,pupil_raw_directions,pupil_tangent_support,conic_pupil_paths,augmented_pupil_paths,sliding_pupil_luma,pupil_profile_footprint,subpixel_pupil_peaks,connected_pupil_width,reject_weak_pupil_core,semantic_pupil_contours,pupil_search_radius_px,pupil_weight_scale,raw_uncertainty,raw_outer_spread,raw_outer_position,without_pupil,all_boundary_samples,coherent_pupil_arcs,shape_pupil_arcs,optical_pupil_arcs,mask_levels,mask_spatial,raw_outer_candidates,withhold_rejected_outer}=policy;
+    if semantic_pupil_contours && (pupil_raw_directions || pupil_tangent_support || coherent_pupil_arcs
+        || shape_pupil_arcs || optical_pupil_arcs || conic_pupil_paths || augmented_pupil_paths
+        || sliding_pupil_luma || pupil_profile_footprint || subpixel_pupil_peaks || connected_pupil_width
+        || reject_weak_pupil_core || pupil_search_radius_px.is_some() || pupil_weight_scale.is_some()
+        || raw_uncertainty || without_pupil) {
+        return Err("compare semantic pupil contours separately from RAW pupil experiments".into());
+    }
+    if sliding_pupil_luma && (pupil_raw_directions || raw_uncertainty) {
+        return Err("compare sliding pupil photometry separately from grid-based direction/uncertainty experiments".into());
+    }
+    if pupil_weight_scale.is_some_and(|s|!s.is_finite() || s<=0.0 || s>1.0) {return Err("pupil weight scale must be in (0, 1]".into());}
+    if pupil_search_radius_px.is_some_and(|r|!r.is_finite() || r<=0.0 || r>12.0) {return Err("pupil search radius must be in (0, 12] native pixels".into());}
+    if [coherent_pupil_arcs,shape_pupil_arcs,optical_pupil_arcs,conic_pupil_paths,augmented_pupil_paths].into_iter().filter(|v|*v).count()>1 {return Err("select one pupil path experiment".into());}
     if [raw_outer_candidates,partial_outlines,withhold_rejected_outer].into_iter().filter(|v|*v).count()>1 {
         return Err("compare RAW outer candidates, partial-mask extraction and outer withholding separately".into());
     }
@@ -196,11 +292,38 @@ fn prepare_with_policy(row:Value,policy:ExtractionPolicy)->Result<Frame,String> 
         }
       }
     }
+    let mut pupil_directions=None;
+    let mut pupil_core_support=None;
+    let mut semantic_pupil_contour=None;
     let mut partial_outline=PartialOutlineReport::default();
     if let Some(raw)=raw.as_ref() {
-        if let Some((pupil,config))=pupil.zip(baseline.and_then(|outer|
-            RawArcConfig::for_pupil(&raw,size[0] as usize,size[1] as usize,outer))) {
-            append_raw_ring_arcs_with_cohesion(&mut packet,&raw,pupil,BoundaryKind::PupillaryBoundary,100,config,coherent_pupil_arcs);
+        let sampling=if sliding_pupil_luma {RawSampling::SlidingBox} else {RawSampling::CfaGrid};
+        if let Some((pupil,mut config))=pupil.zip(baseline.and_then(|outer|
+            RawArcConfig::for_pupil_with_sampling(&raw,size[0] as usize,size[1] as usize,outer,sampling))) {
+            config.profile_footprint=pupil_profile_footprint;
+            config.subpixel_peaks=subpixel_pupil_peaks;
+            config.connected_peak_width=connected_pupil_width;
+            config.reject_weak_pupil_core=reject_weak_pupil_core;
+            if reject_weak_pupil_core {
+                pupil_core_support=Some(outline_conic_segments::sparse_evidence::pupil_core_support(
+                    raw,size[0] as usize,size[1] as usize,pupil,config));
+            }
+            if let Some(radius)=pupil_search_radius_px {config.radial_search_px=radius;}
+            let semantic=if semantic_pupil_contours {semantic_pupil_review(&row,raw,pupil)?} else {None};
+            if let Some((review,report))=semantic {
+                append_retained_boundary_arcs(&mut packet,&review,100,BoundaryKind::PupillaryBoundary,None);
+                semantic_pupil_contour=Some(report);
+            }
+            else if augmented_pupil_paths {append_augmented_raw_ring_arcs(&mut packet,&raw,pupil,BoundaryKind::PupillaryBoundary,100,config);}
+            else if conic_pupil_paths {append_conic_associated_raw_ring_arcs(&mut packet,&raw,pupil,BoundaryKind::PupillaryBoundary,100,config);}
+            else if optical_pupil_arcs {append_optical_raw_ring_arcs(&mut packet,&raw,pupil,BoundaryKind::PupillaryBoundary,100,config);}
+            else if shape_pupil_arcs {append_shape_checked_raw_ring_arcs(&mut packet,&raw,pupil,BoundaryKind::PupillaryBoundary,100,config);}
+            else {append_raw_ring_arcs_with_cohesion(&mut packet,&raw,pupil,BoundaryKind::PupillaryBoundary,100,config,coherent_pupil_arcs);}
+            if pupil_raw_directions {
+                let mut report=raw_optical_uncertainty::measure_pupil_directions(&mut packet,&raw,config.maximum_profile_luma_raw10);
+                if pupil_tangent_support {report.support_caps=raw_optical_uncertainty::cap_pupil_tangent_support(&mut packet);}
+                pupil_directions=Some(report);
+            }
         }
         if try_partial {
             let mut ranked=candidates.iter().filter(|c|c["semantic_score"].as_f64().is_some_and(f64::is_finite)).collect::<Vec<_>>();
@@ -255,12 +378,21 @@ fn prepare_with_policy(row:Value,policy:ExtractionPolicy)->Result<Frame,String> 
     for (index,arc) in packet.arcs.iter_mut().enumerate() {
         if !all_boundary_samples && arc.points_roi_px.len()>=6 {
             validation.push((index,arc.evidence_group,arc.kind,arc.points_roi_px.iter().skip(1).step_by(2).copied().collect()));
+            arc.sampling_support_px=arc.sampling_support_px.take().map(|support|
+                roi_evidence::reduce_sampling_support(&support,
+                    &(0..arc.points_roi_px.len()).step_by(2).collect::<Vec<_>>())
+                    .expect("extractor supplies valid fixed profile support"));
             arc.points_roi_px=arc.points_roi_px.iter().step_by(2).copied().collect();
             arc.outward_normals_roi=arc.outward_normals_roi.take().map(|normals|normals.into_iter().step_by(2).collect());
             arc.level_sets_roi=arc.level_sets_roi.take().map(|levels|levels.into_iter().step_by(2).collect());
         }
     }
-    Ok(Frame {input,outer_spread,outer_position,mask_levels,outer_candidates,rejected_outer_ablation,packet,pose,validation,baseline,selected_raw_admitted,partial_outline,pupil_ablation,all_boundary_samples,coherent_pupil_arcs})
+    // Apply the ablation to the actual fitted samples, including in held-out
+    // runs; the removed probes must not set the remaining information budget.
+    if let Some(scale)=pupil_weight_scale {raw_optical_uncertainty::scale_pupil_information(&mut packet,scale);}
+    if semantic_pupil_contours && row.get("selected_semantic_pupil_contour").is_some_and(|v|!v.is_null())
+        && semantic_pupil_contour.is_none() {return Err("selected semantic contour did not reach pupil extraction".into());}
+    Ok(Frame {input,conic_pupil_paths,augmented_pupil_paths,sliding_pupil_luma,pupil_profile_footprint,subpixel_pupil_peaks,connected_pupil_width,reject_weak_pupil_core,pupil_core_support,semantic_pupil_contour,pupil_search_radius_px,pupil_weight_scale,pupil_directions,outer_spread,outer_position,mask_levels,outer_candidates,rejected_outer_ablation,packet,pose,validation,baseline,selected_raw_admitted,partial_outline,pupil_ablation,all_boundary_samples,coherent_pupil_arcs,shape_pupil_arcs,optical_pupil_arcs})
 }
 
 fn heldout(solution:&JointConicSolution,frames:[Option<&Frame>;2])->[Value;2] {
@@ -306,8 +438,13 @@ fn solution_json(result:Result<JointConicSolution,JointConicUnavailable>,frames:
             "hypotheses":solution.hypotheses_evaluated,"refinement_steps":solution.refinement_steps,
             "hypotheses_by_association":solution.hypotheses_by_association,
             "outer_ellipses":solution.ellipses_roi_px.map(|e|ellipse_json(e[0])),
+            "fitted_ellipses":solution.ellipses_roi_px.map(|e|e.map(ellipse_json)),
+            "fitted_ellipses_contract":"Source-ROI model conics in outer/inner/pupil order; an unobserved boundary can have a latent model ellipse. Only source-matched used support is measured evidence.",
             "support":solution.arcs.iter().map(|a|json!({"roi":a.exposure.roi.0,"kind":format!("{:?}",a.kind),
                 "group":a.evidence_group,"arc":a.arc_index,"rms_px":a.rms_px,"sigma_px":a.sigma_px,"used":a.used,
+                "points_roi_px":a.points_roi_px,
+                "source":{"roi_id":a.exposure.roi.0,"sequence":a.exposure.sequence.to_string(),
+                    "timestamp_ns":a.exposure.timestamp_ns.to_string()},
                 "boundary_normal_samples":a.boundary_normal_samples,"boundary_normal_rms_radians":a.boundary_normal_rms_radians,
                 "support_length_px":a.support_length_px,"evidence_weight":a.evidence_weight})).collect::<Vec<_>>(),
             "withheld_sample_residuals":heldout(&solution,frames),"elapsed_ms":elapsed,
@@ -343,7 +480,13 @@ fn evaluate_with_distribution(frames:[Option<Frame>;2],export_sparse:bool,probab
     let camera=PinholeCamera {focal_px:[4000.0,4000.0],principal_px:[4000.0,3000.0]};
     let base=json!({"inputs":frames.each_ref().map(|f|f.as_ref().map(|f|&f.input)),
         "pupil_ablation":frames.each_ref().map(|f|f.as_ref().map(|f|&f.pupil_ablation)),
+        "pupil_raw_directions":frames.each_ref().map(|f|f.as_ref().and_then(|f|f.pupil_directions.as_ref())),
+        "conic_pupil_paths":frames.each_ref().map(|f|f.as_ref().map(|f|f.conic_pupil_paths)),
+        "augmented_pupil_paths":frames.each_ref().map(|f|f.as_ref().map(|f|f.augmented_pupil_paths)),
+        "pupil_weight_scale":frames.each_ref().map(|f|f.as_ref().and_then(|f|f.pupil_weight_scale)),
         "all_boundary_samples":frames.each_ref().map(|f|f.as_ref().map(|f|f.all_boundary_samples)),
+        "shape_pupil_arcs":frames.each_ref().map(|f|f.as_ref().map(|f|f.shape_pupil_arcs)),
+        "optical_pupil_arcs":frames.each_ref().map(|f|f.as_ref().map(|f|f.optical_pupil_arcs)),
         "coherent_pupil_arcs":frames.each_ref().map(|f|f.as_ref().map(|f|f.coherent_pupil_arcs)),
         "baseline_sam_outer":frames.each_ref().map(|f|ellipse_json(f.as_ref().and_then(|f|f.baseline))),
         "raw_admitted":frames.each_ref().map(|f|f.as_ref().map(|f|f.selected_raw_admitted)),
@@ -354,6 +497,19 @@ fn evaluate_with_distribution(frames:[Option<Frame>;2],export_sparse:bool,probab
             "emitted_arcs":f.partial_outline.emitted_arcs}))),
         "contract":"shared latent fixation versus separate monocular optimizations of the SAME training arcs; no averaged gaze; held-out points condition on upstream detector segmentation/search and are absent in all-boundary-samples mode. Neither metric pose nor gaze accuracy is ground truth."});
     let mut row=base;
+    if frames.iter().flatten().any(|f|f.pupil_profile_footprint) {row["pupil_profile_footprint"]=json!(true);}
+    if frames.iter().flatten().any(|f|f.subpixel_pupil_peaks) {row["subpixel_pupil_peaks"]=json!(true);}
+    if frames.iter().flatten().any(|f|f.connected_pupil_width) {row["connected_pupil_width"]=json!(true);}
+    if frames.iter().flatten().any(|f|f.reject_weak_pupil_core) {
+        row["pupil_core_support"]=json!(frames.each_ref().map(|f|f.as_ref().and_then(|f|f.pupil_core_support)));
+    }
+    if frames.iter().flatten().any(|f|f.semantic_pupil_contour.is_some()) {
+        row["semantic_pupil_contour"]=json!(frames.each_ref().map(|f|f.as_ref().and_then(|f|f.semantic_pupil_contour.as_ref())));
+    }
+    if frames.iter().flatten().any(|f|f.pupil_search_radius_px.is_some()) {row["pupil_search_radius_px"]=json!(frames.each_ref().map(|f|f.as_ref().and_then(|f|f.pupil_search_radius_px)));}
+    if frames.iter().flatten().any(|f|f.sliding_pupil_luma) {
+        row["sliding_pupil_luma"]=json!(true);
+    }
     if frames.iter().flatten().any(|f|f.outer_spread.is_some()) {
         row["outer_raw_spread"]=json!(frames.each_ref().map(|f|f.as_ref().map(|f|&f.outer_spread)));
     }
@@ -403,6 +559,7 @@ fn run()->Result<(),String> {
     let mut maximum_frames_per_cache=usize::MAX;
     let mut extraction=ExtractionPolicy::default();
     let mut export_sparse=false;
+    let mut extract_only=false;
     let mut source_order_replay=false;
     let mut export_hypotheses=false;
     let mut probabilistic=false;
@@ -411,10 +568,22 @@ fn run()->Result<(),String> {
         if arg=="--max-frames-per-cache" {
             maximum_frames_per_cache=args.next().ok_or("missing frame limit")?.parse::<usize>().map_err(|e|e.to_string())?;
             if maximum_frames_per_cache==0 {return Err("frame limit must be positive".into());}
-        } else if arg=="--partial-outlines" {extraction.partial_outlines=true;}
+        } else if arg=="--extract-only" {extract_only=true;}
+        else if arg=="--partial-outlines" {extraction.partial_outlines=true;}
         else if arg=="--export-sparse-evidence" {export_sparse=true;}
         else if arg=="--source-order-replay" {source_order_replay=true;}
         else if arg=="--export-hypotheses" {export_hypotheses=true;}
+        else if let Some(scale)=arg.strip_prefix("--pupil-weight-scale=") {extraction.pupil_weight_scale=Some(scale.parse().map_err(|_|"invalid pupil weight scale")?);}
+        else if arg=="--conic-pupil-paths" {extraction.conic_pupil_paths=true;}
+        else if arg=="--augment-pupil-paths" {extraction.augmented_pupil_paths=true;}
+        else if arg=="--pupil-profile-footprint" {extraction.pupil_profile_footprint=true;}
+        else if arg=="--subpixel-pupil-peaks" {extraction.subpixel_pupil_peaks=true;}
+        else if arg=="--connected-pupil-width" {extraction.connected_pupil_width=true;}
+        else if arg=="--reject-weak-pupil-core" {extraction.reject_weak_pupil_core=true;}
+        else if let Some(radius)=arg.strip_prefix("--pupil-search-radius=") {extraction.pupil_search_radius_px=Some(radius.parse().map_err(|_|"invalid pupil search radius")?);}
+        else if arg=="--sliding-pupil-luma" {extraction.sliding_pupil_luma=true;}
+        else if arg=="--pupil-tangent-support" {extraction.pupil_raw_directions=true;extraction.pupil_tangent_support=true;}
+        else if arg=="--pupil-raw-directions" {extraction.pupil_raw_directions=true;}
         else if arg=="--retained-outline-directions" {extraction.outline_directions=true;}
         else if arg=="--raw-boundary-uncertainty" {extraction.raw_uncertainty=true;}
         else if arg=="--raw-outer-spread" {extraction.raw_outer_spread=true;}
@@ -424,6 +593,9 @@ fn run()->Result<(),String> {
         else if arg=="--probabilistic" {probabilistic=true;}
         else if arg=="--without-pupil" {extraction.without_pupil=true;}
         else if arg=="--all-boundary-samples" {extraction.all_boundary_samples=true;}
+        else if arg=="--semantic-pupil-contours" {extraction.semantic_pupil_contours=true;}
+        else if arg=="--optical-pupil-arcs" {extraction.optical_pupil_arcs=true;}
+        else if arg=="--shape-pupil-arcs" {extraction.shape_pupil_arcs=true;}
         else if arg=="--coherent-pupil-arcs" {extraction.coherent_pupil_arcs=true;}
         else if arg=="--mask-levels" {extraction.mask_levels=true;}
         else if arg=="--mask-spatial" {extraction.mask_levels=true;extraction.mask_spatial=true;}
@@ -438,6 +610,38 @@ fn run()->Result<(),String> {
     let allowed=std::fs::canonicalize("outputs").map_err(|e|e.to_string())?;
     if !std::fs::canonicalize(output.parent().ok_or("missing output directory")?).map_err(|e|e.to_string())?.starts_with(allowed) {return Err("output must be under outputs".into());}
     let mut writer=BufWriter::new(OpenOptions::new().create_new(true).write(true).open(output).map_err(|e|e.to_string())?);
+    if extract_only {
+        if source_order_replay {return Err("extract-only and source-order-replay are separate diagnostics".into());}
+        for path in &files {
+            for line in BufReader::new(File::open(path).map_err(|e|e.to_string())?).lines().take(maximum_frames_per_cache) {
+                let row=serde_json::from_str(&line.map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+                let frame=prepare_with_policy(row,extraction)?;
+                let mut report=json!({"input":frame.input,"shape_pupil_arcs":extraction.shape_pupil_arcs,
+                    "conic_pupil_paths":extraction.conic_pupil_paths,
+                    "augmented_pupil_paths":extraction.augmented_pupil_paths,
+                    "pupil_weight_scale":extraction.pupil_weight_scale,
+                    "coherent_pupil_arcs":extraction.coherent_pupil_arcs,"optical_pupil_arcs":extraction.optical_pupil_arcs,
+                    "pupil_raw_directions":frame.pupil_directions,
+                    "arcs":frame.packet.arcs.iter().map(|a|json!({"kind":format!("{:?}",a.kind),
+                        "group":a.evidence_group,"points":a.points_roi_px,"normal_band_px":a.normal_band_half_width_px,"support_length_cap_px":a.support_length_cap_px,
+                        "normals":a.outward_normals_roi.as_ref().map(|ns|ns.iter().map(|n|n.map(|n|json!({"unit":n.unit_outward_roi,"sigma_radians":n.angular_sigma_radians}))).collect::<Vec<_>>())})).collect::<Vec<_>>()});
+                if extraction.pupil_profile_footprint {
+                    report["pupil_profile_footprint"]=json!(true);
+                    for (value,arc) in report["arcs"].as_array_mut().unwrap().iter_mut().zip(&frame.packet.arcs) {
+                        value["sampling_support_px"]=json!(arc.sampling_support_px);
+                    }
+                }
+                if extraction.sliding_pupil_luma {report["sliding_pupil_luma"]=json!(true);}
+                if extraction.subpixel_pupil_peaks {report["subpixel_pupil_peaks"]=json!(true);}
+                if extraction.connected_pupil_width {report["connected_pupil_width"]=json!(true);}
+                if extraction.reject_weak_pupil_core {report["pupil_core_support"]=json!(frame.pupil_core_support);}
+                if extraction.semantic_pupil_contours {report["semantic_pupil_contour"]=json!(frame.semantic_pupil_contour);}
+                if let Some(radius)=extraction.pupil_search_radius_px {report["pupil_search_radius_px"]=json!(radius);}
+                serde_json::to_writer(&mut writer,&report).map_err(|e|e.to_string())?;writer.write_all(b"\n").map_err(|e|e.to_string())?;
+            }
+        }
+        return writer.flush().map_err(|e|e.to_string());
+    }
     if source_order_replay {
         return source_order::run(&files,maximum_frames_per_cache,extraction,arrival_delay_ns,export_hypotheses,probabilistic,&mut writer);
     }
@@ -520,6 +724,61 @@ mod extraction_tests {
             &points(&row["candidates"][0]["baseline_retained"]),&[(0..128).collect()]).unwrap();
         row["outer_boundary_logits"]=json!(evidence);
         (file,row)
+    }
+
+    #[test]
+    fn semantic_pupil_contours_preserve_gaps_and_reject_stale_provenance() {
+        use sha2::{Digest,Sha256};
+        let raw=vec![100u16;256*192];
+        let (_file,mut row)=rejected_outline_fixture(&raw);
+        let e=geometry::Ellipse {center:(130.0,98.0),major_radius:20.0,minor_radius:15.0,angle:0.0};
+        row["pupil_void"]=json!({"ellipse":ellipse_json(Some(e))});
+        let mut digest=Sha256::new();for pixel in &raw {digest.update(pixel.to_le_bytes());}
+        let source=json!({"eye_index":0,"sequence":10,"timestamp_ns":"20",
+            "sensor_origin":[400,800],"dimensions":[256,192],
+            "native_u16le_sha256":format!("{:x}",digest.finalize())});
+        // Two disjoint observed runs; all missing middle samples stay missing.
+        let retained=vec![(111.0,94.0),(110.0,98.0),(111.0,102.0),
+            (149.0,94.0),(150.0,98.0),(149.0,102.0)];
+        let evidence=json!({"input":row["input"],
+            "selection":{"input":row["input"],"source":source,"semantic_fit_present":true,
+                "independent_observation":true,"semantic_query":2,"selected_ellipse":ellipse_json(Some(e))},
+            "candidate":{"schema":"buttercup-semantic-pupil-contour-diagnostic-v1",
+                "input":row["input"],"source":source,"prompt":2,"query":2,"ellipse":ellipse_json(Some(e)),
+                "geometry_admitted":true,"center_admitted":true,"history_admitted":true,"raw_admitted":true,
+                "clipped_component_fit":{"retained_points_native":retained,
+                    "flat_tire_points_native":[[130.0,83.0]],"retained_runs":[[0,1,2],[3,4,5]]}}});
+        let policy=ExtractionPolicy {all_boundary_samples:true,semantic_pupil_contours:true,..Default::default()};
+        let baseline=prepare_with_policy(row.clone(),ExtractionPolicy {all_boundary_samples:true,..Default::default()}).unwrap();
+        let recovery=prepare_with_policy(row.clone(),policy).unwrap();
+        assert_eq!(format!("{:?}",baseline.packet),format!("{:?}",recovery.packet));
+        row["selected_semantic_pupil_contour"]=evidence;
+        let candidate=prepare_with_policy(row.clone(),policy).unwrap();
+        let pupil=candidate.packet.arcs.iter().filter(|a|a.kind==BoundaryKind::PupillaryBoundary).collect::<Vec<_>>();
+        assert_eq!(pupil.len(),2);
+        assert_eq!(pupil.iter().flat_map(|a|a.points_roi_px.iter().copied()).collect::<Vec<_>>(),retained);
+        assert!(pupil.iter().all(|a|a.outward_normals_roi.is_none()));
+        let outer=|p:&OwnedRoiEvidence|format!("{:?}",p.arcs.iter().filter(|a|a.kind==BoundaryKind::OuterLimbus).collect::<Vec<_>>());
+        assert_eq!(outer(&baseline.packet),outer(&candidate.packet));
+        assert_eq!(candidate.packet.conics.last().unwrap().supporting_arc_indices,
+            (baseline.packet.arcs.len()..baseline.packet.arcs.len()+2).collect::<Vec<_>>());
+        for (path,value) in [
+            ("/candidate/source/sequence",json!(11)),
+            ("/candidate/source/native_u16le_sha256",json!("different-image")),
+            ("/candidate/query",json!(1)),
+            ("/candidate/history_admitted",json!(false)),
+            ("/selection/independent_observation",json!(false)),
+            ("/candidate/clipped_component_fit/retained_runs",json!([[0,1,2],[2,3,4]])),
+            ("/candidate/clipped_component_fit/retained_points_native/0",json!([-1.0,94.0])),
+        ] {
+            let mut invalid=row.clone();
+            *invalid["selected_semantic_pupil_contour"].pointer_mut(path).unwrap()=value;
+            assert!(prepare_with_policy(invalid,policy).is_err(),"must reject {path}");
+        }
+        let mut moved=row.clone();moved["pupil_void"]["ellipse"]["center"]=json!([131.0,98.0]);
+        assert!(prepare_with_policy(moved,policy).is_err());
+        let mut missing=row;missing["pupil_void"]=Value::Null;
+        assert!(prepare_with_policy(missing,policy).is_err());
     }
 
     #[test]
@@ -912,6 +1171,69 @@ mod extraction_tests {
                 [0;2],true,false,&mut writer).unwrap();
             writer.flush().unwrap();
         }
+    }
+
+    #[test]
+    #[ignore = "matched native source-order experiment for supported retained-mode selection; explicit frozen inputs required"]
+    fn recorded_supported_mode_replay() {
+        use conic_solver::joint::posterior::IntegrationConfig;
+        let directory=PathBuf::from(std::env::var("BUTTERCUP_SUPPORTED_MODE_DIR").expect("set output directory"));
+        assert!(directory.canonicalize().unwrap().starts_with(PathBuf::from("outputs").canonicalize().unwrap()));
+        let inputs:Vec<String>=serde_json::from_str(&std::env::var("BUTTERCUP_SUPPORTED_MODE_INPUTS")
+            .expect("set frozen native inputs as a JSON array")).unwrap();
+        assert!(!inputs.is_empty());
+        let select_supported_mode=std::env::var("BUTTERCUP_SELECT_SUPPORTED_MODE").ok().as_deref()==Some("1");
+        let exact_conic_distances=std::env::var("BUTTERCUP_EXACT_CONIC_DISTANCES").ok().as_deref()==Some("1");
+        std::fs::write(directory.join("metric-contract.json"),serde_json::to_vec_pretty(&json!({
+            "exact_conic_distances":exact_conic_distances,
+            "contract":"Same projected-conic position metric throughout selection, fitting, posterior, uncertainty and reported residuals. Observations and all priors remain unchanged."})).unwrap()).unwrap();
+        let subpixel_pupil_peaks=std::env::var("BUTTERCUP_SUBPIXEL_PUPIL_PEAKS").ok().as_deref()==Some("1");
+        let all_boundary_samples=std::env::var("BUTTERCUP_WITHHOLD_BOUNDARY_SAMPLES").ok().as_deref()!=Some("1");
+        let mut writer=BufWriter::new(OpenOptions::new().write(true).create_new(true)
+            .open(directory.join("source.jsonl")).unwrap());
+        source_order::run_with_supported_mode_diagnostic(&inputs,
+            ExtractionPolicy {all_boundary_samples,subpixel_pupil_peaks,..Default::default()},
+            IntegrationConfig {select_supported_mode,exact_conic_distances,..IntegrationConfig::live()},&mut writer).unwrap();
+        writer.flush().unwrap();
+    }
+
+    #[test]
+    #[ignore = "explicit native RAW audit of whole-pupil path membership; frozen inputs required"]
+    fn recorded_pupil_path_association_audit() {
+        let directory=PathBuf::from(std::env::var("BUTTERCUP_PATH_AUDIT_DIR").expect("set audit output directory"));
+        assert!(directory.canonicalize().unwrap().starts_with(PathBuf::from("outputs").canonicalize().unwrap()));
+        let inputs:Vec<String>=serde_json::from_str(&std::env::var("BUTTERCUP_PATH_AUDIT_INPUTS")
+            .expect("set frozen input paths")).unwrap();
+        let mut writer=BufWriter::new(OpenOptions::new().write(true).create_new(true)
+            .open(directory.join("paths.jsonl")).unwrap());
+        let mut count=0;
+        for path in inputs {
+            for line in BufReader::new(File::open(path).unwrap()).lines() {
+                let row:Value=serde_json::from_str(&line.unwrap()).unwrap();
+                let baseline=prepare_with_policy(row.clone(),ExtractionPolicy {all_boundary_samples:true,..Default::default()}).unwrap();
+                let conic=prepare_with_policy(row.clone(),ExtractionPolicy {all_boundary_samples:true,conic_pupil_paths:true,..Default::default()}).unwrap();
+                let describe=|frame:&Frame| frame.packet.arcs.iter().enumerate().map(|(index,a)|json!({
+                    "arc":index,"group":a.evidence_group,"kind":format!("{:?}",a.kind),
+                    "points":a.points_roi_px,"normal_band_px":a.normal_band_half_width_px,
+                    "sampling_support":a.sampling_support_px,"score":a.detector_score})).collect::<Vec<_>>();
+                let mut output=json!({"input":baseline.input,"baseline_arcs":describe(&baseline),"conic_arcs":describe(&conic),"path_audit":null});
+                if let Some((guide,outer))=ellipse(&row["pupil_void"]["ellipse"]).zip(baseline.baseline) {
+                    let input=&baseline.input;let meta=&input["frame"];
+                    let [width,height]=baseline.packet.dimensions_px.map(|v|v as usize);
+                    let mut file=File::open(input["raw_file"].as_str().unwrap()).unwrap();
+                    file.seek(SeekFrom::Start(integer(input,"raw_offset").unwrap())).unwrap();
+                    let mut bytes=vec![0;integer(input,"raw_length").unwrap() as usize];file.read_exact(&mut bytes).unwrap();
+                    let raw=raw10::try_unpack_raw10(&bytes,width,height,integer(meta,"stride").unwrap() as usize).unwrap();
+                    if let Some(config)=RawArcConfig::for_pupil(&raw,width,height,outer) {
+                        output["path_audit"]=raw_ring_path_audit(&raw,width,height,guide,config);
+                        output["pupil_guide"]=ellipse_json(Some(guide));
+                        output["outer_guide"]=ellipse_json(Some(outer));
+                    }
+                }
+                serde_json::to_writer(&mut writer,&output).unwrap();writer.write_all(b"\n").unwrap();count+=1;
+            }
+        }
+        writer.flush().unwrap();assert!(count>0);eprintln!("PATH_AUDIT source_eye_records={count}");
     }
 
     #[test]

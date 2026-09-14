@@ -4875,7 +4875,19 @@ pub(super) fn sam_pupil_refit<I>(mut args: I) -> Result<(), String>
 where I: Iterator<Item = String> {
     let output = PathBuf::from(args.next().ok_or("expected OUTPUT.json SAM_REPORT.json")?);
     let source = PathBuf::from(args.next().ok_or("missing SAM report")?);
-    if args.next().is_some() { return Err("unexpected pupil-refit argument".into()); }
+    let mut censor_search_boundary = false;
+    let mut constrain_pupil_arcs = false;
+    let mut independent_pupil_shape = false;
+    let mut pupil_position_support = false;
+    for argument in args {
+        match argument.as_str() {
+            "--censor-search-boundary" if !censor_search_boundary => censor_search_boundary = true,
+            "--constrain-pupil-arcs" if !constrain_pupil_arcs => constrain_pupil_arcs = true,
+            "--independent-pupil-shape" if !independent_pupil_shape => independent_pupil_shape = true,
+            "--pupil-position-support" if !pupil_position_support => pupil_position_support = true,
+            _ => return Err("expected optional --censor-search-boundary, --constrain-pupil-arcs, --independent-pupil-shape and --pupil-position-support, once each".into()),
+        }
+    }
     if output.exists() { return Err(format!("output already exists: {}",output.display())); }
     let mut report: Value = serde_json::from_slice(&fs::read(&source).map_err(|e|e.to_string())?)
         .map_err(|e|e.to_string())?;
@@ -4914,7 +4926,15 @@ where I: Iterator<Item = String> {
             width,height,registration_anchor:None,pupil_component_seed:None,
             pixels:Arc::new(raw10::try_unpack_raw10(&packed,width,height,integer(&meta,"stride")? as usize)?),
         });
-        case["pupil_refit"] = outer.map_or(Value::Null,|outer|sam31_outer::inspect_pupil_fit(frame.clone(),outer));
+        case["pupil_refit"] = outer.map_or(Value::Null,|outer| {
+            if censor_search_boundary || constrain_pupil_arcs || independent_pupil_shape || pupil_position_support {
+                sam31_outer::inspect_pupil_fit_with_position_support(
+                    frame.clone(),outer,censor_search_boundary,constrain_pupil_arcs,independent_pupil_shape,
+                    pupil_position_support)
+            } else {
+                sam31_outer::inspect_pupil_fit(frame.clone(),outer)
+            }
+        });
         if capture.is_some() {
             let projection=outer.filter(|_|case["raw_admitted"].as_bool()==Some(true)).and_then(|o|
                 PupilProjectionReference::from_axes(o.center,o.major_radius,o.minor_radius,o.angle,PupilProjectionSource::SelectedIris));
@@ -4924,7 +4944,11 @@ where I: Iterator<Item = String> {
         }
     }
     report["pupil_refit_contract"] = json!({"source_report":source,
+        "censor_search_boundary":censor_search_boundary,
+        "constrain_pupil_arcs":constrain_pupil_arcs,
+        "independent_pupil_shape":independent_pupil_shape,
         "method":"pupil_refit: stateless RAW cleanup with frozen inferred limbus; post_refit: temporal production solver with frozen inferred SAM geometry/center and original RAW; no human seeds"});
+    if pupil_position_support {report["pupil_refit_contract"]["pupil_position_support"]=json!(true);}
     fs::write(output,serde_json::to_vec_pretty(&report).map_err(|e|e.to_string())?).map_err(|e|e.to_string())
 }
 
