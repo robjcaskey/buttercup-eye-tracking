@@ -601,11 +601,45 @@ const SAM31_RAW_SUPPORT_DECISIVE: f64 = 3.50;
 const SAM31_RESULT_MAX_AGE_NS: u64 = 900_000_000;
 const SAM31_MAX_PUPIL_SIGN_ANCHOR_MAGNITUDE: f64 = 0.65;
 // A mode that has already established the selected eye owns the handoff
-// through brief inference/feature dropouts. This is deliberately longer than
-// the generic no-anatomy timer: otherwise a SAM video-memory miss can start a
-// global search which resets that same memory before it has a chance to
-// recover. True sustained loss still yields to semantic acquisition.
-const ACTIVE_MODE_PRESENCE_RETENTION: Duration = Duration::from_secs(8);
+// through brief inference/feature dropouts, so a segmenter memory miss does not
+// immediately start a global search that resets that memory. This replaced a
+// flat 8 s retention; see segmentation_holds_eye_presence for the corpus basis.
+// The sparse border detector fails on ~2/3 of frames where the segmenter sees
+// the eye (lens reflections, lids, glasses). It may escalate to a global search
+// only when the segmenter has not seen this eye for this long...
+const BORDER_PRESENCE_SEGMENTER_HOLD: Duration = Duration::from_millis(1_000);
+// ...and the partner eye does not vouch for it: seen in the same sensor read
+// with the two crops still at their last jointly observed rigid-head spacing.
+const PARTNER_SAME_READ: Duration = Duration::from_millis(250);
+const RIGID_PARTNER_TOLERANCE_PX: f64 = 40.0;
+const RIGID_PARTNER_TOLERANCE_FRACTION: f64 = 0.12;
+
+/// Whether segmenter evidence keeps a weak-border frame from counting toward a
+/// global search. Corpus replay (13 recordings, 15,584 frames): the border-only
+/// rule fired 1,936 searches, 1,809 while the eye was visible; this rule fired
+/// 62, none while the eye was visible.
+fn segmentation_holds_eye_presence(
+    eye: usize,
+    now: Instant,
+    mode: SegmentationMode,
+    seen: [Option<(SegmentationMode, Instant)>; 2],
+    crop_origins: [(i32, i32); 2],
+    rigid_offset: Option<(i32, i32)>,
+) -> bool {
+    let recent = |eye: usize, window: Duration| seen[eye]
+        .is_some_and(|(seen_mode, at)| seen_mode == mode && now.saturating_duration_since(at) < window);
+    if recent(eye, BORDER_PRESENCE_SEGMENTER_HOLD) {
+        return true;
+    }
+    let other = 1 - eye.min(1);
+    let Some(reference) = rigid_offset.filter(|_| recent(other, PARTNER_SAME_READ)) else {
+        return false;
+    };
+    let offset = (crop_origins[1].0 - crop_origins[0].0, crop_origins[1].1 - crop_origins[0].1);
+    let deviation = f64::from(offset.0 - reference.0).hypot(f64::from(offset.1 - reference.1));
+    let spacing = f64::from(reference.0).hypot(f64::from(reference.1));
+    deviation <= RIGID_PARTNER_TOLERANCE_PX.max(RIGID_PARTNER_TOLERANCE_FRACTION * spacing)
+}
 // The pupil is physiologically dynamic, but it cannot change projected
 // anatomical area discontinuously between consecutive RAW frames. These
 // ratio-space rates cap radius below one percent per publication (below two
@@ -8024,9 +8058,20 @@ fn handle_control_command(command: &str, shared: &Arc<Mutex<SharedState>>) -> St
             } else if !value.eq_ignore_ascii_case("STATUS") {
                 return control_error("STEREO must be ON, OFF, or STATUS");
             }
+            // Camera-to-eye-center distances for both eyes from the single newest
+            // joint solve (one solve estimates both centers together). This is
+            // conditional stereo geometry, not a lens focus calibration.
+            let newest_joint = state.eyes.iter().flatten()
+                .filter_map(|frame| frame.joint_conic.as_ref())
+                .max_by_key(|joint| joint.exposures.iter().flatten()
+                    .map(|exposure| exposure.timestamp_ns).max().unwrap_or(0));
+            let eye_distance_mm = [0usize, 1].map(|eye| newest_joint
+                .and_then(|joint| joint.solution.eye_centers_camera_mm[eye])
+                .map(|c| (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt()));
             serde_json::json!({"ok":true,"stereo_solver_enabled":state.stereo_solver_enabled,
                 "active":state.stereo_solver_enabled && state.segmentation_mode.uses_mask_geometry(),
-                "second_roi_enabled":state.second_roi_enabled}).to_string()
+                "second_roi_enabled":state.second_roi_enabled,
+                "eye_distance_mm":eye_distance_mm}).to_string()
         }
         [second, roi, value]
             if second.eq_ignore_ascii_case("SECOND") && roi.eq_ignore_ascii_case("ROI") =>
@@ -10592,6 +10637,8 @@ struct App {
     recording_metadata: recording_trace::scene::HostMetadata,
     desktop_gaze_next_tick: Instant,
     ui: viewer_ui::Workspace,
+    /// Last layout written to viewer-workspace.json (saved only on change).
+    saved_workspace: Option<serde_json::Value>,
     context: Context<DisplayHandle<'static>>,
     window_state: Option<ScreenWindow>,
     shared: Arc<Mutex<SharedState>>,
@@ -29466,22 +29513,12 @@ impl RawRoiTracker {
             return false;
         }
         let missing = 1-survivor;
-        let Some((source, pivot, offset)) = self.readmission_pivots[survivor] else { return false; };
-        if timestamp_ns < source || timestamp_ns-source > SAM31_RESULT_MAX_AGE_NS { return false; }
         let resident = self.region_active_mask & (1 << missing) != 0;
         if resident && (self.readmission_pair_centers.is_none()
             || self.readmission_pivots[missing].is_none_or(|p|timestamp_ns.saturating_sub(p.0) < 1_500_000_000)) {
             return false;
         }
-        let sign = if missing == 1 { 1.0 } else { -1.0 };
-        let missing_offset = self.readmission_pivots[missing].map_or(offset,|p|p.2);
-        let center: [f64;2] = if let Some(pair) = self.readmission_pair_centers {
-            // Translate a previously observed two-eye cap configuration. The
-            // uncertain pivot-to-cap offsets need not agree between eyes.
-            std::array::from_fn(|axis|pair[missing][axis]+pivot[axis]+offset[axis]-pair[survivor][axis])
-        } else {
-            std::array::from_fn(|axis| pivot[axis]+sign*self.readmission_separation[axis]+missing_offset[axis])
-        };
+        let Some(center) = self.readmission_center(survivor, timestamp_ns) else { return false; };
         if resident && center[0] >= (self.absolute[missing].0+32) as f64
             && center[0] <= (self.absolute[missing].0+self.eye_size.0-32) as f64
             && center[1] >= (self.absolute[missing].1+32) as f64
@@ -29509,6 +29546,56 @@ impl RawRoiTracker {
         self.readmission_hold_until = Some(now+Duration::from_millis(1800));
         eprintln!("ROI READMISSION PROBE {} at {x},{y} from {} projected separation {:?}; no identity assertion",subject_eye_label(missing),subject_eye_label(survivor),self.readmission_separation);
         true
+    }
+
+    /// Predicted cap center of the eye opposite `survivor`, translated from
+    /// the survivor's fresh pivot. A transport hint, never an identity claim.
+    fn readmission_center(&self, survivor: usize, timestamp_ns: u64) -> Option<[f64; 2]> {
+        let missing = 1-survivor;
+        let (source, pivot, offset) = self.readmission_pivots[survivor]?;
+        if timestamp_ns < source || timestamp_ns-source > SAM31_RESULT_MAX_AGE_NS { return None; }
+        let sign = if missing == 1 { 1.0 } else { -1.0 };
+        let missing_offset = self.readmission_pivots[missing].map_or(offset,|p|p.2);
+        Some(if let Some(pair) = self.readmission_pair_centers {
+            // Translate a previously observed two-eye cap configuration. The
+            // uncertain pivot-to-cap offsets need not agree between eyes.
+            std::array::from_fn(|axis|pair[missing][axis]+pivot[axis]+offset[axis]-pair[survivor][axis])
+        } else {
+            std::array::from_fn(|axis| pivot[axis]+sign*self.readmission_separation[axis]+missing_offset[axis])
+        })
+    }
+
+    /// With one eye resident, a band planned around the survivor alone can
+    /// leave the evicted eye's predicted center just outside it, where the
+    /// readmission probe (which never moves the band) is refused on every
+    /// frame. Slide the band toward that prediction as far as the survivor's
+    /// crop still fits, so the probe becomes feasible.
+    fn band_leaning_toward_missing_eye(&self, band_y: u32, survivor: usize, survivor_y: i32,
+        timestamp_ns: u64) -> u32 {
+        let missing = 1-survivor;
+        if self.readmission_enabled_mask & (1 << missing) == 0 || self.window.1 < self.eye_size.1 {
+            return band_y;
+        }
+        let Some(center) = self.readmission_center(survivor, timestamp_ns) else { return band_y; };
+        if !center[1].is_finite() { return band_y; }
+        // Readmission's own feasibility margin plus a small guard.
+        let margin = 32.0 + 8.0;
+        let band = band_y as i32;
+        let lowest = (survivor_y + self.eye_size.1 - self.window.1).max(0);
+        let highest = survivor_y.min(SENSOR_HEIGHT as i32 - self.window.1);
+        if lowest > highest { return band_y; }
+        let wanted = if center[1] + margin >= (band + self.window.1) as f64 {
+            (center[1] + margin).ceil() as i32 - self.window.1 + 1
+        } else if center[1] - margin < band as f64 {
+            (center[1] - margin).floor() as i32
+        } else {
+            return band_y;
+        };
+        let shifted = wanted.clamp(lowest, highest);
+        // Keep the survivor contained after even-row alignment.
+        let aligned = if shifted & 1 == 0 { shifted } else if shifted + 1 <= highest { shifted + 1 } else { shifted - 1 };
+        if aligned < lowest || aligned > highest { return band_y; }
+        aligned as u32
     }
 
     fn sync_region_follow_pause(&mut self, paused: bool, eyes: [(u32, u32); 2],
@@ -29640,13 +29727,20 @@ impl RawRoiTracker {
                 }
             }
         }
+        let band_y = match mask {
+            1 | 2 => {
+                let survivor = (mask >> 1) as usize;
+                self.band_leaning_toward_missing_eye(plan.band_y, survivor, desired[survivor].1, current_timestamp_ns)
+            }
+            _ => plan.band_y,
+        };
         // One eye often lacks an admitted 3D surface. Retaining its existing
         // physical crop is NOT a fresh pivot observation. Keep that crop when
         // it fits; packing conflict may evict it, without inventing anatomy.
         for eye in 0..2 {
             if desired[eye].0 >= 0 && desired[eye].0 + self.eye_size.0 <= SENSOR_WIDTH as i32
-                && desired[eye].1 >= plan.band_y as i32
-                && desired[eye].1 + self.eye_size.1 <= plan.band_y as i32 + self.window.1
+                && desired[eye].1 >= band_y as i32
+                && desired[eye].1 + self.eye_size.1 <= band_y as i32 + self.window.1
             { mask |= 1 << eye; }
         }
         if mask == 0 { return; }
@@ -29657,11 +29751,11 @@ impl RawRoiTracker {
                 .max(self.baseline_eye_separation + 16)
         { return; }
         if desired != self.absolute || mask != self.region_active_mask
-            || plan.band_y != self.origin.1 as u32
+            || band_y != self.origin.1 as u32
         {
             self.absolute = desired;
             self.region_active_mask = mask;
-            self.planned_region_origin_y = Some(plan.band_y);
+            self.planned_region_origin_y = Some(band_y);
             self.positions_dirty = true;
         }
     }
@@ -29789,8 +29883,15 @@ impl RawRoiTracker {
         border_score: f64,
         border_points: usize,
         enforce_presence: bool,
+        segmentation_holds_presence: bool,
     ) -> Result<(), String> {
         let strong = has_eye_border_structure(border_score, border_points);
+        if !strong && segmentation_holds_presence {
+            // The active segmenter recently saw this eye. The sparse border
+            // detector fails on ~2/3 of such frames (reflections, lids, glasses)
+            // and must not escalate to a global search or re-center the crop.
+            return Ok(());
+        }
         if !strong {
             self.invalid_frames[eye_index] = self.invalid_frames[eye_index].saturating_add(1);
             if self.invalid_frames[eye_index] == 3 {
@@ -32279,6 +32380,9 @@ fn receive(
     let mut region_observation_floor_ns = [0u64; 2];
     let mut no_anatomy_since: [Option<Instant>; 2] = [None, None];
     let mut active_mode_presence_seen: [Option<(SegmentationMode, Instant)>; 2] = [None, None];
+    // Crop spacing (left origin minus right origin) when both eyes were last
+    // seen by the segmenter in the same sensor read.
+    let mut rigid_eye_offset: Option<(i32, i32)> = None;
     let mut driving_reckoning_handoff_active = [false; 2];
     let mut temporal_feature_presence_handoffs = [TemporalFeaturePresenceHandoff::default(); 2];
     // The worker intentionally re-exposes its latest result for bounded-age
@@ -36888,6 +36992,16 @@ fn receive(
                                     && !coarse_focus_authorized
                                     && Instant::now() >= context_focus_grace_until
                                     && index == config.focus_eye,
+                                !display_only_reacquisition
+                                    && roi_tracker.semantic_eye_was_seeded(index)
+                                    && segmentation_holds_eye_presence(
+                                        index,
+                                        now,
+                                        segmentation_mode,
+                                        active_mode_presence_seen,
+                                        roi_tracker.absolute,
+                                        rigid_eye_offset,
+                                    ),
                             )
                         }
                     })() {
@@ -36975,6 +37089,13 @@ fn receive(
                     );
                 if active_mode_direct_present {
                     active_mode_presence_seen[index] = Some((segmentation_mode, now));
+                    let other = 1 - index;
+                    if active_mode_presence_seen[other].is_some_and(|(mode, at)| {
+                        mode == segmentation_mode && now.saturating_duration_since(at) < PARTNER_SAME_READ
+                    }) {
+                        let origins = roi_tracker.absolute;
+                        rigid_eye_offset = Some((origins[1].0 - origins[0].0, origins[1].1 - origins[0].1));
+                    }
                 } else if active_mode_presence_seen[index]
                     .is_some_and(|(mode, _)| mode != segmentation_mode)
                 {
@@ -36982,11 +37103,17 @@ fn receive(
                 }
                 let active_mode_presence_retained = !display_only_reacquisition
                     && semantic_seeded
-                    && active_mode_presence_seen[index].is_some_and(|(mode, observed)| {
-                        mode == segmentation_mode
-                            && now.saturating_duration_since(observed)
-                                < ACTIVE_MODE_PRESENCE_RETENTION
-                    });
+                    // Was a flat 8 s hold. Corpus replay: 1 s + a rigid same-read
+                    // partner costs ~1 premature search per 22 min and searches
+                    // for a genuinely lost eye ~7 s sooner.
+                    && segmentation_holds_eye_presence(
+                        index,
+                        now,
+                        segmentation_mode,
+                        active_mode_presence_seen,
+                        roi_tracker.absolute,
+                        rigid_eye_offset,
+                    );
                 let active_mode_present =
                     active_mode_direct_present || active_mode_presence_retained;
                 if anatomy_observation_blocked || active_mode_present {
@@ -44693,6 +44820,14 @@ fn display_gaze_target(direction: RelativeGazeVector, calibration: Option<Calibr
 
 fn draw(app: &mut App, state: &mut ScreenWindow) -> Result<(), String> {
     refresh_viewer_frames(app)?;
+    let layout = app.ui.settings_json();
+    if app.saved_workspace.as_ref() != Some(&layout) {
+        if let Err(error) = monitor_location::write_json_atomic(
+            Path::new(viewer_ui::WORKSPACE_SETTINGS_PATH), &layout) {
+            eprintln!("viewer workspace not saved: {error}");
+        }
+        app.saved_workspace = Some(layout);
+    }
     let wanted = app.ui.wants_display_only_previews();
     if let Ok(mut shared) = app.shared.lock() {
         shared.display_only_previews_wanted = wanted;
@@ -46456,7 +46591,8 @@ fn run() -> Result<(), String> {
         gaze_cursor_window: None,
         recording_metadata: recording_trace::scene::HostMetadata::default(),
         desktop_gaze_next_tick: Instant::now(),
-        ui: viewer_ui::Workspace::default(),
+        ui: viewer_ui::Workspace::load_saved(),
+        saved_workspace: None,
         context,
         window_state: None,
         shared,
@@ -49386,6 +49522,28 @@ mod tests {
         tracker.readmission_separation[1]=1000.0;
         assert!(!tracker.propose_readmission(0,1,Instant::now()),"no sensor movement to force fit");
         assert_eq!(tracker.region_active_mask,1);
+    }
+
+    #[test]
+    fn single_eye_band_leans_toward_evicted_eye_so_readmission_is_feasible() {
+        // Calibration capture 1790512112 (target 6, right-middle): the head was
+        // rolled so subject-left sat ~220 rows lower. After it was evicted the
+        // band re-centered on subject-right (top 2098) and the predicted left
+        // center fell just past the band bottom for the remaining 34 s.
+        let mut tracker=synthetic_tracker();
+        tracker.live_region_transactions=true;
+        tracker.eye_size=(420,280);
+        tracker.window.1=576;
+        tracker.readmission_enabled_mask=3;
+        tracker.readmission_pair_centers=Some([[3580.0,2415.0],[4502.0,2636.0]]);
+        tracker.readmission_pivots[0]=Some((1_000,[3530.0,2380.0],[40.0,45.0]));
+        let center=tracker.readmission_center(0,1_000).unwrap();
+        assert!(center[1]+32.0>=(2098+576) as f64,"reproduces the recorded refusal");
+        let band=tracker.band_leaning_toward_missing_eye(2098,0,2250,1_000);
+        assert!(band%2==0 && band as i32<=2250 && band as i32+576>=2250+280,"survivor stays contained");
+        assert!(center[1]+32.0<(band+576) as f64,"probe center now inside band");
+        tracker.readmission_enabled_mask=1;
+        assert_eq!(tracker.band_leaning_toward_missing_eye(2098,0,2250,1_000),2098,"disabled eye does not move the band");
     }
 
     #[test]
@@ -70816,5 +70974,76 @@ mod tests {
         )
         .expect("the promoted temporal seed survives a remote contour");
         assert_eq!(remote, temporal);
+    }
+}
+
+#[cfg(test)]
+mod segmentation_presence_tests {
+    use super::*;
+
+    fn tracker() -> RawRoiTracker {
+        let config = Config {
+            camera: String::new(),
+            vcm: String::new(),
+            control: PathBuf::new(),
+            model_streams: Vec::new(),
+            origin: (0, 2000),
+            eyes: [(1168, 2128), (4848, 2128)],
+            eye_size: (384, 256),
+            window_size: (SENSOR_WIDTH, FINE_SENSOR_WINDOW_HEIGHT),
+            record: None,
+            tracking: None,
+            autofocus_armed: false,
+            focus_eye: 0,
+            focus_eye_auto: true,
+            segmentation: SegmentationMode::EyeStudent,
+            rough_pupil_center: RoughPupilCenterMode::IrisGuided,
+            driving_submode: DrivingSubmode::Normal,
+            global_capture_format: GlobalCaptureFormat::Raw10,
+            sam31_model: PathBuf::new(),
+            centimeter_scales: [None, None],
+        };
+        RawRoiTracker::new(&config)
+    }
+
+    #[test]
+    fn presence_hold_uses_short_memory_or_a_rigid_same_read_partner() {
+        let now = Instant::now();
+        let mode = SegmentationMode::EyeStudent;
+        let origins = [(1168, 2128), (4848, 2128)];
+        let spacing = Some((3680, 0));
+        let at = |ago_ms: u64| Some((mode, now - Duration::from_millis(ago_ms)));
+        // Seen 0.5 s ago: held. Seen 2 s ago with no partner: search allowed.
+        assert!(segmentation_holds_eye_presence(0, now, mode, [at(500), None], origins, spacing));
+        assert!(!segmentation_holds_eye_presence(0, now, mode, [at(2_000), None], origins, spacing));
+        // Partner seen in this read at the same rigid spacing vouches for it.
+        assert!(segmentation_holds_eye_presence(0, now, mode, [at(2_000), at(50)], origins, spacing));
+        // Partner stale, or the crops no longer at the head's spacing: search.
+        assert!(!segmentation_holds_eye_presence(0, now, mode, [at(2_000), at(900)], origins, spacing));
+        let drifted = [(1168, 2128), (4848 + 600, 2128 + 200)];
+        assert!(!segmentation_holds_eye_presence(0, now, mode, [at(2_000), at(50)], drifted, spacing));
+        // Small head motion within tolerance still counts as rigid.
+        let nudged = [(1168, 2128), (4848 + 30, 2128 + 20)];
+        assert!(segmentation_holds_eye_presence(0, now, mode, [at(2_000), at(50)], nudged, spacing));
+        // Another segmentation mode's sighting never counts.
+        let other = Some((SegmentationMode::Sam31, now - Duration::from_millis(50)));
+        assert!(!segmentation_holds_eye_presence(0, now, mode, [other, None], origins, spacing));
+    }
+
+    #[test]
+    fn weak_border_frames_do_not_trigger_global_search_while_segmenter_holds_the_eye() {
+        let mut held = tracker();
+        for _ in 0..10 {
+            // Sparse border evidence fails (e.g. a lens reflection over the iris).
+            assert!(held.observe(0, (1168, 2128), (384, 256), (192.0, 128.0), 0.0, 0, true, true).is_ok());
+        }
+        assert_eq!(held.invalid_frames[0], 0, "held frames must not accumulate toward reacquisition");
+
+        let mut unheld = tracker();
+        let triggered = (0..10).find_map(|_| {
+            unheld.observe(0, (1168, 2128), (384, 256), (192.0, 128.0), 0.0, 0, true, false).err()
+        });
+        assert!(triggered.is_some_and(|reason| reason.contains("failed eye-presence confidence")),
+            "without segmenter presence the existing global search still fires");
     }
 }

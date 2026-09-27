@@ -2445,3 +2445,107 @@ mod tests {
         }
     }
 }
+
+/// Saved main-window layout: scope, linked view, stereo layer and preview modes.
+/// Presentation only; restoring it never changes detection or camera state.
+pub(super) const WORKSPACE_SETTINGS_PATH: &str = "outputs/settings/viewer-workspace.json";
+
+fn named<T: Copy + std::fmt::Debug>(value: &serde_json::Value, all: &[T]) -> Option<T> {
+    let name = value.as_str()?;
+    all.iter().copied().find(|candidate| format!("{candidate:?}") == name)
+}
+
+const ALL_SCOPES: [Scope; 3] = [Scope::Roi, Scope::Linked, Scope::Global];
+const ALL_LINKED: [LinkedView; 11] = [
+    LinkedView::Compare, LinkedView::StereoSolver, LinkedView::StereoSegments,
+    LinkedView::LimbusRefinementEdges, LinkedView::Timing, LinkedView::Contacts,
+    LinkedView::TweakedContacts, LinkedView::PinkWellSightline, LinkedView::StudentMaskOutline,
+    LinkedView::StudentEllipseOnly, LinkedView::StudentPupilOnly,
+];
+const ALL_GLOBAL: [GlobalView; 2] = [GlobalView::Sensor, GlobalView::Objects];
+const ALL_PANELS: [Panel; 4] = [Panel::Selection, Panel::Analysis, Panel::Camera, Panel::Diagnostics];
+const ALL_LAYERS: [stereo::Layer; 4] =
+    [stereo::Layer::Conics, stereo::Layer::Segments, stereo::Layer::Masks, stereo::Layer::Raw];
+const ALL_OVERLAYS: [RoiOverlayMode; 15] = [
+    RoiOverlayMode::FullDiagnostics, RoiOverlayMode::SamOuterIrisMasks,
+    RoiOverlayMode::SamSegmentationOnly, RoiOverlayMode::SamOuterIrisFit,
+    RoiOverlayMode::LimbusRefinementEdges, RoiOverlayMode::SamConicSegments,
+    RoiOverlayMode::StereoContributions, RoiOverlayMode::SamDeflattenedVirtualContact,
+    RoiOverlayMode::SamTweakedContactGeometry, RoiOverlayMode::PinkWellSightline,
+    RoiOverlayMode::StudentMaskOutline, RoiOverlayMode::StudentEllipseOnly,
+    RoiOverlayMode::StudentPupilOnly, RoiOverlayMode::StudentSourceRaw, RoiOverlayMode::Clean,
+];
+
+impl Workspace {
+    pub(super) fn settings_json(&self) -> serde_json::Value {
+        let overrides = self.preview_overrides.map(|o| serde_json::json!({
+            "pixels": o.pixels.map(|v| format!("{v:?}")),
+            "overlay": o.overlay.map(|v| format!("{v:?}")),
+        }));
+        serde_json::json!({
+            "schema": "buttercup-viewer-workspace-v1",
+            "scope": format!("{:?}", self.scope),
+            "selected": self.selected,
+            "linked": format!("{:?}", self.linked),
+            "stereo_layer": format!("{:?}", self.stereo_layer),
+            "global": format!("{:?}", self.global),
+            "panel": format!("{:?}", self.panel),
+            "preview_defaults": {
+                "pixels": format!("{:?}", self.preview_defaults.pixels),
+                "overlay": format!("{:?}", self.preview_defaults.overlay),
+            },
+            "preview_overrides": overrides,
+        })
+    }
+
+    /// Unknown or missing entries keep their defaults; a stale file never fails startup.
+    pub(super) fn from_settings_json(value: &serde_json::Value) -> Self {
+        let mut ui = Self::default();
+        if value["schema"] != "buttercup-viewer-workspace-v1" {
+            return ui;
+        }
+        if let Some(scope) = named(&value["scope"], &ALL_SCOPES) { ui.scope = scope; }
+        if let Some(selected) = value["selected"].as_u64() { ui.selected = (selected as usize).min(1); }
+        if let Some(linked) = named(&value["linked"], &ALL_LINKED) { ui.linked = linked; }
+        if let Some(layer) = named(&value["stereo_layer"], &ALL_LAYERS) { ui.stereo_layer = layer; }
+        if let Some(global) = named(&value["global"], &ALL_GLOBAL) { ui.global = global; }
+        if let Some(panel) = named(&value["panel"], &ALL_PANELS) { ui.panel = panel; }
+        let defaults = &value["preview_defaults"];
+        if let Some(pixels) = named(&defaults["pixels"], &ViewMode::ALL) { ui.preview_defaults.pixels = pixels; }
+        if let Some(overlay) = named(&defaults["overlay"], &ALL_OVERLAYS) { ui.preview_defaults.overlay = overlay; }
+        for eye in 0..2 {
+            let saved = &value["preview_overrides"][eye];
+            ui.preview_overrides[eye].pixels = named(&saved["pixels"], &ViewMode::ALL);
+            ui.preview_overrides[eye].overlay = named(&saved["overlay"], &ALL_OVERLAYS);
+        }
+        ui
+    }
+
+    pub(super) fn load_saved() -> Self {
+        std::fs::read(WORKSPACE_SETTINGS_PATH).ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .map(|value| Self::from_settings_json(&value))
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod workspace_settings_tests {
+    use super::*;
+    #[test]
+    fn linked_stereo_workspace_roundtrips_and_bad_entries_fall_back() {
+        let mut ui = Workspace::default();
+        ui.scope = Scope::Linked;
+        ui.linked = LinkedView::StereoSolver;
+        ui.stereo_layer = stereo::Layer::Segments;
+        ui.selected = 1;
+        ui.preview_overrides[1].pixels = Some(ViewMode::Canny);
+        let restored = Workspace::from_settings_json(&ui.settings_json());
+        assert_eq!(restored.settings_json(), ui.settings_json());
+        let mut stale = ui.settings_json();
+        stale["linked"] = serde_json::json!("NoSuchView");
+        let fallback = Workspace::from_settings_json(&stale);
+        assert_eq!(fallback.linked, LinkedView::default());
+        assert_eq!(fallback.scope, Scope::Linked);
+    }
+}

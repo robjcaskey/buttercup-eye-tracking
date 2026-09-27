@@ -283,7 +283,17 @@ pub(crate) fn prepare<I: Iterator<Item = String>>(mut args: I) -> Result<(), Str
         let epoch = key["stream_epoch"].as_str().filter(|s| !s.is_empty()).ok_or("missing native clock epoch")?;
         lineages.insert(epoch.to_owned());
     }
-    if lineages.len() != 1 { return Err("calibration replay requires a single recorded clock epoch".into()); }
+    // A mid-run reacquisition opens a new clock epoch and the live
+    // calibration discards every earlier sample, so replaying only the final
+    // epoch reproduces what was fitted. Opt-in; never pairs across epochs.
+    if lineages.len() > 1 && std::env::var("BUTTERCUP_CALIBRATION_REPLAY_EPOCH").is_ok_and(|v| v == "last") {
+        let last_epoch = |f: &Value| f["source_clock"]["source_key"]["stream_epoch"].as_str().map(str::to_owned);
+        let latest = frames.iter().max_by_key(|f| f["host_arrival_unix_ns"].as_u64()).and_then(last_epoch);
+        frames.retain(|f| last_epoch(f) == latest);
+        lineages.retain(|epoch| Some(epoch) == latest.as_ref());
+        eprintln!("calibration replay kept only final clock epoch {latest:?} ({} sources)", frames.len());
+    }
+    if lineages.len() != 1 { return Err("calibration replay requires a single recorded clock epoch (BUTTERCUP_CALIBRATION_REPLAY_EPOCH=last keeps the final one)".into()); }
     frames.sort_by_key(|f| (f["timestamp_ns"].as_u64(), f["eye_id"].as_u64()));
     fs::create_dir(&output).map_err(|e| e.to_string())?;
     let capture = output.join("capture");

@@ -444,7 +444,12 @@ fn run_with_availability<I: Iterator<Item = String>>(mut args: I, coupled:bool) 
         let frame: Value = serde_json::from_slice(line).map_err(|e|e.to_string())?;
         let key = &frame["source_clock"]["source_key"];
         let epoch = key["stream_epoch"].as_str().ok_or("RAW source lacks clock lineage")?;
-        if lineage.as_deref().is_some_and(|old|old!=epoch) { return Err("RAW calibration spans different source clocks".into()); }
+        if lineage.as_deref().is_some_and(|old|old!=epoch) {
+            // Same opt-in as prepare: keep only the final epoch, whose samples
+            // alone survived the live mid-run reacquisition restart.
+            if std::env::var("BUTTERCUP_CALIBRATION_REPLAY_EPOCH").is_ok_and(|v|v=="last") { frames.clear(); }
+            else { return Err("RAW calibration spans different source clocks".into()); }
+        }
         lineage = Some(epoch.to_owned());
         let identity = (ns(&frame["eye_id"])?, ns(&frame["timestamp_ns"])?, ns(&frame["sequence"])?);
         if identity != (ns(&key["roi_id"])?, ns(&key["sensor_timestamp_ns"])?, ns(&key["sequence"])?)

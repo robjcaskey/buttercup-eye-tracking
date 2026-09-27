@@ -146,8 +146,28 @@ def map_output(requested):
     return output
 
 
+def osd(title, body, error=False):
+    """Show the change on the attention-style eye overview card; False if unavailable."""
+    try:
+        import importlib.util
+        sys.dont_write_bytecode = True  # keep generated files out of the source tree
+        path = Path(__file__).resolve().with_name("eye-focus-osd.py")
+        spec = importlib.util.spec_from_file_location("eye_focus_osd", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        enabled = title.endswith(" ON")
+        return module.show({"kind": "status", "eyebrow": "EYE TRACKING",
+                            "title": title.removeprefix("Buttercup ").capitalize(), "detail": body,
+                            "tone": "error" if error else ("success" if enabled else "waiting"),
+                            "sticky_tone": True, "hold_s": 3.0})
+    except (OSError, ImportError, ValueError, AttributeError):
+        return False
+
+
 def notify(title, body, error=False):
     print(f"{title}: {body}", file=sys.stderr if error else sys.stdout)
+    if osd(title, body, error):
+        return
     try:
         subprocess.run(["notify-send", "--app-name=Buttercup", "--urgency=" + ("critical" if error else "normal"),
                         "--expire-time=" + ("10000" if error else "2500"), title, body],

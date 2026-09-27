@@ -5,9 +5,10 @@ a click-through layer-shell overlay that never takes keyboard focus.
 
     eye-focus-osd.py serve            # resident overlay (started on demand)
     eye-focus-osd.py show JSON        # send one update, starting the overlay if needed
+    eye-focus-osd.py status           # toggle the pinned overview (press again to hide)
 
 JSON fields: title, detail, tone (working|success|waiting|error), position,
-kind (focus|exposure), eyebrow, range [min, max], log_scale.
+kind (focus|exposure|status), eyebrow, range [min, max], log_scale, hold_s.
 """
 import json
 import os
@@ -51,6 +52,9 @@ window.eye-focus-osd { background-color: rgba(0,0,0,0); background-image: none; 
 .pill.on { color: #71e0b8; border-color: rgba(113,224,184,0.62); background-color: rgba(113,224,184,0.08); }
 .pill.warn { color: rgb(255,203,107); border-color: rgba(255,203,107,0.62); background-color: rgba(255,203,107,0.08); }
 .pill.info { color: #e0e0e0; border-color: #626273; }
+.kv-grid { margin-top: 14px; }
+.kv-key { color: #8a8a98; font-size: 16px; font-weight: 600; min-width: 190px; }
+.kv-value { color: #f4f4f6; font-size: 18px; font-weight: 700; min-width: 230px; }
 .dialog-footer { color: #a6a6b5; font-size: 15px; margin-top: 26px; }
 """
 TONES = ("working", "success", "waiting", "error")
@@ -100,6 +104,9 @@ def viewer_status(command, key):
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SETTINGS = os.path.join(REPO, "outputs", "settings")
 CARD_WIDTH = 900
+# Fine eye mode: 14704 pixel clocks per line (camera FINE_LINE_LENGTH); the
+# line period measured from frame length vs delivered frame rate is ~34.5 us.
+LINE_TIME_US = 34.5
 MODEL_NAMES = {"eye-student": "Butter Obelisk", "sam31": "SAM 3.1", "native": "Native"}
 
 
@@ -127,38 +134,93 @@ def camera_snapshot():
     }
 
 
+def imperial_units():
+    """True when the locale's LC_MEASUREMENT is US/imperial (glibc measurement=2)."""
+    if not hasattr(imperial_units, "cached"):
+        imperial = None
+        try:
+            output = subprocess.run(["locale", "-k", "LC_MEASUREMENT"], capture_output=True,
+                                    text=True, timeout=2).stdout
+            for line in output.splitlines():
+                if line.startswith("measurement="):
+                    imperial = line.split("=", 1)[1].strip() == "2"
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if imperial is None:
+            name = next((os.environ[key] for key in ("LC_ALL", "LC_MEASUREMENT", "LANG")
+                         if os.environ.get(key)), "")
+            territory = name.split(".")[0].split("_")[-1].upper() if "_" in name else ""
+            imperial = territory in ("US", "LR", "MM")
+        imperial_units.cached = imperial
+    return imperial_units.cached
+
+
+def length_text(mm):
+    if not mm:
+        return "—"
+    return f"{mm / 25.4:.1f} in" if imperial_units() else f"{mm / 10:.1f} cm"
+
+
+def exposure_text(lines):
+    if not isinstance(lines, (int, float)):
+        return "—"
+    return f"{lines * LINE_TIME_US / 1000:.1f} ms ({lines} lines)"
+
+
 def overview_pills(snapshot):
-    """(text, style) pills: style 'on', 'warn', 'info' or '' (off)."""
+    """Per section: {"pills": [(text, style)], "values": [(key, value)]}.
+
+    Pills are on/off states (style 'on', 'warn' or '' for off); facts are
+    key/value readouts rendered as a label and a value, never as pills.
+    """
     status, focus, exposure = snapshot["status"], snapshot["focus"], snapshot["exposure"]
     if not status:
-        return {"camera": [("viewer not running", "warn")], "tracking": [], "outputs": []}
+        return {"camera": {"pills": [("viewer not running", "warn")], "values": []},
+                "tracking": {"pills": [], "values": []}, "outputs": {"pills": [], "values": []}}
     autofocus = not status.get("manual_focus", False)
     auto_exposure = not exposure.get("manual", True) if exposure else False
-    camera = [
-        ("● AF auto" if autofocus else "○ AF manual", "on" if autofocus else ""),
-        ("● AE auto" if auto_exposure else "○ AE manual", "on" if auto_exposure else ""),
-        (f"lens {focus.get('position', '—')}" + ("" if focus.get("settled", True) else " moving"), "info"),
-        (f"exposure {exposure.get('actual_lines', '—')} lines", "info"),
-    ]
+    # Index 0 is the subject's right eye, 1 the left (viewer subject_eye_label).
+    distances = (list(snapshot["stereo"].get("eye_distance_mm") or []) + [None, None])[:2]
+
+    distance_text = length_text
+    camera = {
+        "pills": [
+            ("● AF auto" if autofocus else "○ AF manual", "on" if autofocus else ""),
+            ("● AE auto" if auto_exposure else "○ AE manual", "on" if auto_exposure else ""),
+        ],
+        "values": [
+            ("Lens position", f"{focus.get('position', '—')}" + ("" if focus.get("settled", True) else "  moving")),
+            ("Exposure", exposure_text(exposure.get("actual_lines"))),
+            ("Right eye distance", distance_text(distances[0])),
+            ("Left eye distance", distance_text(distances[1])),
+        ],
+    }
     mode = (status.get("segmentation") or {}).get("mode", "?")
     stereo = snapshot["stereo"].get("active")
-    mount = snapshot["mount"].get("mode", "flexible")
     lens = snapshot["lens"]
-    tracking = [
-        (MODEL_NAMES.get(mode, mode), "info"),
-        ("● stereo" if stereo else "○ single eye", "on" if stereo else ""),
-        (f"mount {mount}", "info"),
-        ("● calibrated" if snapshot["calibration"] else "○ not calibrated", "on" if snapshot["calibration"] else "warn"),
-        (f"● lens {lens['fx_fy_cx_cy_px'][0]:.0f}px" if lens else "○ lens nominal", "on" if lens else ""),
-        (f"eye {status.get('focus_eye', '?')}", "info"),
-    ]
+    tracking = {
+        "pills": [
+            ("● stereo" if stereo else "○ single eye", "on" if stereo else ""),
+            ("● calibrated" if snapshot["calibration"] else "○ not calibrated",
+             "on" if snapshot["calibration"] else "warn"),
+        ],
+        "values": [
+            ("Segmentation model", MODEL_NAMES.get(mode, mode)),
+            ("Camera mount", snapshot["mount"].get("mode", "flexible").replace("-", " ")),
+            ("Lens model", f"measured {lens['fx_fy_cx_cy_px'][0]:.0f} px" if lens else "nominal 4000 px"),
+            ("Calibration eye", status.get("focus_eye", "?")),
+        ],
+    }
     cursor, mouse = snapshot["cursor"], snapshot["mouse"]
-    outputs = [
-        ("● gaze ring" if cursor.get("enabled") else "○ gaze ring", "on" if cursor.get("enabled") else ""),
-        ("● mouse control" if mouse.get("enabled") else "○ mouse control", "on" if mouse.get("enabled") else ""),
-    ]
+    outputs = {
+        "pills": [
+            ("● gaze ring" if cursor.get("enabled") else "○ gaze ring", "on" if cursor.get("enabled") else ""),
+            ("● mouse control" if mouse.get("enabled") else "○ mouse control", "on" if mouse.get("enabled") else ""),
+        ],
+        "values": [],
+    }
     if cursor.get("enabled") and cursor.get("status") not in (None, "", "tracking"):
-        outputs.append((cursor["status"], "warn"))
+        outputs["values"].append(("Gaze ring", cursor["status"]))
     return {"camera": camera, "tracking": tracking, "outputs": outputs}
 
 
@@ -167,6 +229,14 @@ def serve():
     if LAYER_SHELL not in os.environ.get("LD_PRELOAD", "") and os.path.exists(LAYER_SHELL):
         env = dict(os.environ, LD_PRELOAD=(LAYER_SHELL + " " + os.environ.get("LD_PRELOAD", "")).strip())
         os.execve(sys.executable, [sys.executable, os.path.abspath(__file__), "serve"], env)
+    # Single instance: a second helper would steal the socket and orphan the
+    # first overlay, so later messages could toggle an invisible copy.
+    import fcntl
+    lock = open(os.path.join(RUNTIME, "buttercup-eye-focus-osd.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return
     import gi
     gi.require_version("Gtk", "4.0")
     gi.require_version("Gdk", "4.0")
@@ -182,7 +252,7 @@ def serve():
     inbox.setblocking(False)
 
     app = Gtk.Application(application_id="org.buttercup.EyeFocusOsd")
-    state = {"hide_at": 0.0, "tone": "success", "message": {}}
+    state = {"hide_at": 0.0, "tone": "success", "message": {}, "pinned": False, "pinned_message": {}}
 
     def activate(app):
         provider = Gtk.CssProvider()
@@ -231,11 +301,15 @@ def serve():
             flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=8,
                                column_spacing=10, row_spacing=10, homogeneous=False,
                                halign=Gtk.Align.START)
+            grid = Gtk.Grid(column_spacing=18, row_spacing=6, halign=Gtk.Align.START)
+            grid.add_css_class("kv-grid")
             card.append(label)
             card.append(flow)
-            rows[key] = flow
+            card.append(grid)
+            rows[key] = (flow, grid)
         footer = Gtk.Label(xalign=0, wrap=True,
-                           label="Super+] [ exposure   Super+Shift+] [ focus   Super+\\ autofocus   Super+Shift+\\ auto exposure")
+                           label="Super+] [ exposure   Shift+] [ focus   \\ autofocus   Shift+\\ auto exposure\n"
+                                 "Super+/ status   Shift+M gaze mouse   Shift+O gaze ring   Y wleyes   (Magic works too)")
         footer.add_css_class("dialog-footer")
         card.append(footer)
         window.set_child(card)
@@ -249,6 +323,20 @@ def serve():
                 if style:
                     pill.add_css_class(style)
                 flow.insert(pill, -1)
+
+        def set_values(grid, values):
+            while (child := grid.get_first_child()) is not None:
+                grid.remove(child)
+            # Two key/value pairs per row: dim label, bright value.
+            for index, (name, value) in enumerate(values):
+                row, column = divmod(index, 2)
+                key_label = Gtk.Label(label=name, xalign=0)
+                key_label.add_css_class("kv-key")
+                value_label = Gtk.Label(label=value, xalign=0)
+                value_label.add_css_class("kv-value")
+                grid.attach(key_label, column * 2, row, 1, 1)
+                grid.attach(value_label, column * 2 + 1, row, 1, 1)
+            grid.set_visible(bool(values))
 
         def render(position, tone, message, overview):
             for name in TONES:
@@ -268,8 +356,12 @@ def serve():
             else:
                 fraction = (position - low) / (high - low)
             fill.set_size_request(max(10, int((CARD_WIDTH - 88) * min(1.0, max(0.0, fraction)))), 10)
-            for key, pills in overview.items():
-                set_pills(rows[key], pills)
+            gauge.set_visible(message.get("kind") != "status")
+            for key, section in overview.items():
+                flow, grid = rows[key]
+                set_pills(flow, section["pills"])
+                flow.set_visible(bool(section["pills"]))
+                set_values(grid, section["values"])
 
         def poll():
             changed = False
@@ -279,18 +371,34 @@ def serve():
                 except BlockingIOError:
                     break
                 try:
-                    state["message"] = json.loads(data)
+                    incoming = json.loads(data)
                 except ValueError:
                     continue
-                state["tone"] = state["message"].get("tone") if state["message"].get("tone") in TONES else "working"
-                state["hide_at"] = time.monotonic() + HIDE_AFTER_S
                 changed = True
+                if incoming.get("toggle"):
+                    # The status card toggles: a press pins it until the next press.
+                    visible = state["pinned"] or time.monotonic() < state["hide_at"]
+                    state["pinned"] = not (state["pinned"] and visible)
+                    state["hide_at"] = 0.0
+                    state["pinned_message"] = incoming
+                    state["message"] = incoming
+                    state["tone"] = incoming.get("tone", "success")
+                    continue
+                state["message"] = incoming
+                state["tone"] = incoming.get("tone") if incoming.get("tone") in TONES else "working"
+                state["hide_at"] = time.monotonic() + float(incoming.get("hold_s", HIDE_AFTER_S))
             now = time.monotonic()
-            if now < state["hide_at"]:
+            if state["pinned"] and now >= state["hide_at"] and state["message"] is not state["pinned_message"]:
+                # A transient change has expired; fall back to the pinned status.
+                state["message"] = state["pinned_message"]
+                state["tone"] = state["pinned_message"].get("tone", "success")
+            if now < state["hide_at"] or state["pinned"]:
                 message = dict(state["message"])
                 position = message.get("position")
                 snapshot = camera_snapshot()
-                if message.get("kind") == "exposure":
+                if message.get("kind") == "status":
+                    pass
+                elif message.get("kind") == "exposure":
                     exposure = snapshot.get("exposure") or {}
                     if exposure:
                         position = exposure.get("actual_lines", position)
@@ -298,7 +406,8 @@ def serve():
                             settled = exposure.get("actual_lines") == exposure.get("target_lines")
                             state["tone"] = "success" if settled else "working"
                         if position is not None:
-                            message["title"] = f"Exposure {position} lines"
+                            message["title"] = f"Exposure {position * LINE_TIME_US / 1000:.1f} ms"
+                            message["detail"] = f"{message.get('detail', '')}   {position} lines".strip()
                 else:
                     focus = snapshot.get("focus") or {}
                     if focus:
@@ -335,6 +444,10 @@ def main():
         return 0
     if len(sys.argv) == 3 and sys.argv[1] == "show":
         return 0 if show(json.loads(sys.argv[2])) else 1
+    if len(sys.argv) == 2 and sys.argv[1] == "status":
+        return 0 if show({"kind": "status", "eyebrow": "EYE TRACKING", "title": "Status",
+                          "detail": "Camera, eye tracking and gaze outputs",
+                          "tone": "success", "sticky_tone": True, "toggle": True}) else 1
     print(__doc__)
     return 2
 
