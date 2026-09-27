@@ -56,6 +56,9 @@ mapfile -t unexpected_files < <(
       ./docs/physics-naming-audit.md \
       ./scripts/audit-tree.sh \
       ./scripts/run-viewer.sh \
+      ./scripts/camera-focus.py \
+      ./scripts/camera-exposure.py \
+      ./scripts/eye-focus-osd.py \
       ./scripts/audit-readmission-corpus.py \
       ./scripts/inventory-stereo-corpus.py \
       ./scripts/prepare-stereo-replay.py \

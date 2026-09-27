@@ -400,6 +400,17 @@ takes focus and never moves the pointer; `scripts/toggle-mouse-output.py --curso
 While a calibration target or the orientation plus is shown, the screen shows
 only the stimulus; status text appears once the attempt is accepted or fails.
 
+Camera controls are also available outside the viewer through its control
+socket (`EXPOSURE STEP n|AUTO|MANUAL|STATUS`, `FOCUS SET n|AUTO`, each change under
+a short lease). `scripts/camera-exposure.py up|down|toggle` and
+`scripts/camera-focus.py in|out|auto` wrap them for desktop shortcuts; Rob's Sway
+bindings are Super+] / [ exposure, Super+Shift+] / [ focus, Super+\\ autofocus and
+Super+Shift+\\ auto-exposure toggle. Each change shows `scripts/eye-focus-osd.py`,
+a centered, click-through overview styled like the attention-manager surface: the
+changed value with a gauge, then camera (AF/AE, lens, exposure), eye-tracking
+(model, stereo, mount, calibration, measured lens, eye) and output (gaze ring,
+mouse) status. It starts on demand or from the Sway session.
+
 The stereo selection (Shift+3) is saved in `outputs/settings/stereo-solver.json`.
 A measured lens pinhole in `outputs/settings/joint-camera-intrinsics.json`
 (`[fx, fy, cx, cy]` in native sensor pixels, e.g. from the checkerboard collector)

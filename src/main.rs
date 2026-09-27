@@ -6643,6 +6643,8 @@ fn valid_control_lease_owner(owner: &str) -> bool {
 fn control_command_requires_lease(fields: &[&str]) -> bool {
     match fields {
         [focus, ..] if focus.eq_ignore_ascii_case("FOCUS") => true,
+        [exposure, action, ..] if exposure.eq_ignore_ascii_case("EXPOSURE")
+            && !action.eq_ignore_ascii_case("STATUS") => true,
         [roi, ..] if roi.eq_ignore_ascii_case("ROI") => true,
         [reacquire] if reacquire.eq_ignore_ascii_case("REACQUIRE") => true,
         [pupil, center, ..]
@@ -8475,6 +8477,48 @@ fn handle_control_command(command: &str, shared: &Arc<Mutex<SharedState>>) -> St
         {
             state.focus_action = Some(FocusAction::Autofocus);
             "{\"ok\":true,\"queued\":\"autofocus\"}".to_string()
+        }
+        // Same queued actions as the viewer's . / and A keys.
+        [exposure, status]
+            if exposure.eq_ignore_ascii_case("EXPOSURE") && status.eq_ignore_ascii_case("STATUS") =>
+        {
+            serde_json::json!({"ok":true,"exposure":{
+                "actual_lines":state.exposure_actual,"target_lines":state.exposure_target,
+                "frame_length":state.exposure_frame_length,"manual":state.manual_exposure,
+                "meter_p90_raw10":state.exposure_meter_raw10,
+                "range_lines":[AUTO_EXPOSURE_MIN_LINES,MANUAL_EXPOSURE_MAX_LINES]}}).to_string()
+        }
+        [exposure, step, value]
+            if exposure.eq_ignore_ascii_case("EXPOSURE") && step.eq_ignore_ascii_case("STEP") =>
+        {
+            let delta = match value.parse::<i32>() {
+                Ok(delta) if delta != 0 => delta,
+                Ok(_) => return control_error("exposure step must be nonzero"),
+                Err(error) => return control_error(format!("invalid exposure step: {error}")),
+            };
+            state.manual_camera_tuning_until = Some(Instant::now() + Duration::from_secs(3));
+            let pending = match state.exposure_action.take() {
+                Some(ExposureAction::Step(value)) => value,
+                _ => 0,
+            };
+            let travel = i32::from(MANUAL_EXPOSURE_MAX_LINES - AUTO_EXPOSURE_MIN_LINES);
+            let queued = pending.saturating_add(delta).clamp(-travel, travel);
+            state.exposure_action = Some(ExposureAction::Step(queued));
+            serde_json::json!({"ok":true,"queued":"exposure-step","delta":queued,
+                "actual_lines":state.exposure_actual}).to_string()
+        }
+        // Freeze at the current exposure: a zero step switches to manual only.
+        [exposure, manual]
+            if exposure.eq_ignore_ascii_case("EXPOSURE") && manual.eq_ignore_ascii_case("MANUAL") =>
+        {
+            state.exposure_action = Some(ExposureAction::Step(0));
+            "{\"ok\":true,\"queued\":\"manual-exposure\"}".to_string()
+        }
+        [exposure, auto]
+            if exposure.eq_ignore_ascii_case("EXPOSURE") && auto.eq_ignore_ascii_case("AUTO") =>
+        {
+            state.exposure_action = Some(ExposureAction::Auto);
+            "{\"ok\":true,\"queued\":\"auto-exposure\"}".to_string()
         }
         [roi, hold, right_x, right_y, left_x, left_y]
             if roi.eq_ignore_ascii_case("ROI") && hold.eq_ignore_ascii_case("HOLD") =>
