@@ -445,6 +445,12 @@ const VERIFIED_FINE_CENTER_MIN_SAMPLES: usize = 5;
 const VERIFIED_FINE_CENTER_MAD_LIMIT: i32 = 10;
 const VERIFIED_FINE_CENTER_TOLERANCE: (i32, i32) = (24, 24);
 const VERIFIED_FINE_CENTER_MAX_STEP: (i32, i32) = (96, 96);
+/// Segmenter iris anchor for pivot-planned crops: the last N fresh centers
+/// must agree within SPREAD; a plan more than TOLERANCE off is re-centered.
+const SEGMENTER_IRIS_ANCHOR_SAMPLES: usize = 3;
+const SEGMENTER_IRIS_ANCHOR_MAX_AGE_NS: u64 = 600_000_000;
+const SEGMENTER_IRIS_ANCHOR_SPREAD_PX: f64 = 24.0;
+const SEGMENTER_IRIS_ANCHOR_TOLERANCE_PX: f64 = 40.0;
 const ROI_CENSORED_CENTER_HISTORY: usize = 7;
 const ROI_CENSORED_CENTER_MIN_SAMPLES: usize = 4;
 const ROI_CENSORED_CENTER_MAD_LIMIT: i32 = 8;
@@ -29481,6 +29487,9 @@ struct RawRoiTracker {
     sam_follow_seen: [Option<Instant>; 2],
     roi_censored_center_history: [Vec<(i32, i32, u8)>; 2],
     roi_censored_center_last_timestamp_ns: [Option<u64>; 2],
+    /// Recent segmenter iris centers (source ns, sensor px), recorded before
+    /// any crop-origin gating so a pivot plan can be checked against them.
+    segmenter_iris_centers: [VecDeque<(u64, (f64, f64))>; 2],
     /// Last position independently established by MediaPipe or the bilateral
     /// fixed-context matcher. Eye-local fits are bounded around this anchor.
     trusted_absolute: [(i32, i32); 2],
@@ -29596,6 +29605,54 @@ impl RawRoiTracker {
         let aligned = if shifted & 1 == 0 { shifted } else if shifted + 1 <= highest { shifted + 1 } else { shifted - 1 };
         if aligned < lowest || aligned > highest { return band_y; }
         aligned as u32
+    }
+
+    fn record_segmenter_iris_center(&mut self, eye_index: usize, source_timestamp_ns: u64, center: (f64, f64)) {
+        let history = &mut self.segmenter_iris_centers[eye_index.min(1)];
+        if history.back().is_some_and(|(previous, _)| source_timestamp_ns <= *previous) { return; }
+        history.push_back((source_timestamp_ns, center));
+        while history.len() > SEGMENTER_IRIS_ANCHOR_SAMPLES { history.pop_front(); }
+    }
+
+    /// Median of the last few segmenter iris centers when they are fresh and
+    /// mutually consistent; a crop-placement anchor, not identity evidence.
+    fn segmenter_iris_anchor(&self, eye_index: usize, timestamp_ns: u64) -> Option<(f64, f64)> {
+        let history = &self.segmenter_iris_centers[eye_index.min(1)];
+        if history.len() < SEGMENTER_IRIS_ANCHOR_SAMPLES
+            || history.iter().any(|(source, _)| timestamp_ns.saturating_sub(*source) > SEGMENTER_IRIS_ANCHOR_MAX_AGE_NS) {
+            return None;
+        }
+        let median = |axis: fn(&(f64, f64)) -> f64| {
+            let mut values = history.iter().map(|(_, c)| axis(c)).collect::<Vec<_>>();
+            values.sort_by(f64::total_cmp);
+            values[values.len() / 2]
+        };
+        let center = (median(|c| c.0), median(|c| c.1));
+        history.iter().all(|(_, c)| (c.0 - center.0).abs() <= SEGMENTER_IRIS_ANCHOR_SPREAD_PX
+            && (c.1 - center.1).abs() <= SEGMENTER_IRIS_ANCHOR_SPREAD_PX).then_some(center)
+    }
+
+    /// A pivot plan follows the joint solve's rotation center. When that eye
+    /// has dropped out of the joint solve (its iris clipped at the crop edge)
+    /// the pivot goes stale and the plan keeps the crop parked beside the
+    /// iris. A fresh, consistent segmenter iris center overrides the planned
+    /// crop position so the iris is re-captured; band containment is kept.
+    fn crop_following_segmenter_iris(&self, eye_index: usize, planned: (i32, i32), band_y: u32,
+        timestamp_ns: u64) -> (i32, i32) {
+        let Some(center) = self.segmenter_iris_anchor(eye_index, timestamp_ns) else { return planned; };
+        let offset = (center.0 - (planned.0 + self.eye_size.0 / 2) as f64,
+            center.1 - (planned.1 + self.eye_size.1 / 2) as f64);
+        if offset.0.abs() <= SEGMENTER_IRIS_ANCHOR_TOLERANCE_PX && offset.1.abs() <= SEGMENTER_IRIS_ANCHOR_TOLERANCE_PX {
+            return planned;
+        }
+        let band_top = band_y as i32;
+        let band_bottom = band_top + self.window.1 - self.eye_size.1;
+        if band_bottom < band_top { return planned; }
+        let x = ((center.0 - self.eye_size.0 as f64 * 0.5).round() as i32)
+            .clamp(0, SENSOR_WIDTH as i32 - self.eye_size.0) & !3;
+        let y = ((center.1 - self.eye_size.1 as f64 * 0.5).round() as i32).clamp(band_top, band_bottom) & !1;
+        let y = if y < band_top { y + 2 } else { y };
+        (x, y)
     }
 
     fn sync_region_follow_pause(&mut self, paused: bool, eyes: [(u32, u32); 2],
@@ -29734,6 +29791,11 @@ impl RawRoiTracker {
             }
             _ => plan.band_y,
         };
+        for eye in 0..2 {
+            if mask & (1 << eye) != 0 {
+                desired[eye] = self.crop_following_segmenter_iris(eye, desired[eye], band_y, current_timestamp_ns);
+            }
+        }
         // One eye often lacks an admitted 3D surface. Retaining its existing
         // physical crop is NOT a fresh pivot observation. Keep that crop when
         // it fits; packing conflict may evict it, without inventing anatomy.
@@ -29825,6 +29887,7 @@ impl RawRoiTracker {
             sam_follow_seen: [None; 2],
             roi_censored_center_history: [Vec::new(), Vec::new()],
             roi_censored_center_last_timestamp_ns: [None; 2],
+            segmenter_iris_centers: std::array::from_fn(|_| VecDeque::new()),
             trusted_absolute: absolute,
             roi_censored_last_step: [None; 2],
             valid_seen: [false; 2],
@@ -30222,6 +30285,10 @@ impl RawRoiTracker {
         anticipatory: bool,
     ) -> Result<Option<String>, String> {
         let eye_index = eye_index.min(1);
+        if anticipatory && center_in_frame.0.is_finite() && center_in_frame.1.is_finite() {
+            self.record_segmenter_iris_center(eye_index, source_timestamp_ns,
+                (sensor_origin.0 as f64 + center_in_frame.0, sensor_origin.1 as f64 + center_in_frame.1));
+        }
 
         // A previous verified correction may be waiting only for the 250 ms
         // camera-command debounce.  Retry that exact absolute position before
@@ -49522,6 +49589,29 @@ mod tests {
         tracker.readmission_separation[1]=1000.0;
         assert!(!tracker.propose_readmission(0,1,Instant::now()),"no sensor movement to force fit");
         assert_eq!(tracker.region_active_mask,1);
+    }
+
+    #[test]
+    fn stale_pivot_plan_yields_to_consistent_segmenter_iris() {
+        // Calibration 1790547016, top-right target: subject-right iris at
+        // sensor (3426,2587) while the stale pivot plan centered the crop at
+        // (3530,2566), clipping the iris at the crop's left edge.
+        let mut tracker=synthetic_tracker();
+        tracker.eye_size=(420,280);
+        tracker.window.1=576;
+        let planned=(3530-210,2566-140);
+        for (i,x) in [3420.0,3426.0,3431.0].into_iter().enumerate() {
+            tracker.record_segmenter_iris_center(0,1_000_000_000+i as u64*100_000_000,(x,2587.0));
+        }
+        let now=1_250_000_000;
+        let moved=tracker.crop_following_segmenter_iris(0,planned,2300,now);
+        assert_eq!(moved,((3426-210)&!3,(2587-140)&!1));
+        assert!(moved.1>=2300 && moved.1+280<=2300+576);
+        assert_eq!(tracker.crop_following_segmenter_iris(0,planned,2300,now+1_000_000_000),planned,"stale iris does not steer");
+        let near=((3440-210)&!3,2587-140);
+        assert_eq!(tracker.crop_following_segmenter_iris(0,near,2300,now),near,"within tolerance keeps the plan");
+        tracker.record_segmenter_iris_center(0,1_300_000_000,(3900.0,2587.0));
+        assert_eq!(tracker.crop_following_segmenter_iris(0,planned,2300,1_350_000_000),planned,"inconsistent samples do not steer");
     }
 
     #[test]
