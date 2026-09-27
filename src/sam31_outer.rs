@@ -59,8 +59,9 @@ const FILMSTRIP_WIDTH: usize = FRAME_WIDTH * HISTORY_FRAMES;
 const FILMSTRIP_PIXELS: usize = FILMSTRIP_WIDTH * FRAME_HEIGHT;
 // The corpus includes ordinary iris masks below the old 20,000-pixel floor
 // (~20% of a model ROI). A 5% trial admitted tiny lid/pupil fragments; retain
-// a conservative 12% cold-fit floor together with conic and RAW-edge checks.
-const MIN_COMPONENT_AREA_FULL_RES: usize = FRAME_WIDTH * FRAME_HEIGHT * 12 / 100;
+// a 10% cold-fit floor together with conic and RAW-edge checks. The latest
+// upper-right fixation has a visible right iris at 11.5%, rejected by 12%.
+const MIN_COMPONENT_AREA_FULL_RES: usize = FRAME_WIDTH * FRAME_HEIGHT * 10 / 100;
 const MAX_COMPONENT_AREA_FULL_RES: usize = FRAME_WIDTH * FRAME_HEIGHT * 9 / 10;
 const MAX_MASK_CANDIDATE_FITS: usize = 8;
 const MIN_RAW_RING_SUPPORT_SCORE: f64 = 2.45;
@@ -915,6 +916,16 @@ pub struct StatusSnapshot {
     /// Opt-in synchronized benchmark: preparation, H2D, forward, mask
     /// materialization, remaining downstream work, in milliseconds.
     pub student_stages_ms: Option<[f64;5]>,
+}
+
+/// Register optional CUDA hooks before CPU tensors cache ATen fallback hooks.
+/// This only loads dispatch code; CPU inference remains on CPU. CPU-only tools
+/// do not call this preparation for the switchable interactive viewer.
+pub(crate) fn prepare_viewer_runtime() {
+    #[cfg(feature = "sam31")]
+    if let Err(error) = runtime::load_cuda_dispatch_library() {
+        eprintln!("SAM GPU backend unavailable: {error}; CPU analysis remains available");
+    }
 }
 
 impl Default for StatusSnapshot {
@@ -2285,6 +2296,9 @@ fn deflattened_pupil_component_diagnostic(
     mut diagnostic: Option<&mut serde_json::Value>,
 ) -> Option<Ellipse> {
     if reference.major_radius < 7.0 || reference.minor_radius < 5.0 {
+        if let Some(diagnostic) = diagnostic.as_deref_mut() {
+            diagnostic["contour_rejection"] = serde_json::json!("component-too-small");
+        }
         return None;
     }
     let scale = 80.0 / reference.major_radius;
@@ -2342,11 +2356,17 @@ fn deflattened_pupil_component_diagnostic(
             }
         }
     }
-    let review = deflattened_mask_fit_with_censoring(
+    let Some(review) = deflattened_mask_fit_with_censoring(
         contour, canonical_reference, None, pixel_scale,
         // The limbus's joint-arc policy remains opt-in for pupil diagnostics.
         constrain_arcs, censored,
-    )?;
+    ) else {
+        if let Some(diagnostic) = diagnostic.as_deref_mut() {
+            diagnostic["contour_rejection"] = serde_json::json!(
+                if constrain_arcs { "constrained-arc-fit" } else { "unconstrained-contour-fit" });
+        }
+        return None;
+    };
     if let Some(diagnostic) = diagnostic.as_deref_mut() {
         diagnostic["retained_points_native"] = serde_json::json!(
             review.retained_points.iter().map(to_native).collect::<Vec<_>>());
@@ -2354,6 +2374,12 @@ fn deflattened_pupil_component_diagnostic(
             review.flat_tire_points.iter().map(to_native).collect::<Vec<_>>());
         diagnostic["retained_runs"] = serde_json::json!(
             review.conic_segments.iter().cloned().collect::<Vec<_>>());
+        diagnostic["provisional_contour_ellipse"] = serde_json::json!({
+            "center":to_native(&review.ellipse.center),
+            "major_radius":review.ellipse.major_radius / scale,
+            "minor_radius":review.ellipse.minor_radius / scale,
+            "angle":review.ellipse.angle});
+        diagnostic["retained_sample_count"] = serde_json::json!(review.retained_points.len());
     }
     // The offline policy tests actual positional coverage/conditioning in
     // place of a count floor. A contour/guide is still only a hypothesis;
@@ -2374,6 +2400,10 @@ fn deflattened_pupil_component_diagnostic(
         review.retained_points.len() >= 48
     };
     if !supported {
+        if let Some(diagnostic) = diagnostic.as_deref_mut() {
+            diagnostic["contour_rejection"] = serde_json::json!(
+                if position_support { "positional-support" } else { "retained-sample-count-below-48" });
+        }
         return None;
     }
     let fitted = review.ellipse;
@@ -2636,9 +2666,19 @@ fn fit_inner_pupil_void_conditioned(
         // Unprompted acquisition must not pick a distant lid/shadow just
         // because its dark contour is strong. Explicit operator component
         // seeds retain their existing wider anatomical corridor.
-        if !pupil_ellipse_plausible_with_shape(ellipse, outer, diagnostics.independent_pupil_shape)
-            || (component_seed.is_none()
-                && ellipse_coordinate(ellipse.center, outer) > MAX_UNPROMPTED_PUPIL_CENTER_OFFSET)
+        let plausible_geometry = pupil_ellipse_plausible_with_shape(
+            ellipse, outer, diagnostics.independent_pupil_shape);
+        let center_offset = ellipse_coordinate(ellipse.center, outer);
+        let acquisition_center_allowed = component_seed.is_some()
+            || center_offset <= MAX_UNPROMPTED_PUPIL_CENTER_OFFSET;
+        if diagnostics.detailed {
+            diagnostics.candidates.last_mut().unwrap()["geometry_gate"] = serde_json::json!({
+                "plausible_geometry":plausible_geometry,
+                "center_offset_outer_radii":center_offset,
+                "unprompted_center_limit":MAX_UNPROMPTED_PUPIL_CENTER_OFFSET,
+                "acquisition_center_allowed":acquisition_center_allowed});
+        }
+        if !plausible_geometry || !acquisition_center_allowed
         {
             diagnostics.geometry_rejected += 1;
             continue;
@@ -4716,11 +4756,13 @@ mod runtime {
         fn drop(&mut self) { unsafe { buttercup_sam_stream_leave(self.0) }; }
     }
 
-    fn load_cuda_dispatch_library() -> Result<(), String> {
+    pub(super) fn load_cuda_dispatch_library() -> Result<(), String> {
         // GNU ld drops libtorch_cuda under --as-needed because tch reaches its
         // kernels through PyTorch's dispatcher rather than a direct symbol.
         // Loading it globally registers CUDA kernels before JIT parameters are
         // materialized. Keep the handle process-resident intentionally.
+        static LOADED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+        LOADED.get_or_init(|| {
         let library = CString::new("libtorch_cuda.so").unwrap();
         let handle = unsafe { dlopen(library.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
         if handle.is_null() {
@@ -4736,6 +4778,7 @@ mod runtime {
         } else {
             Ok(())
         }
+        }).clone()
     }
 
     fn configure_cuda_bfloat16_autocast() {
@@ -7924,6 +7967,9 @@ mod runtime {
 
     fn update_status(status: &Arc<Mutex<StatusSnapshot>>, state: &'static str, detail: &str) {
         if let Ok(mut status) = status.lock() {
+            if state == "error" && (status.state != state || status.detail != detail) {
+                eprintln!("SAM31_WORKER_ERROR {}", detail.lines().next().unwrap_or(detail));
+            }
             status.state = state;
             status.detail.clear();
             status.detail.push_str(detail);
@@ -9439,6 +9485,17 @@ mod runtime {
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "sam31")]
+    #[test]
+    #[ignore = "requires pinned CPU Obelisk and SAM assets plus CUDA; run in a fresh process"]
+    fn viewer_cpu_obelisk_then_sam_loads_in_same_process() {
+        prepare_viewer_runtime();
+        let _cpu = student::Model::load_on_device(&student::default_model_path(), tch::Device::Cpu).unwrap();
+        let _sam = tch::CModule::load_on_device(default_model_path(), tch::Device::Cuda(0)).unwrap();
+        assert_eq!(tch::Tensor::ones([2], (tch::Kind::Float, tch::Device::Cuda(0)))
+            .sum(tch::Kind::Float).double_value(&[]), 2.0);
+    }
+
+    #[cfg(feature = "sam31")]
     fn load_paired_corpus(capture: &Path) -> Vec<[Option<Arc<RawFrame>>; 2]> {
         use std::io::{Read, Seek, SeekFrom};
         let rows = std::fs::read_to_string(capture.join("frames.jsonl")).unwrap();
@@ -10933,7 +10990,7 @@ mod tests {
 
     #[test]
     fn ordinary_small_iris_mask_reaches_constrained_fit() {
-        let expected = Ellipse { center: (192.0,128.0),major_radius: 72.0,minor_radius: 54.0,angle: -0.2 };
+        let expected = Ellipse { center: (192.0,128.0),major_radius: 72.0,minor_radius: 50.0,angle: -0.2 };
         let width = FILMSTRIP_WIDTH;
         let mut mask = vec![0; width * FRAME_HEIGHT];
         for y in 0..FRAME_HEIGHT {
@@ -10944,7 +11001,7 @@ mod tests {
             }
         }
         let area = mask.iter().filter(|&&value|value != 0).count();
-        assert!(area < 20_000 && area > MIN_COMPONENT_AREA_FULL_RES);
+        assert!(area < FRAME_WIDTH * FRAME_HEIGHT * 12 / 100 && area > MIN_COMPONENT_AREA_FULL_RES);
         let fit = fit_mask_component_review(&mask,width,FRAME_HEIGHT,HISTORY_FRAMES-1)
             .expect("ordinary smaller iris must reach the conic/RAW gates");
         assert!((fit.ellipse.center.0-expected.center.0).hypot(fit.ellipse.center.1-expected.center.1)<2.0);

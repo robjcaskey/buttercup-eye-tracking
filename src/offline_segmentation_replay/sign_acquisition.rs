@@ -208,6 +208,7 @@ impl ScaleChain {
 }
 
 pub(crate) fn run<I: Iterator<Item = String>>(args: I) -> Result<(), String> {
+    let camera_mount = eye_scene_model::CameraMount::for_offline_checks()?;
     let mut args = args.peekable();
     let output = PathBuf::from(args.next().ok_or("OUTPUT EYE [--arrival|--source] [--cold|--seed-recorded] [--no-motion] [--limit N] CAPTURE_DIR...")?);
     if output.exists() {
@@ -323,9 +324,13 @@ pub(crate) fn run<I: Iterator<Item = String>>(args: I) -> Result<(), String> {
             File::open(capture.join(format!("{label}.raw10"))).map_err(|e| e.to_string())?,
         );
     }
+    if seed && camera_mount != eye_scene_model::CameraMount::Flexible {
+        return Err("recorded-sign seeding is a flexible-mode ablation; set BUTTERCUP_OFFLINE_CAMERA_MOUNT=flexible or use --cold".into());
+    }
     let make_trackers = || {
         POLICIES.map(|acquisition_policy| SurfaceGazeTracker {
             acquisition_policy,
+            camera_mount,
             ..SurfaceGazeTracker::default()
         })
     };
@@ -519,6 +524,7 @@ pub(crate) fn run<I: Iterator<Item = String>>(args: I) -> Result<(), String> {
             "first_signed_frame_ns":signed.first().map(|c|&c["frame_source_ns"])})
     }).collect();
     let report = json!({"schema":"buttercup-sign-acquisition-trial-v1","captures":captures,"eye":label,
+        "camera_mount_assumption":camera_mount.label(),
         "schedule":if arrival{"recorded-publication-frame"}else{"idealized-source-order"},"seed_recorded":seed,"no_motion":no_motion,
         "raw_frames":frames.len(),"verified_duplicate_exposures":verified_duplicate_exposures,
         "reliable_raw_motion_frames":reliable_raw,"source_resets":resets,"compatible_roi_moves":reframes,

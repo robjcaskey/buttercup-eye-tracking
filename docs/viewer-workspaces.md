@@ -68,6 +68,60 @@ compositing and source-aligned eye-overlay helpers are reused. The new view
 layer does not claim a stereo solve, fresh observations from held data, or an
 improvement to SN-FEIDA/localization accuracy.
 
+## Clusters motion diagnostics
+
+Pulsing pink diamonds mark **normal-flow edge tracks**: displacement is measured
+perpendicular to the local edge. They are not pupil centers or independently
+identified iris landmarks. Cyan/green/orange trails are motion-layer slots;
+anonymous clustering alone does not establish those slots' anatomical identity.
+The dashed gold/violet pair proposes outer-limbus/pupil boundaries from ordered
+RAW transitions. Its geometry can be wrong even when a separate current-frame
+anatomy gate permits displaying diagnostics.
+
+The temporal fitter requires an independently supplied eye-region proposal; it
+no longer invents a circle at the median of all moving features. When semantic
+or confirmed relation evidence has actually assigned an iris layer, other
+layers cannot substitute for it. Track counts alone do not establish that
+assignment. Common head motion can still corroborate independently measured
+iris geometry; differential motion is not universally required.
+
+The September 22 kernel changes reuse ellipse-invariant edge weights, native
+row-filter values across horizontal-walk hypotheses, and identical rounded
+half-resolution patch costs within each refinement basin. The search grids and
+arithmetic ordering are preserved. On 262 matched native RAW frames from three
+Rob recordings, the arithmetic changes produced identical candidate fits and
+motion layers while reducing mean temporal-clustering-plus-fit time by 17–21%
+per recording. This excludes native seed detection, asynchronous cold geometry
+acquisition, final anatomical gates, rendering and camera transport; it is not
+an end-to-end FPS result. The separate identity fixes change eight candidate
+decisions, with 78/262 candidates before and after; this is not accepted gaze
+coverage or evidence of overall localization improvement.
+
+`buttercup-cluster-replay BUNDLE NEW_OUTPUT FRAMES_PER_EYE SKIP_PER_EYE` replays
+native RAW without recorded predictions. Its `--compare BASELINE_DIR
+CANDIDATE_DIR NEW_REPORT [LABELS_DIR]` mode verifies source identities and reads
+human labels only after both solves are fixed. Independent scale is absent in
+this bounded evaluation, so SN-FEIDA is withheld. The one source-matched reviewed
+label still has 47.3 px mean candidate-boundary error: bad seeds and inner/outer
+boundary confusion remain unresolved. Results and rejected experiments are in
+`outputs/clusters-math-20260922/README.md`.
+
+## Pink well and sight line
+
+SAM3.1 and Buttercup Obelisk have a **PINK WELL + SIGHT LINE** F view in both
+Preview and Linked Views, immediately after tweaked contact geometry. It uses
+the detector's retained RAW frame and dimensions, including after the live
+ROI moves or resizes. V controls those source pixels as usual. Thin pink
+meridians follow spherical arcs and turn sharply inward at the pupil rim with
+no fade; projected 3D
+circle-center dots and thin dashed outward axes show both unresolved circle
+poses. Pink draws one coherent illustrative well using the more upward camera
+normal (leftward breaks horizontal ties); cyan marks the alternate axis. This
+colour convention is shared by both eyes, independent of their local solver
+branch order. The well depth is illustrative and neither branch is promoted
+to accepted gaze. Missing pupils are labelled and permit only the existing
+iris-axis fallback. See [the geometry and offline review contract](void-sightline-review.md).
+
 ## Runtime limbus refinement
 
 **Shift+F** or **LIMBUS ON/OFF** toggles experimental shared limbus refinement.
@@ -84,6 +138,28 @@ bounded-correction gates still apply. Missing/rejected refinement retains baseli
 geometry with the existing immutable attempt diagnostics; it is not a successful
 correction. The model remains CPU-only and experimental, without a cold-bootstrap
 proof. Rendering a comparison cannot enable refinement.
+
+### Limbus edges before / after
+
+Select **LIMBUS EDGES BEFORE / AFTER** with **F**, then use **Shift+F** to
+toggle refinement independently. The view is available for SAM3.1 and Obelisk
+in Preview (immediately after the outer-fit review) and Linked Views (fourth,
+after Stereo Segments). **V** still controls the source image appearance.
+
+Cyan traces the original retained limbus edge samples. Pink dashes show the
+accepted refined samples on the exact same RAW exposure; dashing keeps the
+cyan baseline visible where the two overlap. The source sequence and maximum
+native-pixel displacement are labelled. With no source refinement, only the
+baseline is drawn. Rejected/missing-model attempts say **UNCHANGED** and keep
+their original edges; an unaccepted candidate is never presented as the result.
+
+Only existing retained runs are connected. Excluded arcs stay empty, and there
+are no full fitted ellipses, pupil outlines, reticles or gaze rays in this layer.
+Drawing happens after image magnification so subpixel native shifts can be seen.
+The renderer neither runs the model nor changes the refinement toggle or gaze
+authority. It uses the saved worker decision, including after a newer ROI moves.
+The existing Obelisk **mask outlines** and **fitted limbus only** views remain:
+the raw mask boundary itself does not change when geometric refinement toggles.
 
 ## Stereo solver inspection (September 12)
 
@@ -187,6 +263,18 @@ Cursor projection and the main/thumbnail laser axes use the same signed,
 source-clock-bound gaze vector that calibration consumes, including Native,
 Driving and Clusters. The contact mesh can retain its geometric surface normal;
 that normal is not a fallback cursor direction when signed gaze is unavailable.
+
+Completed screen mappings are reusable across detectors for the calibrated eye:
+all providers publish camera-frame gaze rays. The stored detector name records
+how the mapping was fitted; it does not switch the mapping off. Reuse does not
+guarantee accuracy after a changed camera pose, different selected 3D solution,
+or a detector's systematic localization error. Shift+M restores orientation and
+reuses the existing mapping; ordinary M fits a new mapping when needed.
+
+The J cursor, desktop pointer and accuracy view project the accepted gaze ray
+directly. Drawing an illustrative spherical contact is not a prerequisite for
+showing that ray's screen target. Source/prompt matching, current gaze settings,
+resolved direction, and desktop freshness/held-observation checks still apply.
 
 **F** and **V** are presentation controls, not alternate gaze providers. A clean
 image, a mask, an ellipse, a contact or a diagnostic display can all inspect the

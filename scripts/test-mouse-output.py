@@ -14,6 +14,20 @@ spec.loader.exec_module(mouse)
 
 
 class ShortcutTests(unittest.TestCase):
+    def test_eyes_toggle_never_moves_pointer_or_changes_focus(self):
+        with patch.object(mouse, "command", side_effect=[{"enabled": False}, {"enabled": True}]) as command, \
+             patch.object(mouse, "place_eyes") as place, \
+             patch.object(mouse.os, "open", side_effect=AssertionError("wleyes must not open uinput")), \
+             patch.object(mouse, "map_output", side_effect=AssertionError("wleyes must not map pointer")):
+            mouse.eyes_toggle(self.args())
+        self.assertTrue(all(c.kwargs == {"eyes": True} for c in command.call_args_list))
+        place.assert_called_once()
+
+    def test_eyes_off_does_not_need_compositor(self):
+        with patch.object(mouse, "command", side_effect=[{"enabled": True}, {"enabled": False}]), \
+             patch.object(mouse, "place_eyes", side_effect=AssertionError("OFF must not need Sway")):
+            mouse.eyes_toggle(self.args())
+
     def args(self, action="toggle"):
         return SimpleNamespace(action=action, socket="unused", output=None, quiet=True)
 

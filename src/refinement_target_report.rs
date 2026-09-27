@@ -3,7 +3,14 @@
 use super::*;
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{BufReader, ErrorKind};
+use std::io::BufReader;
+use buttercup_eye_tracking::recorded_bundle::metadata_records;
+
+#[path = "refinement_frame_pairs.rs"]
+mod frame_pairs;
+pub(super) fn pairs(args: &[String]) -> Result<()> {
+    if args.first().is_some_and(|s|s=="calibration-pairs") {frame_pairs::calibration_report(args)} else {frame_pairs::report(args)}
+}
 
 type V3 = [f64; 3];
 fn timestamp(v: &Value) -> Result<i128> {
@@ -71,10 +78,13 @@ impl Monitor {
     // Deliberately retain the capture's fixed reference-eye mapping. No
     // current/personal calibration or candidate-dependent origin is borrowed.
     fn target(&self, xy: [f64; 2], viewport: [f64; 2]) -> V3 {
+        self.target_uv([xy[0] / (viewport[0] - 1.0), xy[1] / (viewport[1] - 1.0)])
+    }
+    fn target_uv(&self, uv: [f64; 2]) -> V3 {
         std::array::from_fn(|i| {
             self.center[i]
-                + self.right[i] * self.width * (xy[0] / (viewport[0] - 1.0) - 0.5)
-                + self.down[i] * self.height * (xy[1] / (viewport[1] - 1.0) - 0.5)
+                + self.right[i] * self.width * (uv[0] - 0.5)
+                + self.down[i] * self.height * (uv[1] - 0.5)
         })
     }
 }
@@ -112,7 +122,7 @@ fn read_evidence(path: &Path) -> Result<Evidence> {
     read_evidence_stream(BufReader::new(File::open(path)?))
 }
 
-fn read_evidence_stream(mut file: impl Read) -> Result<Evidence> {
+fn read_evidence_stream(file: impl Read) -> Result<Evidence> {
     let mut session = None::<String>;
     let mut monitor = Value::Null;
     let mut targets: Vec<Presentation> = vec![];
@@ -120,23 +130,8 @@ fn read_evidence_stream(mut file: impl Read) -> Result<Evidence> {
     let mut current = None::<Target>;
     let mut site = 0;
     let mut receipt = None::<u64>;
-    loop {
-        let mut header = [0u8; 24];
-        match file.read_exact(&mut header[..1]) {
-            Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
-            other => other?,
-        }
-        file.read_exact(&mut header[1..])?;
-        if &header[..4] != b"OIM1" {
-            return Err("not native OIM1 metadata".into());
-        }
-        let n = u64::from_le_bytes(header[8..16].try_into().unwrap());
-        if n > 4_000_000 {
-            return Err("oversized metadata record".into());
-        }
-        let mut payload = vec![0; n as usize];
-        file.read_exact(&mut payload)?;
-        let row: Value = serde_json::from_slice(&payload)?;
+    for row in metadata_records(file) {
+        let row = row?;
         if row["event"] == "recording_start_snapshot" || row["event"] == "presentation" {
             let id = string(&row["viewer_session_id"])?;
             if id.is_empty() || session.as_ref().is_some_and(|old| old != id) {
@@ -491,6 +486,8 @@ mod tests {
                 let payload = serde_json::to_vec(row).unwrap();
                 let mut header = [0u8; 24];
                 header[..4].copy_from_slice(b"OIM1");
+                header[4..6].copy_from_slice(&1u16.to_le_bytes());
+                header[6..8].copy_from_slice(&24u16.to_le_bytes());
                 header[8..16].copy_from_slice(&(payload.len() as u64).to_le_bytes());
                 bytes.extend(header);
                 bytes.extend(payload);

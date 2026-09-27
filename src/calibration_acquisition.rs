@@ -1,5 +1,7 @@
-//! Recorded motion stimulus before stationary calibration, not another gaze
-//! solver. Target coordinates NEVER choose a sign or enter the monitor fit.
+//! Acquisition before stationary calibration. Legacy modes show a moving
+//! stimulus; BelowEyes stereo uses a stationary top-screen reference and an
+//! explicit conditional direction prior in the native solver. Acquisition
+//! observations never enter the nine-target display fit.
 use std::time::{Duration, Instant};
 
 pub(crate) const MAX_DURATION: Duration = Duration::from_secs(20);
@@ -28,6 +30,7 @@ pub(crate) enum Update {
 
 #[derive(Default)]
 pub(crate) struct Acquisition {
+    screen_reference: bool,
     started: Option<Instant>,
     accumulated: Duration,
     pub(crate) episodes: u32,
@@ -41,6 +44,8 @@ pub(crate) struct Acquisition {
 }
 
 impl Acquisition {
+    pub(crate) fn use_screen_reference(&mut self, enabled:bool) {self.screen_reference=enabled;}
+    pub(crate) fn is_screen_reference(&self)->bool {self.screen_reference}
     pub(crate) fn active(&self) -> bool {
         self.started.is_some()
     }
@@ -74,6 +79,7 @@ impl Acquisition {
     }
 
     pub(crate) fn target(&self, now: Instant) -> (f64, f64) {
+        if self.screen_reference { return (0.5,0.1); }
         let phase = self.elapsed(now).as_secs_f64() * std::f64::consts::TAU / 6.4;
         (0.5 + 0.095 * phase.sin(), 0.5 + 0.095 * (2.0 * phase).sin())
     }
@@ -89,6 +95,9 @@ impl Acquisition {
         }
         if self.elapsed(now) >= MAX_DURATION {
             return Update::TimedOut;
+        }
+        if self.screen_reference && self.elapsed(now)<Duration::from_millis(2100) {
+            return Update::Waiting;
         }
         if self.lineage != Some(lineage) {
             self.lineage = Some(lineage);

@@ -220,6 +220,8 @@ pub fn snapshot(
             "contact_axis_candidate": axis, "admitted_contact_axis": pose.filter(|_|usable&&contact_surface.is_some_and(|s|s.sign_resolved)).map(|p|p.relative_gaze.as_array()),
             "gaze_axis_candidate": surface.map(|s|s.relative_gaze.as_array()),
             "joint_conics":frame.filter(|f|f.joint_gaze_active).map(crate::joint_gaze_live::json),
+            "continuous_gaze_sign":contact_surface.and_then(|s|s.sign_diagnostics)
+                .and_then(|d|d.continuous_gaze).map(|r|r.json()),
             "contact_authority": pose.map(|p|p.authority.label()), "visual_axis": null,
             "held_geometry": pose.is_some_and(|p|p.authority == crate::VirtualContactAuthority::MotionHeld),
             "same_source_as_displayed_exposure": frame.zip(surface).map(|(f,s)| s.source_timestamp_ns==Some(f.timestamp_ns)),
@@ -242,6 +244,10 @@ pub fn snapshot(
         .map(crate::joint_gaze_live::json).unwrap_or_else(||json!({"target":null,"status":"joint-conics-inactive-or-unavailable"}));
     json!({"geometry": geometry(input.plane,input.reference_eye,input.camera), "calibration": input.calibration,
         "camera_mount_assumption":shared.lock().ok().map(|s|s.camera_mount.label()),
+        "joint_camera_intrinsics":crate::joint_gaze_live::configured_camera().map(|camera|
+            json!({"focal_px":camera.focal_px,"principal_px":camera.principal_px,
+                "units":"native-sensor-pixels","provenance":"uncalibrated pinhole approximation"}))
+            .expect("joint intrinsics must be validated before recording"),
         "eyes":samples,"roi_states":states,"fused":fused})
 }
 

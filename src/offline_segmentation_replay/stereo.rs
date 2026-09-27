@@ -3,7 +3,7 @@
 use super::*;
 use std::io::{BufRead,BufReader,BufWriter,Write};
 
-fn source_frames(input:&Path, start:usize, count:usize)
+pub(crate) fn source_frames(input:&Path, start:usize, count:usize)
     -> Result<impl Iterator<Item=Result<(Value,Arc<sam31_outer::RawFrame>),String>>,String> {
     let mut last_file:Option<(String,File)>=None;
     let records=BufReader::new(File::open(input).map_err(|e|e.to_string())?).lines().skip(start).take(count);
@@ -147,21 +147,31 @@ pub(crate) fn export_motion<I>(mut args:I)->Result<(),String> where I:Iterator<I
 }
 
 pub(crate) fn export<I>(mut args:I)->Result<(),String> where I:Iterator<Item=String> {
-    let input=PathBuf::from(args.next().ok_or("expected FRAMES.jsonl OUTPUT.jsonl [START] [COUNT]")?);
+    let input=PathBuf::from(args.next().ok_or("expected FRAMES.jsonl OUTPUT.jsonl [START] [COUNT] [sam|student]")?);
     let output=PathBuf::from(args.next().ok_or("missing output")?);
     let start=args.next().map(|s|s.parse::<usize>().map_err(|e|e.to_string())).transpose()?.unwrap_or(0);
     let count=args.next().map(|s|s.parse::<usize>().map_err(|e|e.to_string())).transpose()?.unwrap_or(usize::MAX);
+    let backend=args.next().unwrap_or_else(||"sam".into());
+    if !matches!(backend.as_str(),"sam"|"student") {return Err("stereo replay backend must be sam or student (Butter Obelisk)".into());}
     if args.next().is_some() {return Err("unexpected stereo export argument".into());}
+    if backend=="student" && sam31_outer::student::InferenceDevice::configured()?
+        !=sam31_outer::student::InferenceDevice::Cpu {
+        return Err("Butter Obelisk corpus inference requires explicit CPU selection: set BUTTERCUP_OBELISK_DEVICE=cpu before replay".into());
+    }
     let allowed=fs::canonicalize("outputs").map_err(|e|e.to_string())?;
     if !fs::canonicalize(output.parent().ok_or("output needs a parent")?).map_err(|e|e.to_string())?.starts_with(allowed) {
         return Err("stereo evidence output must be beneath outputs".into());
     }
     let mut writer=BufWriter::new(std::fs::OpenOptions::new().create_new(true).write(true).open(&output).map_err(|e|e.to_string())?);
     let frames=source_frames(&input,start,count)?;
-    let model=env::var_os("BUTTERCUP_SAM31_MODEL").map(PathBuf::from).unwrap_or_else(sam31_outer::default_model_path);
+    let model=if backend=="student" {sam31_outer::student::default_model_path()} else {
+        env::var_os("BUTTERCUP_SAM31_MODEL").map(PathBuf::from).unwrap_or_else(sam31_outer::default_model_path)};
     let started=Instant::now();
     let mut visit=|row:Value,_:&Arc<sam31_outer::RawFrame>,mut case:Value| {
         case["input"]=row;
+        case["backend"]=json!(backend);
+        case["model"]=json!(model);
+        case["configuration"]=sam31_outer::live_configuration();
         // Native outline samples are retained for rejected candidates too.
         // Sparse selection after this immutable cache is shared by both arms.
         serde_json::to_writer(&mut writer,&case).map_err(|e|e.to_string())?;
@@ -169,11 +179,12 @@ pub(crate) fn export<I>(mut args:I)->Result<(),String> where I:Iterator<Item=Str
         writer.flush().map_err(|e|e.to_string())
     };
     let total=match env::var("BUTTERCUP_STEREO_LIVE_REPLAY").ok().as_deref() {
-        Some("outer") => visit_live_frames(&model,frames,sam31_outer::Target::OuterLimbus,&mut visit)?,
-        Some("combined") => visit_live_frames(&model,frames,sam31_outer::Target::OuterLimbusAndInnerPupilVoid,&mut visit)?,
-        Some("offered-combined") => visit_offered_frames(&model,frames,sam31_outer::Target::OuterLimbusAndInnerPupilVoid,&mut visit)?,
+        Some("outer") => visit_live_frames(&model,&backend,frames,sam31_outer::Target::OuterLimbus,&mut visit)?,
+        Some("combined") => visit_live_frames(&model,&backend,frames,sam31_outer::Target::OuterLimbusAndInnerPupilVoid,&mut visit)?,
+        Some("offered-combined") => visit_offered_frames(&model,&backend,frames,sam31_outer::Target::OuterLimbusAndInnerPupilVoid,&mut visit)?,
         Some(other) => return Err(format!("unknown live replay profile {other:?}")),
-        None => sam31_outer::visit_native_outline_frames(&model,frames,&mut visit)?,
+        None if backend=="sam" => sam31_outer::visit_native_outline_frames(&model,frames,&mut visit)?,
+        None => return Err("Butter Obelisk requires an explicit live replay profile".into()),
     };
     writer.flush().map_err(|e|e.to_string())?;
     eprintln!("stereo SAM export completed frames={total} elapsed_seconds={:.3} output={}",started.elapsed().as_secs_f64(),output.display());
@@ -183,11 +194,11 @@ pub(crate) fn export<I>(mut args:I)->Result<(),String> where I:Iterator<Item=Str
 /// Completion-paced, source-grouped replay of the actual asynchronous video
 /// workers. This isolates geometry: it is NOT an offered-load latency test.
 /// Only one source group is held here, and the two eyes run concurrently.
-fn visit_live_frames<I,F>(model:&Path, frames:I, target:sam31_outer::Target, mut visit:F)
+fn visit_live_frames<I,F>(model:&Path, backend:&str, frames:I, target:sam31_outer::Target, mut visit:F)
     ->Result<usize,String>
 where I:Iterator<Item=Result<(Value,Arc<sam31_outer::RawFrame>),String>>,
     F:FnMut(Value,&Arc<sam31_outer::RawFrame>,Value)->Result<(),String> {
-    let client=sam31_outer::Client::start(model)?;
+    let client=if backend=="student" {sam31_outer::Client::start_student(model)?} else {sam31_outer::Client::start(model)?};
     let mut frames=frames.peekable();
     let mut lineage=Value::Null;
     let mut epoch=0;
@@ -209,7 +220,13 @@ where I:Iterator<Item=Result<(Value,Arc<sam31_outer::RawFrame>),String>>,
         let started=Instant::now();
         let before=client.status().completed_batches;
         let mut proposals:[Option<Arc<sam31_outer::ProposalMasks>>;2]=[None,None];
-        for (_,raw) in &group {
+        let atomic=present==[true,true] && client.supports_source_groups();
+        if atomic {
+            let pair=std::array::from_fn(|eye|Arc::clone(&group.iter().find(|(_,r)|r.eye_index==eye).unwrap().1));
+            if client.submit_source_group(pair,target,sam31_outer::OUTER_IRIS_PROMPT,0,[epoch;2],[None,None])
+                !=sam31_outer::SubmitOutcome::Accepted {return Err("completion-paced source group was not accepted".into());}
+        }
+        for (_,raw) in group.iter().filter(|_|!atomic) {
             let history=VecDeque::from([Arc::clone(raw)]);
             loop {
                 match client.submit_history(&history,target,sam31_outer::OUTER_IRIS_PROMPT,0,epoch) {
@@ -268,7 +285,8 @@ fn live_case(raw:&sam31_outer::RawFrame,proposal:Option<&sam31_outer::ProposalMa
         "source_group_roi_count":proposal.map(|p|p.source_group_roi_count),
         "sensor_origin":[raw.sensor_x,raw.sensor_y],"width":raw.width,"height":raw.height,
         "candidates":candidates,"selected_query":fit.map(|_|0),
-        "pupil_void":proposal.and_then(|p|p.inner_pupil_fit).map(|p|json!({"ellipse":ellipse(p.ellipse)}))});
+        "pupil_void":proposal.and_then(|p|p.inner_pupil_fit).map(|p|json!({"ellipse":ellipse(p.ellipse)})),
+        "limbus_refinement":proposal.and_then(|p|p.limbus_refinement.as_ref()).map(|a|a.diagnostic())});
     if let Some(proposal) = proposal { proposal.export_boundary_logits(&mut record); }
     record
 }
@@ -277,10 +295,21 @@ fn live_case(raw:&sam31_outer::RawFrame,proposal:Option<&sam31_outer::ProposalMa
 /// stereo ingress. Replaced/absent jobs are not written as negative detections.
 /// Cache only bounded source references; save actual completion times and the
 /// latest received crop metadata so downstream acquisition sees real latency.
-fn visit_offered_frames<I,F>(model:&Path,frames:I,target:sam31_outer::Target,mut visit:F)->Result<usize,String>
+fn visit_offered_frames<I,F>(model:&Path,backend:&str,frames:I,target:sam31_outer::Target,mut visit:F)->Result<usize,String>
 where I:Iterator<Item=Result<(Value,Arc<sam31_outer::RawFrame>),String>>,
     F:FnMut(Value,&Arc<sam31_outer::RawFrame>,Value)->Result<(),String> {
-    let client=sam31_outer::Client::start(model)?;
+    visit_offered_frames_native(model,backend,frames,target,|row,raw,case,_|visit(row,raw,case))
+}
+
+/// Native completion hook permits the real bridge to run while worker ingress
+/// is active, so its service cost affects subsequent dispatch and completion.
+pub(crate) fn visit_offered_frames_native<I,F>(model:&Path,backend:&str,frames:I,target:sam31_outer::Target,mut visit:F)->Result<usize,String>
+where I:Iterator<Item=Result<(Value,Arc<sam31_outer::RawFrame>),String>>,
+    F:FnMut(Value,&Arc<sam31_outer::RawFrame>,Value,&Arc<sam31_outer::ProposalMasks>)->Result<(),String> {
+    if backend=="student" && sam31_outer::student::InferenceDevice::configured()?!=sam31_outer::student::InferenceDevice::Cpu {
+        return Err("native Obelisk replay requires BUTTERCUP_OBELISK_DEVICE=cpu".into());
+    }
+    let client=if backend=="student" {sam31_outer::Client::start_student(model)?} else {sam31_outer::Client::start(model)?};
     if !client.supports_source_groups() {return Err("offered stereo replay requires two pipelined worker lanes".into());}
     // Model loading/JIT warm-up precedes a live user's calibration. Use a
     // blank frame in a disposable epoch, not future eye evidence, to keep the
@@ -301,22 +330,37 @@ where I:Iterator<Item=Result<(Value,Arc<sam31_outer::RawFrame>),String>>,
     let initial_completed=client.status().completed_batches;
     let mut frames=frames.peekable();
     let first_source=frames.peek().ok_or("empty replay")?.as_ref().map_err(Clone::clone)?.1.timestamp_ns;
+    let host_arrival=|row:&Value|->Result<u64,String> {
+        let value=&row["frame"]["source_clock"]["host_arrival_monotonic_ns"];
+        value.as_u64().or_else(||value.as_str()?.parse().ok()).ok_or("missing native host arrival clock".into())
+    };
+    let host_schedule=match env::var("BUTTERCUP_STEREO_OFFERED_CLOCK").ok().as_deref() {
+        None|Some("sensor")=>false,Some("recorded-host-arrival")=>true,
+        Some(_)=>return Err("unknown offered replay clock".into()),
+    };
+    let first_host=if host_schedule {Some(host_arrival(&frames.peek().unwrap().as_ref().unwrap().0)?)} else {None};
     let lineage=frames.peek().unwrap().as_ref().unwrap().0["clock_lineage"].clone();
     let start=Instant::now();
     let mut pending=BTreeMap::<(usize,u64,u64),(Value,Arc<sam31_outer::RawFrame>)>::new();
     let mut latest=[Value::Null,Value::Null];
     let mut count=0;let mut offered=0;let mut incomplete=0;
+    let mut drain_id=0_u64;
     let mut drain=|pending:&mut BTreeMap<(usize,u64,u64),(Value,Arc<sam31_outer::RawFrame>)>,latest:&[Value;2]|->Result<(),String> {
-        for proposal in client.drain_proposal_masks() {
+        let completions=client.drain_proposal_masks();drain_id+=1;
+        let drain_size=completions.len();
+        for proposal in completions {
             let key=(proposal.eye_index,proposal.source_sequence,proposal.source_timestamp_ns);
             let (row,raw)=pending.remove(&key).ok_or("completion outside bounded offered source ledger")?;
             if proposal.tracking_epoch!=1 || proposal.prompt_generation!=0 {return Err("offered replay lineage mismatch".into());}
             let mut case=live_case(&raw,Some(&proposal));
             case["replay"]=json!({"method":"live-video-worker-offered-load","target":target.label(),
                 "ready_elapsed_ns":start.elapsed().as_nanos().to_string(),"first_source_ns":first_source.to_string(),
+                "source_schedule":if host_schedule {"recorded-host-arrival"} else {"sensor-cadence"},
+                "first_host_arrival_monotonic_ns":first_host.map(|v|v.to_string()),
+                "completion_drain_id":drain_id.to_string(),"completion_drain_size":drain_size,
                 "presentation_inputs":latest,"global_motion":"unavailable-no-RAW-thumbnail-motion-replay",
                 "initial_memory":"blank-warmup-discarded-by-new-tracking-epoch","timing_validation":true});
-            visit(row,&raw,case)?;count+=1;
+            visit(row,&raw,case,&proposal)?;count+=1;
         }
         client.drain_results();
         if client.status().state=="error" {return Err(format!("offered SAM replay: {}",client.status().detail));}
@@ -328,7 +372,9 @@ where I:Iterator<Item=Result<(Value,Arc<sam31_outer::RawFrame>),String>>,
         let mut group=vec![first];
         while frames.peek().is_some_and(|next|next.as_ref().is_ok_and(|(row,raw)|
             row["clock_lineage"]==lineage && raw.timestamp_ns==time)) {group.push(frames.next().unwrap()?);}
-        while start.elapsed()<Duration::from_nanos(time-first_source) {
+        let due=if let Some(origin)=first_host {group.iter().map(|(row,_)|host_arrival(row))
+            .collect::<Result<Vec<_>,_>>()?.into_iter().max().unwrap().saturating_sub(origin)} else {time-first_source};
+        while start.elapsed()<Duration::from_nanos(due) {
             drain(&mut pending,&latest)?;std::thread::sleep(Duration::from_millis(1));
         }
         drain(&mut pending,&latest)?;

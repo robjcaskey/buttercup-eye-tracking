@@ -128,8 +128,12 @@ current live prior does not invent an independent pivot from its own candidate.
 ### Executable constraint examples and conditional fidelity
 
 `conic_solver/constraint_tests.rs` supplies small numerical examples for this
-contract, not a replacement live solver. An outer projected circle and coplanar
-concentric inner circles leave opposite camera-facing tilt signs equally valid.
+contract, not a replacement live solver. In these **weak-perspective fixtures**,
+an outer projected circle and coplanar concentric inner circles leave opposite
+camera-facing tilt signs equally valid. This is not a general perspective
+result: exact perspective projection of concentric circles can distinguish the
+plane orientation. `conic_solver/nested_pupil.rs` tests that distinction and
+retains decentration/depth sensitivity in its real-eye diagnostic.
 A partial pupil arc breaks that tie only under explicit relative-depth and
 bounded-decentration assumptions; a free decentration restores the ambiguity.
 Both mirrored examples are tested. A soft, explicitly synchronized/settled

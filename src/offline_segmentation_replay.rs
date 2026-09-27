@@ -14,9 +14,17 @@ mod contact_sign;
 pub(super) use contact_sign::run as contact_sign_eval;
 mod sign_acquisition;
 pub(super) use sign_acquisition::run as sign_acquisition_trial;
-mod stereo;
+pub(crate) mod stereo;
 pub(super) use stereo::export as stereo_sam_export;
 pub(super) use stereo::export_motion as stereo_motion_export;
+mod calibration;
+pub(super) use calibration::prepare as calibration_prepare;
+pub(super) use calibration::summarize as calibration_summarize;
+pub(super) use calibration::playback::run as calibration_playback;
+pub(super) use calibration::playback::run_availability as calibration_availability;
+pub(super) use calibration::playback::compare_camera as calibration_camera_compare;
+pub(super) use calibration::geometry::compare as calibration_geometry_compare;
+pub(super) use calibration::geometry::compare_precision as calibration_precision_compare;
 
 #[derive(Default)]
 struct ModelAggregate {
@@ -5185,6 +5193,7 @@ where I: Iterator<Item = String> {
         return Err("sequence backend must be sam or student".into());
     }
     if args.next().is_some() { return Err("unexpected sequence argument".into()); }
+    let camera_mount = eye_scene_model::CameraMount::for_offline_checks()?;
     if output.exists() { return Err(format!("output already exists: {}", output.display())); }
     let records = fs::read_to_string(capture.join("frames.jsonl")).map_err(|e|e.to_string())?
         .lines().map(serde_json::from_str::<Value>).collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?
@@ -5227,8 +5236,8 @@ where I: Iterator<Item = String> {
     let mut motion_timeline = GlobalSimilarityTimeline::default();
     let mut previous_motion_clock = None;
     let mut gaze_authority_generation = 0u64;
-    let mut surface_tracker = SurfaceGazeTracker::default();
-    let mut contact_tracker = SurfaceGazeTracker::default();
+    let mut surface_tracker = SurfaceGazeTracker { camera_mount, ..Default::default() };
+    let mut contact_tracker = SurfaceGazeTracker { camera_mount, ..Default::default() };
     let mut latest = None::<sam31_outer::OuterResult>;
     let mut latest_proposals = None::<Arc<sam31_outer::ProposalMasks>>;
     let mut source_clock = None::<(u64, Instant)>;
@@ -5437,6 +5446,7 @@ where I: Iterator<Item = String> {
     }
     let report = json!({"schema":"buttercup-sam-sequence-eval-v1","capture":capture,"label":label,
         "model":model,"backend":backend,"configuration":sam31_outer::live_configuration(),
+        "camera_mount_assumption":camera_mount.label(),
         "sampling":{"start":start,"maximum_samples":count,"source_frame_stride":stride,"crop_mode":crop_mode},
         "caller_policy":if legacy_caller_crop_reset {"legacy-crop-reset-ablation"} else {"shared-live-roi-continuity"},
         "contract":"production source/session and result-admission policy, video worker, sensor registration and keyed contact tracker; sequential native RAW exposures with no prediction/label seeds; blocking completion cadence, optimistic post-SAM focus, not full UI/AF/calibration publication or accuracy ground truth",

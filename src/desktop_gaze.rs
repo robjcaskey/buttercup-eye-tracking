@@ -10,17 +10,20 @@ pub(crate) fn tick(app: &mut App) {
         return;
     }
     app.desktop_gaze_next_tick = now + Duration::from_millis(10);
-    let (mouse_generation, focus_generation) = app
+    let (mouse_generation, focus_generation, eyes_generation, cursor_generation) = app
         .shared
         .lock()
         .map(|s| {
             (
                 s.mouse_output.enabled_generation(),
                 s.gaze_focus.enabled_generation(),
+                s.wleyes.enabled_generation(),
+                s.gaze_cursor.enabled_generation(),
             )
         })
-        .unwrap_or((None, None));
-    if mouse_generation.is_none() && focus_generation.is_none() {
+        .unwrap_or((None, None, None, None));
+    if mouse_generation.is_none() && focus_generation.is_none() && eyes_generation.is_none()
+        && cursor_generation.is_none() {
         return;
     }
     // refresh_viewer_frames updates each image only when its source changes.
@@ -29,6 +32,10 @@ pub(crate) fn tick(app: &mut App) {
     } else {
         current_sample(app)
     };
+    // The cartoon is a diagnostic preview, not an input-control consumer.
+    // It may display the same source's conditional direction before sign is
+    // accepted; that path never supplies a mouse/focus/calibration sample.
+    let preview = eyes_generation.map(|_| cartoon_sample(app));
     let error = app.shared.lock().ok().and_then(|mut shared| {
         let now = Instant::now();
         // Projection happens outside this lock. A concurrent G/settings,
@@ -41,6 +48,18 @@ pub(crate) fn tick(app: &mut App) {
         });
         if let Some(generation) = focus_generation {
             shared.gaze_focus.publish(generation, now, sample);
+        }
+        if let Some(generation) = cursor_generation {
+            shared.gaze_cursor.publish(generation, sample);
+        }
+        if let Some(generation) = eyes_generation {
+            let mut approximate=false;
+            let input=preview.expect("enabled cartoon has a preview result").and_then(|(sample,selection,rough)|{
+                approximate=rough;
+                (selection==Selection::from_shared(&shared)).then_some(sample)
+                    .ok_or("paused: global gaze selection changed during projection")
+            });
+            shared.wleyes.publish_preview(generation, input, approximate);
         }
         mouse_generation.and_then(|generation| shared.mouse_output.update(generation, now, sample))
     });
@@ -63,14 +82,17 @@ pub(crate) fn tick(app: &mut App) {
 }
 
 fn source(frame: &EyeFrame, prompt_generation: u64) -> Result<Source, &'static str> {
+    let (source,surface)=preview_source(frame,prompt_generation)?;
+    if !surface.sign_resolved {return Err("paused: unresolved gaze sign");}
+    Ok(source)
+}
+
+fn preview_source(frame: &EyeFrame, prompt_generation: u64) -> Result<(Source,crate::SurfaceGazeSample), &'static str> {
     if let Some(reason) = frame.gaze_policy_error { return Err(reason); }
     if !frame.eye_identity_present {
         return Err("paused: eye not present");
     }
     let surface = crate::mouse_gaze_surface(frame).ok_or("paused: no gaze surface")?;
-    if !surface.sign_resolved {
-        return Err("paused: unresolved gaze sign");
-    }
     let timestamp_ns = surface
         .source_timestamp_ns
         .ok_or("paused: no gaze source clock")?;
@@ -83,12 +105,12 @@ fn source(frame: &EyeFrame, prompt_generation: u64) -> Result<Source, &'static s
     {
         return Err("paused: SAM source or prompt mismatch");
     }
-    Ok(Source {
+    Ok((Source {
         eye: frame.eye_id.saturating_sub(1) as usize,
         authority: frame.gaze_authority_generation,
         sign_epoch: surface.sign_epoch,
         timestamp_ns,
-    })
+    },surface))
 }
 
 /// Shared pre-projection gaze evidence for desktop output and read-only
@@ -100,7 +122,7 @@ fn source(frame: &EyeFrame, prompt_generation: u64) -> Result<Source, &'static s
 pub(crate) struct AuthorizedGaze {
     pub source: Source,
     pub receipt: crate::recording_trace::SourceReceipt,
-    pub pose: crate::VirtualContactPose,
+    pub direction: crate::RelativeGazeVector,
 }
 
 pub(crate) fn authorized_gaze(
@@ -112,12 +134,11 @@ pub(crate) fn authorized_gaze(
     let receipt = trace
         .source_receipt(frame.eye_id, source.timestamp_ns)
         .ok_or("paused: unknown or ambiguous source clock")?;
-    let pose = crate::virtual_contact_pose(frame).ok_or("paused: no current virtual contact")?;
-    if pose.authority == VirtualContactAuthority::MotionHeld {
+    if frame.presentation_pivot_held {
         return Err("paused: held contact is not a fresh observation");
     }
-    let pose = crate::pose_for_cursor(frame, pose).ok_or("paused: no current joint gaze ray")?;
-    Ok(AuthorizedGaze { source, receipt, pose })
+    let direction = crate::gaze_output_direction(frame).ok_or("paused: no current gaze ray")?;
+    Ok(AuthorizedGaze { source, receipt, direction })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -138,7 +159,7 @@ impl Selection {
     }
 }
 
-fn current_sample(app: &App) -> Result<(Sample, Selection), &'static str> {
+fn prepared_frame(app: &App) -> Result<(EyeFrame,Selection,crate::recording_trace::Hub), &'static str> {
     // No desktop pointer movement while collecting targets, editing a prompt,
     // or doing non-eye object search. Neither pause toggles J or stops analysis.
     if app.virtual_mouse.is_some() || app.accuracy_requested || app.accuracy_check.is_some() {
@@ -164,11 +185,16 @@ fn current_sample(app: &App) -> Result<(Sample, Selection), &'static str> {
         .clone()
         .ok_or("paused: no eye frame")?;
     crate::prepare_current_contact_frame(app, selection.eye, &mut frame, selection.policy);
+    Ok((frame,selection,trace))
+}
+
+fn current_sample(app: &App) -> Result<(Sample, Selection), &'static str> {
+    let (frame,selection,trace)=prepared_frame(app)?;
     let gaze = authorized_gaze(&frame, selection.policy.prompt_generation, &trace)?;
     let calibration = app
         .calibrated_display
         .and_then(|c| c.for_frame(selection.eye, Some(&frame)));
-    let target = crate::display_gaze_target(gaze.pose, calibration, selection.plane)
+    let target = crate::display_gaze_target(gaze.direction, calibration, selection.plane)
         .ok_or("paused: no forward monitor intersection")?;
     Ok((Sample {
         source: gaze.source,
@@ -176,6 +202,23 @@ fn current_sample(app: &App) -> Result<(Sample, Selection), &'static str> {
             .ok_or("paused: unknown or ambiguous source clock")?,
         target,
     }, selection))
+}
+
+fn cartoon_sample(app:&App)->Result<(Sample,Selection,bool),&'static str>{
+    let (frame,selection,trace)=prepared_frame(app)?;
+    if frame.presentation_pivot_held {return Err("paused: held contact is not a fresh observation");}
+    let (source,surface)=preview_source(&frame,selection.policy.prompt_generation)?;
+    let receipt=trace.source_receipt(frame.eye_id,source.timestamp_ns)
+        .ok_or("paused: unknown or ambiguous source clock")?;
+    let age=receipt.age_at(Instant::now()).ok_or("paused: unknown or ambiguous source clock")?;
+    let calibrated=app.calibrated_display.and_then(|c|c.for_frame(selection.eye,Some(&frame)))
+        .and_then(|calibration|authorized_gaze(&frame,selection.policy.prompt_generation,&trace).ok()
+            .and_then(|gaze|crate::display_gaze_target(gaze.direction,Some(calibration),selection.plane)));
+    // Deliberately approximate camera-relative motion. A mirrored conic branch
+    // can still be wrong; neither this estimate nor a stale screen mapping
+    // becomes input-control or calibration evidence.
+    let target=calibrated.unwrap_or((0.5-1.25*surface.relative_gaze.right,0.5+1.25*surface.relative_gaze.down));
+    Ok((Sample{source,age,target},selection,calibrated.is_none()))
 }
 
 #[cfg(test)]
@@ -195,6 +238,22 @@ mod tests {
             kinematic_sign_correction: [false; 2],
             sign_diagnostics: None,
         }
+    }
+
+    #[test]
+    fn cartoon_can_preview_uncertain_direction_without_authorizing_pointer() {
+        let mut frame=crate::tests::control_eye_frame(1);
+        frame.eye_identity_present=true;
+        frame.segmentation_mode=SegmentationMode::Sam31;
+        frame.gaze_authority_sam_prompt_generation=Some(3);
+        let mut estimate=surface();estimate.sign_resolved=false;
+        frame.virtual_contact_surface_gaze=Some(estimate);
+        frame.sam31_proposal_masks=Some(std::sync::Arc::new(crate::sam31_outer::ProposalMasks {
+            source_timestamp_ns:100,prompt_generation:3,..Default::default()
+        }));
+        assert!(preview_source(&frame,3).is_ok());
+        assert_eq!(source(&frame,3).unwrap_err(),"paused: unresolved gaze sign");
+        assert!(preview_source(&frame,4).is_err(),"cartoon must still reject another prompt/source");
     }
 
     #[test]
@@ -448,9 +507,20 @@ mod tests {
             gaze_affine:crate::GazeAffine{x:[1.0,0.1,0.4],y:[0.2,1.0,0.6]}};
         let stamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let path=std::path::PathBuf::from(format!("outputs/settings-tests/gaze-{}-{stamp}.json",std::process::id()));
-        original.save(&path).unwrap();
+        let recording=path.with_extension("tar");
+        original.save_accepted(&path,Some(&recording)).unwrap();
         let restored=crate::CalibratedDisplay::load(&path).unwrap();
+        let archive=recording.with_extension("gaze-calibration.json");
+        assert_eq!(crate::CalibratedDisplay::load(&archive).unwrap(),restored);
+        let mut replacement=original;
+        replacement.gaze_affine.x[2]+=0.1;
+        replacement.save_accepted(&path,Some(&path.with_extension("next.tar"))).unwrap();
+        assert_eq!(crate::CalibratedDisplay::load(&archive).unwrap(),restored,
+            "a replacement fit must preserve the previous recording's calibration");
+        assert_eq!(crate::CalibratedDisplay::load(&path).unwrap().gaze_affine,replacement.gaze_affine);
         std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(archive).unwrap();
+        std::fs::remove_file(recording.with_extension("next.gaze-calibration.json")).unwrap();
         for (actual,expected) in restored.plane.center_inches.into_iter()
             .chain(restored.plane.right_axis).chain(restored.plane.down_axis)
             .chain([restored.plane.width_inches,restored.plane.height_inches])
@@ -461,13 +531,72 @@ mod tests {
         assert_eq!(restored.gaze_affine,original.gaze_affine);
         frame.gaze_authority_generation=900;
         frame.gaze_authority_sam_prompt_generation=Some(100);
-        assert!(original.for_frame(0,Some(&frame)).is_none());
+        assert!(original.for_frame(0,Some(&frame)).is_some(),
+            "a completed fit must resume after a tracking reset without requiring an app restart");
         assert!(restored.for_frame(0,Some(&frame)).is_some());
         assert!(restored.for_frame(1,Some(&frame)).is_none());
         frame.surface_gaze.as_mut().unwrap().sign_resolved=false;
         assert!(restored.for_frame(0,Some(&frame)).is_none());
         let mut bad=original.json();bad["gaze_affine"]["screen_x"]=serde_json::json!([1,2]);
         assert!(crate::CalibratedDisplay::from_json(&bad).is_err());
+    }
+
+    #[test]
+    fn calibrated_screen_mapping_is_shared_between_mask_detectors() {
+        let mut frame=crate::tests::control_eye_frame(1);
+        frame.eye_identity_present=true;
+        frame.virtual_contact_surface_gaze=Some(surface());
+        frame.gaze_authority_sam_prompt_generation=Some(3);
+        frame.sam31_proposal_masks=Some(std::sync::Arc::new(crate::sam31_outer::ProposalMasks {
+            source_timestamp_ns:100,prompt_generation:3,..Default::default()
+        }));
+        let saved=crate::CalibratedDisplay {restored:true,eye:0,
+            segmentation_mode:SegmentationMode::Sam31,sam_prompt_generation:Some(7),
+            gaze_authority_generation:40,sign_epoch:7,plane:VirtualDisplayPlane::nominal(),
+            gaze_affine_input:crate::GazeAffineInput::DisplayIntersection,
+            gaze_affine:crate::GazeAffine {x:[0.97,0.03,-0.01],y:[0.01,1.0,-0.02]}};
+        let expected=saved.target(surface().relative_gaze).unwrap();
+        for method in [SegmentationMode::Sam31,SegmentationMode::EyeStudent] {
+            frame.segmentation_mode=method;
+            let calibration=saved.for_frame(0,Some(&frame)).expect("same camera-frame ray mapping");
+            let ray=crate::gaze_output_direction(&frame).unwrap();
+            assert_eq!(crate::display_gaze_target(ray,Some(calibration),VirtualDisplayPlane::nominal()),Some(expected));
+            assert!(saved.for_frame(1,Some(&frame)).is_none(),"eye-specific mapping stays eye-specific");
+        }
+        frame.virtual_contact_surface_gaze.as_mut().unwrap().sign_resolved=false;
+        assert!(saved.for_frame(0,Some(&frame)).is_none());
+        assert!(crate::gaze_output_direction(&frame).is_none());
+        frame.virtual_contact_surface_gaze.as_mut().unwrap().sign_resolved=true;
+        frame.gaze_policy_error=Some("paused: changed gaze settings");
+        assert!(saved.for_frame(0,Some(&frame)).is_none());
+    }
+
+    #[test]
+    fn cursor_ray_does_not_require_the_illustrative_contact_surface() {
+        let mut frame=crate::tests::control_eye_frame(1);
+        frame.eye_identity_present=true;
+        frame.surface_gaze=Some(surface());
+        frame.virtual_contact_surface_gaze=Some(surface());
+        frame.gaze_authority_sam_prompt_generation=Some(3);
+        frame.sam31_proposal_masks=Some(std::sync::Arc::new(crate::sam31_outer::ProposalMasks {
+            source_timestamp_ns:100,prompt_generation:3,..Default::default()
+        }));
+        let trace=crate::recording_trace::Hub::default();
+        trace.raw_arrived(serde_json::json!({"roi_id":1,"sensor_timestamp_ns":"100",
+            "stream_epoch":"cursor-ray-fixture"}),Instant::now(),1);
+        for method in [SegmentationMode::Native,SegmentationMode::Sam31,SegmentationMode::EyeStudent] {
+            frame.segmentation_mode=method;
+            assert!(crate::virtual_contact_pose(&frame).is_none(),"fixture has no renderable cap");
+            let gaze=authorized_gaze(&frame,3,&trace).expect("published ray can drive the cursor");
+            assert_eq!(gaze.direction,surface().relative_gaze);
+            let plane=VirtualDisplayPlane::nominal();
+            assert_eq!(crate::display_gaze_target(gaze.direction,None,plane),plane.target(surface().relative_gaze));
+        }
+        frame.presentation_pivot_held=true;
+        assert_eq!(authorized_gaze(&frame,3,&trace).unwrap_err(),"paused: held contact is not a fresh observation");
+        frame.presentation_pivot_held=false;
+        std::sync::Arc::make_mut(frame.sam31_proposal_masks.as_mut().unwrap()).source_timestamp_ns=99;
+        assert_eq!(authorized_gaze(&frame,3,&trace).unwrap_err(),"paused: SAM source or prompt mismatch");
     }
 
     #[test]
@@ -495,21 +624,14 @@ mod tests {
             plane.center_inches[1] / plane.distance_inches(),
         )
         .unwrap();
-        let pose = crate::VirtualContactPose {
-            rotation_center: (0.0, 0.0),
-            rotation_center_z: None,
-            relative_gaze: ray,
-            sphere_radius: Some(100.0),
-            authority: VirtualContactAuthority::SamEllipseProvisional,
-        };
         assert!(plane.target(ray).is_some());
         assert!(cal.target(ray).is_some());
         assert_eq!(
-            crate::display_gaze_target(pose, None, plane),
+            crate::display_gaze_target(ray, None, plane),
             plane.target(ray)
         );
         assert_eq!(
-            crate::display_gaze_target(pose, Some(cal), plane),
+            crate::display_gaze_target(ray, Some(cal), plane),
             cal.target(ray)
         );
         assert!(cal.for_frame(0, Some(&frame)).is_some());
@@ -520,11 +642,12 @@ mod tests {
         assert!(cal.for_frame(0, Some(&frame)).is_none());
         frame.surface_gaze.as_mut().unwrap().sign_resolved = true;
         frame.gaze_authority_generation += 1;
-        assert!(cal.for_frame(0, Some(&frame)).is_none());
+        assert!(cal.for_frame(0, Some(&frame)).is_some(),
+            "fresh signed gaze may reuse the completed map after reacquisition");
     }
 
     #[test]
-    fn sam_calibration_keeps_its_affine_across_sign_changes_but_not_provider_changes() {
+    fn sam_calibration_keeps_its_affine_for_current_camera_frame_rays() {
         let mut frame = crate::tests::control_eye_frame(1);
         frame.segmentation_mode = SegmentationMode::Sam31;
         frame.gaze_authority_sam_prompt_generation = Some(3);
@@ -545,6 +668,7 @@ mod tests {
         };
         for epoch in [7, 8, 12] {
             frame.virtual_contact_surface_gaze.as_mut().unwrap().sign_epoch = epoch;
+            frame.gaze_authority_generation = epoch * 100;
             let active = cal.for_frame(0, Some(&frame)).unwrap();
             assert_eq!(active.sign_epoch, 7, "retain training provenance");
             for feature in [(0.1, -0.2), (-0.1, 0.2)] {
@@ -555,13 +679,21 @@ mod tests {
         assert!(cal.for_frame(0, None).is_none());
         assert!(cal.for_frame(1, Some(&frame)).is_none());
         frame.gaze_authority_sam_prompt_generation = Some(4);
-        assert!(cal.for_frame(0, Some(&frame)).is_none());
+        assert!(cal.for_frame(0, Some(&frame)).is_some(),
+            "session-local prompt counters do not invalidate a completed map");
+        frame.gaze_policy_error = Some("paused: waiting for global gaze prompt");
+        assert!(cal.for_frame(0, Some(&frame)).is_none(),
+            "persisted calibration cannot bypass current source-policy checks");
+        frame.gaze_policy_error = None;
         frame.gaze_authority_sam_prompt_generation = Some(3);
         frame.virtual_contact_surface_gaze.as_mut().unwrap().sign_resolved = false;
         assert!(cal.for_frame(0, Some(&frame)).is_none());
         frame.virtual_contact_surface_gaze.as_mut().unwrap().sign_resolved = true;
         frame.segmentation_mode = SegmentationMode::Native;
         assert!(cal.for_frame(0, Some(&frame)).is_none());
+        frame.surface_gaze=Some(surface());
+        assert!(cal.for_frame(0,Some(&frame)).is_some(),
+            "a different provider can reuse the mapping once it publishes its own signed ray");
     }
 
     #[test]

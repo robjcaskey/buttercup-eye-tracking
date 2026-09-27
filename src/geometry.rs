@@ -13,6 +13,45 @@ pub struct Ellipse {
     pub angle: f64,
 }
 
+/// Orthogonal least-squares plane in the caller's 3D coordinate system.
+/// The fit is geometry only; it does not establish that a measured curve is
+/// anatomically planar. Normal sign is arbitrary and offset uses that sign.
+#[derive(Clone, Copy, Debug)]
+pub struct PlaneFit {
+    pub normal: [f64; 3],
+    pub offset: f64,
+    pub rms: f64,
+}
+
+pub fn fit_plane(points: &[[f64; 3]]) -> Option<PlaneFit> {
+    if points.len() < 3 || !points.iter().flatten().all(|v| v.is_finite()) {
+        return None;
+    }
+    let mean = std::array::from_fn::<_, 3, _>(|j| {
+        points.iter().map(|p| p[j]).sum::<f64>() / points.len() as f64
+    });
+    let mut covariance = [[0.; 3]; 3];
+    for p in points {
+        for j in 0..3 {
+            for k in 0..3 {
+                covariance[j][k] += (p[j] - mean[j]) * (p[k] - mean[k]) / points.len() as f64;
+            }
+        }
+    }
+    let (values, vectors) = crate::conic_solver::joint::symmetric_eigen_3x3(covariance)?;
+    let mut axes = [0, 1, 2];
+    axes.sort_by(|&a, &b| values[a].total_cmp(&values[b]));
+    if values[axes[1]] <= 1e-12 * values[axes[2]].max(1.) {
+        return None;
+    }
+    let normal = std::array::from_fn(|j| vectors[j][axes[0]]);
+    Some(PlaneFit {
+        normal,
+        offset: normal.iter().zip(mean).map(|(a, b)| a * b).sum(),
+        rms: values[axes[0]].max(0.).sqrt(),
+    })
+}
+
 impl Ellipse {
     pub fn dense_points(self, count: usize) -> Vec<(f64, f64)> {
         let count = count.max(8);
@@ -30,6 +69,27 @@ impl Ellipse {
             })
             .collect()
     }
+}
+
+/// Native projected-circle hypotheses, with sensor-right/down and +Z toward
+/// the camera. Centers are in iris-radius units. Intrinsics and physical scale
+/// remain caller assumptions; neither candidate is a measured gaze direction.
+pub fn projected_circle_candidates(
+    ellipse: Ellipse,
+    origin: [u32; 2],
+    focal_px: [f64; 2],
+    principal_px: [f64; 2],
+) -> Option<[([f64; 3], [f64; 3]); 2]> {
+    use crate::conic_solver::joint::{circle_pose_hypotheses, PinholeCamera};
+    circle_pose_hypotheses(
+        PinholeCamera {
+            focal_px,
+            principal_px,
+        },
+        ellipse,
+        origin,
+    )
+    .map(|poses| poses.map(|p| (p.normal, p.center_per_radius)))
 }
 
 pub(crate) fn ellipse_coordinate(point: (f64, f64), ellipse: Ellipse) -> f64 {

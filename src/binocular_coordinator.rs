@@ -42,15 +42,20 @@ impl BinocularCoordinator {
         request: BinocularRequest<'_>,
     ) -> Result<BinocularFactors, CoordinationUnavailable> {
         match request.eyes {
-            [None,None] => Err(CoordinationUnavailable::NoEyes),
-            [Some(a),Some(b)] => {
-                let skew = a.exposure.separation_ns(b.exposure)
+            [None, None] => Err(CoordinationUnavailable::NoEyes),
+            [Some(a), Some(b)] => {
+                let skew = a
+                    .exposure
+                    .separation_ns(b.exposure)
                     .ok_or(CoordinationUnavailable::IncompatibleClocks)?;
                 // No motion history is available at this boundary yet. Only
                 // same-stamped reads are granted simultaneous fixation. The
                 // optical row-time allowance remains explicit in the solver.
-                Ok(BinocularFactors { source_skew_ns: Some(skew),
-                    maximum_joint_skew_ns: 0, ..Default::default() })
+                Ok(BinocularFactors {
+                    source_skew_ns: Some(skew),
+                    maximum_joint_skew_ns: 0,
+                    ..Default::default()
+                })
             }
             _ => Ok(BinocularFactors::default()),
         }
@@ -103,10 +108,12 @@ mod tests {
             [None, Some(soft_second_eye)],
             [Some(eye), Some(soft_second_eye)],
         ] {
-            let factors = BinocularCoordinator.coordinate(BinocularRequest { eyes }).unwrap();
-            assert_eq!(factors.maximum_joint_skew_ns,0);
-            assert_eq!(factors.settled,[None,None]);
-            assert_eq!(factors.vergence_angle_radians,None);
+            let factors = BinocularCoordinator
+                .coordinate(BinocularRequest { eyes })
+                .unwrap();
+            assert_eq!(factors.maximum_joint_skew_ns, 0);
+            assert_eq!(factors.settled, [None, None]);
+            assert_eq!(factors.vergence_angle_radians, None);
         }
     }
 }

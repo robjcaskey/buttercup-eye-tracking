@@ -99,9 +99,13 @@ impl BoundaryLevelSetObservation {
             && self.displacement_px.into_iter().all(f64::is_finite)
             && self.displacement_px[1] == 0.0
             && self.displacement_px[0] * self.displacement_px[2] <= 0.0
-            && self.spatial_displacement_px.is_none_or(|states| states.into_iter().all(|v|
-                v.is_finite() && v >= self.displacement_px[0].min(self.displacement_px[2]) - 1e-12
-                    && v <= self.displacement_px[0].max(self.displacement_px[2]) + 1e-12))
+            && self.spatial_displacement_px.is_none_or(|states| {
+                states.into_iter().all(|v| {
+                    v.is_finite()
+                        && v >= self.displacement_px[0].min(self.displacement_px[2]) - 1e-12
+                        && v <= self.displacement_px[0].max(self.displacement_px[2]) + 1e-12
+                })
+            })
     }
     pub(crate) fn varies(self) -> bool {
         self.displacement_px[0] != 0.0 || self.displacement_px[2] != 0.0
@@ -113,8 +117,13 @@ impl BoundaryLevelSetObservation {
     pub(crate) fn with_spatial_sensitivity(mut self) -> Self {
         let angle = 2.0 * self.unit_normal_roi[1].atan2(self.unit_normal_roi[0]);
         let (sine, cosine) = angle.sin_cos();
-        self.spatial_displacement_px = Some([cosine,-cosine,sine,-sine].map(|level|
-            if level < 0.0 {-level*self.displacement_px[0]} else {level*self.displacement_px[2]}));
+        self.spatial_displacement_px = Some([cosine, -cosine, sine, -sine].map(|level| {
+            if level < 0.0 {
+                -level * self.displacement_px[0]
+            } else {
+                level * self.displacement_px[2]
+            }
+        }));
         self
     }
 }
@@ -158,17 +167,22 @@ pub(crate) struct BoundaryArcObservation<'a> {
 /// nearest retained source index receives each cell; ties go to the earlier
 /// sample. No discarded measurement coordinates enter the new weights.
 pub(crate) fn reduce_sampling_support(support: &[f64], retained: &[usize]) -> Option<Vec<f64>> {
-    if support.is_empty() || retained.is_empty()
+    if support.is_empty()
+        || retained.is_empty()
         || support.iter().any(|v| !v.is_finite() || *v < 0.0)
         || retained.iter().any(|&i| i >= support.len())
         || retained.windows(2).any(|p| p[0] >= p[1])
-    { return None; }
+    {
+        return None;
+    }
     let mut result = vec![0.0; retained.len()];
     let mut nearest = 0;
     for (i, &mass) in support.iter().enumerate() {
-        while nearest+1 < retained.len()
-            && i.abs_diff(retained[nearest+1]) < i.abs_diff(retained[nearest])
-        { nearest += 1; }
+        while nearest + 1 < retained.len()
+            && i.abs_diff(retained[nearest + 1]) < i.abs_diff(retained[nearest])
+        {
+            nearest += 1;
+        }
         result[nearest] += mass;
     }
     result.iter().all(|v| v.is_finite()).then_some(result)
@@ -282,12 +296,12 @@ impl SimilarityMotion {
 /// clocks; these coordinates are full-sensor pixels, not current ROI pixels.
 /// A match is not an anatomical identity or a pure head-motion observation.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct NativePatchCorrespondence {
-    pub(crate) previous_sensor_px: [f32; 2],
-    pub(crate) current_sensor_px: [f32; 2],
-    pub(crate) photometric_score: f32,
-    pub(crate) distinct_match_margin: f32,
-    pub(crate) global_similarity_inlier: bool,
+pub struct NativePatchCorrespondence {
+    pub previous_sensor_px: [f32; 2],
+    pub current_sensor_px: [f32; 2],
+    pub photometric_score: f32,
+    pub distinct_match_margin: f32,
+    pub global_similarity_inlier: bool,
 }
 
 /// Independent full-ROI evidence that an apparent radius change is supported

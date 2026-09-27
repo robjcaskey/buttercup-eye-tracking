@@ -19,6 +19,7 @@ pub(crate) fn run<I: Iterator<Item = String>>(mut args: I) -> Result<(), String>
     };
     let start = parse_usize(args.next(), 0, "start")?;
     let count = parse_usize(args.next(), usize::MAX, "count")?;
+    let camera_mount = eye_scene_model::CameraMount::for_offline_checks()?;
     if args.next().is_some() || output.exists() {
         return Err("unexpected argument or output already exists".into());
     }
@@ -66,8 +67,8 @@ pub(crate) fn run<I: Iterator<Item = String>>(mut args: I) -> Result<(), String>
     let mut raw = File::open(capture.join(format!("{label}.raw10"))).map_err(|e| e.to_string())?;
     let mut motion = raw_motion_octrees::NativeGlobalSimilarityTracker::default();
     let mut timeline = GlobalSimilarityTimeline::default();
-    let mut trackers: [SurfaceGazeTracker; 2] =
-        std::array::from_fn(|_| SurfaceGazeTracker::default());
+    let make_trackers = || std::array::from_fn(|_| SurfaceGazeTracker { camera_mount, ..Default::default() });
+    let mut trackers: [SurfaceGazeTracker; 2] = make_trackers();
     let mut previous_session = None;
     let mut previous_source = None;
     let mut clock_start = (integer(&frames[0], "timestamp_ns")?, Instant::now());
@@ -83,7 +84,7 @@ pub(crate) fn run<I: Iterator<Item = String>>(mut args: I) -> Result<(), String>
         let ns = integer(record, "timestamp_ns")?;
         let session = record["region"]["session"].as_u64();
         if session != previous_session || previous_source.is_some_and(|previous| ns <= previous) {
-            trackers = std::array::from_fn(|_| SurfaceGazeTracker::default());
+            trackers = make_trackers();
             motion.clear();
             timeline = GlobalSimilarityTimeline::default();
             clock_start = (ns, Instant::now());
@@ -169,7 +170,7 @@ pub(crate) fn run<I: Iterator<Item = String>>(mut args: I) -> Result<(), String>
                 &outer,
                 source_motion,
             )?;
-            if fresh_seed {
+            if fresh_seed && camera_mount == eye_scene_model::CameraMount::Flexible {
                 let same = sample.relative_gaze.right * vector[0]
                     + sample.relative_gaze.down * vector[1]
                     >= 0.0;
@@ -215,11 +216,13 @@ pub(crate) fn run<I: Iterator<Item = String>>(mut args: I) -> Result<(), String>
         }
     }
     let report = json!({"capture":capture,"label":label,"start":start,"raw_frames":frames.len(),
+        "camera_mount_assumption":camera_mount.label(),
+        "seed_recorded":camera_mount==eye_scene_model::CameraMount::Flexible,
         "reliable_raw_motion_frames":reliable_raw,"source_matched_contacts":cases.len(),
         "contacts_with_source_motion":paired_motion,"changed_sign_samples":changed_signs,
         "roi_origin_changes":reframes,"max_baseline_candidate_rectified_area_difference_px2":maximum_area_difference,
         "limitations":["Frozen recorded ellipse geometry recovered from published contact; no segmentation rerun or human sign labels.",
-            "Initial recorded sign checkpoint is shared by both arms; subsequent predictions are independent single-eye rollouts.",
+            "Only the explicit flexible ablation shares an initial recorded sign checkpoint; constrained modes acquire fresh mounting votes.",
             "Both arms recompute independent native RAW transport on recorded frames; unavailable/dropped frames cannot invent transport.",
             "Only the new motion window is disabled in baseline. No other-eye evidence enters solving.",
             "Area/ellipse localization invariance is a sign-only contract, not proof of geometry accuracy or independent metric scale."],

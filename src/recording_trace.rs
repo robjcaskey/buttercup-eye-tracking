@@ -403,6 +403,7 @@ impl Hub {
         let configuration = json!({"display": presentation.display, "mapping": presentation.gaze.mapping,
             "gaze_basis": presentation.gaze.source_basis,
             "camera_mount_assumption": presentation.scene["camera_mount_assumption"],
+            "joint_camera_intrinsics": presentation.scene["joint_camera_intrinsics"],
             "geometry": presentation.scene["geometry"], "calibration": presentation.scene["calibration"]});
         if configuration != journal.configuration {
             journal.config_revision += 1;

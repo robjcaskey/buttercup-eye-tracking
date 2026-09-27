@@ -267,46 +267,65 @@ pub(crate) fn calibration_mapping_has_shared_support(
     if !gaze_affine_linear_geometry_plausible(affine) {
         return false;
     }
-    let shared_targets = observations
-        .iter()
-        .filter_map(|observation| {
-            let gaze = RelativeGazeVector::from_projected(observation.0 .0, observation.0 .1)?;
-            let plane_prediction = plane.target(gaze)?;
-            let affine_prediction = input.target(affine, plane, gaze)?;
-            let plane_residual = (plane_prediction.0 - observation.1 .0)
-                .hypot(plane_prediction.1 - observation.1 .1);
-            let affine_residual = (affine_prediction.0 - observation.1 .0)
-                .hypot(affine_prediction.1 - observation.1 .1);
+    calibration_predictions_have_shared_support(observations.iter().map(|&(feature,target)| {
+        let gaze=RelativeGazeVector::from_projected(feature.0,feature.1);
+        (target,gaze.and_then(|g|plane.target(g)),gaze.and_then(|g|input.target(affine,plane,g)))
+    }))
+}
+
+/// Shared consistency policy for the live mapping and explicit offline input
+/// ablations. Missing predictions cannot count toward target coverage.
+pub(crate) fn calibration_predictions_have_shared_support(
+    predictions: impl IntoIterator<Item=((f64,f64),Option<(f64,f64)>,Option<(f64,f64)>)>,
+) -> bool {
+    let shared_targets = predictions.into_iter().filter_map(|(target,plane_prediction,affine_prediction)| {
+            let plane_prediction=plane_prediction?;
+            let affine_prediction=affine_prediction?;
+            let plane_residual = (plane_prediction.0 - target.0)
+                .hypot(plane_prediction.1 - target.1);
+            let affine_residual = (affine_prediction.0 - target.0)
+                .hypot(affine_prediction.1 - target.1);
             let model_disagreement = (plane_prediction.0 - affine_prediction.0)
                 .hypot(plane_prediction.1 - affine_prediction.1);
             (plane_residual <= VIRTUAL_MOUSE_PLANE_INLIER_RESIDUAL
                 && affine_residual <= VIRTUAL_MOUSE_AFFINE_INLIER_RESIDUAL
                 && model_disagreement <= VIRTUAL_MOUSE_MODEL_MAX_DISAGREEMENT)
-                .then_some(observation.1)
+                .then_some(target)
         })
         .collect::<Vec<_>>();
     calibration_targets_have_required_coverage(shared_targets)
+}
+
+/// Fit one explicit mapping basis. Callers must retain the shared-support gate;
+/// exposing alternatives does not make an unsupported fit acceptable.
+pub(crate) fn fit_gaze_mapping_basis(
+    plane: VirtualDisplayPlane,
+    observations: &[((f64, f64), (f64, f64))],
+    input: GazeAffineInput,
+) -> Option<GazeAffine> {
+    let transformed = observations.iter().map(|&(feature, target)| {
+        let gaze = RelativeGazeVector::from_projected(feature.0, feature.1)?;
+        let feature = match input {
+            GazeAffineInput::ProjectedDirection => feature,
+            GazeAffineInput::DisplayIntersection => plane.target(gaze)?,
+        };
+        Some((feature, target))
+    }).collect::<Option<Vec<_>>>()?;
+    fit_robust_gaze_affine(&transformed)
 }
 
 pub(crate) fn fit_calibrated_gaze_mapping(
     plane: VirtualDisplayPlane,
     observations: &[((f64, f64), (f64, f64))],
 ) -> Option<(GazeAffine, GazeAffineInput)> {
-    // Preserve an already adequate historical fit. If unit-vector XY cannot
-    // support a linear screen map, account for perspective using the accepted
-    // metric plane before fitting the affine. This is not independent evidence
+    // Prefer the perspective-aware coordinates of the accepted metric plane.
+    // An affine on unit-vector XY can pass training consistency while bending
+    // the held-out screen edge. Retain it as a fallback if the plane-coordinate
+    // correction cannot meet the same shared-support gate. This is not independent evidence
     // for that plane: coverage, residuals and correction size are consistency
     // checks on the SAME fixation observations, not calibrated probabilities.
-    for input in [GazeAffineInput::ProjectedDirection, GazeAffineInput::DisplayIntersection] {
-        let transformed = observations.iter().map(|&(feature, target)| {
-            let gaze = RelativeGazeVector::from_projected(feature.0, feature.1)?;
-            let feature = match input {
-                GazeAffineInput::ProjectedDirection => feature,
-                GazeAffineInput::DisplayIntersection => plane.target(gaze)?,
-            };
-            Some((feature, target))
-        }).collect::<Option<Vec<_>>>()?;
-        let Some(affine) = fit_robust_gaze_affine(&transformed) else { continue; };
+    for input in [GazeAffineInput::DisplayIntersection, GazeAffineInput::ProjectedDirection] {
+        let Some(affine) = fit_gaze_mapping_basis(plane, observations, input) else { continue; };
         if calibration_mapping_has_shared_support(plane, affine, input, observations) {
             eprintln!("mouse calibration mapping input={}", input.label());
             return Some((affine, input));
@@ -810,10 +829,28 @@ pub(crate) fn fit_virtual_display_plane(
     fit_virtual_display_plane_with_dimensions(observations, nominal_display_dimensions_inches())
 }
 
+/// Diagnostic candidate before coverage rejection; never an accepted calibration.
+#[derive(Default)]
+pub(crate) struct DisplayPlaneFitDiagnostics {
+    pub(crate) refined_candidates: usize,
+    pub(crate) best_partial: Option<(VirtualDisplayPlane, usize, f64)>,
+}
+
 pub(crate) fn fit_virtual_display_plane_with_dimensions(
     observations: &[((f64, f64), (f64, f64))],
     dimensions: (f64, f64),
 ) -> Option<VirtualDisplayPlane> {
+    fit_virtual_display_plane_diagnosed(observations, dimensions, None)
+}
+
+pub(crate) fn fit_virtual_display_plane_diagnosed(
+    observations: &[((f64, f64), (f64, f64))],
+    dimensions: (f64, f64),
+    mut diagnostics: Option<&mut DisplayPlaneFitDiagnostics>,
+) -> Option<VirtualDisplayPlane> {
+    if let Some(diagnostic) = diagnostics.as_deref_mut() {
+        *diagnostic = DisplayPlaneFitDiagnostics::default();
+    }
     if observations.len() < VIRTUAL_MOUSE_MIN_STABLE_TARGETS {
         return None;
     }
@@ -873,6 +910,17 @@ pub(crate) fn fit_virtual_display_plane_with_dimensions(
                         continue;
                     };
                     let candidate = refine_virtual_display_plane(seed, observations);
+                    if let Some(diagnostic) = diagnostics.as_deref_mut() {
+                        diagnostic.refined_candidates += 1;
+                        let inliers = observations.iter().filter(|observation|
+                            display_plane_residual(candidate, observation).is_some_and(|r|
+                                r[0].hypot(r[1]) <= VIRTUAL_MOUSE_PLANE_INLIER_RESIDUAL)).count();
+                        let cost = display_plane_robust_cost(candidate, observations);
+                        if diagnostic.best_partial.as_ref().is_none_or(|(_, count, prior)|
+                            inliers > *count || (inliers == *count && cost < *prior)) {
+                            diagnostic.best_partial = Some((candidate, inliers, cost));
+                        }
+                    }
                     let Some(score) = score_virtual_display_plane(candidate, observations) else {
                         continue;
                     };

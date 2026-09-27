@@ -12,6 +12,7 @@ serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.10.9"
 softbuffer = { version = "0.4.8", default-features = false, features = ["wayland", "wayland-dlopen"] }
+wayland-client = { version = "0.31.15", features = ["system", "dlopen"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen"] }
 opencv = { version = "0.92.3", optional = true, default-features = false, features = ["clang-runtime", "imgproc", "calib3d"] }
 tch = { version = "0.22.0", optional = true }
@@ -47,6 +48,22 @@ incremental = true
 [[bin]]
 name = "buttercup-eye-viewer"
 path = "src/main.rs"
+
+[[bin]]
+name = "buttercup-cluster-replay"
+path = "src/bin/buttercup_cluster_replay.rs"
+
+[[bin]]
+name = "buttercup-pink-waterfall-sheet"
+path = "src/bin/buttercup_pink_waterfall_sheet.rs"
+
+[[bin]]
+name = "buttercup-globe-meridian-sheet"
+path = "src/bin/buttercup_globe_meridian_sheet.rs"
+
+[[bin]]
+name = "buttercup-waterfall-validate"
+path = "src/bin/buttercup_waterfall_validate.rs"
 
 [[bin]]
 name = "buttercup-screen-reflection-raw-decode"

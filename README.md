@@ -20,8 +20,50 @@ The [bootstrapability contract](bootstrapability.md) requires current-checkout
 retraining from RAW, human labels and pinned SAM3 assets, with explicit model
 ancestry and separate proof for new-user onboarding.
 
+For reproducible random RAW samples and SAM3.1 prompt comparison contact sheets,
+see [the contact-sheet workflow](docs/sam-roi-contact-sheets.md).
+For pink waterfall lines bending into the pupil, see
+[the pink waterfall workflow](docs/pink-waterfall-contact-sheets.md).
+
+For the current upright rig, use the temporary **camera below eyes** assumption
+(`F8`; saved between sessions). With stereo enabled, `M` now starts at the top
+plus to establish direction, then collects display calibration; routine tracking
+uses conditional continuation and allows off-screen gaze. `Shift+M` repeats just
+orientation when a saved display mapping is available. After a camera move, use
+`M` to update that mapping. Live startup warns when below-eyes is disabled.
+Offline historical controls retain explicitly recorded legacy priors.
+See [the mounting policy and its limits](docs/camera-mount-assumption.md).
+The global **Continuous sign** button (`F9`) enables the separate experimental
+trajectory module for single-eye and joint paths; the setting is saved and restored. Its camera-invariant scores
+retain ambiguous alternatives; they do not yet authorize calibration or make
+the saved screen mapping follow a moving camera.
+For source-checked calibration reconstruction using the recorded stimulus,
+see [the calibration playback guide](docs/calibration-playback.md).
+
+The viewer also owns a small **wleyes** desktop cartoon on a transparent
+background. Its pupils follow the shared current gaze and, when valid, calibrated
+screen mapping. Without an accepted sign/matching calibration it displays
+camera-relative motion labeled “APPROXIMATE”; an ambiguous branch can be wrong.
+This display-only estimate never controls the mouse, focus or calibration.
+Sleepy eyes and “WAITING FOR GAZE” mean no fresh gaze estimate. With Rob's Sway bindings,
+**Super+Y** or **Super+Shift+Y** toggles it (also available with Mod3).
+It starts off and opens floating in the upper right; right-click hides it.
+It neither moves the pointer nor changes keyboard focus. There is no separate
+wleyes executable: the existing shortcut client uses
+`scripts/toggle-mouse-output.py --eyes`, and the viewer accepts
+`WLEYES ON|OFF|TOGGLE|STATUS` on its existing control socket.
+
+SAM3.1 runs inside the viewer with local LibTorch/model assets, without a SAM
+server. Interactive startup registers optional CUDA dispatch hooks before CPU
+Obelisk loads, so a later G switch to SAM works in the same process. CPU-only
+offline/training paths retain their CPU initialization policy. Missing SAM
+answers display the actual per-eye worker state with wrapped error text.
+
 Buttercup expects a compatible external RAW camera service over TCP. Camera
 firmware and device-side control live elsewhere.
+For reboot, hotplug, missing-service and ownership failures, see the
+[camera startup and recovery guide](docs/camera-startup.md). Connection logs
+identify the failed stage and the external Podbay steps needed to restore it.
 
 Coarse semantic reacquisition uses the MediaPipe Tasks C ABI directly from
 Rust. It consumes a lossless 500x375 GRAY16 sensor overview, converts the
@@ -59,6 +101,10 @@ pipeline. Start it directly with `--segmentation eye-student`; weights and their
 manifest live under `data/models/eye_student_v1.*`. It is faster but has lower
 pupil coverage on the initial replay, so SAM remains the default. See
 [training, measurements, and limitations](docs/eye-student.md).
+
+The Student **Contact Geometry** preview shows the same source-matched candidate
+as the stereo scene even when its direction is unconfirmed. The visible warning
+does not authorize mouse/focus output; those still require accepted live gaze.
 
 SAM's `F` cycle also includes experimental **Tweaked Contact Geometry** after
 the original contact view (`6/8` for an ROI, `4/4` for linked ROIs). A separate
@@ -347,12 +393,34 @@ The reconstruction viewpoint slowly oscillates ±45° horizontally (24-second
 cycle) and ±10° vertically (32-second cycle). This is presentation-only: the
 monitor fit, gaze hit, distances and printed pose angles do not rotate with it.
 
-A completed calibration keeps driving the cursor and wireframe when the
-tracker's sign epoch changes. It uses the current signed gaze with the existing
-map; a real sign reversal can therefore make the cursor jump. Training/current
-epochs remain recorded for diagnosis. Missing or unsigned gaze and incompatible
-eye/provider/prompt sources are still rejected; unfinished calibration still
-restarts its sample collection on a sign change.
+Leaving an accepted calibration with **M** turns on a small yellow **gaze
+ring** that follows the calibrated screen gaze. It passes clicks through, never
+takes focus and never moves the pointer; `scripts/toggle-mouse-output.py --cursor`
+(or `GAZE CURSOR ON|OFF|TOGGLE|STATUS` on the control socket) toggles it.
+While a calibration target or the orientation plus is shown, the screen shows
+only the stimulus; status text appears once the attempt is accepted or fails.
+
+The stereo selection (Shift+3) is saved in `outputs/settings/stereo-solver.json`.
+A measured lens pinhole in `outputs/settings/joint-camera-intrinsics.json`
+(`[fx, fy, cx, cy]` in native sensor pixels, e.g. from the checkerboard collector)
+replaces the 4000 px engineering default; `BUTTERCUP_JOINT_CAMERA_INTRINSICS`
+still overrides it. The checkerboard square size is set with
+`BUTTERCUP_CHECKERBOARD_SQUARE_MM` (measure the inner six squares and divide by 6).
+
+A completed calibration is saved automatically to
+`outputs/settings/gaze-calibration.json` and reloaded at startup. With stereo on,
+routine tracking re-establishes eye direction from ordinary on-screen viewing
+(the same screen half-space and coherent vote as the orientation plus), so a
+reloaded calibration becomes usable without pressing Shift+M. A separate
+loadable `*.gaze-calibration.json` is kept beside each calibration recording.
+Tracker resets, source/sign epochs and application restarts do not discard the
+screen mapping. Fresh signed gaze from the matching eye and detector resumes
+the same fit; current prompt/source matching remains enforced by the shared gaze
+pipeline. Missing or unsigned gaze pauses output without deleting calibration.
+If the direction reference is lost, **Shift+M** reorients using the existing map;
+**M** performs a replacement nine-point calibration. A real sign reversal can
+make the cursor jump. Training/current epochs remain recorded for diagnosis;
+unfinished calibration still restarts its sample collection on a sign change.
 Near-frontal correspondence now distinguishes a continued crossing from a
 turnaround using source-timed motion and bounded pivot support. See the
 [meridian regression tests and native-video review](docs/meridian-sign-continuity.md)

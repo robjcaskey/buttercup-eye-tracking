@@ -43,6 +43,10 @@ impl TailProposal {
 
 #[derive(Clone, Copy)]
 pub(crate) struct IntegrationConfig {
+    pub(crate) direction_prior: crate::conic_solver::camera_mount::DirectionPrior,
+    /// Explicit operating prior, shared by optimized-mode selection and every
+    /// integration draw. It is not inferred from a calibration target.
+    pub(crate) camera_mount: crate::conic_solver::camera_mount::CameraMount,
     pub(crate) budget: usize,
     pub(crate) seed: u64,
     pub(crate) adaptive: bool,
@@ -85,6 +89,8 @@ pub(crate) struct IntegrationConfig {
 impl Default for IntegrationConfig {
     fn default() -> Self {
         Self {
+            direction_prior: Default::default(),
+            camera_mount: crate::conic_solver::camera_mount::CameraMount::Flexible,
             budget: 8192,
             seed: 0xd1b5_4a32_d192_ed03,
             adaptive: false,
@@ -142,6 +148,8 @@ pub(crate) struct SupportedModeSelection {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ModelPosterior {
+    pub(crate) direction_prior: crate::conic_solver::camera_mount::DirectionPrior,
+    pub(crate) camera_mount: crate::conic_solver::camera_mount::CameraMount,
     pub(crate) status: &'static str,
     pub(crate) samples: usize,
     pub(crate) feasible_samples: usize,
@@ -174,6 +182,18 @@ impl ModelPosterior {
     /// A bounded model-support gate, not a calibrated accuracy guarantee.
     /// A broad mirror pair or failed integration cannot authorize a cursor
     /// direction merely because the optimizer chose one of its modes.
+    /// Looser than `supports_direction`: the posterior is concentrated well
+    /// inside a 45-degree continuation cone. It can keep an existing branch
+    /// reference alive; it never admits a calibration sample or initializes one.
+    pub(crate) fn continues_direction(&self, eye: usize) -> bool {
+        self.status == "estimated-conditional"
+            && self
+                .gaze_radius_90_degrees
+                .get(eye)
+                .copied()
+                .flatten()
+                .is_some_and(|radius| radius.is_finite() && (0.0..=30.0).contains(&radius))
+    }
     pub(crate) fn supports_direction(&self, eye: usize) -> bool {
         if self.require_numerical_margin
             && !self
@@ -203,6 +223,8 @@ impl ModelPosterior {
     pub(crate) fn json(&self) -> serde_json::Value {
         #[allow(unused_mut)]
         let mut json = serde_json::json!({
+            "camera_mount_assumption":self.camera_mount.label(),
+            "direction_prior":self.direction_prior.label(),
             "status":self.status,"samples":self.samples,"feasible_samples":self.feasible_samples,
             "pilot_samples":self.pilot_samples,"pilot_feasible_samples":self.pilot_feasible_samples,
             "estimation_samples":self.samples.saturating_sub(self.pilot_samples),
@@ -226,6 +248,7 @@ impl ModelPosterior {
             "adaptation":"discard proposal-fitting pilot draws, freeze a mixture retaining every original proposal, then estimate using fresh draws and the complete frozen mixture density",
             "contract":"conditional on current contours, selected ROI association and fixed camera/model priors; model probabilities, not calibrated gaze accuracy; finite samples do not certify unvisited modes",
             "selected_fit":"unchanged joint MAP geometry; posterior mean is diagnostic only",
+            "mounting_contract":"conditional on the explicit camera mounting prior; excluded whole surface normals have zero model mass; not measured sign accuracy",
         });
         json["direction_numerics"]=serde_json::json!(self.direction_numerics.map(|n|n.map(|n|
             serde_json::json!({"mass_within_15_degrees":n.mass,"mass_standard_error":n.standard_error,
@@ -234,8 +257,9 @@ impl ModelPosterior {
         json["direction_numerics_contract"]=serde_json::json!(
             "Stratified self-normalized importance delta-method error; approximate numerical precision of current sampled model mass, not calibrated gaze accuracy, finite-sample coverage or a bound on unvisited modes.");
         if self.require_numerical_margin {
-            json["admission_direction_numerics"]=serde_json::json!([0,1].map(|eye|
-                self.admission_numerics(eye).map(|n|serde_json::json!({
+            json["admission_direction_numerics"] = serde_json::json!([0, 1].map(|eye| self
+                .admission_numerics(eye)
+                .map(|n| serde_json::json!({
                     "mass_within_15_degrees":n.mass,"mass_standard_error":n.standard_error,
                     "two_standard_error_lower":n.mass-2.0*n.standard_error,
                     "two_standard_error_upper":n.mass+2.0*n.standard_error}))));
@@ -262,7 +286,9 @@ impl ModelPosterior {
             json["direction_numerics_contract"] = serde_json::json!("Delta-method error across independent populations, pooled using their estimated normalizers. Descendants within a population are dependent and never independent numerical trials. Finite population count and unvisited modes can defeat this diagnostic; no calibrated accuracy claim.");
             json["replicate_contract"] = json["direction_numerics_contract"].clone();
             json["direction_support_rule"] = serde_json::json!("at least eight effective independent populations, maximum population normalizer share at most 25%, 90% model angular radius at most 15 degrees, and mass minus twice the between-population error at least 90%; engineering admission only");
-            json["effective_samples_unit"] = serde_json::json!("independent population normalizer shares, not resampled particles");
+            json["effective_samples_unit"] = serde_json::json!(
+                "independent population normalizer shares, not resampled particles"
+            );
         }
         if let Some(selection) = &self.supported_mode_selection {
             json["supported_mode_selection"] = serde_json::json!({
@@ -411,48 +437,97 @@ pub(super) struct DirectionSamples<'a> {
 
 impl DirectionSamples<'_> {
     fn numerically_decided(&self, solution: &JointConicSolution, replicas: usize) -> bool {
-        let precision = direction_numerics(solution, self.samples, self.weights,
-            self.sample_proposals, self.proposals, self.draws);
-        let replicated = replicate_direction_numerics(solution, self.samples, self.weights,
-            self.sample_replicas, self.replica_draw_counts);
+        let precision = direction_numerics(
+            solution,
+            self.samples,
+            self.weights,
+            self.sample_proposals,
+            self.proposals,
+            self.draws,
+        );
+        let replicated = replicate_direction_numerics(
+            solution,
+            self.samples,
+            self.weights,
+            self.sample_replicas,
+            self.replica_draw_counts,
+        );
         (0..2).filter(|&eye| solution.modeled_eyes[eye]).all(|eye| {
             precision[eye].is_some_and(|mut n| {
                 if replicas > 1 {
-                    let Some(r) = &replicated[eye] else { return false; };
+                    let Some(r) = &replicated[eye] else {
+                        return false;
+                    };
                     n.standard_error = n.standard_error.max(r.standard_error);
                 }
-                n.mass - 2.0 * n.standard_error >= 0.9
-                    || n.mass + 2.0 * n.standard_error < 0.9
+                n.mass - 2.0 * n.standard_error >= 0.9 || n.mass + 2.0 * n.standard_error < 0.9
             })
         })
     }
 
-    pub(super) fn summarize_about(&self, result: &mut ModelPosterior, solution: &JointConicSolution) {
-        result.direction_numerics = direction_numerics(solution, self.samples, self.weights,
-            self.sample_proposals, self.proposals, self.draws);
+    pub(super) fn summarize_about(
+        &self,
+        result: &mut ModelPosterior,
+        solution: &JointConicSolution,
+    ) {
+        result.direction_numerics = direction_numerics(
+            solution,
+            self.samples,
+            self.weights,
+            self.sample_proposals,
+            self.proposals,
+            self.draws,
+        );
         result.replicate_direction_numerics = if result.replicas > 1 {
-            replicate_direction_numerics(solution, self.samples, self.weights,
-                self.sample_replicas, self.replica_draw_counts)
-        } else { [None, None] };
+            replicate_direction_numerics(
+                solution,
+                self.samples,
+                self.weights,
+                self.sample_replicas,
+                self.replica_draw_counts,
+            )
+        } else {
+            [None, None]
+        };
         result.gaze_radius_90_degrees = std::array::from_fn(|eye| {
             let axis = solution.eye_gaze_directions[eye]?;
-            quantile(self.samples.iter().zip(self.weights).filter_map(|(s, w)| {
-                Some((dot3(axis, s.1[eye]?).clamp(-1.0, 1.0).acos().to_degrees(), *w))
-            }).collect(), 0.9)
+            quantile(
+                self.samples
+                    .iter()
+                    .zip(self.weights)
+                    .filter_map(|(s, w)| {
+                        Some((
+                            dot3(axis, s.1[eye]?).clamp(-1.0, 1.0).acos().to_degrees(),
+                            *w,
+                        ))
+                    })
+                    .collect(),
+                0.9,
+            )
         });
     }
 
-    pub(super) fn select_supported_mode(&self, result: &mut ModelPosterior,
-        modes: &[(Parameters, JointConicSolution)]) {
-        if result.status != "estimated-conditional" { return; }
-        let supported = |p: &ModelPosterior| (0..2).filter(|&eye| p.modeled_eyes[eye])
-            .all(|eye| p.supports_direction(eye));
+    pub(super) fn select_supported_mode(
+        &self,
+        result: &mut ModelPosterior,
+        modes: &[(Parameters, JointConicSolution)],
+    ) {
+        if result.status != "estimated-conditional" {
+            return;
+        }
+        let supported = |p: &ModelPosterior| {
+            (0..2)
+                .filter(|&eye| p.modeled_eyes[eye])
+                .all(|eye| p.supports_direction(eye))
+        };
         let mut selected_index = 0;
         if !supported(result) {
             // Cost order provides a deterministic tie break. Never switch ROI
             // association using a posterior conditional on a different one.
             for (index, (_, solution)) in modes.iter().enumerate().skip(1) {
-                if solution.modeled_eyes != result.modeled_eyes { continue; }
+                if solution.modeled_eyes != result.modeled_eyes {
+                    continue;
+                }
                 let mut candidate = result.clone();
                 self.summarize_about(&mut candidate, solution);
                 if supported(&candidate) {
@@ -554,10 +629,14 @@ impl ProfileTransport {
         for &i in self.base.active.iter().filter(|&&i| i >= TARGET_PARAMETERS) {
             let mut delta = self.constant[i];
             for a in 0..k {
-                if self.steps[a] <= 0.0 { continue; }
+                if self.steps[a] <= 0.0 {
+                    continue;
+                }
                 let x = (z[a] / self.steps[a]).clamp(-2.0, 2.0);
                 delta += self.linear[a][i] * x;
-                if self.include_quadratic { delta += self.quadratic[a][i] * x * x; }
+                if self.include_quadratic {
+                    delta += self.quadratic[a][i] * x * x;
+                }
             }
             output[i] += sign * delta;
         }
@@ -625,7 +704,10 @@ impl Proposal {
     /// Marginal Student-t proposal: retain the covariance submatrix, not the
     /// information submatrix (which would condition on the omitted radii).
     fn marginal(self, omitted: &[usize], preserve_draws: bool) -> Option<Self> {
-        assert!(self.profile_transport.is_none(), "marginalize before fitting a transport");
+        assert!(
+            self.profile_transport.is_none(),
+            "marginalize before fitting a transport"
+        );
         if omitted.is_empty() {
             return Some(self);
         }
@@ -734,7 +816,10 @@ impl Proposal {
     }
 
     fn with_conditional_nuisance(&self) -> Option<Self> {
-        assert!(self.profile_transport.is_none(), "set the base proposal before fitting a transport");
+        assert!(
+            self.profile_transport.is_none(),
+            "set the base proposal before fitting a transport"
+        );
         let covariance = uncertainty::inverse_information(&self.information)?;
         let n = covariance.len();
         let mut lower = vec![vec![0.0; n]; n];
@@ -759,7 +844,10 @@ impl Proposal {
     }
 
     fn recentered(&self, mean: Parameters) -> Self {
-        assert!(self.profile_transport.is_none(), "recenter before fitting a transport");
+        assert!(
+            self.profile_transport.is_none(),
+            "recenter before fitting a transport"
+        );
         let mut proposal = self.clone();
         proposal.mean = mean;
         // A retained full-dimensional sampler still has its OLD mean. The
@@ -768,26 +856,45 @@ impl Proposal {
         proposal
     }
 
-    fn with_profile_transport(&self, model: &Problem<'_>, quadratic: bool) -> Option<(Self, serde_json::Value)> {
+    fn with_profile_transport(
+        &self,
+        model: &Problem<'_>,
+        quadratic: bool,
+    ) -> Option<(Self, serde_json::Value)> {
         assert!(self.profile_transport.is_none());
         let lower = self.conditional_lower.as_ref()?;
-        let k = self.active.iter().take_while(|&&i| i < TARGET_PARAMETERS).count();
-        let cost = |p: &Parameters| model.conics(p)
-            .and_then(|c| model.residuals(p, &model.select(&c))).map(|r| squared_norm(&r));
+        let k = self
+            .active
+            .iter()
+            .take_while(|&&i| i < TARGET_PARAMETERS)
+            .count();
+        let cost = |p: &Parameters| {
+            model
+                .conics(p)
+                .and_then(|c| model.residuals(p, &model.select(&c)))
+                .map(|r| squared_norm(&r))
+        };
         let (center, center_cost, center_steps) = conditional_refined_center(model, self.mean)?;
-        assert_eq!(&center[..TARGET_PARAMETERS], &self.mean[..TARGET_PARAMETERS]);
+        assert_eq!(
+            &center[..TARGET_PARAMETERS],
+            &self.mean[..TARGET_PARAMETERS]
+        );
         let mut transport = ProfileTransport {
             base: Box::new(self.clone()),
             target_lower: lower[..k].iter().map(|row| row[..k].to_vec()).collect(),
-            steps: vec![0.0; k], constant: [0.0; PARAMETERS],
-            linear: vec![[0.0; PARAMETERS]; k], quadratic: vec![[0.0; PARAMETERS]; k],
+            steps: vec![0.0; k],
+            constant: [0.0; PARAMETERS],
+            linear: vec![[0.0; PARAMETERS]; k],
+            quadratic: vec![[0.0; PARAMETERS]; k],
             include_quadratic: quadratic,
         };
         for &i in self.active.iter().filter(|&&i| i >= TARGET_PARAMETERS) {
             transport.constant[i] = center[i] - self.mean[i];
         }
-        let mut fits = vec![serde_json::json!({"axis":null,"sign":0,"target_parameters":self.mean[..TARGET_PARAMETERS],
-            "cost_before":cost(&self.mean),"cost_after":center_cost,"refinement_steps":center_steps})];
+        let mut fits = vec![
+            serde_json::json!({"axis":null,"sign":0,"target_parameters":self.mean[..TARGET_PARAMETERS],
+            "cost_before":cost(&self.mean),"cost_after":center_cost,"refinement_steps":center_steps}),
+        ];
         let mut fitted_axes = 0;
         for axis in 0..k {
             let mut step = 1.0_f64;
@@ -801,7 +908,9 @@ impl Proposal {
                     step = step.min(0.5 * margin / delta);
                 }
             }
-            if !step.is_finite() || step < 1e-3 { continue; }
+            if !step.is_finite() || step < 1e-3 {
+                continue;
+            }
             let mut displacements = Vec::new();
             for sign in [-1.0, 1.0] {
                 // This is the base distribution's conditional nuisance center
@@ -811,20 +920,35 @@ impl Proposal {
                 for (a, &i) in self.active.iter().enumerate() {
                     predicted[i] += self.scales[i] * lower[a][axis] * step * sign;
                 }
-                let Some(seed) = model.project_step(predicted) else { break; };
-                if seed[..TARGET_PARAMETERS] != predicted[..TARGET_PARAMETERS] { break; }
-                let Some((refined, fitted_cost, steps)) = conditional_refined_center(model, seed) else { break; };
-                assert_eq!(&refined[..TARGET_PARAMETERS], &predicted[..TARGET_PARAMETERS]);
+                let Some(seed) = model.project_step(predicted) else {
+                    break;
+                };
+                if seed[..TARGET_PARAMETERS] != predicted[..TARGET_PARAMETERS] {
+                    break;
+                }
+                let Some((refined, fitted_cost, steps)) = conditional_refined_center(model, seed)
+                else {
+                    break;
+                };
+                assert_eq!(
+                    &refined[..TARGET_PARAMETERS],
+                    &predicted[..TARGET_PARAMETERS]
+                );
                 fits.push(serde_json::json!({"axis":axis,"sign":sign,"target_parameters":predicted[..TARGET_PARAMETERS],
                     "cost_before":cost(&seed),"cost_after":fitted_cost,"refinement_steps":steps}));
-                displacements.push(std::array::from_fn::<_, PARAMETERS, _>(|i| refined[i] - predicted[i]));
+                displacements.push(std::array::from_fn::<_, PARAMETERS, _>(|i| {
+                    refined[i] - predicted[i]
+                }));
             }
-            if displacements.len() != 2 { continue; }
+            if displacements.len() != 2 {
+                continue;
+            }
             transport.steps[axis] = step;
             fitted_axes += 1;
             for &i in self.active.iter().filter(|&&i| i >= TARGET_PARAMETERS) {
                 transport.linear[axis][i] = 0.5 * (displacements[1][i] - displacements[0][i]);
-                transport.quadratic[axis][i] = 0.5 * (displacements[1][i] + displacements[0][i]) - transport.constant[i];
+                transport.quadratic[axis][i] =
+                    0.5 * (displacements[1][i] + displacements[0][i]) - transport.constant[i];
             }
         }
         let trace = serde_json::json!({"quadratic":quadratic,"fitted_axes":fitted_axes,"target_axes":k,
@@ -888,7 +1012,7 @@ impl Proposal {
             upper: model.upper,
             scales: model.scales,
             marginalize_arc_alternatives: model.marginalize_arc_alternatives,
-        exact_conic_distances: model.exact_conic_distances,
+            exact_conic_distances: model.exact_conic_distances,
         };
         let mut mean = model.initial;
         mean[0] = 0.0;
@@ -1086,12 +1210,26 @@ pub(super) fn boundary_relaxations(model: &Problem<'_>) -> Vec<Vec<usize>> {
     // Explore pupil/outer competition first. Genuine inner-limbus evidence
     // also remains eligible when those boundaries are absent. Mixed-kind
     // alternatives stay together and are never removed by this shortcut.
-    for kind in [BoundaryKind::PupillaryBoundary, BoundaryKind::OuterLimbus, BoundaryKind::InnerLimbus] {
+    for kind in [
+        BoundaryKind::PupillaryBoundary,
+        BoundaryKind::OuterLimbus,
+        BoundaryKind::InnerLimbus,
+    ] {
         for eye in 0..2 {
-            let groups = model.groups.iter().enumerate().filter_map(|(i,g)| {
-                g.alternatives.iter().all(|a| a.eye == eye && a.kind == kind).then_some(i)
-            }).collect::<Vec<_>>();
-            if !groups.is_empty() { masks.push(groups); }
+            let groups = model
+                .groups
+                .iter()
+                .enumerate()
+                .filter_map(|(i, g)| {
+                    g.alternatives
+                        .iter()
+                        .all(|a| a.eye == eye && a.kind == kind)
+                        .then_some(i)
+                })
+                .collect::<Vec<_>>();
+            if !groups.is_empty() {
+                masks.push(groups);
+            }
         }
     }
     masks
@@ -1104,16 +1242,29 @@ pub(super) fn with_relaxed_proposal_groups<'a>(
 ) -> Option<(Problem<'a>, Vec<usize>)> {
     let conics = model.conics(p)?;
     let mut rejected = model.rejected_groups(&conics, &model.select(&conics));
-    for &index in forced { rejected[index] = true; }
-    let omitted = rejected.iter().enumerate().filter_map(|(i, &r)| r.then_some(i)).collect();
+    for &index in forced {
+        rejected[index] = true;
+    }
+    let omitted = rejected
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &r)| r.then_some(i))
+        .collect();
     // This temporary objective only constructs q. The final target retains
     // every group and reconsiders its outlier status at every fresh sample.
     let relaxed = Problem {
         request: model.request,
         target_chart: model.target_chart,
-        groups: model.groups.iter().zip(rejected).filter(|(_, r)| !*r).map(|(g, _)| Group {
-            alternatives: g.alternatives.clone(), weight: g.weight,
-        }).collect(),
+        groups: model
+            .groups
+            .iter()
+            .zip(rejected)
+            .filter(|(_, r)| !*r)
+            .map(|(g, _)| Group {
+                alternatives: g.alternatives.clone(),
+                weight: g.weight,
+            })
+            .collect(),
         present: model.present,
         initial: model.initial,
         lower: model.lower,
@@ -1134,12 +1285,18 @@ pub(super) fn conditional_refined_center(
     // MAP, target density and full-dimensional curvature stay unchanged.
     let mut conditional = Problem {
         request: JointConicRequest {
-            maximum_refinements: model.request.maximum_refinements.min(6), ..model.request
+            maximum_refinements: model.request.maximum_refinements.min(6),
+            ..model.request
         },
         target_chart: model.target_chart,
-        groups: model.groups.iter().map(|g| Group {
-            alternatives: g.alternatives.clone(), weight: g.weight,
-        }).collect(),
+        groups: model
+            .groups
+            .iter()
+            .map(|g| Group {
+                alternatives: g.alternatives.clone(),
+                weight: g.weight,
+            })
+            .collect(),
         present: model.present,
         initial: model.initial,
         lower: model.lower,
@@ -1157,13 +1314,15 @@ pub(super) fn conditional_refined_center(
 /// cover individual family changes and both extremes before bounded joint
 /// combinations. The cap is work accounting, never a posterior truncation.
 pub(super) fn mask_assignments(families: usize) -> Vec<Vec<usize>> {
-    mask_assignments_for_counts(&vec![3;families])
+    mask_assignments_for_counts(&vec![3; families])
 }
 
 pub(super) fn mask_assignments_for_counts(counts: &[usize]) -> Vec<Vec<usize>> {
-    assert!(counts.len() <= 6 && counts.iter().all(|&n|n==3 || n==7));
+    assert!(counts.len() <= 6 && counts.iter().all(|&n| n == 3 || n == 7));
     let families = counts.len();
-    if families == 0 { return Vec::new(); }
+    if families == 0 {
+        return Vec::new();
+    }
     let mut assignments = Vec::new();
     let mut push = |value: Vec<usize>| {
         if assignments.len() < 16 && !assignments.contains(&value) {
@@ -1173,16 +1332,27 @@ pub(super) fn mask_assignments_for_counts(counts: &[usize]) -> Vec<Vec<usize>> {
     };
     push(vec![1; families]);
     for family in 0..families {
-        for level in (0..counts[family]).filter(|&level|level!=1) {
+        for level in (0..counts[family]).filter(|&level| level != 1) {
             let mut value = vec![1; families];
             value[family] = level;
             push(value);
         }
     }
     push(vec![0; families]);
-    push(counts.iter().map(|n|n-1).collect());
+    push(counts.iter().map(|n| n - 1).collect());
     for mut code in 0..counts.iter().product() {
-        if !push(counts.iter().map(|&count| { let level = code % count; code /= count; level }).collect()) {break;}
+        if !push(
+            counts
+                .iter()
+                .map(|&count| {
+                    let level = code % count;
+                    code /= count;
+                    level
+                })
+                .collect(),
+        ) {
+            break;
+        }
     }
     assignments
 }
@@ -1191,16 +1361,20 @@ pub(super) fn mask_assignments_for_counts(counts: &[usize]) -> Vec<Vec<usize>> {
 /// In particular, moved sample coordinates must not create extra point mass.
 /// The cloned request remains provenance only: refinement consumes these arcs,
 /// without calling seeds() or constructing new completed-ellipse hints.
-pub(super) fn conditioned_mask_model<'a>(model: &Problem<'a>,
-    families: &[mask_levels::FamilyActivity], levels: &[usize]) -> Problem<'a>
-{
+pub(super) fn conditioned_mask_model<'a>(
+    model: &Problem<'a>,
+    families: &[mask_levels::FamilyActivity],
+    levels: &[usize],
+) -> Problem<'a> {
     assert_eq!(families.len(), levels.len());
     let mut conditional = model.clone();
     for (family, &level) in families.iter().zip(levels) {
         assert!(level < family.states.len());
         for &index in &family.groups {
             for arc in &mut conditional.groups[index].alternatives {
-                arc.points = (0..arc.points.len()).map(|i| arc.point_at_level(i, level)).collect();
+                arc.points = (0..arc.points.len())
+                    .map(|i| arc.point_at_level(i, level))
+                    .collect();
                 arc.level_sets.fill(None);
             }
         }
@@ -1211,24 +1385,32 @@ pub(super) fn conditioned_mask_model<'a>(model: &Problem<'a>,
 /// A displaced state can start beyond a group's robust cap, where its gradient
 /// is zero. Two scalar radius steps initialize the proposal fit from the real
 /// shifted samples. This is not a likelihood term, a new prior or a gaze vote.
-pub(super) fn mask_radius_start(model: &Problem<'_>, mut p: Parameters,
-    families: &[mask_levels::FamilyActivity]) -> Parameters
-{
+pub(super) fn mask_radius_start(
+    model: &Problem<'_>,
+    mut p: Parameters,
+    families: &[mask_levels::FamilyActivity],
+) -> Parameters {
     for _ in 0..2 {
-        let Some(conics) = model.conics(&p) else { break; };
+        let Some(conics) = model.conics(&p) else {
+            break;
+        };
         let selection = model.select(&conics);
         let mut next = p;
         for family in families {
             let eye = family.eye;
             let boundary = family.boundary;
             let radius = TARGET_PARAMETERS + eye * EYE_PARAMETERS + 3 + boundary;
-            if model.lower[radius] == model.upper[radius] { continue; }
+            if model.lower[radius] == model.upper[radius] {
+                continue;
+            }
             let base = conics[eye][boundary].unwrap();
             let h = model.scales[radius] * 1e-4;
             let sample = |sign: f64| {
                 let mut q = p;
                 q[radius] += sign * h;
-                if q[radius] < model.lower[radius] || q[radius] > model.upper[radius] { return None; }
+                if q[radius] < model.lower[radius] || q[radius] > model.upper[radius] {
+                    return None;
+                }
                 model.conics(&q).and_then(|c| c[eye][boundary])
             };
             let (a, b, delta) = match (sample(-1.0), sample(1.0)) {
@@ -1243,7 +1425,8 @@ pub(super) fn mask_radius_start(model: &Problem<'_>, mut p: Parameters,
                 let arc = &model.groups[index].alternatives[selection[index]];
                 for (&point, &weight) in arc.points.iter().zip(&arc.quadrature) {
                     let residual = base.residual_px(point) / arc.sigma;
-                    let derivative = (b.residual_px(point) - a.residual_px(point)) / (delta * arc.sigma);
+                    let derivative =
+                        (b.residual_px(point) - a.residual_px(point)) / (delta * arc.sigma);
                     numerator += arc.weight * weight * residual * derivative;
                     denominator += arc.weight * weight * derivative.powi(2);
                 }
@@ -1252,7 +1435,12 @@ pub(super) fn mask_radius_start(model: &Problem<'_>, mut p: Parameters,
                 next[radius] -= numerator / denominator;
             }
         }
-        let Some(next) = model.project_step(next).filter(|q| model.conics(q).is_some()) else { break; };
+        let Some(next) = model
+            .project_step(next)
+            .filter(|q| model.conics(q).is_some())
+        else {
+            break;
+        };
         p = next;
     }
     p
@@ -1268,23 +1456,33 @@ pub(super) struct MaskStateRefinement {
 /// Conditional masks only supply starting coordinates. Every returned cost
 /// and fit comes from refinement of the unchanged full marginal objective.
 /// No conditional cost is eligible to choose the final joint solution.
-pub(super) fn refine_mask_state_initializations(model: &Problem<'_>, starts: &[Parameters],
-    maximum_starts: usize) -> MaskStateRefinement
-{
+pub(super) fn refine_mask_state_initializations(
+    model: &Problem<'_>,
+    starts: &[Parameters],
+    maximum_starts: usize,
+) -> MaskStateRefinement {
     let mut result = MaskStateRefinement::default();
-    let Some(conics) = starts.first().and_then(|p| model.conics(p)) else { return result; };
+    let Some(conics) = starts.first().and_then(|p| model.conics(p)) else {
+        return result;
+    };
     let selection = model.select(&conics);
     let families = &selection.families;
     let counts = families.iter().map(|f| f.states.len()).collect::<Vec<_>>();
     for states in mask_assignments_for_counts(&counts) {
         let conditional = conditioned_mask_model(model, families, &states);
         for &start in starts.iter().take(2) {
-            if result.attempts >= maximum_starts { return result; }
+            if result.attempts >= maximum_starts {
+                return result;
+            }
             result.attempts += 1;
             let start = mask_radius_start(&conditional, start, families);
-            let Some((initial, _, steps)) = conditional.refine(start) else { continue; };
+            let Some((initial, _, steps)) = conditional.refine(start) else {
+                continue;
+            };
             result.steps += steps;
-            let Some((fitted, cost, steps)) = model.refine(initial) else { continue; };
+            let Some((fitted, cost, steps)) = model.refine(initial) else {
+                continue;
+            };
             result.steps += steps;
             result.fits.push((fitted, cost));
         }
@@ -1292,19 +1490,28 @@ pub(super) fn refine_mask_state_initializations(model: &Problem<'_>, starts: &[P
     result
 }
 
-fn add_mask_state_proposals(model: &Problem<'_>, modes: &[(Parameters, JointConicSolution)],
-    config: IntegrationConfig, inner: &IntegratedInner, proposals: &mut Vec<Proposal>,
-    diagnostics: &mut Vec<serde_json::Value>)
-{
-    let Some(conics) = model.conics(&modes[0].0) else { return; };
+fn add_mask_state_proposals(
+    model: &Problem<'_>,
+    modes: &[(Parameters, JointConicSolution)],
+    config: IntegrationConfig,
+    inner: &IntegratedInner,
+    proposals: &mut Vec<Proposal>,
+    diagnostics: &mut Vec<serde_json::Value>,
+) {
+    let Some(conics) = model.conics(&modes[0].0) else {
+        return;
+    };
     let selection = model.select(&conics);
     let families = &selection.families;
-    let counts = families.iter().map(|f|f.states.len()).collect::<Vec<_>>();
+    let counts = families.iter().map(|f| f.states.len()).collect::<Vec<_>>();
     let assignments = mask_assignments_for_counts(&counts);
     for levels in &assignments {
         let conditional = conditioned_mask_model(model, families, levels);
-        for (mode, (p, _)) in modes.iter().enumerate()
-            .filter(|(_, (_, s))| s.modeled_eyes == model.present).take(2)
+        for (mode, (p, _)) in modes
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, s))| s.modeled_eyes == model.present)
+            .take(2)
         {
             let mut trace = serde_json::json!({"mode":mode,
                 "families":families.iter().map(|f|[f.eye,f.boundary]).collect::<Vec<_>>(),
@@ -1313,16 +1520,18 @@ fn add_mask_state_proposals(model: &Problem<'_>, modes: &[(Parameters, JointConi
                 "enumerated_states":assignments.len(),"status":"refinement-unavailable"});
             if counts.contains(&7) {
                 trace.as_object_mut().unwrap().remove("levels");
-                trace["states"]=serde_json::json!(levels);
-                trace["family_state_counts"]=serde_json::json!(counts);
+                trace["states"] = serde_json::json!(levels);
+                trace["family_state_counts"] = serde_json::json!(counts);
             }
             let start = mask_radius_start(&conditional, *p, families);
             if let Some((fitted, cost, steps)) = conditional.refine(start) {
                 trace["conditional_cost"] = serde_json::json!(cost);
                 trace["refinement_steps"] = serde_json::json!(steps);
                 trace["target_camera_mm"] = serde_json::json!(model.target(&fitted));
-                trace["marginal_cost"] = serde_json::json!(model.conics(&fitted)
-                    .and_then(|c|model.residuals(&fitted,&model.select(&c))).map(|r|squared_norm(&r)));
+                trace["marginal_cost"] = serde_json::json!(model
+                    .conics(&fitted)
+                    .and_then(|c| model.residuals(&fitted, &model.select(&c)))
+                    .map(|r| squared_norm(&r)));
                 let proposal = constrained_proposal_information(&conditional, &fitted)
                     .and_then(|i| Proposal::new(model, fitted, &i))
                     .and_then(|p| p.marginal(&inner.indices, config.preserve_marginal_draws));
@@ -1331,7 +1540,9 @@ fn add_mask_state_proposals(model: &Problem<'_>, modes: &[(Parameters, JointConi
                     // components need not multiply all nuisance tail scales.
                     let proposal = if config.conditional_nuisance {
                         proposal.with_conditional_nuisance().unwrap_or(proposal)
-                    } else { proposal };
+                    } else {
+                        proposal
+                    };
                     proposals.push(proposal);
                     trace["status"] = serde_json::json!("added");
                 } else {
@@ -1390,17 +1601,28 @@ fn constrained_proposal_information(model: &Problem<'_>, p: &Parameters) -> Opti
     )
 }
 
+fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    crate::parallel_work::ordered_map(items, 64, f)
+}
+
 pub(super) fn integrate(
     model: &Problem<'_>,
     modes: &[(Parameters, JointConicSolution)],
     config: IntegrationConfig,
 ) -> ModelPosterior {
     assert!((1..=4).contains(&config.replicas), "bounded replica count");
-    assert!(!config.adaptive || config.tail_proposal == TailProposal::Off,
-        "compare per-basin moment adaptation and tail refinement separately");
-    assert!(!config.select_supported_mode || (config.populations.is_none() && config.numerical_admission),
-        "supported-mode experiment requires importance integration and numerical admission");
+    assert!(
+        !config.adaptive || config.tail_proposal == TailProposal::Off,
+        "compare per-basin moment adaptation and tail refinement separately"
+    );
+    assert!(
+        !config.select_supported_mode
+            || (config.populations.is_none() && config.numerical_admission),
+        "supported-mode experiment requires importance integration and numerical admission"
+    );
     let mut result = ModelPosterior {
+        direction_prior: config.direction_prior,
+        camera_mount: config.camera_mount,
         status: "proposal-unavailable",
         samples: 0,
         feasible_samples: 0,
@@ -1499,6 +1721,17 @@ pub(super) fn integrate(
         {
             return None;
         }
+        // Restrict the target density, not the proposal density. Both pilot
+        // and estimation draws use this same whole-normal support; infeasible
+        // draws still count against the work budget and numerical precision.
+        for eye in (0..2).filter(|&eye| model.present[eye]) {
+            let (center, normal, _) = model.geometry(p, eye)?;
+            if !config.camera_mount.supports(normal[1])
+                || !config.direction_prior.supports(eye, center, normal)
+            {
+                return None;
+            }
+        }
         let conics = model.conics(p)?;
         let residuals = model.residuals(p, &model.select(&conics))?;
         // The axial-distance Gaussian prior has the same log-chart Jacobian
@@ -1519,8 +1752,14 @@ pub(super) fn integrate(
         }
     }
     if config.mask_state_proposals {
-        add_mask_state_proposals(model, modes, config, &integrated_inner,
-            &mut proposals, &mut result.mask_state_proposals);
+        add_mask_state_proposals(
+            model,
+            modes,
+            config,
+            &integrated_inner,
+            &mut proposals,
+            &mut result.mask_state_proposals,
+        );
     }
     if config.global_proposal {
         if let Some(global) = Proposal::global(model)
@@ -1545,17 +1784,20 @@ pub(super) fn integrate(
         let mut pilot = vec![Vec::new(); original_count];
         let mut tail_pilot = Vec::new();
         let mut tail_refinements = Vec::new();
-        for index in 0..pilot_count {
-            result.samples += 1;
-            result.pilot_samples += 1;
-            let mut p = proposals[index % pilot_components].draw(&mut rng);
-            let Some(target) = log_target(&mut p) else {
-                continue;
-            };
+        // Same order-preserving split as final estimation: sequential draws,
+        // parallel pure density evaluation, sequential accumulation.
+        let drawn = (0..pilot_count)
+            .map(|index| proposals[index % pilot_components].draw(&mut rng))
+            .collect::<Vec<_>>();
+        result.samples += pilot_count;
+        result.pilot_samples += pilot_count;
+        let evaluated = parallel_map(&drawn, |p| {
+            let mut p = *p;
+            let target = log_target(&mut p)?;
             let density = log_mean_exp(proposals.iter().map(|q| q.log_density(&p)));
-            if !density.is_finite() {
-                continue;
-            }
+            density.is_finite().then_some((p, target, density))
+        });
+        for (p, target, density) in evaluated.into_iter().flatten() {
             pilot[closest_mode(&p, &proposals)].push((p, target - density));
             if config.tail_proposal != TailProposal::Off {
                 tail_pilot.push((p, target));
@@ -1570,37 +1812,78 @@ pub(super) fn integrate(
                 // if a basin lacks sufficient pilot support to fit a covariance.
                 proposals.push(adapted.unwrap_or_else(|| proposals[i].clone()));
             }
-        } else if matches!(config.tail_proposal,
-            TailProposal::Recenter | TailProposal::Refit | TailProposal::ConditionalRefit | TailProposal::OutlierRefit | TailProposal::BoundaryRefit | TailProposal::BoundaryDefensive | TailProposal::ProfileAffine | TailProposal::ProfileQuadratic) {
+        } else if matches!(
+            config.tail_proposal,
+            TailProposal::Recenter
+                | TailProposal::Refit
+                | TailProposal::ConditionalRefit
+                | TailProposal::OutlierRefit
+                | TailProposal::BoundaryRefit
+                | TailProposal::BoundaryDefensive
+                | TailProposal::ProfileAffine
+                | TailProposal::ProfileQuadratic
+        ) {
             let mut selected = vec![false; tail_pilot.len()];
             let boundary_masks = if config.tail_proposal.explicit_boundaries() {
                 boundary_relaxations(model)
-            } else { Vec::new() };
+            } else {
+                Vec::new()
+            };
             // All selection and curvature work uses only discarded pilot
             // configurations. Up to four components augment the unchanged
             // original mixture; neither the MAP nor the model priors change.
             for attempt in 0..4 {
-                let next = tail_pilot.iter().enumerate()
+                let next = tail_pilot
+                    .iter()
+                    .enumerate()
                     .filter(|(i, _)| !selected[*i])
                     .filter_map(|(i, (p, target))| {
-                        let importance = target - log_mean_exp(proposals.iter().map(|q| q.log_density(p)));
+                        let importance =
+                            target - log_mean_exp(proposals.iter().map(|q| q.log_density(p)));
                         importance.is_finite().then_some((i, importance))
                     })
                     .max_by(|a, b| a.1.total_cmp(&b.1));
-                let Some((index, _)) = next else { break; };
+                let Some((index, _)) = next else {
+                    break;
+                };
                 selected[index] = true;
                 let mut p = tail_pilot[index].0;
-                let forced = if boundary_masks.is_empty() { &[][..] }
-                    else { boundary_masks[attempt % boundary_masks.len()].as_slice() };
-                let relaxed = if matches!(config.tail_proposal, TailProposal::OutlierRefit | TailProposal::BoundaryRefit | TailProposal::BoundaryDefensive) {
-                    let Some(relaxed) = with_relaxed_proposal_groups(model, &p, forced) else { continue; };
+                let forced = if boundary_masks.is_empty() {
+                    &[][..]
+                } else {
+                    boundary_masks[attempt % boundary_masks.len()].as_slice()
+                };
+                let relaxed = if matches!(
+                    config.tail_proposal,
+                    TailProposal::OutlierRefit
+                        | TailProposal::BoundaryRefit
+                        | TailProposal::BoundaryDefensive
+                ) {
+                    let Some(relaxed) = with_relaxed_proposal_groups(model, &p, forced) else {
+                        continue;
+                    };
                     Some(relaxed)
-                } else { None };
+                } else {
+                    None
+                };
                 let shaping_model = relaxed.as_ref().map(|(m, _)| m).unwrap_or(model);
-                if matches!(config.tail_proposal, TailProposal::ConditionalRefit | TailProposal::OutlierRefit | TailProposal::BoundaryRefit | TailProposal::BoundaryDefensive | TailProposal::ProfileAffine | TailProposal::ProfileQuadratic) {
-                    let before = shaping_model.conics(&p).and_then(|c| shaping_model.residuals(&p, &shaping_model.select(&c)))
+                if matches!(
+                    config.tail_proposal,
+                    TailProposal::ConditionalRefit
+                        | TailProposal::OutlierRefit
+                        | TailProposal::BoundaryRefit
+                        | TailProposal::BoundaryDefensive
+                        | TailProposal::ProfileAffine
+                        | TailProposal::ProfileQuadratic
+                ) {
+                    let before = shaping_model
+                        .conics(&p)
+                        .and_then(|c| shaping_model.residuals(&p, &shaping_model.select(&c)))
                         .map(|r| squared_norm(&r));
-                    let Some((refined, cost, steps)) = conditional_refined_center(shaping_model, p) else { continue; };
+                    let Some((refined, cost, steps)) = conditional_refined_center(shaping_model, p)
+                    else {
+                        continue;
+                    };
                     assert_eq!(&refined[..TARGET_PARAMETERS], &p[..TARGET_PARAMETERS]);
                     let mut trace = serde_json::json!({
                         "shared_target_parameters":p[..TARGET_PARAMETERS],
@@ -1616,8 +1899,10 @@ pub(super) fn integrate(
                                 "group":g.alternatives[0].group,"weight":g.weight,
                                 "alternative_kinds":g.alternatives.iter().map(|a|format!("{:?}",a.kind)).collect::<Vec<_>>()})
                         }).collect::<Vec<_>>());
-                        trace["complete_model_cost_after"] = serde_json::json!(model.conics(&refined)
-                            .and_then(|c|model.residuals(&refined,&model.select(&c))).map(|r|squared_norm(&r)));
+                        trace["complete_model_cost_after"] = serde_json::json!(model
+                            .conics(&refined)
+                            .and_then(|c| model.residuals(&refined, &model.select(&c)))
+                            .map(|r| squared_norm(&r)));
                     }
                     tail_refinements.push(trace);
                     p = refined;
@@ -1627,10 +1912,16 @@ pub(super) fn integrate(
                 } else {
                     constrained_proposal_information(shaping_model, &p)
                         .and_then(|information| Proposal::new(shaping_model, p, &information))
-                        .and_then(|q| q.marginal(&integrated_inner.indices, config.preserve_marginal_draws))
+                        .and_then(|q| {
+                            q.marginal(&integrated_inner.indices, config.preserve_marginal_draws)
+                        })
                 };
                 let proposal = proposal.and_then(|q| {
-                    if config.conditional_nuisance { q.with_conditional_nuisance() } else { Some(q) }
+                    if config.conditional_nuisance {
+                        q.with_conditional_nuisance()
+                    } else {
+                        Some(q)
+                    }
                 });
                 if let Some(proposal) = proposal {
                     proposals.push(proposal);
@@ -1646,7 +1937,8 @@ pub(super) fn integrate(
         if config.tail_proposal.profiled() {
             for (index, proposal) in proposals.iter_mut().enumerate().skip(pilot_components) {
                 if let Some((transported, mut trace)) = proposal.with_profile_transport(
-                    model, config.tail_proposal == TailProposal::ProfileQuadratic,
+                    model,
+                    config.tail_proposal == TailProposal::ProfileQuadratic,
                 ) {
                     trace["component"] = serde_json::json!(index);
                     trace["fitted"] = serde_json::json!(true);
@@ -1664,7 +1956,9 @@ pub(super) fn integrate(
             // each original component's share in the complete final mixture.
             // Uniform stratification over these slots and their full density
             // gives exactly the corresponding 3:1 component weighting.
-            for _ in 0..2 { proposals.extend_from_within(..pilot_components); }
+            for _ in 0..2 {
+                proposals.extend_from_within(..pilot_components);
+            }
         }
         if config.trace_tail && config.tail_proposal != TailProposal::Off {
             let mut trace = serde_json::json!({
@@ -1685,19 +1979,39 @@ pub(super) fn integrate(
     if let Some(reference) = config.annealed_reference {
         // Independent numerical control: never advances the production draw
         // stream or changes its geometry, weights, confidence or publication.
-        let diagnostic = annealed::diagnose(model, best, &modes[0].0, &integrated_inner.indices,
-            &proposals, &log_target, reference, config.seed);
+        let diagnostic = annealed::diagnose(
+            model,
+            best,
+            &modes[0].0,
+            &integrated_inner.indices,
+            &proposals,
+            &log_target,
+            reference,
+            config.seed,
+        );
         eprintln!("posterior-annealed {diagnostic}");
     }
     if let Some(populations) = config.populations {
-        return populations::integrate(model, best, &proposals, original_count,
-            &log_target, populations, config.seed, result);
+        return populations::integrate(
+            model,
+            best,
+            &proposals,
+            original_count,
+            &log_target,
+            populations,
+            config.seed,
+            result,
+        );
     }
     // Stratify uniformly by proposal. Use equal counts so the density below
     // is the exact mixture used to draw this bounded sample population.
     let balanced_components = proposals.len();
     let balanced_components = balanced_components
-        * if config.preserve_replica_draws { 1 } else { config.replicas };
+        * if config.preserve_replica_draws {
+            1
+        } else {
+            config.replicas
+        };
     let mut replica_draw_counts = vec![0; config.replicas];
     let mut replica_rngs = (0..config.replicas)
         .map(|replica| {
@@ -1710,7 +2024,7 @@ pub(super) fn integrate(
         .collect::<Vec<_>>();
     let count = (config.budget - result.pilot_samples) / balanced_components * balanced_components;
     let batch = (512 / balanced_components).max(1) * balanced_components;
-    for index in 0..count {
+    for index in (0..count).step_by(batch) {
         // Easy observations stop early. Difficult constrained observations
         // receive more integration work within the same strict source-local
         // budget, never extra optimizer starts or borrowed temporal evidence.
@@ -1746,18 +2060,26 @@ pub(super) fn integrate(
                                 }
                                 let supported = n.mass - 2.0 * n.standard_error >= 0.9;
                                 map_supported &= supported;
-                                supported
-                                    || n.mass + 2.0 * n.standard_error < 0.9
+                                supported || n.mass + 2.0 * n.standard_error < 0.9
                             })
                         });
                     }
                     if config.select_supported_mode && settled && !map_supported {
-                        let directions = DirectionSamples {samples: &samples, weights: &weights,
-                            sample_proposals: &sample_proposals, proposals: proposals.len(), draws: index,
-                            sample_replicas: &sample_replicas, replica_draw_counts: &replica_draw_counts};
+                        let directions = DirectionSamples {
+                            samples: &samples,
+                            weights: &weights,
+                            sample_proposals: &sample_proposals,
+                            proposals: proposals.len(),
+                            draws: index,
+                            sample_replicas: &sample_replicas,
+                            replica_draw_counts: &replica_draw_counts,
+                        };
                         // A clearly unsupported MAP must not stop integration
                         // before an alternative's existing numerical gate resolves.
-                        settled = modes.iter().skip(1).filter(|(_, s)| s.modeled_eyes == model.present)
+                        settled = modes
+                            .iter()
+                            .skip(1)
+                            .filter(|(_, s)| s.modeled_eyes == model.present)
                             .all(|(_, s)| directions.numerically_decided(s, config.replicas));
                     }
                     if settled {
@@ -1766,40 +2088,52 @@ pub(super) fn integrate(
                 }
             }
         }
-        result.samples += 1;
-        let replica = (index / proposals.len()) % config.replicas;
-        { replica_draw_counts[replica] += 1; }
-        let random = &mut rng;
-        let random = if config.replicas > 1 && !config.preserve_replica_draws {
-            &mut replica_rngs[replica]
-        } else {
-            random
-        };
-        let mut p = proposals[index % proposals.len()].draw(random);
-        let Some(log_target) = log_target(&mut p) else {
-            continue;
-        };
-        let Some(target) = model.target(&p) else {
-            continue;
-        };
-        let gazes = std::array::from_fn::<_, 2, _>(|eye| {
-            if !model.present[eye] {
-                return None;
+        // Draws consume the RNG streams in exactly the original order. Only the
+        // pure density evaluation below runs in parallel, so every sample,
+        // weight and early-stop decision is bit-identical to serial evaluation.
+        let chunk_end = (index + batch).min(count);
+        let mut drawn = Vec::with_capacity(chunk_end - index);
+        for index in index..chunk_end {
+            result.samples += 1;
+            let replica = (index / proposals.len()) % config.replicas;
+            {
+                replica_draw_counts[replica] += 1;
             }
-            let k = TARGET_PARAMETERS + eye * EYE_PARAMETERS;
-            normalized3(sub3(target, [p[k], p[k + 1], p[k + 2]]))
-        });
-        let log_proposal = log_mean_exp(proposals.iter().map(|q| q.log_density(&p)));
-        if !log_target.is_finite() || !log_proposal.is_finite() {
-            continue;
+            let random = &mut rng;
+            let random = if config.replicas > 1 && !config.preserve_replica_draws {
+                &mut replica_rngs[replica]
+            } else {
+                random
+            };
+            drawn.push((index, replica, proposals[index % proposals.len()].draw(random)));
         }
-        let mode = closest_mode(&p, &proposals);
-        log_weights.push(log_target - log_proposal);
-        samples.push((target, gazes, mode));
-        #[cfg(test)]
-        sample_parameters.push(p);
-        sample_replicas.push(replica);
-        sample_proposals.push(index % proposals.len());
+        let evaluate = |mut p: Parameters| -> Option<(Parameters, f64, [f64; 3], f64)> {
+            let log_target = log_target(&mut p)?;
+            let target = model.target(&p)?;
+            let log_proposal = log_mean_exp(proposals.iter().map(|q| q.log_density(&p)));
+            (log_target.is_finite() && log_proposal.is_finite())
+                .then_some((p, log_target, target, log_proposal))
+        };
+        let evaluated = parallel_map(&drawn, |(_, _, p)| evaluate(*p));
+        for ((index, replica, _), evaluated) in drawn.into_iter().zip(evaluated) {
+            let Some((p, log_target, target, log_proposal)) = evaluated else {
+                continue;
+            };
+            let gazes = std::array::from_fn::<_, 2, _>(|eye| {
+                if !model.present[eye] {
+                    return None;
+                }
+                let k = TARGET_PARAMETERS + eye * EYE_PARAMETERS;
+                normalized3(sub3(target, [p[k], p[k + 1], p[k + 2]]))
+            });
+            let mode = closest_mode(&p, &proposals);
+            log_weights.push(log_target - log_proposal);
+            samples.push((target, gazes, mode));
+            #[cfg(test)]
+            sample_parameters.push(p);
+            sample_replicas.push(replica);
+            sample_proposals.push(index % proposals.len());
+        }
     }
     result.feasible_samples = samples.len();
     let Some((weights, effective)) = weights(&log_weights) else {
@@ -1894,10 +2228,16 @@ pub(super) fn integrate(
         }
     }
     if config.select_supported_mode {
-        DirectionSamples {samples: &samples, weights: &weights,
-            sample_proposals: &sample_proposals, proposals: proposals.len(),
-            draws: result.samples-result.pilot_samples, sample_replicas: &sample_replicas,
-            replica_draw_counts: &replica_draw_counts}.select_supported_mode(&mut result, modes);
+        DirectionSamples {
+            samples: &samples,
+            weights: &weights,
+            sample_proposals: &sample_proposals,
+            proposals: proposals.len(),
+            draws: result.samples - result.pilot_samples,
+            sample_replicas: &sample_replicas,
+            replica_draw_counts: &replica_draw_counts,
+        }
+        .select_supported_mode(&mut result, modes);
     }
     result
 }
@@ -1914,20 +2254,39 @@ mod tests {
         let mut scales = [1.0; PARAMETERS];
         scales[0] = 0.75;
         scales[3] = 1.25;
-        let original = Proposal::with_active(origin, vec![0, 1, 3], scales,
-            &[vec![2.0, 0.3, 0.5], vec![0.3, 1.2, 0.1], vec![0.5, 0.1, 1.5]])
-            .unwrap().marginal(&[1], true).unwrap();
+        let original = Proposal::with_active(
+            origin,
+            vec![0, 1, 3],
+            scales,
+            &[
+                vec![2.0, 0.3, 0.5],
+                vec![0.3, 1.2, 0.1],
+                vec![0.5, 0.1, 1.5],
+            ],
+        )
+        .unwrap()
+        .marginal(&[1], true)
+        .unwrap();
         for conditional in [false, true] {
             for quadratic in [false, true] {
-                let base = if conditional { original.with_conditional_nuisance().unwrap() }
-                    else { original.clone() };
+                let base = if conditional {
+                    original.with_conditional_nuisance().unwrap()
+                } else {
+                    original.clone()
+                };
                 assert_eq!(base.original_sampler.is_some(), !conditional);
-                let target_scale = base.with_conditional_nuisance().unwrap()
-                    .conditional_lower.unwrap()[0][0];
+                let target_scale = base
+                    .with_conditional_nuisance()
+                    .unwrap()
+                    .conditional_lower
+                    .unwrap()[0][0];
                 let mut transport = ProfileTransport {
-                    base: Box::new(base.clone()), target_lower: vec![vec![target_scale]],
-                    steps: vec![1.0], constant: [0.0; PARAMETERS],
-                    linear: vec![[0.0; PARAMETERS]], quadratic: vec![[0.0; PARAMETERS]],
+                    base: Box::new(base.clone()),
+                    target_lower: vec![vec![target_scale]],
+                    steps: vec![1.0],
+                    constant: [0.0; PARAMETERS],
+                    linear: vec![[0.0; PARAMETERS]],
+                    quadratic: vec![[0.0; PARAMETERS]],
                     include_quadratic: quadratic,
                 };
                 transport.constant[3] = 0.35;
@@ -1944,8 +2303,12 @@ mod tests {
                     let moved = transport.apply(p, 1.0);
                     let recovered = transport.apply(moved, -1.0);
                     for i in 0..PARAMETERS {
-                        if i == 3 { assert!((recovered[i] - p[i]).abs() < 1e-12); }
-                        else { assert_eq!(moved[i], p[i]); assert_eq!(recovered[i], p[i]); }
+                        if i == 3 {
+                            assert!((recovered[i] - p[i]).abs() < 1e-12);
+                        } else {
+                            assert_eq!(moved[i], p[i]);
+                            assert_eq!(recovered[i], p[i]);
+                        }
                     }
                 }
                 let mut original_rng = Random(0x7174_14c0_a4b6_2391);
@@ -1966,21 +2329,46 @@ mod tests {
                 let mut logs = Vec::new();
                 for i in 0..64000 {
                     let p = proposals[i % 2].draw(&mut rng);
-                    if [0, 3].iter().any(|&j| !(-1.0..=1.0).contains(&p[j])) { continue; }
+                    if [0, 3].iter().any(|&j| !(-1.0..=1.0).contains(&p[j])) {
+                        continue;
+                    }
                     logs.push(-log_mean_exp(proposals.iter().map(|q| q.log_density(&p))));
                     samples.push(p);
                 }
                 let (weights, effective) = weights(&logs).unwrap();
-                assert!(effective > 4000.0, "conditional={conditional} quadratic={quadratic}: {effective}");
+                assert!(
+                    effective > 4000.0,
+                    "conditional={conditional} quadratic={quadratic}: {effective}"
+                );
                 for axis in [0, 3] {
-                    let mean = samples.iter().zip(&weights).map(|(p, w)| w * p[axis]).sum::<f64>();
-                    let second = samples.iter().zip(&weights).map(|(p, w)| w * p[axis].powi(2)).sum::<f64>();
-                    assert!(mean.abs() < 0.025, "conditional={conditional} quadratic={quadratic} axis={axis}: {mean}");
-                    assert!((second - 1.0 / 3.0).abs() < 0.025,
-                        "conditional={conditional} quadratic={quadratic} axis={axis}: {second}");
+                    let mean = samples
+                        .iter()
+                        .zip(&weights)
+                        .map(|(p, w)| w * p[axis])
+                        .sum::<f64>();
+                    let second = samples
+                        .iter()
+                        .zip(&weights)
+                        .map(|(p, w)| w * p[axis].powi(2))
+                        .sum::<f64>();
+                    assert!(
+                        mean.abs() < 0.025,
+                        "conditional={conditional} quadratic={quadratic} axis={axis}: {mean}"
+                    );
+                    assert!(
+                        (second - 1.0 / 3.0).abs() < 0.025,
+                        "conditional={conditional} quadratic={quadratic} axis={axis}: {second}"
+                    );
                 }
-                let cross = samples.iter().zip(&weights).map(|(p, w)| w * p[0] * p[3]).sum::<f64>();
-                assert!(cross.abs() < 0.025, "conditional={conditional} quadratic={quadratic}: {cross}");
+                let cross = samples
+                    .iter()
+                    .zip(&weights)
+                    .map(|(p, w)| w * p[0] * p[3])
+                    .sum::<f64>();
+                assert!(
+                    cross.abs() < 0.025,
+                    "conditional={conditional} quadratic={quadratic}: {cross}"
+                );
             }
         }
     }
@@ -1990,33 +2378,56 @@ mod tests {
         let mut origin = [0.0; PARAMETERS];
         origin[0] = -0.5;
         origin[3] = 0.7;
-        let full = Proposal::with_active(origin,vec![0,1,3],[1.0;PARAMETERS],
-            &[vec![2.0,0.3,0.5],vec![0.3,1.2,0.1],vec![0.5,0.1,1.5]]).unwrap();
-        let original = full.marginal(&[1],true).unwrap();
+        let full = Proposal::with_active(
+            origin,
+            vec![0, 1, 3],
+            [1.0; PARAMETERS],
+            &[
+                vec![2.0, 0.3, 0.5],
+                vec![0.3, 1.2, 0.1],
+                vec![0.5, 0.1, 1.5],
+            ],
+        )
+        .unwrap();
+        let original = full.marginal(&[1], true).unwrap();
         assert!(original.original_sampler.is_some());
         let mut center = origin;
         center[0] = 1.5;
         center[3] = -1.0;
         let moved = original.recentered(center);
         for original_slots in [1, 3] {
-        let mut proposals = vec![original.clone(); original_slots];
-        proposals.push(moved.clone());
-        let mut rng = Random(0x4875_abc3_4956_ade1);
-        let mut samples=Vec::new();let mut logs=Vec::new();
-        for i in 0..48000 {
-            let p=proposals[i%proposals.len()].draw(&mut rng);
-            if [0,3].iter().any(|&j| !(-1.0..=1.0).contains(&p[j])) {continue;}
-            samples.push(p);
-            logs.push(-log_mean_exp(proposals.iter().map(|q|q.log_density(&p))));
-        }
-        let (weights,effective)=weights(&logs).unwrap();
-        assert!(effective>6000.0,"{effective}");
-        for axis in [0,3] {
-            let mean=samples.iter().zip(&weights).map(|(p,w)|p[axis]*w).sum::<f64>();
-            let second=samples.iter().zip(&weights).map(|(p,w)|p[axis].powi(2)*w).sum::<f64>();
-            assert!(mean.abs()<0.025,"axis={axis} mean={mean}");
-            assert!((second-1.0/3.0).abs()<0.02,"axis={axis} second={second}");
-        }
+            let mut proposals = vec![original.clone(); original_slots];
+            proposals.push(moved.clone());
+            let mut rng = Random(0x4875_abc3_4956_ade1);
+            let mut samples = Vec::new();
+            let mut logs = Vec::new();
+            for i in 0..48000 {
+                let p = proposals[i % proposals.len()].draw(&mut rng);
+                if [0, 3].iter().any(|&j| !(-1.0..=1.0).contains(&p[j])) {
+                    continue;
+                }
+                samples.push(p);
+                logs.push(-log_mean_exp(proposals.iter().map(|q| q.log_density(&p))));
+            }
+            let (weights, effective) = weights(&logs).unwrap();
+            assert!(effective > 6000.0, "{effective}");
+            for axis in [0, 3] {
+                let mean = samples
+                    .iter()
+                    .zip(&weights)
+                    .map(|(p, w)| p[axis] * w)
+                    .sum::<f64>();
+                let second = samples
+                    .iter()
+                    .zip(&weights)
+                    .map(|(p, w)| p[axis].powi(2) * w)
+                    .sum::<f64>();
+                assert!(mean.abs() < 0.025, "axis={axis} mean={mean}");
+                assert!(
+                    (second - 1.0 / 3.0).abs() < 0.02,
+                    "axis={axis} second={second}"
+                );
+            }
         }
     }
 
@@ -2075,8 +2486,14 @@ mod tests {
                 estimated_variance += n.standard_error.powi(2);
             }
             let expected = (0.8_f64.powi(2) * 0.8 * 0.2 + 0.2_f64.powi(2) * 0.05 * 0.95) / 400.0;
-            assert!((squared_error / 1200.0 / expected - 1.0).abs() < 0.12, "{counts:?}");
-            assert!((estimated_variance / 1200.0 / expected - 1.0).abs() < 0.10, "{counts:?}");
+            assert!(
+                (squared_error / 1200.0 / expected - 1.0).abs() < 0.12,
+                "{counts:?}"
+            );
+            assert!(
+                (estimated_variance / 1200.0 / expected - 1.0).abs() < 0.10,
+                "{counts:?}"
+            );
         }
     }
 

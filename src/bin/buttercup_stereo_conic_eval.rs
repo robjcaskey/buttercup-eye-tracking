@@ -9,7 +9,7 @@
     pub(crate) mod outline_conic_segments;
     pub(crate) mod roi_evidence;
     pub(crate) mod binocular_coordinator;
-    pub(crate) mod eye_scene_model {pub(crate) mod binocular_pose;pub(crate) mod camera_mount;pub(crate) use camera_mount::CameraMount;}
+    pub(crate) mod eye_scene_model {pub(crate) mod binocular_pose;pub(crate) use crate::conic_solver::camera_mount::CameraMount;}
 }
 use native::{conic_solver,outline_conic_segments,roi_evidence};
 use native::{binocular_coordinator,eye_scene_model};
@@ -470,10 +470,12 @@ fn solution_json(result:Result<JointConicSolution,JointConicUnavailable>,frames:
 }
 
 fn evaluate(frames:[Option<Frame>;2],export_sparse:bool)->Value {
-    evaluate_with_distribution(frames,export_sparse,false)
+    // Geometry unit/component fixtures deliberately retain their unconstrained prior.
+    evaluate_with_distribution(frames,export_sparse,false,eye_scene_model::CameraMount::Flexible)
 }
 
-fn evaluate_with_distribution(frames:[Option<Frame>;2],export_sparse:bool,probabilistic:bool)->Value {
+fn evaluate_with_distribution(frames:[Option<Frame>;2],export_sparse:bool,probabilistic:bool,
+    camera_mount:eye_scene_model::CameraMount)->Value {
     let poses=frames.each_ref().map(|f|f.as_ref().map(|f|f.pose));
     let prepared=frames.each_ref().map(|f|f.as_ref().map(|f|f.packet.prepare()));
     let evidence=prepared.each_ref().map(|e|e.as_ref().map(|p|p.evidence()));
@@ -497,6 +499,7 @@ fn evaluate_with_distribution(frames:[Option<Frame>;2],export_sparse:bool,probab
             "emitted_arcs":f.partial_outline.emitted_arcs}))),
         "contract":"shared latent fixation versus separate monocular optimizations of the SAME training arcs; no averaged gaze; held-out points condition on upstream detector segmentation/search and are absent in all-boundary-samples mode. Neither metric pose nor gaze accuracy is ground truth."});
     let mut row=base;
+    row["camera_mount_assumption"]=json!(camera_mount.label());
     if frames.iter().flatten().any(|f|f.pupil_profile_footprint) {row["pupil_profile_footprint"]=json!(true);}
     if frames.iter().flatten().any(|f|f.subpixel_pupil_peaks) {row["subpixel_pupil_peaks"]=json!(true);}
     if frames.iter().flatten().any(|f|f.connected_pupil_width) {row["connected_pupil_width"]=json!(true);}
@@ -545,14 +548,16 @@ fn evaluate_with_distribution(frames:[Option<Frame>;2],export_sparse:bool,probab
             maximum_hypotheses:16,maximum_refinements:12,maximum_source_skew_ns:0,
             exposure_uncertainty_ns:2_000_000,motion_bound_px_per_second:150.0,
         };
-        let result=if probabilistic {solve_joint_conic_distribution(request,1).map(|mut solutions|solutions.remove(0))}
-            else {solve_joint_conics(request)};
+        let count=if camera_mount==eye_scene_model::CameraMount::Flexible {1}else{16};
+        let result=conic_solver::joint::solve_joint_conics_with_mount(request,count,camera_mount,probabilistic)
+            .map(|mut hypotheses|hypotheses.remove(0));
         row[name]=solution_json(result,frames.each_ref().map(Option::as_ref),started.elapsed().as_secs_f64()*1000.0);
     }
     row
 }
 
 fn run()->Result<(),String> {
+    let camera_mount=eye_scene_model::CameraMount::for_offline_checks()?;
     let mut args=std::env::args().skip(1);
     let output=PathBuf::from(args.next().ok_or("usage: buttercup_stereo_conic_eval OUTPUT.jsonl SAM_CACHE.jsonl...")?);
     let mut files=Vec::new();
@@ -650,7 +655,7 @@ fn run()->Result<(),String> {
     let mut pending:HashMap<(String,u64),[Option<Frame>;2]>=HashMap::new();
     let mut count=0usize;
     let mut write=|frames|->Result<(),String> {
-        let row=evaluate_with_distribution(frames,export_sparse,probabilistic);serde_json::to_writer(&mut writer,&row).map_err(|e|e.to_string())?;
+        let row=evaluate_with_distribution(frames,export_sparse,probabilistic,camera_mount);serde_json::to_writer(&mut writer,&row).map_err(|e|e.to_string())?;
         writer.write_all(b"\n").map_err(|e|e.to_string())?;count+=1;
         if count%500==0 {writer.flush().map_err(|e|e.to_string())?;eprintln!("stereo evaluation reads={count}");}
         Ok(())

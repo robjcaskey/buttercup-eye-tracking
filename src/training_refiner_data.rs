@@ -478,6 +478,9 @@ pub fn prepare_cli(args: Vec<String>) -> Result<()> {
 /// Compare end-to-end worker replays, not archived contour-only refits.
 /// Labels are scoring-only, and unsupported scale/held contacts stay missing.
 pub fn summarize_live_pair(baseline: &Value, candidate: &Value) -> Result<Value> {
+    if baseline["camera_mount_assumption"] != candidate["camera_mount_assumption"] {
+        return Err("mismatched replay camera_mount_assumption".into());
+    }
     for key in ["capture", "label", "sampling", "model", "backend"] {
         if baseline[key].is_null() || baseline[key] != candidate[key] {
             return Err(format!("mismatched replay {key}").into());
@@ -517,6 +520,7 @@ pub fn summarize_live_pair(baseline: &Value, candidate: &Value) -> Result<Value>
     }
     let mut result=json!({"schema":"buttercup-limbus-live-comparison-v1",
         "capture":baseline["capture"],"label":baseline["label"],"sampling":baseline["sampling"],
+        "camera_mount_assumption":baseline["camera_mount_assumption"],
         "sources":rows.len(),"refinement_applied":rows.iter().filter(|r|r["refinement"]["applied"]==true).count(),
         "refinement_status":counts(rows.iter().map(|r|r["refinement"]["status"].as_str().unwrap_or("NO ATTEMPT").to_string())),
         "cpu_refinement_ms":stats(rows.iter().map(|r|r["refinement"]["cpu_ms"].as_f64())),
@@ -538,6 +542,9 @@ pub fn summarize_live_pair(baseline: &Value, candidate: &Value) -> Result<Value>
 }
 
 pub fn report_cli(args: Vec<String>) -> Result<()> {
+    if args.first().is_some_and(|mode|mode=="pairs"||mode=="calibration-pairs") {
+        return refinement_target_report::pairs(&args);
+    }
     if args.first().is_some_and(|mode|mode=="targets") {
         return refinement_target_report::report(&args);
     }
@@ -584,6 +591,9 @@ mod tests {
         assert_eq!(summary["baseline"]["matched_human_rms_px"]["n"],0);
         let mut other=report.clone();other["cases"][0]["motion_clock"]["epoch"]=json!(2);
         assert!(summarize_live_pair(&report,&other).is_err());
+        let mut other=report.clone();other["camera_mount_assumption"]=json!("below-eyes");
+        assert!(summarize_live_pair(&report,&other).is_err(), "a mount change is not a refiner-only comparison");
+        assert_eq!(summarize_live_pair(&other,&other).unwrap()["camera_mount_assumption"], "below-eyes");
     }
 
     fn sample(i: u64) -> Value {

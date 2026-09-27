@@ -249,11 +249,14 @@ impl SurfaceSignEvidence {
     }
 }
 
-mod camera_mount;
-pub(crate) use camera_mount::CameraMount;
+pub(crate) use crate::conic_solver::camera_mount::CameraMount;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SurfaceSignDiagnostics {
+    /// The native orientation solver's reference state, separate from current
+    /// direction precision. None means this provider makes no such assertion.
+    pub(crate) orientation_reference_ready: Option<bool>,
+    pub(crate) continuous_gaze: Option<crate::conic_solver::continuous_gaze_sign::MonocularReport>,
     pub(crate) evidence: SurfaceSignEvidence,
     pub(crate) selected_branch: usize,
     pub(crate) branch_residual_ema_px: [f64; 2],
@@ -279,6 +282,8 @@ pub(crate) enum SignAcquisitionPolicy {
 
 #[derive(Debug, Default)]
 pub(crate) struct SurfaceGazeTracker {
+    pub(crate) continuous_gaze_enabled: bool,
+    pub(crate) continuous_gaze: crate::conic_solver::continuous_gaze_sign::MonocularContinuity,
     pub(crate) camera_mount: CameraMount,
     pub(crate) mount_vote: Option<usize>,
     pub(crate) mount_votes: u8,
@@ -564,6 +569,15 @@ pub(crate) fn quantize_frontal_disk_area(frontal_equivalent_disk_area_px2: f64) 
 }
 
 impl SurfaceGazeTracker {
+    pub(crate) fn set_continuous_gaze(&mut self, enabled:bool) {
+        if self.continuous_gaze_enabled!=enabled {
+            self.continuous_gaze=Default::default();
+            if let Some(sample)=&mut self.last_keyed_sample {
+                if let Some(diagnostics)=&mut sample.sign_diagnostics {diagnostics.continuous_gaze=None;}
+            }
+        }
+        self.continuous_gaze_enabled=enabled;
+    }
     pub(crate) fn clear_floating_point(&mut self) {
         self.motion_sign_window.clear();
         self.sign_evidence = SurfaceSignEvidence::Unresolved;
@@ -1257,6 +1271,19 @@ impl SurfaceGazeTracker {
             sign_epoch: self.sign_epoch,
             kinematic_sign_correction: [kinematic_switch_committed || motion_window_switch; 2],
             sign_diagnostics: Some(SurfaceSignDiagnostics {
+                orientation_reference_ready:None,
+                continuous_gaze: if self.continuous_gaze_enabled {
+                    let hypotheses=self.contact_sign_hypotheses?;
+                    let normals=hypotheses.map(|h| {
+                        RelativeGazeVector::from_projected(
+                            (h.near_surface_sensor_px.0-center_sensor.0)/quantized_frontal_disk_radius_px,
+                            (h.near_surface_sensor_px.1-center_sensor.1)/quantized_frontal_disk_radius_px)
+                            .map(|n|[n.right,n.down,n.toward_camera]).unwrap_or([f64::NAN;3])
+                    });
+                    Some(self.continuous_gaze.observe(source_timestamp_ns,self.sign_epoch,normals,
+                        hypotheses.map(|h|h.residual_ema),
+                        global_similarity.filter(|g|g.reliable).map(|g|f64::from(g.motion.residual))))
+                } else {None},
                 evidence: self.sign_evidence,
                 selected_branch: self.selected_sign_hypothesis,
                 branch_residual_ema_px: self.contact_sign_hypotheses?.map(|h| h.residual_ema),

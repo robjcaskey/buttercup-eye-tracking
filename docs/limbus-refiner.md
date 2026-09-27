@@ -6,8 +6,8 @@ not yet constitute a current-checkout cold-bootstrap proof or a new-user
 onboarding validation.
 
 **Tweaked Contact Geometry** follows the original contact view: SAM3.1 ROI
-`F 6/8`, Butter Obelisk/Student ROI `F 9/12`; linked SAM `F 5/5`, linked
-Obelisk/Student `F 7/8`. Both use immutable inference-source RAW and dimensions,
+`F 8/11`, Butter Obelisk/Student ROI `F 11/15`; linked SAM `F 7/8`, linked
+Obelisk/Student `F 9/11`. Both use immutable inference-source RAW and dimensions,
 including after a newer ROI crop moves or resizes. Other detectors omit it.
 
 This is a separate trained model with a different purpose from the SAM mask
@@ -16,6 +16,13 @@ outward normal, while distinguishing the surface landmark from deeper visible
 optical continuation. It does not replace SAM, recover a missing iris, or
 promise a perfect fit. Selecting F changes **presentation only**, not tracking,
 calibration, mouse, laser or eye-presence authority.
+
+For a lean comparison of the actual toggle's effect, select **LIMBUS EDGES
+BEFORE / AFTER** instead: cyan original edges, pink dashed accepted corrections,
+using the worker's saved before/after on one source frame. It does not run a
+preview refinement, draw a completed hidden ellipse, or include the contact
+meridians. Rejected attempts remain the original edge. See the
+[viewer controls](viewer-workspaces.md#limbus-edges-before--after).
 
 ## Shared geometry plumbing and experimental authority
 

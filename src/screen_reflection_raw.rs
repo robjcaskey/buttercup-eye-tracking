@@ -181,6 +181,9 @@ pub struct NativeFrameTranslation {
     pub step: (f64, f64),
     pub support: usize,
     pub residual: f64,
+    /// False includes a failed match whose compatibility step is zero. A zero
+    /// held transport must never be interpreted as measured stillness.
+    pub reliable: bool,
 }
 
 fn sparse_corner_score(raw: PackedRaw10<'_>, x: i32, y: i32) -> f64 {
@@ -412,6 +415,7 @@ pub fn estimate_native_frame_translations(
             step,
             support: cluster.len(),
             residual,
+            reliable,
         });
     }
     result

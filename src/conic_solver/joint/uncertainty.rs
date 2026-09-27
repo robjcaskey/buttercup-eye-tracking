@@ -175,7 +175,9 @@ impl Problem<'_> {
             // state. Only the full marginal distribution may report spread.
             result.status = if selected.group_mixtures.iter().any(Option::is_some) {
                 "arc-alternative-mixture-requires-distribution"
-            } else {"mask-level-mixture-requires-distribution"};
+            } else {
+                "mask-level-mixture-requires-distribution"
+            };
             return result;
         }
         let rejected = self.rejected_groups(&conics, &selected);

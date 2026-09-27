@@ -134,6 +134,7 @@ pub(super) fn run_with_selected_annealed_diagnostic(files:&[String],config:conic
 
 fn run_with_tracker(files:&[String],limit:usize,extraction:ExtractionPolicy,delay:[u64;2],export_hypotheses:bool,
     probabilistic:bool,writer:&mut impl Write,mut configure:impl FnMut(&mut JointTracker,&Frame))->Result<(),String> {
+    let camera_mount=eye_scene_model::CameraMount::for_offline_checks()?;
     #[cfg(test)]
     let counterfactual_sources = diagnostic_sources("BUTTERCUP_PUPIL_COUNTERFACTUAL_SOURCES")?;
     #[cfg(test)]
@@ -154,6 +155,7 @@ fn run_with_tracker(files:&[String],limit:usize,extraction:ExtractionPolicy,dela
     let mut retained:[VecDeque<Arc<Frame>>;2]=std::array::from_fn(|_|VecDeque::new());
     let mut previous:[Option<(u64,[u32;2],[u32;2])>;2]=[None;2];
     let mut tracker=JointTracker::default();
+    tracker.camera_mount=camera_mount;
     tracker.retain_diagnostic_hypotheses(export_hypotheses);
     tracker.set_probabilistic(probabilistic);
     let mut clock=None;
@@ -192,6 +194,7 @@ fn run_with_tracker(files:&[String],limit:usize,extraction:ExtractionPolicy,dela
         let result=tracker.observe(packet(),camera);
         let elapsed=started.elapsed().as_secs_f64()*1000.0;
         let mut output=json!({"schema":"buttercup-joint-source-replay-v1","event":event,"input":frame.input,
+            "camera_mount_assumption":camera_mount.label(),
             "pupil_ablation":frame.pupil_ablation,
             "all_boundary_samples":extraction.all_boundary_samples,
             "coherent_pupil_arcs":extraction.coherent_pupil_arcs,

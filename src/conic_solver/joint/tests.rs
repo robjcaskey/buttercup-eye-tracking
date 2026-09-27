@@ -2,19 +2,30 @@ use super::*;
 use crate::roi_evidence::{BoundaryArcObservation, ConicObservation, RoiId, SourceClock};
 use std::f64::consts::TAU;
 
-fn attribute_arc_mixture(model:&Problem<'_>, index:usize, level:usize, mask_q:f64,
-    mixture:&mask_levels::ArcMixture, take:&mut impl FnMut(serde_json::Value,usize)) {
-    let group=&model.groups[index];
-    for (component,&q) in mixture.components.iter().zip(&mixture.responsibilities) {
-        let arc=&group.alternatives[component.choice];
-        take(serde_json::json!({"family":"boundary_alternative","eye":arc.eye,
+fn attribute_arc_mixture(
+    model: &Problem<'_>,
+    index: usize,
+    level: usize,
+    mask_q: f64,
+    mixture: &mask_levels::ArcMixture,
+    take: &mut impl FnMut(serde_json::Value, usize),
+) {
+    let group = &model.groups[index];
+    for (component, &q) in mixture.components.iter().zip(&mixture.responsibilities) {
+        let arc = &group.alternatives[component.choice];
+        take(
+            serde_json::json!({"family":"boundary_alternative","eye":arc.eye,
             "kind":format!("{:?}",arc.kind),"group":arc.group,"arc":arc.index,
             "mask_state":level,"responsibility":mask_q*q,"used":!component.outlier,
             "sigma_px":arc.sigma,"arc_weight":arc.weight}),
-            arc.points.len()+arc.outward_normals.iter().filter(|n|n.is_some()).count()+1);
+            arc.points.len() + arc.outward_normals.iter().filter(|n| n.is_some()).count() + 1,
+        );
     }
-    take(serde_json::json!({"family":"boundary_alternative_entropy","eye":group.alternatives[0].eye,
-        "group":group.alternatives[0].group,"mask_state":level,"mask_state_responsibility":mask_q}),1);
+    take(
+        serde_json::json!({"family":"boundary_alternative_entropy","eye":group.alternatives[0].eye,
+        "group":group.alternatives[0].group,"mask_state":level,"mask_state_responsibility":mask_q}),
+        1,
+    );
 }
 
 impl Problem<'_> {
@@ -34,58 +45,97 @@ impl Problem<'_> {
             factors.push(identity);
             offset += count;
         };
-        for (group_index,(group, &choice)) in self.groups.iter().zip(&selected).enumerate() {
-            if selected.in_family[group_index] || selected.has_group_mixture(group_index) { continue; }
+        for (group_index, (group, &choice)) in self.groups.iter().zip(&selected).enumerate() {
+            if selected.in_family[group_index] || selected.has_group_mixture(group_index) {
+                continue;
+            }
             let arc = &group.alternatives[choice];
-            take(serde_json::json!({"family":"boundary", "eye":arc.eye,
+            take(
+                serde_json::json!({"family":"boundary", "eye":arc.eye,
                 "kind":format!("{:?}", arc.kind), "group":arc.group, "arc":arc.index,
                 "used":arc.mean_cost(conics[arc.eye][arc.boundary]?) < MAXIMUM_GROUP_COST,
                 "sigma_px":arc.sigma, "arc_weight":arc.weight, "group_weight":group.weight}),
-                arc.points.len() + arc.outward_normals.iter().filter(|n|n.is_some()).count() + 1);
+                arc.points.len() + arc.outward_normals.iter().filter(|n| n.is_some()).count() + 1,
+            );
         }
-        for (index,mixture) in selected.group_mixtures.iter().enumerate() {
-            if let Some(mixture)=mixture {attribute_arc_mixture(self,index,1,1.0,mixture,&mut take);}
+        for (index, mixture) in selected.group_mixtures.iter().enumerate() {
+            if let Some(mixture) = mixture {
+                attribute_arc_mixture(self, index, 1, 1.0, mixture, &mut take);
+            }
         }
         for family in &selected.families {
             for level in 0..family.states.len() {
-                for (&index,activity) in family.groups.iter().zip(&family.states[level]) {
-                    if let Some(mixture)=&activity.mixture {
-                        attribute_arc_mixture(self,index,level,family.responsibilities[level],mixture,&mut take);
+                for (&index, activity) in family.groups.iter().zip(&family.states[level]) {
+                    if let Some(mixture) = &activity.mixture {
+                        attribute_arc_mixture(
+                            self,
+                            index,
+                            level,
+                            family.responsibilities[level],
+                            mixture,
+                            &mut take,
+                        );
                         continue;
                     }
-                    let arc=&self.groups[index].alternatives[activity.choice];
-                    let mut identity=serde_json::json!({"family":"mask_boundary_level","eye":family.eye,
+                    let arc = &self.groups[index].alternatives[activity.choice];
+                    let mut identity = serde_json::json!({"family":"mask_boundary_level","eye":family.eye,
                         "kind":format!("{:?}",arc.kind),"group":arc.group,"arc":arc.index,
                         "level":level as i8-1,"responsibility":family.responsibilities[level],
                         "used":!activity.outlier,"sigma_px":arc.sigma,"arc_weight":arc.weight});
-                    if family.states.len()==7 {
+                    if family.states.len() == 7 {
                         identity.as_object_mut().unwrap().remove("level");
-                        identity["state"]=serde_json::json!(level);
-                        identity["family"]=serde_json::json!("mask_boundary_spatial_sensitivity");
+                        identity["state"] = serde_json::json!(level);
+                        identity["family"] = serde_json::json!("mask_boundary_spatial_sensitivity");
                     }
-                    take(identity,
-                        arc.points.len()+arc.outward_normals.iter().filter(|n|n.is_some()).count()+1);
+                    take(
+                        identity,
+                        arc.points.len()
+                            + arc.outward_normals.iter().filter(|n| n.is_some()).count()
+                            + 1,
+                    );
                 }
             }
-            take(serde_json::json!({"family":"mask_boundary_level_entropy","eye":family.eye,
-                "boundary":family.boundary}),1);
+            take(
+                serde_json::json!({"family":"mask_boundary_level_entropy","eye":family.eye,
+                "boundary":family.boundary}),
+                1,
+            );
         }
-        take(serde_json::json!({"family":"prior", "kind":"fixation_axial_distance"}), 1);
+        take(
+            serde_json::json!({"family":"prior", "kind":"fixation_axial_distance"}),
+            1,
+        );
         let mut eye_parameters = Vec::new();
         for eye in 0..2 {
-            if !self.present[eye] { continue; }
+            if !self.present[eye] {
+                continue;
+            }
             let prior = self.request.scene.eyes[eye]?;
             let k = TARGET_PARAMETERS + eye * EYE_PARAMETERS;
-            for (kind, count) in [("limbus_center", 3), ("outer_radius", 1),
-                ("inner_radius", 1), ("pupil_radius", 1), ("pupil_decentration", 2),
-                ("pupil_depth", 1)] {
-                take(serde_json::json!({"family":"prior", "eye":eye, "kind":kind}), count);
+            for (kind, count) in [
+                ("limbus_center", 3),
+                ("outer_radius", 1),
+                ("inner_radius", 1),
+                ("pupil_radius", 1),
+                ("pupil_decentration", 2),
+                ("pupil_depth", 1),
+            ] {
+                take(
+                    serde_json::json!({"family":"prior", "eye":eye, "kind":kind}),
+                    count,
+                );
             }
             if prior.surface_axis_alignment.is_some() {
-                take(serde_json::json!({"family":"prior", "eye":eye, "kind":"surface_axis_alignment"}), 2);
+                take(
+                    serde_json::json!({"family":"prior", "eye":eye, "kind":"surface_axis_alignment"}),
+                    2,
+                );
             }
             if prior.effective_pivot.is_some() {
-                take(serde_json::json!({"family":"prior", "eye":eye, "kind":"effective_pivot"}), 3);
+                take(
+                    serde_json::json!({"family":"prior", "eye":eye, "kind":"effective_pivot"}),
+                    3,
+                );
             }
             eye_parameters.push(serde_json::json!({"eye":eye,
                 "limbus_center_camera_mm":&p[k..k+3], "radii_mm":&p[k+3..k+6],
@@ -93,15 +143,27 @@ impl Problem<'_> {
                 "surface_axis_alignment_radians":&p[k+9..k+11]}));
         }
         if self.present == [true, true] && self.request.scene.interocular_distance_mm.is_some() {
-            take(serde_json::json!({"family":"prior", "kind":"interocular_distance"}), 1);
+            take(
+                serde_json::json!({"family":"prior", "kind":"interocular_distance"}),
+                1,
+            );
         }
-        assert_eq!(offset, residuals.len(), "every native residual must be attributed exactly once");
-        let sum: f64 = factors.iter().map(|v|v["squared_cost"].as_f64().unwrap()).sum();
+        assert_eq!(
+            offset,
+            residuals.len(),
+            "every native residual must be attributed exactly once"
+        );
+        let sum: f64 = factors
+            .iter()
+            .map(|v| v["squared_cost"].as_f64().unwrap())
+            .sum();
         let native = squared_norm(&residuals);
-        assert!((sum-native).abs() <= 1e-10*(1.0+native));
-        Some(serde_json::json!({"schema":"buttercup-joint-native-factor-costs-v1",
+        assert!((sum - native).abs() <= 1e-10 * (1.0 + native));
+        Some(
+            serde_json::json!({"schema":"buttercup-joint-native-factor-costs-v1",
             "contract":"Test-only exact native local residual costs; add unlocalized_eye_cost for the full association objective. Cost differences are conditional model preferences, not calibrated probabilities or measured accuracy.",
-            "native_local_cost":native, "factors":factors, "eye_parameters":eye_parameters}))
+            "native_local_cost":native, "factors":factors, "eye_parameters":eye_parameters}),
+        )
     }
 }
 
@@ -323,7 +385,7 @@ impl Fixture {
         budget: usize,
         integration: Option<posterior::IntegrationConfig>,
     ) -> Result<JointConicSolution, JointConicUnavailable> {
-        self.with_request(enabled,budget,|request| {
+        self.with_request(enabled, budget, |request| {
             if let Some(config) = integration {
                 solve_joint_conic_distribution_diagnostic(request, 1, config)
                     .map(|mut solutions| solutions.remove(0))
@@ -333,10 +395,18 @@ impl Fixture {
         })
     }
 
-    fn with_request<R>(&self, enabled: [bool;2], budget: usize, apply: impl FnOnce(JointConicRequest<'_>)->R) -> R {
+    fn with_request<R>(
+        &self,
+        enabled: [bool; 2],
+        budget: usize,
+        apply: impl FnOnce(JointConicRequest<'_>) -> R,
+    ) -> R {
         let arcs = self.arcs.each_ref().map(|arcs| {
             arcs.iter()
-                .map(|a| BoundaryArcObservation { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,
+                .map(|a| BoundaryArcObservation {
+                    support_length_cap_px: None,
+                    sampling_support_px: None,
+                    level_sets_roi: None,
                     evidence_group: a.group,
                     kind: a.kind,
                     points_roi_px: &a.points,
@@ -383,44 +453,75 @@ impl Fixture {
 
 #[test]
 fn integrating_unobserved_inner_radius_preserves_original_nested_model_density() {
-    let mut fixture=Fixture::new([90.0,-170.0,250.0]);
-    fixture.arcs[0].retain(|a|a.kind!=BoundaryKind::InnerLimbus);
+    let mut fixture = Fixture::new([90.0, -170.0, 250.0]);
+    fixture.arcs[0].retain(|a| a.kind != BoundaryKind::InnerLimbus);
     // Keep its initializer deliberately: a conic hint cannot become evidence.
-    fixture.with_request([true,true],24,|request| {
-        let model=Problem::new(request).unwrap();
-        let integrated=posterior::IntegratedInner::new(&model);
-        assert_eq!(integrated.indices,vec![TARGET_PARAMETERS+4],"observed left inner boundary must remain sampled");
-        for (slope,outer) in [(-0.25,5.0),(0.0,6.0),(0.2,6.9)] {
-            let mut p=model.project_step(model.initial).unwrap();p[0]=slope;p[TARGET_PARAMETERS+3]=outer;
-            let correction=integrated.condition(&mut p).unwrap();
-            let loss=|p:&Parameters| {
-                let c=model.conics(p).unwrap();
-                squared_norm(&model.residuals(p,&model.select(&c)).unwrap())
+    fixture.with_request([true, true], 24, |request| {
+        let model = Problem::new(request).unwrap();
+        let integrated = posterior::IntegratedInner::new(&model);
+        assert_eq!(
+            integrated.indices,
+            vec![TARGET_PARAMETERS + 4],
+            "observed left inner boundary must remain sampled"
+        );
+        for (slope, outer) in [(-0.25, 5.0), (0.0, 6.0), (0.2, 6.9)] {
+            let mut p = model.project_step(model.initial).unwrap();
+            p[0] = slope;
+            p[TARGET_PARAMETERS + 3] = outer;
+            let correction = integrated.condition(&mut p).unwrap();
+            let loss = |p: &Parameters| {
+                let c = model.conics(p).unwrap();
+                squared_norm(&model.residuals(p, &model.select(&c)).unwrap())
             };
-            let reference_loss=loss(&p);
-            let prior=fixture.scene.eyes[0].unwrap().radii_mm[1];
-            let lower=prior.minimum.max(p[TARGET_PARAMETERS+5]);
-            let upper=prior.maximum.min(p[TARGET_PARAMETERS+3]);
-            let n=8192;
-            let direct=(0..n).map(|i| {
-                let mut draw=p;draw[TARGET_PARAMETERS+4]=lower+(upper-lower)*(i as f64+0.5)/n as f64;
-                (-0.5*(loss(&draw)-reference_loss)).exp()
-            }).sum::<f64>()*(upper-lower)/n as f64;
-            assert!((correction.exp()/direct-1.0).abs()<1e-7,"nested prior mass changed for outer radius {outer}");
+            let reference_loss = loss(&p);
+            let prior = fixture.scene.eyes[0].unwrap().radii_mm[1];
+            let lower = prior.minimum.max(p[TARGET_PARAMETERS + 5]);
+            let upper = prior.maximum.min(p[TARGET_PARAMETERS + 3]);
+            let n = 8192;
+            let direct = (0..n)
+                .map(|i| {
+                    let mut draw = p;
+                    draw[TARGET_PARAMETERS + 4] =
+                        lower + (upper - lower) * (i as f64 + 0.5) / n as f64;
+                    (-0.5 * (loss(&draw) - reference_loss)).exp()
+                })
+                .sum::<f64>()
+                * (upper - lower)
+                / n as f64;
+            assert!(
+                (correction.exp() / direct - 1.0).abs() < 1e-7,
+                "nested prior mass changed for outer radius {outer}"
+            );
         }
     });
 }
 
 #[test]
 fn observed_inner_evidence_disables_analytic_elimination_without_changing_output() {
-    let fixture=Fixture::new([90.0,-170.0,250.0]);
-    let config=posterior::IntegrationConfig {budget:2048,early_stop:false,..Default::default()};
-    let ordinary=fixture.solve_with_integration([true,true],24,Some(config)).unwrap();
-    let integrated=fixture.solve_with_integration([true,true],24,Some(posterior::IntegrationConfig {
-        marginalize_unobserved_inner:true,..config
-    })).unwrap();
-    assert_eq!(ordinary.target_camera_mm,integrated.target_camera_mm);
-    assert_eq!(ordinary.posterior.unwrap().json(),integrated.posterior.unwrap().json());
+    let fixture = Fixture::new([90.0, -170.0, 250.0]);
+    let config = posterior::IntegrationConfig {
+        budget: 2048,
+        early_stop: false,
+        ..Default::default()
+    };
+    let ordinary = fixture
+        .solve_with_integration([true, true], 24, Some(config))
+        .unwrap();
+    let integrated = fixture
+        .solve_with_integration(
+            [true, true],
+            24,
+            Some(posterior::IntegrationConfig {
+                marginalize_unobserved_inner: true,
+                ..config
+            }),
+        )
+        .unwrap();
+    assert_eq!(ordinary.target_camera_mm, integrated.target_camera_mm);
+    assert_eq!(
+        ordinary.posterior.unwrap().json(),
+        integrated.posterior.unwrap().json()
+    );
 }
 
 fn angular_error(solution: &JointConicSolution, fixture: &Fixture, eye: usize) -> f64 {
@@ -1112,31 +1213,69 @@ fn pupil_fixed_sampling_support_does_not_reward_jagged_measurements() {
     let fixture = Fixture::new([50.0, -150.0, 250.0]);
     fixture.with_request([true, true], 24, |request| {
         let original = request.eyes[0].unwrap();
-        let index = original.arcs.iter().position(|a|a.kind==BoundaryKind::PupillaryBoundary).unwrap();
+        let index = original
+            .arcs
+            .iter()
+            .position(|a| a.kind == BoundaryKind::PupillaryBoundary)
+            .unwrap();
         let source = original.arcs[index];
         let support = vec![2.0; source.points_roi_px.len()];
-        let jagged = source.points_roi_px.iter().enumerate().map(|(i,&(x,y))|
-            (x,y+if i%2==0 {6.0} else {-6.0})).collect::<Vec<_>>();
-        assert!(polyline_quadrature(&jagged).unwrap().1 > polyline_quadrature(source.points_roi_px).unwrap().1);
+        let jagged = source
+            .points_roi_px
+            .iter()
+            .enumerate()
+            .map(|(i, &(x, y))| (x, y + if i % 2 == 0 { 6.0 } else { -6.0 }))
+            .collect::<Vec<_>>();
+        assert!(
+            polyline_quadrature(&jagged).unwrap().1
+                > polyline_quadrature(source.points_roi_px).unwrap().1
+        );
         let models = [source.points_roi_px, jagged.as_slice()].map(|points| {
             let mut arcs = original.arcs.to_vec();
             arcs[index].points_roi_px = points;
             arcs[index].sampling_support_px = Some(&support);
-            let eye = RoiConicEvidence {arcs:&arcs, ..original};
-            let model = Problem::new(JointConicRequest {eyes:[Some(eye),request.eyes[1]], ..request}).unwrap();
-            model.groups.iter().flat_map(|g|&g.alternatives).find(|a|a.eye==0 && a.index==index).unwrap().clone()
+            let eye = RoiConicEvidence {
+                arcs: &arcs,
+                ..original
+            };
+            let model = Problem::new(JointConicRequest {
+                eyes: [Some(eye), request.eyes[1]],
+                ..request
+            })
+            .unwrap();
+            model
+                .groups
+                .iter()
+                .flat_map(|g| &g.alternatives)
+                .find(|a| a.eye == 0 && a.index == index)
+                .unwrap()
+                .clone()
         });
-        assert_ne!(models[0].points,models[1].points);
-        assert_eq!(models[0].quadrature,models[1].quadrature);
-        assert_eq!(models[0].length_px,models[1].length_px);
-        assert_eq!(models[0].weight,models[1].weight);
-        assert_eq!(models[0].sigma,models[1].sigma);
-        for invalid in [vec![], vec![1.0;support.len()-1], vec![-1.0;support.len()],
-            vec![f64::NAN;support.len()], vec![f64::MAX;support.len()]] {
-            let mut arcs = original.arcs.to_vec();arcs[index].sampling_support_px=Some(&invalid);
-            let eye=RoiConicEvidence {arcs:&arcs,..original};
-            assert!(matches!(Problem::new(JointConicRequest {eyes:[Some(eye),request.eyes[1]],..request}),
-                Err(JointConicUnavailable::InvalidRequest)));
+        assert_ne!(models[0].points, models[1].points);
+        assert_eq!(models[0].quadrature, models[1].quadrature);
+        assert_eq!(models[0].length_px, models[1].length_px);
+        assert_eq!(models[0].weight, models[1].weight);
+        assert_eq!(models[0].sigma, models[1].sigma);
+        for invalid in [
+            vec![],
+            vec![1.0; support.len() - 1],
+            vec![-1.0; support.len()],
+            vec![f64::NAN; support.len()],
+            vec![f64::MAX; support.len()],
+        ] {
+            let mut arcs = original.arcs.to_vec();
+            arcs[index].sampling_support_px = Some(&invalid);
+            let eye = RoiConicEvidence {
+                arcs: &arcs,
+                ..original
+            };
+            assert!(matches!(
+                Problem::new(JointConicRequest {
+                    eyes: [Some(eye), request.eyes[1]],
+                    ..request
+                }),
+                Err(JointConicUnavailable::InvalidRequest)
+            ));
         }
     });
 }
@@ -1144,19 +1283,27 @@ fn pupil_fixed_sampling_support_does_not_reward_jagged_measurements() {
 #[test]
 fn pupil_sampling_support_reduction_conserves_the_fixed_domain() {
     use crate::roi_evidence::reduce_sampling_support;
-    let weights=[1.0,2.0,3.0,4.0,5.0];
-    assert_eq!(reduce_sampling_support(&weights,&[0,1,2,3,4]).unwrap(),weights);
-    assert_eq!(reduce_sampling_support(&weights,&[0,2,4]).unwrap(),[3.0,7.0,5.0]);
+    let weights = [1.0, 2.0, 3.0, 4.0, 5.0];
+    assert_eq!(
+        reduce_sampling_support(&weights, &[0, 1, 2, 3, 4]).unwrap(),
+        weights
+    );
+    assert_eq!(
+        reduce_sampling_support(&weights, &[0, 2, 4]).unwrap(),
+        [3.0, 7.0, 5.0]
+    );
     for n in 3..100 {
-        let support=(0..n).map(|i| (i+1) as f64).collect::<Vec<_>>();
-        let count=n.min(MAX_POINTS_PER_ARC);
-        let indices=(0..count).map(|j|j*(n-1)/(count-1)).collect::<Vec<_>>();
-        let reduced=reduce_sampling_support(&support,&indices).unwrap();
-        assert_eq!(reduced.len(),count);
-        assert_eq!(reduced.iter().sum::<f64>(),support.iter().sum::<f64>());
+        let support = (0..n).map(|i| (i + 1) as f64).collect::<Vec<_>>();
+        let count = n.min(MAX_POINTS_PER_ARC);
+        let indices = (0..count)
+            .map(|j| j * (n - 1) / (count - 1))
+            .collect::<Vec<_>>();
+        let reduced = reduce_sampling_support(&support, &indices).unwrap();
+        assert_eq!(reduced.len(), count);
+        assert_eq!(reduced.iter().sum::<f64>(), support.iter().sum::<f64>());
     }
-    for indices in [vec![],vec![5],vec![1,1],vec![3,1]] {
-        assert!(reduce_sampling_support(&weights,&indices).is_none());
+    for indices in [vec![], vec![5], vec![1, 1], vec![3, 1]] {
+        assert!(reduce_sampling_support(&weights, &indices).is_none());
     }
 }
 
@@ -1168,32 +1315,46 @@ fn pupil_support_length_cap_changes_only_information_mass_and_rejects_invalid_ca
         for cap in [Some(2.0), Some(1e9), None] {
             let mut arcs = request.eyes[0].unwrap().arcs.to_vec();
             for arc in &mut arcs {
-                if arc.kind == BoundaryKind::PupillaryBoundary { arc.support_length_cap_px = cap; }
+                if arc.kind == BoundaryKind::PupillaryBoundary {
+                    arc.support_length_cap_px = cap;
+                }
             }
             let mut eye = request.eyes[0].unwrap();
             eye.arcs = &arcs;
-            let candidate = Problem::new(JointConicRequest { eyes: [Some(eye), request.eyes[1]], ..request }).unwrap();
+            let candidate = Problem::new(JointConicRequest {
+                eyes: [Some(eye), request.eyes[1]],
+                ..request
+            })
+            .unwrap();
             assert_eq!(candidate.groups.len(), baseline.groups.len());
-            for (a,b) in candidate.groups.iter().zip(&baseline.groups) {
-                for (a,b) in a.alternatives.iter().zip(&b.alternatives) {
-                    assert_eq!(a.points,b.points);
-                    assert_eq!(a.quadrature,b.quadrature);
-                    assert_eq!(a.sigma,b.sigma);
-                    assert_eq!(a.outward_normals,b.outward_normals);
+            for (a, b) in candidate.groups.iter().zip(&baseline.groups) {
+                for (a, b) in a.alternatives.iter().zip(&b.alternatives) {
+                    assert_eq!(a.points, b.points);
+                    assert_eq!(a.quadrature, b.quadrature);
+                    assert_eq!(a.sigma, b.sigma);
+                    assert_eq!(a.outward_normals, b.outward_normals);
                     assert!(a.weight <= b.weight);
                     if a.eye == 0 && a.kind == BoundaryKind::PupillaryBoundary && cap == Some(2.0) {
                         assert!(a.weight < b.weight);
-                        assert_eq!(a.length_px,2.0);
-                    } else { assert_eq!(a.weight,b.weight); }
+                        assert_eq!(a.length_px, 2.0);
+                    } else {
+                        assert_eq!(a.weight, b.weight);
+                    }
                 }
             }
         }
         for invalid in [-1.0, f64::NAN, f64::INFINITY] {
             let mut arcs = request.eyes[0].unwrap().arcs.to_vec();
             arcs[0].support_length_cap_px = Some(invalid);
-            let mut eye = request.eyes[0].unwrap(); eye.arcs = &arcs;
-            assert!(matches!(Problem::new(JointConicRequest {eyes:[Some(eye), request.eyes[1]], ..request}),
-                Err(JointConicUnavailable::InvalidRequest)));
+            let mut eye = request.eyes[0].unwrap();
+            eye.arcs = &arcs;
+            assert!(matches!(
+                Problem::new(JointConicRequest {
+                    eyes: [Some(eye), request.eyes[1]],
+                    ..request
+                }),
+                Err(JointConicUnavailable::InvalidRequest)
+            ));
         }
     });
 }
@@ -1327,7 +1488,10 @@ fn numerical_linearization_cannot_turn_a_capped_arc_into_a_force() {
         0.5,
         12,
     );
-    let arcs = [BoundaryArcObservation { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,
+    let arcs = [BoundaryArcObservation {
+        support_length_cap_px: None,
+        sampling_support_px: None,
+        level_sets_roi: None,
         evidence_group: 0,
         kind: BoundaryKind::OuterLimbus,
         points_roi_px: &points,
@@ -1438,7 +1602,10 @@ fn capped_negative_position_residuals_cannot_pull_ordinary_live_evidence() {
         0.5,
         12,
     );
-    let arcs = [BoundaryArcObservation { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,
+    let arcs = [BoundaryArcObservation {
+        support_length_cap_px: None,
+        sampling_support_px: None,
+        level_sets_roi: None,
         evidence_group: 0,
         kind: BoundaryKind::OuterLimbus,
         points_roi_px: &points,
@@ -1499,7 +1666,10 @@ fn joint_selection_uses_measured_direction_not_just_equal_point_alternatives() {
         detail_reliability: Some(1.0),
         arcs: fixture.arcs[eye]
             .iter()
-            .map(|a| OwnedBoundaryArc { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,
+            .map(|a| OwnedBoundaryArc {
+                support_length_cap_px: None,
+                sampling_support_px: None,
+                level_sets_roi: None,
                 evidence_group: a.group,
                 kind: a.kind,
                 points_roi_px: a.points.clone(),
@@ -1605,7 +1775,10 @@ fn malformed_or_misaligned_boundary_directions_cannot_be_silently_ignored() {
             points.len()
         ],
     ] {
-        let arcs = [BoundaryArcObservation { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,
+        let arcs = [BoundaryArcObservation {
+            support_length_cap_px: None,
+            sampling_support_px: None,
+            level_sets_roi: None,
             evidence_group: 0,
             kind: BoundaryKind::OuterLimbus,
             points_roi_px: points,
@@ -1956,7 +2129,10 @@ fn a_secondary_circle_seed_carries_its_own_center_and_metric_radius() {
         supporting_arc_indices: &[0],
         residual_px: None,
     });
-    let arcs = [BoundaryArcObservation { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,
+    let arcs = [BoundaryArcObservation {
+        support_length_cap_px: None,
+        sampling_support_px: None,
+        level_sets_roi: None,
         evidence_group: 0,
         kind: BoundaryKind::OuterLimbus,
         points_roi_px: &fixture.arcs[0][0].points,
@@ -1999,7 +2175,10 @@ fn previous_targets_are_competing_initializations_not_averaged_points_or_extra_r
     let targets = [[-100.0, 80.0, 250.0], [150.0, -120.0, 250.0]];
     fixture.scene.target_seed_camera_mm = Some(targets[0]);
     fixture.scene.secondary_target_seed_camera_mm = Some(targets[1]);
-    let arcs = [BoundaryArcObservation { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,
+    let arcs = [BoundaryArcObservation {
+        support_length_cap_px: None,
+        sampling_support_px: None,
+        level_sets_roi: None,
         evidence_group: 0,
         kind: BoundaryKind::OuterLimbus,
         points_roi_px: &fixture.arcs[0][0].points,
@@ -2083,8 +2262,11 @@ fn posterior_integrates_shared_geometry_without_changing_the_map_solution() {
         let baseline = fixture.solve(enabled, 24).unwrap();
         // Exercise the production entry point. Offline controls deliberately
         // retain the original integration configuration for matched replays.
-        let candidate = fixture.with_request(enabled, 24, |request|
-            solve_joint_conic_distribution(request, 1).unwrap().remove(0));
+        let candidate = fixture.with_request(enabled, 24, |request| {
+            solve_joint_conic_distribution(request, 1)
+                .unwrap()
+                .remove(0)
+        });
         assert_eq!(baseline.target_camera_mm, candidate.target_camera_mm);
         assert_eq!(baseline.contributing_eyes, candidate.contributing_eyes);
         assert_eq!(baseline.robust_cost, candidate.robust_cost);
@@ -2133,13 +2315,19 @@ fn same_eye_pupil_support_resolves_the_outer_only_mirror_distribution() {
     let mut fixture = Fixture::new([90.0, -170.0, 250.0]);
     fixture.arcs[0].retain(|a| a.kind != BoundaryKind::InnerLimbus);
     fixture.hints[0].retain(|a| a.0 != BoundaryKind::InnerLimbus);
-    let supported = fixture.with_request([true, false], 24, |request|
-        solve_joint_conic_distribution(request, 1).unwrap().remove(0));
+    let supported = fixture.with_request([true, false], 24, |request| {
+        solve_joint_conic_distribution(request, 1)
+            .unwrap()
+            .remove(0)
+    });
     assert!(angular_error(&supported, &fixture, 0) < 0.1);
     fixture.arcs[0].retain(|a| a.kind == BoundaryKind::OuterLimbus);
     fixture.hints[0].retain(|a| a.0 == BoundaryKind::OuterLimbus);
-    let outer_only = fixture.with_request([true, false], 24, |request|
-        solve_joint_conic_distribution(request, 1).unwrap().remove(0));
+    let outer_only = fixture.with_request([true, false], 24, |request| {
+        solve_joint_conic_distribution(request, 1)
+            .unwrap()
+            .remove(0)
+    });
     let good = supported.posterior.as_ref().unwrap();
     let ambiguous = outer_only.posterior.as_ref().unwrap();
     eprintln!(
@@ -2186,8 +2374,11 @@ fn a_sharp_pupil_with_sparse_same_eye_outer_support_remains_solvable() {
     fixture.add_arc(0, BoundaryKind::OuterLimbus, 0.0, TAU * 0.25, 12, 0);
     fixture.add_arc(0, BoundaryKind::PupillaryBoundary, 0.0, TAU, 32, 1);
     fixture.hints[0].retain(|(kind, _)| *kind == BoundaryKind::PupillaryBoundary);
-    let result = fixture.with_request([true, false], 24, |request|
-        solve_joint_conic_distribution(request, 1).unwrap().remove(0));
+    let result = fixture.with_request([true, false], 24, |request| {
+        solve_joint_conic_distribution(request, 1)
+            .unwrap()
+            .remove(0)
+    });
     let error = angular_error(&result, &fixture, 0);
     let posterior = result.posterior.as_ref().unwrap();
     eprintln!(
@@ -2262,127 +2453,231 @@ fn separated_same_eye_outer_arcs_can_anchor_a_sharp_pupil() {
 #[test]
 #[ignore = "large independent-seed reference audit; prints numerical support failures rather than treating a good MAP as proof of posterior convergence"]
 fn same_eye_and_complementary_stereo_posterior_reference_diagnostic() {
-    support_case_posterior_reference(false,false,false,None);
+    support_case_posterior_reference(false, false, false, None);
 }
 
-fn add_test_mask_levels(model:&mut Problem<'_>,at:&Parameters,width:f64) {
-    let conics=model.conics(at).unwrap();
-    for group in &mut model.groups {for arc in &mut group.alternatives {
-        if arc.kind!=BoundaryKind::OuterLimbus {continue;}
-        let [a,b,c,d,e,_]=conics[arc.eye][0].unwrap().0;
-        arc.level_sets=arc.points.iter().map(|&(x,y)| {
-            let gradient=[2.0*a*x+b*y+d,b*x+2.0*c*y+e];
-            let length=gradient[0].hypot(gradient[1]);
-            Some(BoundaryLevelSetObservation {unit_normal_roi:gradient.map(|g|g/length),
-                displacement_px:[-width,0.0,width],spatial_displacement_px:None})
-        }).collect();
-    }}
-}
-
-fn add_competing_test_arcs(model:&mut Problem<'_>) {
+fn add_test_mask_levels(model: &mut Problem<'_>, at: &Parameters, width: f64) {
+    let conics = model.conics(at).unwrap();
     for group in &mut model.groups {
-        let mut alternate=group.alternatives[0].clone();
-        alternate.index+=64;
-        for p in &mut alternate.points {p.0+=1.5;p.1-=0.7;}
+        for arc in &mut group.alternatives {
+            if arc.kind != BoundaryKind::OuterLimbus {
+                continue;
+            }
+            let [a, b, c, d, e, _] = conics[arc.eye][0].unwrap().0;
+            arc.level_sets = arc
+                .points
+                .iter()
+                .map(|&(x, y)| {
+                    let gradient = [2.0 * a * x + b * y + d, b * x + 2.0 * c * y + e];
+                    let length = gradient[0].hypot(gradient[1]);
+                    Some(BoundaryLevelSetObservation {
+                        unit_normal_roi: gradient.map(|g| g / length),
+                        displacement_px: [-width, 0.0, width],
+                        spatial_displacement_px: None,
+                    })
+                })
+                .collect();
+        }
+    }
+}
+
+fn add_competing_test_arcs(model: &mut Problem<'_>) {
+    for group in &mut model.groups {
+        let mut alternate = group.alternatives[0].clone();
+        alternate.index += 64;
+        for p in &mut alternate.points {
+            p.0 += 1.5;
+            p.1 -= 0.7;
+        }
         group.alternatives.push(alternate);
     }
 }
 
 #[test]
 fn arc_alternative_marginal_matches_enumerated_likelihood_and_keeps_group_mass() {
-    let fixture=Fixture::new([90.0,-170.0,250.0]);
-    fixture.with_request([true,true],24,|request| {
-        let mut model=Problem::new(request).unwrap();
-        let mut p=model.initial;p[..3].copy_from_slice(&model.target_chart.coordinates(fixture.target).unwrap());
+    let fixture = Fixture::new([90.0, -170.0, 250.0]);
+    fixture.with_request([true, true], 24, |request| {
+        let mut model = Problem::new(request).unwrap();
+        let mut p = model.initial;
+        p[..3].copy_from_slice(&model.target_chart.coordinates(fixture.target).unwrap());
         add_competing_test_arcs(&mut model);
-        let conics=model.conics(&p).unwrap();
-        let before=model.select(&conics);
-        let baseline=squared_norm(&model.residuals(&p,&before).unwrap());
-        let old_cost=model.groups.iter().zip(&before).map(|(g,&choice)| {
-            let a=&g.alternatives[choice];a.weight*a.mean_cost(conics[a.eye][a.boundary].unwrap()).min(MAXIMUM_GROUP_COST)
-                +(g.weight-a.weight)*MAXIMUM_GROUP_COST
-        }).sum::<f64>();
-        let mass=model.groups.iter().map(|g|g.weight).collect::<Vec<_>>();
-        model.marginalize_arc_alternatives=true;
-        let selected=model.select(&conics);
-        let expected=model.groups.iter().map(|g| {
-            let costs=g.alternatives.iter().map(|a|a.weight*a.mean_cost(conics[a.eye][a.boundary].unwrap()).min(MAXIMUM_GROUP_COST)
-                +(g.weight-a.weight)*MAXIMUM_GROUP_COST).collect::<Vec<_>>();
-            -2.0*(costs.iter().map(|c|(-0.5*c).exp()).sum::<f64>()/costs.len() as f64).ln()
-        }).sum::<f64>();
-        let actual=squared_norm(&model.residuals(&p,&selected).unwrap());
-        assert!((actual-(baseline-old_cost+expected)).abs()<1e-10);
+        let conics = model.conics(&p).unwrap();
+        let before = model.select(&conics);
+        let baseline = squared_norm(&model.residuals(&p, &before).unwrap());
+        let old_cost = model
+            .groups
+            .iter()
+            .zip(&before)
+            .map(|(g, &choice)| {
+                let a = &g.alternatives[choice];
+                a.weight
+                    * a.mean_cost(conics[a.eye][a.boundary].unwrap())
+                        .min(MAXIMUM_GROUP_COST)
+                    + (g.weight - a.weight) * MAXIMUM_GROUP_COST
+            })
+            .sum::<f64>();
+        let mass = model.groups.iter().map(|g| g.weight).collect::<Vec<_>>();
+        model.marginalize_arc_alternatives = true;
+        let selected = model.select(&conics);
+        let expected = model
+            .groups
+            .iter()
+            .map(|g| {
+                let costs = g
+                    .alternatives
+                    .iter()
+                    .map(|a| {
+                        a.weight
+                            * a.mean_cost(conics[a.eye][a.boundary].unwrap())
+                                .min(MAXIMUM_GROUP_COST)
+                            + (g.weight - a.weight) * MAXIMUM_GROUP_COST
+                    })
+                    .collect::<Vec<_>>();
+                -2.0 * (costs.iter().map(|c| (-0.5 * c).exp()).sum::<f64>() / costs.len() as f64)
+                    .ln()
+            })
+            .sum::<f64>();
+        let actual = squared_norm(&model.residuals(&p, &selected).unwrap());
+        assert!((actual - (baseline - old_cost + expected)).abs() < 1e-10);
         assert!(selected.group_mixtures.iter().all(Option::is_some));
-        assert_eq!(mass,model.groups.iter().map(|g|g.weight).collect::<Vec<_>>());
-        assert_eq!(model.local_uncertainty(&p).status,"arc-alternative-mixture-requires-distribution");
-        assert!((model.factor_cost_diagnostic(&p).unwrap()["native_local_cost"].as_f64().unwrap()-actual).abs()<1e-12);
+        assert_eq!(
+            mass,
+            model.groups.iter().map(|g| g.weight).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            model.local_uncertainty(&p).status,
+            "arc-alternative-mixture-requires-distribution"
+        );
+        assert!(
+            (model.factor_cost_diagnostic(&p).unwrap()["native_local_cost"]
+                .as_f64()
+                .unwrap()
+                - actual)
+                .abs()
+                < 1e-12
+        );
     });
 }
 
 #[test]
 fn duplicate_arc_alternatives_do_not_change_the_marginal_or_its_geometry_gradient() {
-    let fixture=Fixture::new([90.0,-170.0,250.0]);
-    fixture.with_request([true,true],24,|request| {
-        let mut model=Problem::new(request).unwrap().with_arc_marginalization(true);
+    let fixture = Fixture::new([90.0, -170.0, 250.0]);
+    fixture.with_request([true, true], 24, |request| {
+        let mut model = Problem::new(request)
+            .unwrap()
+            .with_arc_marginalization(true);
         add_competing_test_arcs(&mut model);
-        let mut repeated=model.clone();
-        for g in &mut repeated.groups {g.alternatives.push(g.alternatives[0].clone());}
-        let mut at=model.initial;at[..3].copy_from_slice(&model.target_chart.coordinates(fixture.target).unwrap());
-        for dx in [-0.02,0.0,0.02] {
-            let mut p=at;p[0]+=dx;
-            let a=model.residuals(&p,&model.select(&model.conics(&p).unwrap())).unwrap();
-            let b=repeated.residuals(&p,&repeated.select(&repeated.conics(&p).unwrap())).unwrap();
-            assert_eq!(a,b,"copying one physical alternative cannot change its prior weight");
+        let mut repeated = model.clone();
+        for g in &mut repeated.groups {
+            g.alternatives.push(g.alternatives[0].clone());
+        }
+        let mut at = model.initial;
+        at[..3].copy_from_slice(&model.target_chart.coordinates(fixture.target).unwrap());
+        for dx in [-0.02, 0.0, 0.02] {
+            let mut p = at;
+            p[0] += dx;
+            let a = model
+                .residuals(&p, &model.select(&model.conics(&p).unwrap()))
+                .unwrap();
+            let b = repeated
+                .residuals(&p, &repeated.select(&repeated.conics(&p).unwrap()))
+                .unwrap();
+            assert_eq!(
+                a, b,
+                "copying one physical alternative cannot change its prior weight"
+            );
         }
     });
 }
 
 #[test]
 fn nested_arc_and_mask_marginals_have_tangent_em_derivatives_and_exact_attribution() {
-    let fixture=Fixture::new([90.0,-170.0,250.0]);
-    fixture.with_request([true,true],24,|request| {
-        for profiles in [false,true] {
-            let mut model=Problem::new(request).unwrap().with_arc_marginalization(true);
-            let mut p=model.initial;p[..3].copy_from_slice(&model.target_chart.coordinates(fixture.target).unwrap());
-            p[0]+=0.01;
+    let fixture = Fixture::new([90.0, -170.0, 250.0]);
+    fixture.with_request([true, true], 24, |request| {
+        for profiles in [false, true] {
+            let mut model = Problem::new(request)
+                .unwrap()
+                .with_arc_marginalization(true);
+            let mut p = model.initial;
+            p[..3].copy_from_slice(&model.target_chart.coordinates(fixture.target).unwrap());
+            p[0] += 0.01;
             add_competing_test_arcs(&mut model);
-            if profiles {add_test_mask_levels(&mut model,&p,1.5);}
-            let conics=model.conics(&p).unwrap();let selected=model.select(&conics);
-            let rejected=model.rejected_groups(&conics,&selected);
-            let marginal=|p:&Parameters|squared_norm(&model.residuals(p,&selected).unwrap());
-            let upper=|p:&Parameters|squared_norm(&model.residuals_with_rejection(p,&selected,Some(&rejected)).unwrap());
-            assert!((marginal(&p)-upper(&p)).abs()<1e-10);
-            assert!((model.factor_cost_diagnostic(&p).unwrap()["native_local_cost"].as_f64().unwrap()-marginal(&p)).abs()<1e-12);
-            for i in 0..PARAMETERS {
-                if model.lower[i]==model.upper[i] {continue;}
-                let h=1e-6*model.scales[i];let mut a=p;let mut b=p;a[i]-=h;b[i]+=h;
-                if model.conics(&a).is_none() || model.conics(&b).is_none() {continue;}
-                let gradient=(marginal(&b)-marginal(&a))/(2.0*h);
-                let em=(upper(&b)-upper(&a))/(2.0*h);
-                assert!((gradient-em).abs()<8e-5*(1.0+gradient.abs()),"profiles {profiles} parameter {i}: {gradient} != {em}");
-                for v in [a,b] {assert!(upper(&v)+1e-9>=marginal(&v));}
+            if profiles {
+                add_test_mask_levels(&mut model, &p, 1.5);
             }
-            let mut trial=p;trial[0]+=0.04;
-            let refreshed=model.select(&model.conics(&trial).unwrap());
-            assert!((marginal(&trial)-squared_norm(&model.residuals(&trial,&refreshed).unwrap())).abs()<1e-10);
-            assert!(mask_levels::arc_diagnostics(&model,&selected).len()>=model.groups.len());
+            let conics = model.conics(&p).unwrap();
+            let selected = model.select(&conics);
+            let rejected = model.rejected_groups(&conics, &selected);
+            let marginal = |p: &Parameters| squared_norm(&model.residuals(p, &selected).unwrap());
+            let upper = |p: &Parameters| {
+                squared_norm(
+                    &model
+                        .residuals_with_rejection(p, &selected, Some(&rejected))
+                        .unwrap(),
+                )
+            };
+            assert!((marginal(&p) - upper(&p)).abs() < 1e-10);
+            assert!(
+                (model.factor_cost_diagnostic(&p).unwrap()["native_local_cost"]
+                    .as_f64()
+                    .unwrap()
+                    - marginal(&p))
+                .abs()
+                    < 1e-12
+            );
+            for i in 0..PARAMETERS {
+                if model.lower[i] == model.upper[i] {
+                    continue;
+                }
+                let h = 1e-6 * model.scales[i];
+                let mut a = p;
+                let mut b = p;
+                a[i] -= h;
+                b[i] += h;
+                if model.conics(&a).is_none() || model.conics(&b).is_none() {
+                    continue;
+                }
+                let gradient = (marginal(&b) - marginal(&a)) / (2.0 * h);
+                let em = (upper(&b) - upper(&a)) / (2.0 * h);
+                assert!(
+                    (gradient - em).abs() < 8e-5 * (1.0 + gradient.abs()),
+                    "profiles {profiles} parameter {i}: {gradient} != {em}"
+                );
+                for v in [a, b] {
+                    assert!(upper(&v) + 1e-9 >= marginal(&v));
+                }
+            }
+            let mut trial = p;
+            trial[0] += 0.04;
+            let refreshed = model.select(&model.conics(&trial).unwrap());
+            assert!(
+                (marginal(&trial) - squared_norm(&model.residuals(&trial, &refreshed).unwrap()))
+                    .abs()
+                    < 1e-10
+            );
+            assert!(mask_levels::arc_diagnostics(&model, &selected).len() >= model.groups.len());
         }
     });
 }
 
 #[test]
 fn enabling_arc_marginalization_without_alternatives_preserves_exact_native_model() {
-    let fixture=Fixture::new([90.0,-170.0,250.0]);
-    fixture.with_request([true,true],24,|request| {
-        for profiles in [false,true] {
-            let mut model=Problem::new(request).unwrap();
-            let mut p=model.initial;p[..3].copy_from_slice(&model.target_chart.coordinates(fixture.target).unwrap());
-            if profiles {add_test_mask_levels(&mut model,&p,1.5);}
-            let before=model.residuals(&p,&model.select(&model.conics(&p).unwrap())).unwrap();
-            model.marginalize_arc_alternatives=true;
-            let selected=model.select(&model.conics(&p).unwrap());
-            assert_eq!(before,model.residuals(&p,&selected).unwrap());
-            assert!(mask_levels::arc_diagnostics(&model,&selected).is_empty());
+    let fixture = Fixture::new([90.0, -170.0, 250.0]);
+    fixture.with_request([true, true], 24, |request| {
+        for profiles in [false, true] {
+            let mut model = Problem::new(request).unwrap();
+            let mut p = model.initial;
+            p[..3].copy_from_slice(&model.target_chart.coordinates(fixture.target).unwrap());
+            if profiles {
+                add_test_mask_levels(&mut model, &p, 1.5);
+            }
+            let before = model
+                .residuals(&p, &model.select(&model.conics(&p).unwrap()))
+                .unwrap();
+            model.marginalize_arc_alternatives = true;
+            let selected = model.select(&model.conics(&p).unwrap());
+            assert_eq!(before, model.residuals(&p, &selected).unwrap());
+            assert!(mask_levels::arc_diagnostics(&model, &selected).is_empty());
         }
     });
     assert!(!posterior::IntegrationConfig::live().marginalize_arc_alternatives);
@@ -2390,246 +2685,430 @@ fn enabling_arc_marginalization_without_alternatives_preserves_exact_native_mode
 
 #[test]
 fn zero_width_mask_states_preserve_the_exact_original_residual_vector() {
-    let fixture=Fixture::new([90.0,-170.0,250.0]);
-    fixture.with_request([true,true],24,|request| {
-        let mut model=Problem::new(request).unwrap();
-        let mut p=model.initial;
+    let fixture = Fixture::new([90.0, -170.0, 250.0]);
+    fixture.with_request([true, true], 24, |request| {
+        let mut model = Problem::new(request).unwrap();
+        let mut p = model.initial;
         p[..3].copy_from_slice(&model.target_chart.coordinates(fixture.target).unwrap());
-        let before=model.residuals(&p,&model.select(&model.conics(&p).unwrap())).unwrap();
-        add_test_mask_levels(&mut model,&p,0.0);
-        let selected=model.select(&model.conics(&p).unwrap());
+        let before = model
+            .residuals(&p, &model.select(&model.conics(&p).unwrap()))
+            .unwrap();
+        add_test_mask_levels(&mut model, &p, 0.0);
+        let selected = model.select(&model.conics(&p).unwrap());
         assert!(selected.families.is_empty());
-        let after=model.residuals(&p,&selected).unwrap();
-        assert_eq!(before.iter().map(|v|v.to_bits()).collect::<Vec<_>>(),
-            after.iter().map(|v|v.to_bits()).collect::<Vec<_>>());
+        let after = model.residuals(&p, &selected).unwrap();
+        assert_eq!(
+            before.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            after.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
     });
 }
 
 #[test]
 fn native_mask_family_residuals_equal_the_correlated_marginal_and_keep_point_mass() {
-    let mut fixture=Fixture::new([90.0,-170.0,250.0]);
+    let mut fixture = Fixture::new([90.0, -170.0, 250.0]);
     for eye in 0..2 {
-        fixture.arcs[eye].retain(|a|a.kind!=BoundaryKind::OuterLimbus);
-        fixture.add_arc(eye,BoundaryKind::OuterLimbus,0.0,TAU*0.25,12,10);
-        fixture.add_arc(eye,BoundaryKind::OuterLimbus,TAU*0.5,TAU*0.75,12,11);
+        fixture.arcs[eye].retain(|a| a.kind != BoundaryKind::OuterLimbus);
+        fixture.add_arc(eye, BoundaryKind::OuterLimbus, 0.0, TAU * 0.25, 12, 10);
+        fixture.add_arc(
+            eye,
+            BoundaryKind::OuterLimbus,
+            TAU * 0.5,
+            TAU * 0.75,
+            12,
+            11,
+        );
     }
-    fixture.with_request([true,true],24,|request| {
-        let mut model=Problem::new(request).unwrap();
-        let mut p=model.initial;
+    fixture.with_request([true, true], 24, |request| {
+        let mut model = Problem::new(request).unwrap();
+        let mut p = model.initial;
         p[..3].copy_from_slice(&model.target_chart.coordinates(fixture.target).unwrap());
-        p[0]+=0.02;
-        let conics=model.conics(&p).unwrap();
-        let before=model.select(&conics);
-        let baseline=squared_norm(&model.residuals(&p,&before).unwrap());
-        let old_outer_cost=model.groups.iter().zip(&before).filter(|(g,_)|g.alternatives[0].boundary==0)
-            .map(|(g,&i)|{let a=&g.alternatives[i];a.weight*a.mean_cost(conics[a.eye][0].unwrap()).min(MAXIMUM_GROUP_COST)
-                +(g.weight-a.weight)*MAXIMUM_GROUP_COST}).sum::<f64>();
-        let mass=model.groups.iter().map(|g|g.weight).collect::<Vec<_>>();
-        let lengths=model.groups.iter().map(|g|g.alternatives[0].length_px).collect::<Vec<_>>();
-        add_test_mask_levels(&mut model,&p,1.5);
-        let selected=model.select(&conics);
-        assert_eq!(selected.families.len(),2);
-        assert!(selected.families.iter().all(|f|f.groups.len()==2));
-        assert_eq!(mass,model.groups.iter().map(|g|g.weight).collect::<Vec<_>>());
-        assert_eq!(lengths,model.groups.iter().map(|g|g.alternatives[0].length_px).collect::<Vec<_>>());
-        let expected=baseline-old_outer_cost+selected.families.iter().map(|f|f.marginal_cost).sum::<f64>();
-        let actual=squared_norm(&model.residuals(&p,&selected).unwrap());
-        assert!((actual-expected).abs()<1e-9);
-        let attribution=model.factor_cost_diagnostic(&p).unwrap();
-        assert!((attribution["native_local_cost"].as_f64().unwrap()-actual).abs()<1e-12);
-        let local=model.local_uncertainty(&p);
-        assert_eq!(local.status,"mask-level-mixture-requires-distribution");
+        p[0] += 0.02;
+        let conics = model.conics(&p).unwrap();
+        let before = model.select(&conics);
+        let baseline = squared_norm(&model.residuals(&p, &before).unwrap());
+        let old_outer_cost = model
+            .groups
+            .iter()
+            .zip(&before)
+            .filter(|(g, _)| g.alternatives[0].boundary == 0)
+            .map(|(g, &i)| {
+                let a = &g.alternatives[i];
+                a.weight
+                    * a.mean_cost(conics[a.eye][0].unwrap())
+                        .min(MAXIMUM_GROUP_COST)
+                    + (g.weight - a.weight) * MAXIMUM_GROUP_COST
+            })
+            .sum::<f64>();
+        let mass = model.groups.iter().map(|g| g.weight).collect::<Vec<_>>();
+        let lengths = model
+            .groups
+            .iter()
+            .map(|g| g.alternatives[0].length_px)
+            .collect::<Vec<_>>();
+        add_test_mask_levels(&mut model, &p, 1.5);
+        let selected = model.select(&conics);
+        assert_eq!(selected.families.len(), 2);
+        assert!(selected.families.iter().all(|f| f.groups.len() == 2));
+        assert_eq!(
+            mass,
+            model.groups.iter().map(|g| g.weight).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            lengths,
+            model
+                .groups
+                .iter()
+                .map(|g| g.alternatives[0].length_px)
+                .collect::<Vec<_>>()
+        );
+        let expected = baseline - old_outer_cost
+            + selected
+                .families
+                .iter()
+                .map(|f| f.marginal_cost)
+                .sum::<f64>();
+        let actual = squared_norm(&model.residuals(&p, &selected).unwrap());
+        assert!((actual - expected).abs() < 1e-9);
+        let attribution = model.factor_cost_diagnostic(&p).unwrap();
+        assert!((attribution["native_local_cost"].as_f64().unwrap() - actual).abs() < 1e-12);
+        let local = model.local_uncertainty(&p);
+        assert_eq!(local.status, "mask-level-mixture-requires-distribution");
         assert!(local.target_covariance_mm2.is_none());
     });
 }
 
 #[test]
 fn native_mask_em_derivatives_are_tangent_to_the_actual_trial_likelihood() {
-    let fixture=Fixture::new([90.0,-170.0,250.0]);
-    fixture.with_request([true,true],24,|request| {
-        let mut model=Problem::new(request).unwrap();
-        let mut p=model.initial;
+    let fixture = Fixture::new([90.0, -170.0, 250.0]);
+    fixture.with_request([true, true], 24, |request| {
+        let mut model = Problem::new(request).unwrap();
+        let mut p = model.initial;
         p[..3].copy_from_slice(&model.target_chart.coordinates(fixture.target).unwrap());
-        p[0]+=0.015;
-        add_test_mask_levels(&mut model,&p,1.5);
-        let conics=model.conics(&p).unwrap();
-        let selected=model.select(&conics);
-        let rejected=model.rejected_groups(&conics,&selected);
-        let marginal=|p:&Parameters|squared_norm(&model.residuals(p,&selected).unwrap());
-        let upper=|p:&Parameters|squared_norm(&model.residuals_with_rejection(p,&selected,Some(&rejected)).unwrap());
-        assert!((marginal(&p)-upper(&p)).abs()<1e-10);
+        p[0] += 0.015;
+        add_test_mask_levels(&mut model, &p, 1.5);
+        let conics = model.conics(&p).unwrap();
+        let selected = model.select(&conics);
+        let rejected = model.rejected_groups(&conics, &selected);
+        let marginal = |p: &Parameters| squared_norm(&model.residuals(p, &selected).unwrap());
+        let upper = |p: &Parameters| {
+            squared_norm(
+                &model
+                    .residuals_with_rejection(p, &selected, Some(&rejected))
+                    .unwrap(),
+            )
+        };
+        assert!((marginal(&p) - upper(&p)).abs() < 1e-10);
         for i in 0..PARAMETERS {
-            if model.lower[i]==model.upper[i] {continue;}
-            let h=1e-6*model.scales[i];let mut a=p;let mut b=p;a[i]-=h;b[i]+=h;
-            if model.conics(&a).is_none() || model.conics(&b).is_none() {continue;}
-            let gradient=(marginal(&b)-marginal(&a))/(2.0*h);
-            let em_gradient=(upper(&b)-upper(&a))/(2.0*h);
-            assert!((gradient-em_gradient).abs()<5e-5*(1.0+gradient.abs()),"parameter {i}: {gradient} versus {em_gradient}");
-            for value in [a,b] {assert!(upper(&value)+1e-10>=marginal(&value));}
+            if model.lower[i] == model.upper[i] {
+                continue;
+            }
+            let h = 1e-6 * model.scales[i];
+            let mut a = p;
+            let mut b = p;
+            a[i] -= h;
+            b[i] += h;
+            if model.conics(&a).is_none() || model.conics(&b).is_none() {
+                continue;
+            }
+            let gradient = (marginal(&b) - marginal(&a)) / (2.0 * h);
+            let em_gradient = (upper(&b) - upper(&a)) / (2.0 * h);
+            assert!(
+                (gradient - em_gradient).abs() < 5e-5 * (1.0 + gradient.abs()),
+                "parameter {i}: {gradient} versus {em_gradient}"
+            );
+            for value in [a, b] {
+                assert!(upper(&value) + 1e-10 >= marginal(&value));
+            }
         }
-        let mut trial=p;trial[0]+=0.08;
-        let refreshed=model.select(&model.conics(&trial).unwrap());
-        assert_ne!(selected.families[0].responsibilities,refreshed.families[0].responsibilities);
-        assert!((marginal(&trial)-squared_norm(&model.residuals(&trial,&refreshed).unwrap())).abs()<1e-12);
+        let mut trial = p;
+        trial[0] += 0.08;
+        let refreshed = model.select(&model.conics(&trial).unwrap());
+        assert_ne!(
+            selected.families[0].responsibilities,
+            refreshed.families[0].responsibilities
+        );
+        assert!(
+            (marginal(&trial) - squared_norm(&model.residuals(&trial, &refreshed).unwrap())).abs()
+                < 1e-12
+        );
     });
 }
 
 #[test]
 fn mask_state_proposal_conditioning_preserves_the_exact_joint_state_likelihood() {
-    let fixture = Fixture::new([90.0,-170.0,250.0]);
-    fixture.with_request([true,true],24,|request| {
+    let fixture = Fixture::new([90.0, -170.0, 250.0]);
+    fixture.with_request([true, true], 24, |request| {
         let mut model = Problem::new(request).unwrap();
         let mut p = model.initial;
         p[..3].copy_from_slice(&model.target_chart.coordinates(fixture.target).unwrap());
         p[0] += 0.015;
-        add_test_mask_levels(&mut model,&p,4.0);
+        add_test_mask_levels(&mut model, &p, 4.0);
         let conics = model.conics(&p).unwrap();
         let selected = model.select(&conics);
-        let residuals = model.residuals(&p,&selected).unwrap();
-        let common = squared_norm(&residuals) - selected.families.iter().map(|f|f.marginal_cost).sum::<f64>();
+        let residuals = model.residuals(&p, &selected).unwrap();
+        let common = squared_norm(&residuals)
+            - selected
+                .families
+                .iter()
+                .map(|f| f.marginal_cost)
+                .sum::<f64>();
         let assignments = posterior::mask_assignments(selected.families.len());
-        assert_eq!(assignments.len(),9,"all two-eye mask combinations are proposed");
+        assert_eq!(
+            assignments.len(),
+            9,
+            "all two-eye mask combinations are proposed"
+        );
         let mut likelihoods = Vec::new();
         for levels in assignments {
-            let conditional = posterior::conditioned_mask_model(&model,&selected.families,&levels);
+            let conditional =
+                posterior::conditioned_mask_model(&model, &selected.families, &levels);
             let selection = conditional.select(&conics);
             assert!(selection.families.is_empty());
-            let cost = squared_norm(&conditional.residuals(&p,&selection).unwrap());
-            let expected = common + selected.families.iter().zip(&levels).map(|(f,&s)|f.costs[s]).sum::<f64>();
-            assert!((cost-expected).abs()<1e-9,"conditional state {levels:?}");
-            likelihoods.push((-0.5*cost).exp());
-            assert_eq!(model.lower,conditional.lower);
-            assert_eq!(model.upper,conditional.upper);
-            assert_eq!(model.scales,conditional.scales);
-            for (a,b) in model.groups.iter().zip(&conditional.groups) {
-                assert_eq!(a.weight,b.weight);
-                for (a,b) in a.alternatives.iter().zip(&b.alternatives) {
-                    assert_eq!(a.sigma,b.sigma);
-                    assert_eq!(a.quadrature,b.quadrature);
-                    assert_eq!(a.length_px,b.length_px);
-                    assert_eq!(a.weight,b.weight);
-                    if a.boundary != 0 { assert_eq!(a.points,b.points,"independent pupil and inner samples unchanged"); }
+            let cost = squared_norm(&conditional.residuals(&p, &selection).unwrap());
+            let expected = common
+                + selected
+                    .families
+                    .iter()
+                    .zip(&levels)
+                    .map(|(f, &s)| f.costs[s])
+                    .sum::<f64>();
+            assert!(
+                (cost - expected).abs() < 1e-9,
+                "conditional state {levels:?}"
+            );
+            likelihoods.push((-0.5 * cost).exp());
+            assert_eq!(model.lower, conditional.lower);
+            assert_eq!(model.upper, conditional.upper);
+            assert_eq!(model.scales, conditional.scales);
+            for (a, b) in model.groups.iter().zip(&conditional.groups) {
+                assert_eq!(a.weight, b.weight);
+                for (a, b) in a.alternatives.iter().zip(&b.alternatives) {
+                    assert_eq!(a.sigma, b.sigma);
+                    assert_eq!(a.quadrature, b.quadrature);
+                    assert_eq!(a.length_px, b.length_px);
+                    assert_eq!(a.weight, b.weight);
+                    if a.boundary != 0 {
+                        assert_eq!(
+                            a.points, b.points,
+                            "independent pupil and inner samples unchanged"
+                        );
+                    }
                 }
             }
-            let initialized = posterior::mask_radius_start(&conditional,p,&selected.families);
-            assert_eq!(&initialized[..TARGET_PARAMETERS],&p[..TARGET_PARAMETERS]);
+            let initialized = posterior::mask_radius_start(&conditional, p, &selected.families);
+            assert_eq!(&initialized[..TARGET_PARAMETERS], &p[..TARGET_PARAMETERS]);
             assert!(conditional.conics(&initialized).is_some());
         }
-        let reconstructed = -2.0*(likelihoods.iter().sum::<f64>()/likelihoods.len() as f64).ln();
-        assert!((reconstructed-squared_norm(&residuals)).abs()<1e-9);
-        assert_eq!(model.residuals(&p,&selected).unwrap(),residuals,"proposal fitting cannot mutate the target");
+        let reconstructed =
+            -2.0 * (likelihoods.iter().sum::<f64>() / likelihoods.len() as f64).ln();
+        assert!((reconstructed - squared_norm(&residuals)).abs() < 1e-9);
+        assert_eq!(
+            model.residuals(&p, &selected).unwrap(),
+            residuals,
+            "proposal fitting cannot mutate the target"
+        );
         let bounded = posterior::mask_assignments(6);
-        assert_eq!(bounded.len(),16);
-        for family in 0..6 { for level in 0..3 {
-            assert!(bounded.iter().any(|s|s[family]==level));
-        }}
+        assert_eq!(bounded.len(), 16);
+        for family in 0..6 {
+            for level in 0..3 {
+                assert!(bounded.iter().any(|s| s[family] == level));
+            }
+        }
     });
 }
 
 #[test]
 fn mask_state_proposals_without_profiles_preserve_exact_posterior_draws() {
-    let fixture = Fixture::new([90.0,-170.0,250.0]);
-    fixture.with_request([true,true],24,|request| {
-        let config = posterior::IntegrationConfig {budget:1024,..posterior::IntegrationConfig::live()};
-        let a = solve_joint_conic_distribution_diagnostic(request,1,config).unwrap().remove(0);
-        let b = solve_joint_conic_distribution_diagnostic(request,1,
-            posterior::IntegrationConfig {mask_state_proposals:true,mask_state_refinement:true,..config}).unwrap().remove(0);
-        assert_eq!(a.target_camera_mm,b.target_camera_mm);
-        assert_eq!(a.robust_cost,b.robust_cost);
-        assert_eq!(a.hypotheses_evaluated,b.hypotheses_evaluated);
-        assert_eq!(a.refinement_steps,b.refinement_steps);
-        assert_eq!(a.posterior.unwrap().json(),b.posterior.unwrap().json());
+    let fixture = Fixture::new([90.0, -170.0, 250.0]);
+    fixture.with_request([true, true], 24, |request| {
+        let config = posterior::IntegrationConfig {
+            budget: 1024,
+            ..posterior::IntegrationConfig::live()
+        };
+        let a = solve_joint_conic_distribution_diagnostic(request, 1, config)
+            .unwrap()
+            .remove(0);
+        let b = solve_joint_conic_distribution_diagnostic(
+            request,
+            1,
+            posterior::IntegrationConfig {
+                mask_state_proposals: true,
+                mask_state_refinement: true,
+                ..config
+            },
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(a.target_camera_mm, b.target_camera_mm);
+        assert_eq!(a.robust_cost, b.robust_cost);
+        assert_eq!(a.hypotheses_evaluated, b.hypotheses_evaluated);
+        assert_eq!(a.refinement_steps, b.refinement_steps);
+        assert_eq!(a.posterior.unwrap().json(), b.posterior.unwrap().json());
     });
 }
 
 #[test]
 fn mask_state_initializations_are_bounded_and_scored_on_the_full_marginal() {
-    let fixture=Fixture::new([90.0,-170.0,250.0]);
-    fixture.with_request([true,true],24,|request| {
-        for spatial in [false,true] {
-            let mut model=Problem::new(request).unwrap();
-            let mut p=model.initial;
+    let fixture = Fixture::new([90.0, -170.0, 250.0]);
+    fixture.with_request([true, true], 24, |request| {
+        for spatial in [false, true] {
+            let mut model = Problem::new(request).unwrap();
+            let mut p = model.initial;
             p[..3].copy_from_slice(&model.target_chart.coordinates(fixture.target).unwrap());
-            add_test_mask_levels(&mut model,&p,4.0);
-            if spatial {for group in &mut model.groups {for arc in &mut group.alternatives {
-                for level in arc.level_sets.iter_mut().flatten() {*level=level.with_spatial_sensitivity();}
-            }}}
-            let before=model.factor_cost_diagnostic(&p).unwrap();
-            let expanded=posterior::refine_mask_state_initializations(&model,&[p,p],5);
-            assert_eq!(expanded.attempts,5);
-            assert!(!expanded.fits.is_empty());
-            assert_eq!(before,model.factor_cost_diagnostic(&p).unwrap());
-            for (fitted,cost) in expanded.fits {
-                let conics=model.conics(&fitted).unwrap();
-                let full=squared_norm(&model.residuals(&fitted,&model.select(&conics)).unwrap());
-                assert!((cost-full).abs()<1e-9,"conditional costs must not select a fit");
-                let solution=model.solution(&fitted,cost).unwrap();
-                for eye in 0..2 {
-                    let ray=normalized3(sub3(solution.target_camera_mm,solution.eye_centers_camera_mm[eye].unwrap())).unwrap();
-                    assert!(norm3(sub3(ray,solution.eye_gaze_directions[eye].unwrap()))<1e-12);
+            add_test_mask_levels(&mut model, &p, 4.0);
+            if spatial {
+                for group in &mut model.groups {
+                    for arc in &mut group.alternatives {
+                        for level in arc.level_sets.iter_mut().flatten() {
+                            *level = level.with_spatial_sensitivity();
+                        }
+                    }
                 }
             }
-            assert_eq!(posterior::refine_mask_state_initializations(&model,&[p],0).attempts,0);
+            let before = model.factor_cost_diagnostic(&p).unwrap();
+            let expanded = posterior::refine_mask_state_initializations(&model, &[p, p], 5);
+            assert_eq!(expanded.attempts, 5);
+            assert!(!expanded.fits.is_empty());
+            assert_eq!(before, model.factor_cost_diagnostic(&p).unwrap());
+            for (fitted, cost) in expanded.fits {
+                let conics = model.conics(&fitted).unwrap();
+                let full = squared_norm(&model.residuals(&fitted, &model.select(&conics)).unwrap());
+                assert!(
+                    (cost - full).abs() < 1e-9,
+                    "conditional costs must not select a fit"
+                );
+                let solution = model.solution(&fitted, cost).unwrap();
+                for eye in 0..2 {
+                    let ray = normalized3(sub3(
+                        solution.target_camera_mm,
+                        solution.eye_centers_camera_mm[eye].unwrap(),
+                    ))
+                    .unwrap();
+                    assert!(norm3(sub3(ray, solution.eye_gaze_directions[eye].unwrap())) < 1e-12);
+                }
+            }
+            assert_eq!(
+                posterior::refine_mask_state_initializations(&model, &[p], 0).attempts,
+                0
+            );
         }
     });
 }
 
 #[test]
 fn spatial_mask_states_preserve_native_envelopes_and_exact_shared_likelihood() {
-    let fixture=Fixture::new([90.0,-170.0,250.0]);
-    fixture.with_request([true,true],24,|request| {
-        let mut model=Problem::new(request).unwrap();
-        let mut p=model.initial;
+    let fixture = Fixture::new([90.0, -170.0, 250.0]);
+    fixture.with_request([true, true], 24, |request| {
+        let mut model = Problem::new(request).unwrap();
+        let mut p = model.initial;
         p[..3].copy_from_slice(&model.target_chart.coordinates(fixture.target).unwrap());
-        add_test_mask_levels(&mut model,&p,4.0);
-        let before=model.clone();
-        for group in &mut model.groups {for arc in &mut group.alternatives {
-            for level in arc.level_sets.iter_mut().flatten() {
-                *level=level.with_spatial_sensitivity();assert!(level.valid());
+        add_test_mask_levels(&mut model, &p, 4.0);
+        let before = model.clone();
+        for group in &mut model.groups {
+            for arc in &mut group.alternatives {
+                for level in arc.level_sets.iter_mut().flatten() {
+                    *level = level.with_spatial_sensitivity();
+                    assert!(level.valid());
+                }
             }
-        }}
-        let conics=model.conics(&p).unwrap();let selected=model.select(&conics);
-        assert_eq!(selected.families.len(),2);
-        assert!(selected.families.iter().all(|f|f.states.len()==7));
-        for (old,new) in before.groups.iter().zip(&model.groups) {
-            assert_eq!(old.weight,new.weight);
-            for (a,b) in old.alternatives.iter().zip(&new.alternatives) {
-                assert_eq!(a.points,b.points);assert_eq!(a.sigma,b.sigma);
-                assert_eq!(a.weight,b.weight);assert_eq!(a.quadrature,b.quadrature);
-                for (i,point) in b.points.iter().enumerate() {
+        }
+        let conics = model.conics(&p).unwrap();
+        let selected = model.select(&conics);
+        assert_eq!(selected.families.len(), 2);
+        assert!(selected.families.iter().all(|f| f.states.len() == 7));
+        for (old, new) in before.groups.iter().zip(&model.groups) {
+            assert_eq!(old.weight, new.weight);
+            for (a, b) in old.alternatives.iter().zip(&new.alternatives) {
+                assert_eq!(a.points, b.points);
+                assert_eq!(a.sigma, b.sigma);
+                assert_eq!(a.weight, b.weight);
+                assert_eq!(a.quadrature, b.quadrature);
+                for (i, point) in b.points.iter().enumerate() {
                     for state in 0..7 {
-                        let q=b.point_at_level(i,state);
-                        assert!((q.0-point.0).hypot(q.1-point.1)<=4.0+1e-9);
-                        if state<3 {assert_eq!(a.point_at_level(i,state),q);}
-                        if b.boundary!=0 {assert_eq!(*point,q,"sharp inner/pupil evidence is untouched");}
+                        let q = b.point_at_level(i, state);
+                        assert!((q.0 - point.0).hypot(q.1 - point.1) <= 4.0 + 1e-9);
+                        if state < 3 {
+                            assert_eq!(a.point_at_level(i, state), q);
+                        }
+                        if b.boundary != 0 {
+                            assert_eq!(*point, q, "sharp inner/pupil evidence is untouched");
+                        }
                     }
                 }
             }
         }
-        let actual=squared_norm(&model.residuals(&p,&selected).unwrap());
-        let common=actual-selected.families.iter().map(|f|f.marginal_cost).sum::<f64>();
-        let mut costs=Vec::new();
-        for a in 0..7 {for b in 0..7 {
-            let conditional=posterior::conditioned_mask_model(&model,&selected.families,&[a,b]);
-            let cost=squared_norm(&conditional.residuals(&p,&conditional.select(&conics)).unwrap());
-            assert!((cost-(common+selected.families[0].costs[a]+selected.families[1].costs[b])).abs()<1e-9);
-            costs.push(cost);
-        }}
-        let minimum=costs.iter().copied().fold(f64::INFINITY,f64::min);
-        let mixture=minimum-2.0*(costs.iter().map(|c|(-0.5*(c-minimum)).exp()).sum::<f64>()/49.0).ln();
-        assert!((actual-mixture).abs()<1e-9);
-        assert!((model.factor_cost_diagnostic(&p).unwrap()["native_local_cost"].as_f64().unwrap()-actual).abs()<1e-10);
-        assert_eq!(posterior::mask_assignments_for_counts(&[7,7]).len(),16,"proposal budget does not truncate likelihood states");
-        let mut translated=model.clone();
-        for group in &mut translated.groups {for arc in &mut group.alternatives {
-            for point in &mut arc.points {point.0+=31.0;point.1-=17.0;}
-        }}
-        for (a,b) in model.groups.iter().zip(&translated.groups) {for (a,b) in a.alternatives.iter().zip(&b.alternatives) {
-            for i in 0..a.points.len() {for state in 0..7 {
-                let x=a.point_at_level(i,state);let y=b.point_at_level(i,state);
-                assert!((x.0+31.0-y.0).abs()<1e-12 && (x.1-17.0-y.1).abs()<1e-12);
-            }}
-        }}
+        let actual = squared_norm(&model.residuals(&p, &selected).unwrap());
+        let common = actual
+            - selected
+                .families
+                .iter()
+                .map(|f| f.marginal_cost)
+                .sum::<f64>();
+        let mut costs = Vec::new();
+        for a in 0..7 {
+            for b in 0..7 {
+                let conditional =
+                    posterior::conditioned_mask_model(&model, &selected.families, &[a, b]);
+                let cost = squared_norm(
+                    &conditional
+                        .residuals(&p, &conditional.select(&conics))
+                        .unwrap(),
+                );
+                assert!(
+                    (cost
+                        - (common + selected.families[0].costs[a] + selected.families[1].costs[b]))
+                        .abs()
+                        < 1e-9
+                );
+                costs.push(cost);
+            }
+        }
+        let minimum = costs.iter().copied().fold(f64::INFINITY, f64::min);
+        let mixture = minimum
+            - 2.0
+                * (costs
+                    .iter()
+                    .map(|c| (-0.5 * (c - minimum)).exp())
+                    .sum::<f64>()
+                    / 49.0)
+                    .ln();
+        assert!((actual - mixture).abs() < 1e-9);
+        assert!(
+            (model.factor_cost_diagnostic(&p).unwrap()["native_local_cost"]
+                .as_f64()
+                .unwrap()
+                - actual)
+                .abs()
+                < 1e-10
+        );
+        assert_eq!(
+            posterior::mask_assignments_for_counts(&[7, 7]).len(),
+            16,
+            "proposal budget does not truncate likelihood states"
+        );
+        let mut translated = model.clone();
+        for group in &mut translated.groups {
+            for arc in &mut group.alternatives {
+                for point in &mut arc.points {
+                    point.0 += 31.0;
+                    point.1 -= 17.0;
+                }
+            }
+        }
+        for (a, b) in model.groups.iter().zip(&translated.groups) {
+            for (a, b) in a.alternatives.iter().zip(&b.alternatives) {
+                for i in 0..a.points.len() {
+                    for state in 0..7 {
+                        let x = a.point_at_level(i, state);
+                        let y = b.point_at_level(i, state);
+                        assert!(
+                            (x.0 + 31.0 - y.0).abs() < 1e-12 && (x.1 - 17.0 - y.1).abs() < 1e-12
+                        );
+                    }
+                }
+            }
+        }
     });
 }
 
@@ -2648,287 +3127,584 @@ fn raw_outer_position_support_cases_diagnostic() {
 #[test]
 #[ignore = "matched mask-level likelihood audit across complete, partial, true-inner and complementary support"]
 fn correlated_mask_level_support_cases_diagnostic() {
-    mask_level_support_cases_diagnostic(false,None,false,None);
+    mask_level_support_cases_diagnostic(false, None, false, None);
 }
 
 #[test]
 #[ignore = "matched conditional-state proposal audit against the unchanged marginal-mask target and MAP"]
 fn mask_state_proposal_support_cases_diagnostic() {
-    mask_level_support_cases_diagnostic(true,None,false,None);
+    mask_level_support_cases_diagnostic(true, None, false, None);
 }
 
 #[test]
 #[ignore = "matched spatial sensitivity across complete, partial and complementary support, including anisotropic boundary bias"]
 fn spatial_mask_support_cases_diagnostic() {
-    for spatial in [false,true] {mask_level_support_cases_diagnostic(true,Some(spatial),false,None);}
+    for spatial in [false, true] {
+        mask_level_support_cases_diagnostic(true, Some(spatial), false, None);
+    }
 }
 
 #[test]
 #[ignore = "matched bounded mask initialization and full marginal refinement across all support cases"]
 fn mask_marginal_refinement_support_cases_diagnostic() {
-    for spatial in [false,true] {for refine in [false,true] {
-        mask_level_support_cases_diagnostic(true,Some(spatial),refine,None);
-    }}
+    for spatial in [false, true] {
+        for refine in [false, true] {
+            mask_level_support_cases_diagnostic(true, Some(spatial), refine, None);
+        }
+    }
 }
 
 #[test]
 #[ignore = "matched independent SMC population integration across complete, partial, true-inner and complementary support"]
 fn population_mask_support_cases_diagnostic() {
-    let config=posterior::populations::Config {
-        particles:std::env::var("BUTTERCUP_POPULATION_PARTICLES").expect("set population particles").parse().unwrap(),
-        steps:std::env::var("BUTTERCUP_POPULATION_STEPS").expect("set population steps").parse().unwrap(),
-        populations:std::env::var("BUTTERCUP_POPULATION_COUNT").expect("set population count").parse().unwrap()};
-    for spatial in [false,true] {for populations in [None,Some(config)] {
-        mask_level_support_cases_diagnostic(true,Some(spatial),true,populations);
-    }}
+    let config = posterior::populations::Config {
+        particles: std::env::var("BUTTERCUP_POPULATION_PARTICLES")
+            .expect("set population particles")
+            .parse()
+            .unwrap(),
+        steps: std::env::var("BUTTERCUP_POPULATION_STEPS")
+            .expect("set population steps")
+            .parse()
+            .unwrap(),
+        populations: std::env::var("BUTTERCUP_POPULATION_COUNT")
+            .expect("set population count")
+            .parse()
+            .unwrap(),
+    };
+    for spatial in [false, true] {
+        for populations in [None, Some(config)] {
+            mask_level_support_cases_diagnostic(true, Some(spatial), true, populations);
+        }
+    }
 }
 
-fn mask_level_support_cases_diagnostic(mask_state_proposals: bool, spatial_arm: Option<bool>, mask_state_refinement: bool,
-    populations: Option<posterior::populations::Config>) {
-    use crate::outline_conic_segments::sparse_evidence::{OwnedBoundaryArc,OwnedConicHint,OwnedRoiEvidence};
-    let tag=match (spatial_arm,mask_state_refinement) {
-        (None,_)=>"mask-level-support", (Some(false),false)=>"spatial-mask-control",
-        (Some(true),false)=>"spatial-mask-candidate", (Some(false),true)=>"mask-refinement-uniform",
-        (Some(true),true)=>"mask-refinement-spatial"};
-    let tag=if populations.is_some() {if spatial_arm==Some(true) {"population-spatial"} else {"population-uniform"}} else {tag};
-    for case in ["complete-pupil","complete-inner","partial-pupil","partial-inner","complementary","outer-only"] {
-        let (mut fixture,enabled)=mask_support_case_fixture(case);
-        let render=Fixture::new(fixture.target);
+fn mask_level_support_cases_diagnostic(
+    mask_state_proposals: bool,
+    spatial_arm: Option<bool>,
+    mask_state_refinement: bool,
+    populations: Option<posterior::populations::Config>,
+) {
+    use crate::outline_conic_segments::sparse_evidence::{
+        OwnedBoundaryArc, OwnedConicHint, OwnedRoiEvidence,
+    };
+    let tag = match (spatial_arm, mask_state_refinement) {
+        (None, _) => "mask-level-support",
+        (Some(false), false) => "spatial-mask-control",
+        (Some(true), false) => "spatial-mask-candidate",
+        (Some(false), true) => "mask-refinement-uniform",
+        (Some(true), true) => "mask-refinement-spatial",
+    };
+    let tag = if populations.is_some() {
+        if spatial_arm == Some(true) {
+            "population-spatial"
+        } else {
+            "population-uniform"
+        }
+    } else {
+        tag
+    };
+    for case in [
+        "complete-pupil",
+        "complete-inner",
+        "partial-pupil",
+        "partial-inner",
+        "complementary",
+        "outer-only",
+    ] {
+        let (mut fixture, enabled) = mask_support_case_fixture(case);
+        let render = Fixture::new(fixture.target);
         // All variants receive the same observed inner/pupil search hints.
         // No exact outer hint leaks the synthetic truth into displaced cases.
-        for hints in &mut fixture.hints {hints.retain(|a|a.0!=BoundaryKind::OuterLimbus);}
-        let mut variants=vec![("control",0.0,None),("sharp-levels",0.0,Some(0.5)),
-            ("broad-levels",0.0,Some(4.0)),("displaced-control",4.0,None),("displaced-levels",4.0,Some(4.0))];
-        if spatial_arm.is_some() {variants.extend([("shape-displaced-control",4.0,None),("shape-displaced-levels",4.0,Some(4.0))]);}
-        for (variant,offset,width) in variants {
-            let packets=std::array::from_fn::<_,2,_>(|eye| {
-                let e=render.hints[eye].iter().find(|a|a.0==BoundaryKind::OuterLimbus).unwrap().1;
-                let (sin,cos)=e.angle.sin_cos();
-                let normal=|point:(f64,f64)| {
-                    let x=point.0-e.center.0;let y=point.1-e.center.1;
-                    let u=(cos*x+sin*y)/e.major_radius.powi(2);
-                    let v=(-sin*x+cos*y)/e.minor_radius.powi(2);
-                    let n=[cos*u-sin*v,sin*u+cos*v];let length=n[0].hypot(n[1]);n.map(|x|x/length)
+        for hints in &mut fixture.hints {
+            hints.retain(|a| a.0 != BoundaryKind::OuterLimbus);
+        }
+        let mut variants = vec![
+            ("control", 0.0, None),
+            ("sharp-levels", 0.0, Some(0.5)),
+            ("broad-levels", 0.0, Some(4.0)),
+            ("displaced-control", 4.0, None),
+            ("displaced-levels", 4.0, Some(4.0)),
+        ];
+        if spatial_arm.is_some() {
+            variants.extend([
+                ("shape-displaced-control", 4.0, None),
+                ("shape-displaced-levels", 4.0, Some(4.0)),
+            ]);
+        }
+        for (variant, offset, width) in variants {
+            let packets = std::array::from_fn::<_, 2, _>(|eye| {
+                let e = render.hints[eye]
+                    .iter()
+                    .find(|a| a.0 == BoundaryKind::OuterLimbus)
+                    .unwrap()
+                    .1;
+                let (sin, cos) = e.angle.sin_cos();
+                let normal = |point: (f64, f64)| {
+                    let x = point.0 - e.center.0;
+                    let y = point.1 - e.center.1;
+                    let u = (cos * x + sin * y) / e.major_radius.powi(2);
+                    let v = (-sin * x + cos * y) / e.minor_radius.powi(2);
+                    let n = [cos * u - sin * v, sin * u + cos * v];
+                    let length = n[0].hypot(n[1]);
+                    n.map(|x| x / length)
                 };
-                OwnedRoiEvidence {exposure:fixture.exposures[eye],sensor_origin_px:fixture.origins[eye],
-                    dimensions_px:[420,280],detail_reliability:Some(fixture.detail[eye]),
-                    arcs:fixture.arcs[eye].iter().map(|a| {
-                        let outer=a.kind==BoundaryKind::OuterLimbus;
-                        OwnedBoundaryArc { support_length_cap_px: None, sampling_support_px: None,evidence_group:a.group,kind:a.kind,normal_band_half_width_px:a.band,
-                            localization_sigma_px:None,outward_normals_roi:None,detector_score:None,
-                            points_roi_px:a.points.iter().map(|&p| {
-                                if !outer || offset==0.0 {p} else {
-                                    let n=normal(p);
-                                    let offset=if variant.starts_with("shape-") {offset*(n[0]*n[0]-n[1]*n[1])} else {offset};
-                                    (p.0+offset*n[0],p.1+offset*n[1])
-                                }
-                            }).collect(),
-                            level_sets_roi:width.filter(|_|outer).map(|width|a.points.iter().map(|&p|
-                                {let level=BoundaryLevelSetObservation {unit_normal_roi:normal(p),displacement_px:[-width,0.0,width],spatial_displacement_px:None};
-                                    Some(if spatial_arm==Some(true) {level.with_spatial_sensitivity()} else {level})}).collect())}
-                    }).collect(),
-                    conics:fixture.hints[eye].iter().map(|&(kind,ellipse_roi_px)|OwnedConicHint {
-                        kind,ellipse_roi_px,supporting_arc_indices:vec![]}).collect()}
+                OwnedRoiEvidence {
+                    exposure: fixture.exposures[eye],
+                    sensor_origin_px: fixture.origins[eye],
+                    dimensions_px: [420, 280],
+                    detail_reliability: Some(fixture.detail[eye]),
+                    arcs: fixture.arcs[eye]
+                        .iter()
+                        .map(|a| {
+                            let outer = a.kind == BoundaryKind::OuterLimbus;
+                            OwnedBoundaryArc {
+                                support_length_cap_px: None,
+                                sampling_support_px: None,
+                                evidence_group: a.group,
+                                kind: a.kind,
+                                normal_band_half_width_px: a.band,
+                                localization_sigma_px: None,
+                                outward_normals_roi: None,
+                                detector_score: None,
+                                points_roi_px: a
+                                    .points
+                                    .iter()
+                                    .map(|&p| {
+                                        if !outer || offset == 0.0 {
+                                            p
+                                        } else {
+                                            let n = normal(p);
+                                            let offset = if variant.starts_with("shape-") {
+                                                offset * (n[0] * n[0] - n[1] * n[1])
+                                            } else {
+                                                offset
+                                            };
+                                            (p.0 + offset * n[0], p.1 + offset * n[1])
+                                        }
+                                    })
+                                    .collect(),
+                                level_sets_roi: width.filter(|_| outer).map(|width| {
+                                    a.points
+                                        .iter()
+                                        .map(|&p| {
+                                            let level = BoundaryLevelSetObservation {
+                                                unit_normal_roi: normal(p),
+                                                displacement_px: [-width, 0.0, width],
+                                                spatial_displacement_px: None,
+                                            };
+                                            Some(if spatial_arm == Some(true) {
+                                                level.with_spatial_sensitivity()
+                                            } else {
+                                                level
+                                            })
+                                        })
+                                        .collect()
+                                }),
+                            }
+                        })
+                        .collect(),
+                    conics: fixture.hints[eye]
+                        .iter()
+                        .map(|&(kind, ellipse_roi_px)| OwnedConicHint {
+                            kind,
+                            ellipse_roi_px,
+                            supporting_arc_indices: vec![],
+                        })
+                        .collect(),
+                }
             });
-            let prepared=packets.each_ref().map(|p|p.prepare());
-            let request=JointConicRequest {eyes:std::array::from_fn(|eye|enabled[eye].then(||prepared[eye].evidence())),
-                scene:&fixture.scene,maximum_hypotheses:24,maximum_refinements:16,maximum_source_skew_ns:0,
-                exposure_uncertainty_ns:2_000_000,motion_bound_px_per_second:150.0};
-            for seed in [0xd1b5_4a32_d192_ed03,0x94c5_09a1_814f_753d,0x419b_79df_a2c7_5301] {
-                let result=match solve_joint_conic_distribution_diagnostic(request,1,
-                    posterior::IntegrationConfig {seed,mask_state_proposals,mask_state_refinement,populations,..posterior::IntegrationConfig::live()}) {
-                    Ok(mut results)=>results.remove(0),
-                    Err(reason)=> {
-                        eprintln!("{tag} {}",serde_json::json!({"case":case,"variant":variant,
-                            "seed":seed.to_string(),"available":false,"reason":format!("{reason:?}")}));
+            let prepared = packets.each_ref().map(|p| p.prepare());
+            let request = JointConicRequest {
+                eyes: std::array::from_fn(|eye| enabled[eye].then(|| prepared[eye].evidence())),
+                scene: &fixture.scene,
+                maximum_hypotheses: 24,
+                maximum_refinements: 16,
+                maximum_source_skew_ns: 0,
+                exposure_uncertainty_ns: 2_000_000,
+                motion_bound_px_per_second: 150.0,
+            };
+            for seed in [
+                0xd1b5_4a32_d192_ed03,
+                0x94c5_09a1_814f_753d,
+                0x419b_79df_a2c7_5301,
+            ] {
+                let result = match solve_joint_conic_distribution_diagnostic(
+                    request,
+                    1,
+                    posterior::IntegrationConfig {
+                        seed,
+                        mask_state_proposals,
+                        mask_state_refinement,
+                        populations,
+                        ..posterior::IntegrationConfig::live()
+                    },
+                ) {
+                    Ok(mut results) => results.remove(0),
+                    Err(reason) => {
+                        eprintln!(
+                            "{tag} {}",
+                            serde_json::json!({"case":case,"variant":variant,
+                            "seed":seed.to_string(),"available":false,"reason":format!("{reason:?}")})
+                        );
                         continue;
                     }
                 };
-                assert!(result.hypotheses_evaluated<=if mask_state_refinement {48} else {24});
+                assert!(result.hypotheses_evaluated <= if mask_state_refinement { 48 } else { 24 });
                 for eye in 0..2 {
-                    if !enabled[eye] {assert!(result.eye_gaze_directions[eye].is_none());continue;}
-                    if let Some(center)=result.eye_centers_camera_mm[eye] {
-                        let ray=normalized3(sub3(result.target_camera_mm,center)).unwrap();
-                        assert!(norm3(sub3(ray,result.eye_gaze_directions[eye].unwrap()))<1e-12);
+                    if !enabled[eye] {
+                        assert!(result.eye_gaze_directions[eye].is_none());
+                        continue;
+                    }
+                    if let Some(center) = result.eye_centers_camera_mm[eye] {
+                        let ray = normalized3(sub3(result.target_camera_mm, center)).unwrap();
+                        assert!(norm3(sub3(ray, result.eye_gaze_directions[eye].unwrap())) < 1e-12);
                     }
                 }
-                if case=="outer-only" {assert!(!result.posterior.as_ref().unwrap().supports_direction(0));}
-                eprintln!("{tag} {}",serde_json::json!({"case":case,"variant":variant,"seed":seed.to_string(),
+                if case == "outer-only" {
+                    assert!(!result.posterior.as_ref().unwrap().supports_direction(0));
+                }
+                eprintln!(
+                    "{tag} {}",
+                    serde_json::json!({"case":case,"variant":variant,"seed":seed.to_string(),
                     "available":true,
                     "gaze_error_degrees":std::array::from_fn::<_,2,_>(|eye|(enabled[eye] && result.eye_normals[eye].is_some()).then(||angular_error(&result,&fixture,eye))),
                     "cost":result.robust_cost,"contributing_eyes":result.contributing_eyes,
                     "mask_level_families":result.mask_level_families,"posterior":result.posterior.as_ref().unwrap().json(),
-                    "contract":"Synthetic projected 3D circles with one shared fixation; coherent outer-boundary displacement and level alternatives, unchanged independent pupil/true-inner points and scene support. Normals are known synthetic geometry, not native confidence calibration."}));
+                    "contract":"Synthetic projected 3D circles with one shared fixation; coherent outer-boundary displacement and level alternatives, unchanged independent pupil/true-inner points and scene support. Normals are known synthetic geometry, not native confidence calibration."})
+                );
             }
         }
     }
 }
 
-fn mask_support_case_fixture(case:&str)->(Fixture,[bool;2]) {
-    let mut fixture=Fixture::new([90.0,-170.0,250.0]);
-    let enabled=[true,case=="complementary"];
-    let inner=if case.ends_with("inner") {BoundaryKind::InnerLimbus} else {BoundaryKind::PupillaryBoundary};
+fn mask_support_case_fixture(case: &str) -> (Fixture, [bool; 2]) {
+    let mut fixture = Fixture::new([90.0, -170.0, 250.0]);
+    let enabled = [true, case == "complementary"];
+    let inner = if case.ends_with("inner") {
+        BoundaryKind::InnerLimbus
+    } else {
+        BoundaryKind::PupillaryBoundary
+    };
     for eye in 0..2 {
-        fixture.arcs[eye].retain(|a|a.kind==BoundaryKind::OuterLimbus || a.kind==inner);
-        fixture.hints[eye].retain(|a|a.0==BoundaryKind::OuterLimbus || a.0==inner);
+        fixture.arcs[eye].retain(|a| a.kind == BoundaryKind::OuterLimbus || a.kind == inner);
+        fixture.hints[eye].retain(|a| a.0 == BoundaryKind::OuterLimbus || a.0 == inner);
     }
-    if case.starts_with("partial") || case=="complementary" {
-        for eye in 0..if enabled[1] {2} else {1} {
-            fixture.arcs[eye].clear();fixture.hints[eye].clear();
-            let phase=if eye==0 {0.1875} else {0.0};
-            fixture.add_arc(eye,BoundaryKind::OuterLimbus,TAU*phase,TAU*(phase+0.125),8,0);
-            fixture.add_arc(eye,BoundaryKind::OuterLimbus,TAU*(phase+0.5),TAU*(phase+0.625),8,1);
-            fixture.add_arc(eye,inner,0.0,TAU,32,2);
-            fixture.hints[eye].retain(|a|a.0==inner);
+    if case.starts_with("partial") || case == "complementary" {
+        for eye in 0..if enabled[1] { 2 } else { 1 } {
+            fixture.arcs[eye].clear();
+            fixture.hints[eye].clear();
+            let phase = if eye == 0 { 0.1875 } else { 0.0 };
+            fixture.add_arc(
+                eye,
+                BoundaryKind::OuterLimbus,
+                TAU * phase,
+                TAU * (phase + 0.125),
+                8,
+                0,
+            );
+            fixture.add_arc(
+                eye,
+                BoundaryKind::OuterLimbus,
+                TAU * (phase + 0.5),
+                TAU * (phase + 0.625),
+                8,
+                1,
+            );
+            fixture.add_arc(eye, inner, 0.0, TAU, 32, 2);
+            fixture.hints[eye].retain(|a| a.0 == inner);
             if enabled[1] {
-                fixture.arcs[eye].remove(if eye==0 {0} else {1});
+                fixture.arcs[eye].remove(if eye == 0 { 0 } else { 1 });
                 fixture.arcs[eye].last_mut().unwrap().points.truncate(16);
             }
         }
-    } else if case=="outer-only" {
-        fixture.arcs[0].retain(|a|a.kind==BoundaryKind::OuterLimbus);
-        fixture.hints[0].retain(|a|a.0==BoundaryKind::OuterLimbus);
+    } else if case == "outer-only" {
+        fixture.arcs[0].retain(|a| a.kind == BoundaryKind::OuterLimbus);
+        fixture.hints[0].retain(|a| a.0 == BoundaryKind::OuterLimbus);
     }
-    (fixture,enabled)
+    (fixture, enabled)
 }
 
 #[test]
 #[ignore = "matched synthetic complete/partial/complementary support with correlated competing edge alternatives"]
 fn arc_alternative_support_cases_diagnostic() {
-    for case in ["complete-pupil","complete-inner","partial-pupil","partial-inner","complementary","outer-only"] {
-        for variant in ["clean","competing-pupil","competing-outer","duplicated-pupil"] {
-            let (mut fixture,enabled)=mask_support_case_fixture(case);
-            if variant!="clean" {
+    for case in [
+        "complete-pupil",
+        "complete-inner",
+        "partial-pupil",
+        "partial-inner",
+        "complementary",
+        "outer-only",
+    ] {
+        for variant in [
+            "clean",
+            "competing-pupil",
+            "competing-outer",
+            "duplicated-pupil",
+        ] {
+            let (mut fixture, enabled) = mask_support_case_fixture(case);
+            if variant != "clean" {
                 for eye in 0..2 {
-                    if !enabled[eye] {continue;}
-                    let original=fixture.arcs[eye].clone();
+                    if !enabled[eye] {
+                        continue;
+                    }
+                    let original = fixture.arcs[eye].clone();
                     for mut arc in original {
-                        let outer=arc.kind==BoundaryKind::OuterLimbus;
-                        if outer!=(variant=="competing-outer") {continue;}
+                        let outer = arc.kind == BoundaryKind::OuterLimbus;
+                        if outer != (variant == "competing-outer") {
+                            continue;
+                        }
                         // A second measured-edge hypothesis in the SAME group,
                         // with unchanged geometry/scale priors and search hints.
                         // This synthetic adjacent edge is not a SAM inference.
                         for point in &mut arc.points {
-                            point.0+=if eye==0 {3.0} else {-3.0};point.1-=1.0;
+                            point.0 += if eye == 0 { 3.0 } else { -3.0 };
+                            point.1 -= 1.0;
                         }
                         fixture.arcs[eye].push(arc.clone());
-                        if variant=="duplicated-pupil" {fixture.arcs[eye].push(arc);}
+                        if variant == "duplicated-pupil" {
+                            fixture.arcs[eye].push(arc);
+                        }
                     }
                 }
             }
-            for seed in [0xd1b5_4a32_d192_ed03,0x94c5_09a1_814f_753d,0x419b_79df_a2c7_5301] {
-                let mut control:Option<JointConicSolution>=None;
-                for marginalize_arc_alternatives in [false,true] {
-                    let config=posterior::IntegrationConfig {seed,marginalize_arc_alternatives,..posterior::IntegrationConfig::live()};
-                    let result=match fixture.solve_with_integration(enabled,24,Some(config)) {
-                        Ok(result)=>result,
-                        Err(reason)=>{
-                            eprintln!("arc-mixture-support {}",serde_json::json!({"case":case,"variant":variant,
+            for seed in [
+                0xd1b5_4a32_d192_ed03,
+                0x94c5_09a1_814f_753d,
+                0x419b_79df_a2c7_5301,
+            ] {
+                let mut control: Option<JointConicSolution> = None;
+                for marginalize_arc_alternatives in [false, true] {
+                    let config = posterior::IntegrationConfig {
+                        seed,
+                        marginalize_arc_alternatives,
+                        ..posterior::IntegrationConfig::live()
+                    };
+                    let result = match fixture.solve_with_integration(enabled, 24, Some(config)) {
+                        Ok(result) => result,
+                        Err(reason) => {
+                            eprintln!(
+                                "arc-mixture-support {}",
+                                serde_json::json!({"case":case,"variant":variant,
                                 "seed":seed.to_string(),"candidate":marginalize_arc_alternatives,"available":false,
-                                "reason":format!("{reason:?}")}));continue;
+                                "reason":format!("{reason:?}")})
+                            );
+                            continue;
                         }
                     };
-                    if !marginalize_arc_alternatives {control=Some(result.clone());}
-                    if variant=="clean" && marginalize_arc_alternatives {
-                        let before=control.as_ref().unwrap();
-                        assert_eq!(result.target_camera_mm,before.target_camera_mm);
-                        assert_eq!(result.robust_cost,before.robust_cost);
-                        assert_eq!(result.posterior.as_ref().unwrap().json(),before.posterior.as_ref().unwrap().json());
+                    if !marginalize_arc_alternatives {
+                        control = Some(result.clone());
+                    }
+                    if variant == "clean" && marginalize_arc_alternatives {
+                        let before = control.as_ref().unwrap();
+                        assert_eq!(result.target_camera_mm, before.target_camera_mm);
+                        assert_eq!(result.robust_cost, before.robust_cost);
+                        assert_eq!(
+                            result.posterior.as_ref().unwrap().json(),
+                            before.posterior.as_ref().unwrap().json()
+                        );
                     }
                     for eye in 0..2 {
-                        if !enabled[eye] {assert!(result.eye_gaze_directions[eye].is_none());}
-                        if let Some(center)=result.eye_centers_camera_mm[eye] {
-                            let ray=normalized3(sub3(result.target_camera_mm,center)).unwrap();
-                            assert!(norm3(sub3(ray,result.eye_gaze_directions[eye].unwrap()))<1e-12);
+                        if !enabled[eye] {
+                            assert!(result.eye_gaze_directions[eye].is_none());
+                        }
+                        if let Some(center) = result.eye_centers_camera_mm[eye] {
+                            let ray = normalized3(sub3(result.target_camera_mm, center)).unwrap();
+                            assert!(
+                                norm3(sub3(ray, result.eye_gaze_directions[eye].unwrap())) < 1e-12
+                            );
                         }
                     }
-                    if case=="outer-only" {assert!(!result.posterior.as_ref().unwrap().supports_direction(0));}
-                    eprintln!("arc-mixture-support {}",serde_json::json!({"case":case,"variant":variant,
+                    if case == "outer-only" {
+                        assert!(!result.posterior.as_ref().unwrap().supports_direction(0));
+                    }
+                    eprintln!(
+                        "arc-mixture-support {}",
+                        serde_json::json!({"case":case,"variant":variant,
                         "seed":seed.to_string(),"candidate":marginalize_arc_alternatives,"available":true,
                         "target":result.target_camera_mm,"cost":result.robust_cost,
                         "gaze_error_degrees":std::array::from_fn::<_,2,_>(|eye|result.eye_gaze_directions[eye]
                             .map(|_|angular_error(&result,&fixture,eye))),
                         "arc_alternative_marginals":result.arc_alternative_marginals,
                         "posterior":result.posterior.as_ref().unwrap().json(),
-                        "contract":"Independently forward-projected 3D circles with correlated adjacent-edge hypotheses. Both arms have the same observations, original conic search hints, priors and shared fixation. Duplicate alternatives are not additional evidence; no native anatomical or calibrated probability claim."}));
+                        "contract":"Independently forward-projected 3D circles with correlated adjacent-edge hypotheses. Both arms have the same observations, original conic search hints, priors and shared fixation. Duplicate alternatives are not additional evidence; no native anatomical or calibrated probability claim."})
+                    );
                 }
             }
         }
     }
 }
 
-fn raw_outer_support_cases_diagnostic(position:bool) {
-    use crate::outline_conic_segments::sparse_evidence::{OwnedBoundaryArc,OwnedConicHint,OwnedRoiEvidence};
-    use crate::outline_conic_segments::sparse_evidence::uncertainty::{measure_outer_spread,measure_outer_position};
-    for case in ["complete-pupil","complete-inner","partial-pupil","partial-inner","complementary","outer-only"] {
-        let (fixture,enabled)=mask_support_case_fixture(case);
-        let render=Fixture::new(fixture.target);
-        let packets=std::array::from_fn::<_,2,_>(|eye|OwnedRoiEvidence {
-            exposure:fixture.exposures[eye],sensor_origin_px:fixture.origins[eye],dimensions_px:[420,280],
-            detail_reliability:Some(fixture.detail[eye]),
-            arcs:fixture.arcs[eye].iter().map(|a|OwnedBoundaryArc { support_length_cap_px: None, sampling_support_px: None, level_sets_roi: None,evidence_group:a.group,kind:a.kind,
-                points_roi_px:a.points.clone(),normal_band_half_width_px:a.band,outward_normals_roi:None,
-                localization_sigma_px:None,detector_score:None}).collect(),
-            conics:fixture.hints[eye].iter().map(|&(kind,ellipse_roi_px)|OwnedConicHint {
-                kind,ellipse_roi_px,supporting_arc_indices:vec![]}).collect()});
-        let mut variants=vec![("control",0.5,400.0,0.0),("sharp-bright",0.5,400.0,0.0),
-            ("sharp-dim",0.5,30.0,0.0),("outer-blurred",8.0,400.0,0.0)];
-        if position {variants.push(("outer-displaced",0.5,400.0,8.0));}
-        for (variant,blur,amplitude,offset) in variants {
-            let mut current=packets.clone();let mut receipts:[Vec<serde_json::Value>;2]=[Vec::new(),Vec::new()];
-            if variant!="control" {
+fn raw_outer_support_cases_diagnostic(position: bool) {
+    use crate::outline_conic_segments::sparse_evidence::uncertainty::{
+        measure_outer_position, measure_outer_spread,
+    };
+    use crate::outline_conic_segments::sparse_evidence::{
+        OwnedBoundaryArc, OwnedConicHint, OwnedRoiEvidence,
+    };
+    for case in [
+        "complete-pupil",
+        "complete-inner",
+        "partial-pupil",
+        "partial-inner",
+        "complementary",
+        "outer-only",
+    ] {
+        let (fixture, enabled) = mask_support_case_fixture(case);
+        let render = Fixture::new(fixture.target);
+        let packets = std::array::from_fn::<_, 2, _>(|eye| OwnedRoiEvidence {
+            exposure: fixture.exposures[eye],
+            sensor_origin_px: fixture.origins[eye],
+            dimensions_px: [420, 280],
+            detail_reliability: Some(fixture.detail[eye]),
+            arcs: fixture.arcs[eye]
+                .iter()
+                .map(|a| OwnedBoundaryArc {
+                    support_length_cap_px: None,
+                    sampling_support_px: None,
+                    level_sets_roi: None,
+                    evidence_group: a.group,
+                    kind: a.kind,
+                    points_roi_px: a.points.clone(),
+                    normal_band_half_width_px: a.band,
+                    outward_normals_roi: None,
+                    localization_sigma_px: None,
+                    detector_score: None,
+                })
+                .collect(),
+            conics: fixture.hints[eye]
+                .iter()
+                .map(|&(kind, ellipse_roi_px)| OwnedConicHint {
+                    kind,
+                    ellipse_roi_px,
+                    supporting_arc_indices: vec![],
+                })
+                .collect(),
+        });
+        let mut variants = vec![
+            ("control", 0.5, 400.0, 0.0),
+            ("sharp-bright", 0.5, 400.0, 0.0),
+            ("sharp-dim", 0.5, 30.0, 0.0),
+            ("outer-blurred", 8.0, 400.0, 0.0),
+        ];
+        if position {
+            variants.push(("outer-displaced", 0.5, 400.0, 8.0));
+        }
+        for (variant, blur, amplitude, offset) in variants {
+            let mut current = packets.clone();
+            let mut receipts: [Vec<serde_json::Value>; 2] = [Vec::new(), Vec::new()];
+            if variant != "control" {
                 for eye in 0..2 {
-                    if !enabled[eye] {continue;}
-                    let e=render.hints[eye].iter().find(|a|a.0==BoundaryKind::OuterLimbus).unwrap().1;
+                    if !enabled[eye] {
+                        continue;
+                    }
+                    let e = render.hints[eye]
+                        .iter()
+                        .find(|a| a.0 == BoundaryKind::OuterLimbus)
+                        .unwrap()
+                        .1;
                     // An independent signed-distance edge around the known
                     // projected disk; blur changes the optical transition,
                     // while measured boundary positions stay fixed. This is
                     // not a SAM inference, real occluder or anatomical image.
-                    let (sin,cos)=e.angle.sin_cos();
-                    let raw=(0..420*280).map(|i| {
-                        let x=(i%420) as f64-e.center.0;let y=(i/420) as f64-e.center.1;
-                        let u=cos*x+sin*y;let v=-sin*x+cos*y;
-                        let q=(u/e.major_radius).powi(2)+(v/e.minor_radius).powi(2);
-                        let distance=crate::conic_solver::ellipse_residual(((i%420) as f64,(i/420) as f64),e)
-                            *if q<1.0 {-1.0} else {1.0};
-                        (150.0+amplitude*(1.0+((distance-offset)/blur).tanh())*0.5).round() as u16
-                    }).collect::<Vec<_>>();
-                    let before=&packets[eye];
-                    receipts[eye]=if position {
-                        measure_outer_position(&mut current[eye],&raw).into_iter().map(|r|serde_json::json!(r)).collect()
+                    let (sin, cos) = e.angle.sin_cos();
+                    let raw = (0..420 * 280)
+                        .map(|i| {
+                            let x = (i % 420) as f64 - e.center.0;
+                            let y = (i / 420) as f64 - e.center.1;
+                            let u = cos * x + sin * y;
+                            let v = -sin * x + cos * y;
+                            let q = (u / e.major_radius).powi(2) + (v / e.minor_radius).powi(2);
+                            let distance = crate::conic_solver::ellipse_residual(
+                                ((i % 420) as f64, (i / 420) as f64),
+                                e,
+                            ) * if q < 1.0 { -1.0 } else { 1.0 };
+                            (150.0 + amplitude * (1.0 + ((distance - offset) / blur).tanh()) * 0.5)
+                                .round() as u16
+                        })
+                        .collect::<Vec<_>>();
+                    let before = &packets[eye];
+                    receipts[eye] = if position {
+                        measure_outer_position(&mut current[eye], &raw)
+                            .into_iter()
+                            .map(|r| serde_json::json!(r))
+                            .collect()
                     } else {
-                        measure_outer_spread(&mut current[eye],&raw).into_iter().map(|r|serde_json::json!(r)).collect()
+                        measure_outer_spread(&mut current[eye], &raw)
+                            .into_iter()
+                            .map(|r| serde_json::json!(r))
+                            .collect()
                     };
-                    assert_eq!(format!("{:?}",current[eye].conics),format!("{:?}",before.conics));
-                    assert_eq!(current[eye].exposure,before.exposure);
-                    for (a,b) in current[eye].arcs.iter().zip(&before.arcs) {
-                        assert_eq!(a.points_roi_px,b.points_roi_px);assert_eq!(a.evidence_group,b.evidence_group);
-                        assert_eq!(a.normal_band_half_width_px,b.normal_band_half_width_px);
-                        if a.kind!=BoundaryKind::OuterLimbus {assert_eq!(format!("{a:?}"),format!("{b:?}"));}
+                    assert_eq!(
+                        format!("{:?}", current[eye].conics),
+                        format!("{:?}", before.conics)
+                    );
+                    assert_eq!(current[eye].exposure, before.exposure);
+                    for (a, b) in current[eye].arcs.iter().zip(&before.arcs) {
+                        assert_eq!(a.points_roi_px, b.points_roi_px);
+                        assert_eq!(a.evidence_group, b.evidence_group);
+                        assert_eq!(a.normal_band_half_width_px, b.normal_band_half_width_px);
+                        if a.kind != BoundaryKind::OuterLimbus {
+                            assert_eq!(format!("{a:?}"), format!("{b:?}"));
+                        }
                     }
                 }
             }
-            let prepared=current.each_ref().map(|p|p.prepare());
-            let request=JointConicRequest {eyes:std::array::from_fn(|eye|enabled[eye].then(||prepared[eye].evidence())),
-                scene:&fixture.scene,maximum_hypotheses:24,maximum_refinements:16,
-                maximum_source_skew_ns:0,exposure_uncertainty_ns:2_000_000,motion_bound_px_per_second:150.0};
-            for seed in [0xd1b5_4a32_d192_ed03,0x94c5_09a1_814f_753d,0x419b_79df_a2c7_5301] {
-                let result=solve_joint_conic_distribution_diagnostic(request,1,
-                    posterior::IntegrationConfig {seed,..posterior::IntegrationConfig::live()}).unwrap().remove(0);
+            let prepared = current.each_ref().map(|p| p.prepare());
+            let request = JointConicRequest {
+                eyes: std::array::from_fn(|eye| enabled[eye].then(|| prepared[eye].evidence())),
+                scene: &fixture.scene,
+                maximum_hypotheses: 24,
+                maximum_refinements: 16,
+                maximum_source_skew_ns: 0,
+                exposure_uncertainty_ns: 2_000_000,
+                motion_bound_px_per_second: 150.0,
+            };
+            for seed in [
+                0xd1b5_4a32_d192_ed03,
+                0x94c5_09a1_814f_753d,
+                0x419b_79df_a2c7_5301,
+            ] {
+                let result = solve_joint_conic_distribution_diagnostic(
+                    request,
+                    1,
+                    posterior::IntegrationConfig {
+                        seed,
+                        ..posterior::IntegrationConfig::live()
+                    },
+                )
+                .unwrap()
+                .remove(0);
                 for eye in 0..2 {
-                    if !enabled[eye] {assert!(result.eye_gaze_directions[eye].is_none());continue;}
-                    let ray=normalized3(sub3(result.target_camera_mm,result.eye_centers_camera_mm[eye].unwrap())).unwrap();
-                    assert!(norm3(sub3(ray,result.eye_gaze_directions[eye].unwrap()))<1e-12);
+                    if !enabled[eye] {
+                        assert!(result.eye_gaze_directions[eye].is_none());
+                        continue;
+                    }
+                    let ray = normalized3(sub3(
+                        result.target_camera_mm,
+                        result.eye_centers_camera_mm[eye].unwrap(),
+                    ))
+                    .unwrap();
+                    assert!(norm3(sub3(ray, result.eye_gaze_directions[eye].unwrap())) < 1e-12);
                 }
-                if case=="outer-only" {assert!(!result.posterior.as_ref().unwrap().supports_direction(0));}
-                if position && case=="complete-pupil" && variant!="outer-displaced" {
+                if case == "outer-only" {
+                    assert!(!result.posterior.as_ref().unwrap().supports_direction(0));
+                }
+                if position && case == "complete-pupil" && variant != "outer-displaced" {
                     assert!(result.posterior.as_ref().unwrap().supports_direction(0),
                         "a centered optical transition must preserve the ideal complete-pupil direction: {variant} seed {seed}");
                 }
-                eprintln!("{} {}",if position {"outer-position-support"} else {"outer-spread-support"},serde_json::json!({"case":case,"variant":variant,"seed":seed.to_string(),
+                eprintln!(
+                    "{} {}",
+                    if position {
+                        "outer-position-support"
+                    } else {
+                        "outer-spread-support"
+                    },
+                    serde_json::json!({"case":case,"variant":variant,"seed":seed.to_string(),
                     "gaze_error_degrees":std::array::from_fn::<_,2,_>(|eye|enabled[eye].then(||angular_error(&result,&fixture,eye))),
                     "posterior":result.posterior.as_ref().unwrap().json(),"outer_measurements":receipts,
-                    "contract":"Synthetic known 3D circles; fixed contour points with varied RAW outer transition width/brightness/offset, separately preserved inner/pupil factors. No native accuracy claim."}));
+                    "contract":"Synthetic known 3D circles; fixed contour points with varied RAW outer transition width/brightness/offset, separately preserved inner/pupil factors. No native accuracy claim."})
+                );
             }
         }
     }
@@ -2937,27 +3713,27 @@ fn raw_outer_support_cases_diagnostic(position:bool) {
 #[test]
 #[ignore = "compare test-only numerical admission on complete, partial, complementary and ambiguous synthetic support"]
 fn same_eye_and_complementary_stereo_admission_diagnostic() {
-    support_case_posterior_reference(true,false,false,None);
+    support_case_posterior_reference(true, false, false, None);
 }
 
 #[test]
 #[ignore = "independent-seed comparison of analytic unobserved-inner integration on complete, partial, complementary and ambiguous geometry"]
 fn same_eye_and_complementary_stereo_integrated_inner_diagnostic() {
-    support_case_posterior_reference(false,true,false,None);
+    support_case_posterior_reference(false, true, false, None);
 }
 
 #[test]
 #[ignore = "independent-seed global scene proposals on complete, partial, complementary and ambiguous geometry"]
 fn same_eye_and_complementary_stereo_conditional_scene_diagnostic() {
-    support_case_posterior_reference(false,true,true,None);
+    support_case_posterior_reference(false, true, true, None);
 }
 
 #[test]
 #[ignore = "matched independent-replica integration and admission across complete/partial/complementary/mirror fixtures"]
 fn same_eye_and_complementary_stereo_replicated_diagnostic() {
-    for replicas in [1,4] {
-        for precision in [false,true] {
-            support_case_posterior_reference(precision,true,false,Some(replicas));
+    for replicas in [1, 4] {
+        for precision in [false, true] {
+            support_case_posterior_reference(precision, true, false, Some(replicas));
         }
     }
 }
@@ -2965,9 +3741,9 @@ fn same_eye_and_complementary_stereo_replicated_diagnostic() {
 #[test]
 #[ignore = "matched broader scene proposal and numerical precision on complete/partial/complementary/mirror fixtures"]
 fn same_eye_and_complementary_stereo_scene_replicated_diagnostic() {
-    for replicas in [1,4] {
-        for precision in [false,true] {
-            support_case_posterior_reference(precision,true,true,Some(replicas));
+    for replicas in [1, 4] {
+        for precision in [false, true] {
+            support_case_posterior_reference(precision, true, true, Some(replicas));
         }
     }
 }
@@ -2975,19 +3751,51 @@ fn same_eye_and_complementary_stereo_scene_replicated_diagnostic() {
 #[test]
 #[ignore = "discarded-pilot tail components with paired numerical admission at live and larger diagnostic budgets"]
 fn same_eye_and_complementary_stereo_tail_precision_diagnostic() {
-    assert!(matches!(std::env::var("BUTTERCUP_POSTERIOR_TAIL_PROPOSAL").ok().as_deref(),
-        Some("pilot" | "recenter" | "refit" | "conditional-refit" | "outlier-refit" | "boundary-refit" | "boundary-defensive" | "profile-affine" | "profile-quadratic")), "select a tail proposal experiment");
-    assert_eq!(std::env::var("BUTTERCUP_POSTERIOR_REPLICA_ORIGINAL_DRAWS").ok().as_deref(),Some("1"));
-    support_case_posterior_reference(true,true,false,Some(4));
+    assert!(
+        matches!(
+            std::env::var("BUTTERCUP_POSTERIOR_TAIL_PROPOSAL")
+                .ok()
+                .as_deref(),
+            Some(
+                "pilot"
+                    | "recenter"
+                    | "refit"
+                    | "conditional-refit"
+                    | "outlier-refit"
+                    | "boundary-refit"
+                    | "boundary-defensive"
+                    | "profile-affine"
+                    | "profile-quadratic"
+            )
+        ),
+        "select a tail proposal experiment"
+    );
+    assert_eq!(
+        std::env::var("BUTTERCUP_POSTERIOR_REPLICA_ORIGINAL_DRAWS")
+            .ok()
+            .as_deref(),
+        Some("1")
+    );
+    support_case_posterior_reference(true, true, false, Some(4));
 }
 
 #[test]
 #[ignore = "independent annealed reference paths for complete, partial, complementary and mirror support"]
 fn same_eye_and_complementary_stereo_annealed_reference() {
     assert!(std::env::var("BUTTERCUP_ANNEALED_STEPS").is_ok());
-    assert_eq!(std::env::var("BUTTERCUP_POSTERIOR_TAIL_PROPOSAL").ok().as_deref(),Some("conditional-refit"));
-    assert_eq!(std::env::var("BUTTERCUP_POSTERIOR_REPLICA_ORIGINAL_DRAWS").ok().as_deref(),Some("1"));
-    support_case_posterior_reference(true,true,false,Some(4));
+    assert_eq!(
+        std::env::var("BUTTERCUP_POSTERIOR_TAIL_PROPOSAL")
+            .ok()
+            .as_deref(),
+        Some("conditional-refit")
+    );
+    assert_eq!(
+        std::env::var("BUTTERCUP_POSTERIOR_REPLICA_ORIGINAL_DRAWS")
+            .ok()
+            .as_deref(),
+        Some("1")
+    );
+    support_case_posterior_reference(true, true, false, Some(4));
 }
 
 #[test]
@@ -2996,23 +3804,41 @@ fn explicit_boundary_proposals_keep_the_opposite_eye_and_original_density() {
     fixture.with_request([true, true], 24, |request| {
         let model = Problem::new(request).unwrap();
         let mut p = model.initial;
-        p[..TARGET_PARAMETERS].copy_from_slice(&model.target_chart.coordinates(fixture.target).unwrap());
+        p[..TARGET_PARAMETERS]
+            .copy_from_slice(&model.target_chart.coordinates(fixture.target).unwrap());
         let masks = posterior::boundary_relaxations(&model);
         assert_eq!(masks.len(), 6);
-        let score = |m: &Problem<'_>| squared_norm(&m.residuals(&p, &m.select(&m.conics(&p).unwrap())).unwrap());
+        let score = |m: &Problem<'_>| {
+            squared_norm(&m.residuals(&p, &m.select(&m.conics(&p).unwrap())).unwrap())
+        };
         let before = score(&model);
-        let kinds = [BoundaryKind::PupillaryBoundary, BoundaryKind::OuterLimbus, BoundaryKind::InnerLimbus];
+        let kinds = [
+            BoundaryKind::PupillaryBoundary,
+            BoundaryKind::OuterLimbus,
+            BoundaryKind::InnerLimbus,
+        ];
         for (index, mask) in masks.iter().enumerate() {
             assert_eq!(mask.len(), 1);
             let eye = index % 2;
             let kind = kinds[index / 2];
-            assert!(model.groups[mask[0]].alternatives.iter().all(|a| a.eye == eye && a.kind == kind));
-            let (relaxed, omitted) = posterior::with_relaxed_proposal_groups(&model, &p, mask).unwrap();
+            assert!(model.groups[mask[0]]
+                .alternatives
+                .iter()
+                .all(|a| a.eye == eye && a.kind == kind));
+            let (relaxed, omitted) =
+                posterior::with_relaxed_proposal_groups(&model, &p, mask).unwrap();
             assert_eq!(&omitted, mask);
             assert_eq!(relaxed.present, [true, true]);
             assert_eq!(relaxed.lower, model.lower);
             assert_eq!(relaxed.upper, model.upper);
-            assert_eq!(relaxed.groups.iter().filter(|g|g.alternatives[0].eye != eye).count(), 3);
+            assert_eq!(
+                relaxed
+                    .groups
+                    .iter()
+                    .filter(|g| g.alternatives[0].eye != eye)
+                    .count(),
+                3
+            );
             assert_eq!(model.groups.len(), 6);
             assert_eq!(score(&model), before);
         }
@@ -3026,20 +3852,30 @@ fn outlier_proposal_keeps_original_pupil_penalty_and_scene_support() {
         if conflicting_pupil {
             for arc in &mut fixture.arcs[0] {
                 if arc.kind == BoundaryKind::PupillaryBoundary {
-                    for p in &mut arc.points { p.0 += 80.0; }
+                    for p in &mut arc.points {
+                        p.0 += 80.0;
+                    }
                 }
             }
         }
         fixture.with_request([true, true], 24, |request| {
             let model = Problem::new(request).unwrap();
             let mut p = model.initial;
-            p[..TARGET_PARAMETERS].copy_from_slice(&model.target_chart.coordinates(fixture.target).unwrap());
-            let original_cost = squared_norm(&model.residuals(&p, &model.select(&model.conics(&p).unwrap())).unwrap());
+            p[..TARGET_PARAMETERS]
+                .copy_from_slice(&model.target_chart.coordinates(fixture.target).unwrap());
+            let original_cost = squared_norm(
+                &model
+                    .residuals(&p, &model.select(&model.conics(&p).unwrap()))
+                    .unwrap(),
+            );
             let original_group_count = model.groups.len();
             let (relaxed, omitted) = posterior::without_pilot_outliers(&model, &p).unwrap();
             assert_eq!(omitted.len(), usize::from(conflicting_pupil));
             for &i in &omitted {
-                assert!(model.groups[i].alternatives.iter().all(|a| a.eye == 0 && a.kind == BoundaryKind::PupillaryBoundary));
+                assert!(model.groups[i]
+                    .alternatives
+                    .iter()
+                    .all(|a| a.eye == 0 && a.kind == BoundaryKind::PupillaryBoundary));
             }
             assert_eq!(relaxed.present, model.present);
             assert_eq!(relaxed.lower, model.lower);
@@ -3047,11 +3883,25 @@ fn outlier_proposal_keeps_original_pupil_penalty_and_scene_support() {
             assert_eq!(relaxed.scales, model.scales);
             assert_eq!(model.groups.len(), original_group_count);
             assert_eq!(relaxed.groups.len() + omitted.len(), original_group_count);
-            let relaxed_cost = squared_norm(&relaxed.residuals(&p, &relaxed.select(&relaxed.conics(&p).unwrap())).unwrap());
-            let outlier_charge = omitted.iter().map(|&i| model.groups[i].weight * MAXIMUM_GROUP_COST).sum::<f64>();
+            let relaxed_cost = squared_norm(
+                &relaxed
+                    .residuals(&p, &relaxed.select(&relaxed.conics(&p).unwrap()))
+                    .unwrap(),
+            );
+            let outlier_charge = omitted
+                .iter()
+                .map(|&i| model.groups[i].weight * MAXIMUM_GROUP_COST)
+                .sum::<f64>();
             assert!((original_cost - relaxed_cost - outlier_charge).abs() < 1e-8);
             // The source objective still charges the complete pupil evidence.
-            assert_eq!(original_cost, squared_norm(&model.residuals(&p, &model.select(&model.conics(&p).unwrap())).unwrap()));
+            assert_eq!(
+                original_cost,
+                squared_norm(
+                    &model
+                        .residuals(&p, &model.select(&model.conics(&p).unwrap()))
+                        .unwrap()
+                )
+            );
             assert_eq!(relaxed.target(&p), model.target(&p));
         });
     }
@@ -3063,9 +3913,12 @@ fn conditional_tail_refinement_keeps_one_fixation_and_original_model_support() {
     for enabled in [[true, false], [true, true]] {
         fixture.with_request(enabled, 24, |request| {
             let model = Problem::new(request).unwrap();
-            let (mut pilot, _, _) = model.seeds().into_iter()
+            let (mut pilot, _, _) = model
+                .seeds()
+                .into_iter()
                 .filter_map(|p| model.refine(p))
-                .min_by(|a,b| a.1.total_cmp(&b.1)).unwrap();
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .unwrap();
             // Perturb observed eye geometry without changing the common target.
             for eye in 0..2 {
                 if enabled[eye] {
@@ -3076,10 +3929,18 @@ fn conditional_tail_refinement_keeps_one_fixation_and_original_model_support() {
             }
             let pilot = model.project_step(pilot).unwrap();
             let bounds = (model.lower, model.upper);
-            let cost_before = squared_norm(&model.residuals(&pilot, &model.select(&model.conics(&pilot).unwrap())).unwrap());
-            let (refined, cost_after, steps) = posterior::conditional_refined_center(&model, pilot).unwrap();
+            let cost_before = squared_norm(
+                &model
+                    .residuals(&pilot, &model.select(&model.conics(&pilot).unwrap()))
+                    .unwrap(),
+            );
+            let (refined, cost_after, steps) =
+                posterior::conditional_refined_center(&model, pilot).unwrap();
             assert_eq!(&refined[..TARGET_PARAMETERS], &pilot[..TARGET_PARAMETERS]);
-            assert!(cost_after < cost_before - 1e-5, "{enabled:?}: {cost_before} -> {cost_after}");
+            assert!(
+                cost_after < cost_before - 1e-5,
+                "{enabled:?}: {cost_before} -> {cost_after}"
+            );
             assert!(steps > 0 && steps <= 6 * 4);
             assert_eq!((model.lower, model.upper), bounds);
             assert!((0..TARGET_PARAMETERS).all(|i| model.upper[i] > model.lower[i]));
@@ -3096,67 +3957,122 @@ fn posterior_batch_diagnostic_preserves_original_samples_and_stopping() {
     for early_stop in [false, true] {
         let mut outputs = Vec::new();
         for replicas in [1, 4] {
-            let solution = fixture.solve_with_integration([true, false], 24,
-                Some(posterior::IntegrationConfig {
-                    budget: if early_stop { 8192 } else { 1031 },
-                    early_stop, replicas, preserve_replica_draws: true,
-                    marginalize_unobserved_inner: true,
-                    global_proposal: true, conditional_nuisance: true,
-                    ..Default::default()
-                })).unwrap();
+            let solution = fixture
+                .solve_with_integration(
+                    [true, false],
+                    24,
+                    Some(posterior::IntegrationConfig {
+                        budget: if early_stop { 8192 } else { 1031 },
+                        early_stop,
+                        replicas,
+                        preserve_replica_draws: true,
+                        marginalize_unobserved_inner: true,
+                        global_proposal: true,
+                        conditional_nuisance: true,
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
             let mut json = solution.posterior.as_ref().unwrap().json();
             json.as_object_mut().unwrap().remove("replicas");
-            json.as_object_mut().unwrap().remove("replicate_direction_numerics");
+            json.as_object_mut()
+                .unwrap()
+                .remove("replicate_direction_numerics");
             outputs.push(json);
         }
-        assert_eq!(outputs[0], outputs[1], "same draws, weights, fitted mass and stopping; early_stop={early_stop}");
+        assert_eq!(
+            outputs[0], outputs[1],
+            "same draws, weights, fitted mass and stopping; early_stop={early_stop}"
+        );
     }
 }
 
 #[test]
 fn supported_mode_selection_uses_full_mass_and_requires_both_eyes() {
     let fixture = Fixture::new([70.0, -130.0, 250.0]);
-    let map = fixture.solve_with_integration([true,true],16,
-        Some(posterior::IntegrationConfig::live())).unwrap();
-    let other = Fixture::new([-300.0, 300.0, 250.0]).solve([true,true],16).unwrap();
-    assert!((0..2).all(|eye| dot3(map.eye_gaze_directions[eye].unwrap(),
-        other.eye_gaze_directions[eye].unwrap()) < 30.0_f64.to_radians().cos()));
+    let map = fixture
+        .solve_with_integration([true, true], 16, Some(posterior::IntegrationConfig::live()))
+        .unwrap();
+    let other = Fixture::new([-300.0, 300.0, 250.0])
+        .solve([true, true], 16)
+        .unwrap();
+    assert!((0..2).all(|eye| dot3(
+        map.eye_gaze_directions[eye].unwrap(),
+        other.eye_gaze_directions[eye].unwrap()
+    ) < 30.0_f64.to_radians().cos()));
     for (alternate_mass, disagree, different_association, draws, expected) in [
-        (0.98,false,false,400,1), (0.50,false,false,400,0),
-        (0.02,false,false,400,0), (0.98,true,false,400,0),
-        (0.98,false,true,400,0), (0.92,false,false,20,0),
+        (0.98, false, false, 400, 1),
+        (0.50, false, false, 400, 0),
+        (0.02, false, false, 400, 0),
+        (0.98, true, false, 400, 0),
+        (0.98, false, true, 400, 0),
+        (0.92, false, false, 20, 0),
     ] {
-        let mut modes = vec![([0.0;PARAMETERS],map.clone()),([0.0;PARAMETERS],other.clone())];
-        if different_association { modes[1].1.modeled_eyes = [true,false]; }
-        let samples: Vec<_> = (0..draws).map(|i| {
-            let mut directions = if i%2 == 0 { map.eye_gaze_directions } else { other.eye_gaze_directions };
-            if disagree { directions[1] = map.eye_gaze_directions[1]; }
-            ([0.0;3],directions,usize::from(i%2 != 0))
-        }).collect();
-        let weights: Vec<_> = (0..draws).map(|i|
-            2.0/ draws as f64 * if i%2 == 0 {1.0-alternate_mass} else {alternate_mass}).collect();
-        let proposals = vec![0;draws];
-        let replicas: Vec<_> = (0..draws).map(|i|(i/2)%4).collect();
-        let counts: Vec<_> = (0..4).map(|r|replicas.iter().filter(|&&i|i==r).count()).collect();
-        let directions = posterior::DirectionSamples {samples:&samples,weights:&weights,
-            sample_proposals:&proposals,proposals:1,draws,sample_replicas:&replicas,
-            replica_draw_counts:&counts};
+        let mut modes = vec![
+            ([0.0; PARAMETERS], map.clone()),
+            ([0.0; PARAMETERS], other.clone()),
+        ];
+        if different_association {
+            modes[1].1.modeled_eyes = [true, false];
+        }
+        let samples: Vec<_> = (0..draws)
+            .map(|i| {
+                let mut directions = if i % 2 == 0 {
+                    map.eye_gaze_directions
+                } else {
+                    other.eye_gaze_directions
+                };
+                if disagree {
+                    directions[1] = map.eye_gaze_directions[1];
+                }
+                ([0.0; 3], directions, usize::from(i % 2 != 0))
+            })
+            .collect();
+        let weights: Vec<_> = (0..draws)
+            .map(|i| {
+                2.0 / draws as f64
+                    * if i % 2 == 0 {
+                        1.0 - alternate_mass
+                    } else {
+                        alternate_mass
+                    }
+            })
+            .collect();
+        let proposals = vec![0; draws];
+        let replicas: Vec<_> = (0..draws).map(|i| (i / 2) % 4).collect();
+        let counts: Vec<_> = (0..4)
+            .map(|r| replicas.iter().filter(|&&i| i == r).count())
+            .collect();
+        let directions = posterior::DirectionSamples {
+            samples: &samples,
+            weights: &weights,
+            sample_proposals: &proposals,
+            proposals: 1,
+            draws,
+            sample_replicas: &replicas,
+            replica_draw_counts: &counts,
+        };
         let mut result = map.posterior.clone().unwrap();
         result.status = "estimated-conditional";
-        directions.summarize_about(&mut result,&map);
+        directions.summarize_about(&mut result, &map);
         let original_mean = result.target_mean_camera_mm;
-        directions.select_supported_mode(&mut result,&modes);
+        directions.select_supported_mode(&mut result, &modes);
         assert_eq!(result.supported_mode_selection.as_ref().unwrap().retained_index,expected,
             "mass={alternate_mass} disagree={disagree} association={different_association} draws={draws}");
-        assert_eq!(result.target_mean_camera_mm,original_mean,"selection never averages geometry");
-        if expected==1 {
-            assert!((0..2).all(|eye|result.supports_direction(eye)));
-            assert!((result.admission_numerics(0).unwrap().mass-alternate_mass).abs()<1e-12,
-                "keep the competing branch's mass in the admission denominator");
+        assert_eq!(
+            result.target_mean_camera_mm, original_mean,
+            "selection never averages geometry"
+        );
+        if expected == 1 {
+            assert!((0..2).all(|eye| result.supports_direction(eye)));
+            assert!(
+                (result.admission_numerics(0).unwrap().mass - alternate_mass).abs() < 1e-12,
+                "keep the competing branch's mass in the admission denominator"
+            );
         }
         result.status = "insufficient-sampling";
         result.supported_mode_selection = None;
-        directions.select_supported_mode(&mut result,&modes);
+        directions.select_supported_mode(&mut result, &modes);
         assert!(result.supported_mode_selection.is_none());
     }
 }
@@ -3164,40 +4080,76 @@ fn supported_mode_selection_uses_full_mass_and_requires_both_eyes() {
 #[test]
 fn supported_mode_experiment_preserves_a_supported_joint_map_and_current_arcs() {
     assert!(!posterior::IntegrationConfig::live().select_supported_mode);
-    let fixture = Fixture::new([70.0,-130.0,250.0]);
+    let fixture = Fixture::new([70.0, -130.0, 250.0]);
     let config = posterior::IntegrationConfig::live();
-    let baseline = fixture.solve_with_integration([true,true],16,Some(config)).unwrap();
-    assert!((0..2).all(|eye|baseline.posterior.as_ref().unwrap().supports_direction(eye)));
-    let candidate = fixture.solve_with_integration([true,true],16,
-        Some(posterior::IntegrationConfig {select_supported_mode:true,..config})).unwrap();
-    assert_eq!(candidate.target_camera_mm,baseline.target_camera_mm);
-    assert_eq!(candidate.eye_gaze_directions,baseline.eye_gaze_directions);
-    assert_eq!(candidate.robust_cost,baseline.robust_cost);
-    assert_eq!(format!("{:?}",candidate.arcs),format!("{:?}",baseline.arcs));
+    let baseline = fixture
+        .solve_with_integration([true, true], 16, Some(config))
+        .unwrap();
+    assert!((0..2).all(|eye| baseline.posterior.as_ref().unwrap().supports_direction(eye)));
+    let candidate = fixture
+        .solve_with_integration(
+            [true, true],
+            16,
+            Some(posterior::IntegrationConfig {
+                select_supported_mode: true,
+                ..config
+            }),
+        )
+        .unwrap();
+    assert_eq!(candidate.target_camera_mm, baseline.target_camera_mm);
+    assert_eq!(candidate.eye_gaze_directions, baseline.eye_gaze_directions);
+    assert_eq!(candidate.robust_cost, baseline.robust_cost);
+    assert_eq!(
+        format!("{:?}", candidate.arcs),
+        format!("{:?}", baseline.arcs)
+    );
     let mut json = candidate.posterior.unwrap().json();
-    assert_eq!(json["supported_mode_selection"]["retained_index"],0);
-    json.as_object_mut().unwrap().remove("supported_mode_selection");
-    assert_eq!(json,baseline.posterior.unwrap().json());
+    assert_eq!(json["supported_mode_selection"]["retained_index"], 0);
+    json.as_object_mut()
+        .unwrap()
+        .remove("supported_mode_selection");
+    assert_eq!(json, baseline.posterior.unwrap().json());
 }
 
-fn support_case_posterior_reference(numerical_admission:bool,marginalize_unobserved_inner:bool,conditional_scene:bool,replicated_global:Option<usize>) {
-    let annealed_reference=std::env::var("BUTTERCUP_ANNEALED_STEPS").ok().map(|steps|posterior::annealed::Config {
-        steps:steps.parse().unwrap(),paths:std::env::var("BUTTERCUP_ANNEALED_PATHS").expect("set path count").parse().unwrap(),
-    });
-    let preserve_marginal_draws=std::env::var("BUTTERCUP_POSTERIOR_PAIRED_DRAWS").ok().as_deref()==Some("1");
-    let preserve_replica_draws=std::env::var("BUTTERCUP_POSTERIOR_REPLICA_ORIGINAL_DRAWS").ok().as_deref()==Some("1");
-    let tail_proposal=match std::env::var("BUTTERCUP_POSTERIOR_TAIL_PROPOSAL").ok().as_deref() {
-        None=>posterior::TailProposal::Off,
-        Some("pilot")=>posterior::TailProposal::PilotOnly,
-        Some("recenter")=>posterior::TailProposal::Recenter,
-        Some("refit")=>posterior::TailProposal::Refit,
-        Some("conditional-refit")=>posterior::TailProposal::ConditionalRefit,
-        Some("outlier-refit")=>posterior::TailProposal::OutlierRefit,
-        Some("boundary-refit")=>posterior::TailProposal::BoundaryRefit,
-        Some("boundary-defensive")=>posterior::TailProposal::BoundaryDefensive,
-        Some("profile-affine")=>posterior::TailProposal::ProfileAffine,
-        Some("profile-quadratic")=>posterior::TailProposal::ProfileQuadratic,
-        _=>panic!("unknown tail proposal recipe"),
+fn support_case_posterior_reference(
+    numerical_admission: bool,
+    marginalize_unobserved_inner: bool,
+    conditional_scene: bool,
+    replicated_global: Option<usize>,
+) {
+    let annealed_reference =
+        std::env::var("BUTTERCUP_ANNEALED_STEPS")
+            .ok()
+            .map(|steps| posterior::annealed::Config {
+                steps: steps.parse().unwrap(),
+                paths: std::env::var("BUTTERCUP_ANNEALED_PATHS")
+                    .expect("set path count")
+                    .parse()
+                    .unwrap(),
+            });
+    let preserve_marginal_draws = std::env::var("BUTTERCUP_POSTERIOR_PAIRED_DRAWS")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let preserve_replica_draws = std::env::var("BUTTERCUP_POSTERIOR_REPLICA_ORIGINAL_DRAWS")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let tail_proposal = match std::env::var("BUTTERCUP_POSTERIOR_TAIL_PROPOSAL")
+        .ok()
+        .as_deref()
+    {
+        None => posterior::TailProposal::Off,
+        Some("pilot") => posterior::TailProposal::PilotOnly,
+        Some("recenter") => posterior::TailProposal::Recenter,
+        Some("refit") => posterior::TailProposal::Refit,
+        Some("conditional-refit") => posterior::TailProposal::ConditionalRefit,
+        Some("outlier-refit") => posterior::TailProposal::OutlierRefit,
+        Some("boundary-refit") => posterior::TailProposal::BoundaryRefit,
+        Some("boundary-defensive") => posterior::TailProposal::BoundaryDefensive,
+        Some("profile-affine") => posterior::TailProposal::ProfileAffine,
+        Some("profile-quadratic") => posterior::TailProposal::ProfileQuadratic,
+        _ => panic!("unknown tail proposal recipe"),
     };
     let mut cases = vec![
         "complete-same-eye",
@@ -3216,12 +4168,18 @@ fn support_case_posterior_reference(numerical_admission:bool,marginalize_unobser
             [true, false]
         };
         for eye in 0..2 {
-            let omitted = if case.ends_with("-inner") { BoundaryKind::PupillaryBoundary }
-                else { BoundaryKind::InnerLimbus };
+            let omitted = if case.ends_with("-inner") {
+                BoundaryKind::PupillaryBoundary
+            } else {
+                BoundaryKind::InnerLimbus
+            };
             fixture.arcs[eye].retain(|a| a.kind != omitted);
             fixture.hints[eye].retain(|a| a.0 != omitted);
         }
-        if matches!(case, "separated-outer-pupil" | "separated-outer-inner" | "complementary-stereo") {
+        if matches!(
+            case,
+            "separated-outer-pupil" | "separated-outer-inner" | "complementary-stereo"
+        ) {
             for eye in 0..if enabled[1] { 2 } else { 1 } {
                 fixture.arcs[eye].clear();
                 fixture.hints[eye].clear();
@@ -3242,8 +4200,11 @@ fn support_case_posterior_reference(numerical_admission:bool,marginalize_unobser
                     8,
                     1,
                 );
-                let inner = if case.ends_with("-inner") { BoundaryKind::InnerLimbus }
-                    else { BoundaryKind::PupillaryBoundary };
+                let inner = if case.ends_with("-inner") {
+                    BoundaryKind::InnerLimbus
+                } else {
+                    BoundaryKind::PupillaryBoundary
+                };
                 fixture.add_arc(eye, inner, 0.0, TAU, 32, 2);
                 fixture.hints[eye].retain(|(kind, _)| *kind == inner);
                 if enabled[1] {
@@ -3259,19 +4220,35 @@ fn support_case_posterior_reference(numerical_admission:bool,marginalize_unobser
         }
         let baseline = fixture.solve(enabled, 24).unwrap();
         let truth_rays = std::array::from_fn::<_, 2, _>(|eye| {
-            enabled[eye].then(|| normalized3(sub3(fixture.target,
-                fixture.scene.eyes[eye].unwrap().limbus_center.camera_mm)).unwrap())
+            enabled[eye].then(|| {
+                normalized3(sub3(
+                    fixture.target,
+                    fixture.scene.eyes[eye].unwrap().limbus_center.camera_mm,
+                ))
+                .unwrap()
+            })
         });
         let gaze_error_degrees = std::array::from_fn::<_, 2, _>(|eye| {
-            Some(dot3(truth_rays[eye]?, baseline.eye_gaze_directions[eye]?)
-                .clamp(-1.0, 1.0).acos().to_degrees())
+            Some(
+                dot3(truth_rays[eye]?, baseline.eye_gaze_directions[eye]?)
+                    .clamp(-1.0, 1.0)
+                    .acos()
+                    .to_degrees(),
+            )
         });
-        eprintln!("support-case-fit {}", serde_json::json!({"case":case,
+        eprintln!(
+            "support-case-fit {}",
+            serde_json::json!({"case":case,
             "truth_target_camera_mm":fixture.target,"selected_target_camera_mm":baseline.target_camera_mm,
             "truth_gaze_directions":truth_rays,"selected_gaze_directions":baseline.eye_gaze_directions,
             "gaze_error_degrees":gaze_error_degrees,"modeled_eyes":enabled,
-            "contract":"Independent noiseless 3D circle forward fixture; conditional synthetic geometry, not native gaze accuracy."}));
-        if std::env::var("BUTTERCUP_POSTERIOR_REFERENCE_FITS_ONLY").ok().as_deref()==Some("1") {
+            "contract":"Independent noiseless 3D circle forward fixture; conditional synthetic geometry, not native gaze accuracy."})
+        );
+        if std::env::var("BUTTERCUP_POSTERIOR_REFERENCE_FITS_ONLY")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
             continue;
         }
         for seed in [
@@ -3279,8 +4256,13 @@ fn support_case_posterior_reference(numerical_admission:bool,marginalize_unobser
             0x94c5_09a1_814f_753d,
             0x419b_79df_a2c7_5301,
         ] {
-            let budgets=if annealed_reference.is_some() {vec![8192]}
-                else if numerical_admission {vec![8192,65536]} else {vec![8192,65536,1048576]};
+            let budgets = if annealed_reference.is_some() {
+                vec![8192]
+            } else if numerical_admission {
+                vec![8192, 65536]
+            } else {
+                vec![8192, 65536, 1048576]
+            };
             for budget in budgets {
                 let solution = fixture
                     .solve_with_integration(
@@ -3312,31 +4294,49 @@ fn support_case_posterior_reference(numerical_admission:bool,marginalize_unobser
                     "posterior-case {case} {seed} {budget}: {} ESS {:.1} {:?}",
                     p.status, p.effective_samples, p.gaze_radius_90_degrees
                 );
-                eprintln!("support-case-numerics {}",serde_json::json!({"case":case,"seed":seed.to_string(),
-                    "budget":budget,"numerical_admission":numerical_admission,"conditional_scene":conditional_scene,"marginalize_unobserved_inner":marginalize_unobserved_inner,"preserve_marginal_draws":preserve_marginal_draws,"preserve_replica_draws":preserve_replica_draws,"tail_proposal":format!("{tail_proposal:?}"),"posterior":p.json()}));
-                if tail_proposal==posterior::TailProposal::Off {assert_eq!(p.pilot_samples,0);}
-                else {
-                    assert!(p.pilot_samples>0 && p.pilot_samples<=2048 && p.pilot_samples<=budget/4);
-                    assert!(p.feasible_samples<=p.samples-p.pilot_samples);
-                    assert!(p.adapted_proposals<=4);
-                    if tail_proposal==posterior::TailProposal::PilotOnly {assert_eq!(p.adapted_proposals,0);}
+                eprintln!(
+                    "support-case-numerics {}",
+                    serde_json::json!({"case":case,"seed":seed.to_string(),
+                    "budget":budget,"numerical_admission":numerical_admission,"conditional_scene":conditional_scene,"marginalize_unobserved_inner":marginalize_unobserved_inner,"preserve_marginal_draws":preserve_marginal_draws,"preserve_replica_draws":preserve_replica_draws,"tail_proposal":format!("{tail_proposal:?}"),"posterior":p.json()})
+                );
+                if tail_proposal == posterior::TailProposal::Off {
+                    assert_eq!(p.pilot_samples, 0);
+                } else {
+                    assert!(
+                        p.pilot_samples > 0
+                            && p.pilot_samples <= 2048
+                            && p.pilot_samples <= budget / 4
+                    );
+                    assert!(p.feasible_samples <= p.samples - p.pilot_samples);
+                    assert!(p.adapted_proposals <= 4);
+                    if tail_proposal == posterior::TailProposal::PilotOnly {
+                        assert_eq!(p.adapted_proposals, 0);
+                    }
                 }
-                assert_eq!(p.modeled_eyes,enabled);
-                if !enabled[1] {assert!(!p.supports_direction(1));}
-                if case=="complete-same-eye" {assert!(p.supports_direction(0));}
-                if case=="outer-only-mirror" {assert!(!p.supports_direction(0));}
+                assert_eq!(p.modeled_eyes, enabled);
+                if !enabled[1] {
+                    assert!(!p.supports_direction(1));
+                }
+                if case == "complete-same-eye" {
+                    assert!(p.supports_direction(0));
+                }
+                if case == "outer-only-mirror" {
+                    assert!(!p.supports_direction(0));
+                }
             }
         }
     }
 }
-
 
 #[test]
 fn exact_ellipse_distance_matches_independent_quartic_reference() {
     // Independent stationary-point quartic roots, including interior and
     // exterior points. These are synthetic coordinates, not corpus labels.
     let distance = EllipseDistance::new(Ellipse {
-        center: (12.0, -7.0), major_radius: 80.0, minor_radius: 11.0, angle: 0.73,
+        center: (12.0, -7.0),
+        major_radius: 80.0,
+        minor_radius: 11.0,
+        angle: 0.73,
     });
     for (point, expected) in [
         ((12.0, -7.0), -11.0),
@@ -3349,26 +4349,40 @@ fn exact_ellipse_distance_matches_independent_quartic_reference() {
         ((-3.0, 9.0), 10.926052395012624),
     ] {
         let actual = distance.residual_px(point);
-        assert!((actual - expected).abs() < 1.0e-8, "{point:?}: {actual} vs {expected}");
+        assert!(
+            (actual - expected).abs() < 1.0e-8,
+            "{point:?}: {actual} vs {expected}"
+        );
     }
 }
 
 #[test]
 fn exact_ellipse_distance_preserves_normal_offsets_and_handles_the_center() {
-    for (major, minor, angle) in [(40.0,40.0,0.0), (80.0,11.0,0.73), (17.0,8.0,-0.25)] {
-        let ellipse = Ellipse {center:(12.0,-7.0),major_radius:major,minor_radius:minor,angle};
+    for (major, minor, angle) in [(40.0, 40.0, 0.0), (80.0, 11.0, 0.73), (17.0, 8.0, -0.25)] {
+        let ellipse = Ellipse {
+            center: (12.0, -7.0),
+            major_radius: major,
+            minor_radius: minor,
+            angle,
+        };
         let distance = EllipseDistance::new(ellipse);
         assert!((distance.residual_px(ellipse.center) + minor).abs() < 1.0e-10);
-        let (sn,cs)=angle.sin_cos();
+        let (sn, cs) = angle.sin_cos();
         for i in 0..64 {
-            let phase=i as f64*std::f64::consts::TAU/64.0;
-            let (y,x)=phase.sin_cos();
-            let nx=x/major;let ny=y/minor;let norm=nx.hypot(ny);
-            for offset in [-0.2,0.0,0.2,10.0] {
-                let px=major*x+offset*nx/norm;let py=minor*y+offset*ny/norm;
-                let point=(12.0+cs*px-sn*py,-7.0+sn*px+cs*py);
-                assert!((distance.residual_px(point)-offset).abs()<1.0e-8,
-                    "{ellipse:?} phase {phase} offset {offset}: {}",distance.residual_px(point));
+            let phase = i as f64 * std::f64::consts::TAU / 64.0;
+            let (y, x) = phase.sin_cos();
+            let nx = x / major;
+            let ny = y / minor;
+            let norm = nx.hypot(ny);
+            for offset in [-0.2, 0.0, 0.2, 10.0] {
+                let px = major * x + offset * nx / norm;
+                let py = minor * y + offset * ny / norm;
+                let point = (12.0 + cs * px - sn * py, -7.0 + sn * px + cs * py);
+                assert!(
+                    (distance.residual_px(point) - offset).abs() < 1.0e-8,
+                    "{ellipse:?} phase {phase} offset {offset}: {}",
+                    distance.residual_px(point)
+                );
             }
         }
     }
@@ -3377,27 +4391,43 @@ fn exact_ellipse_distance_preserves_normal_offsets_and_handles_the_center() {
 #[test]
 fn exact_ellipse_distance_is_an_explicit_offline_metric_and_invalidates_cached_costs() {
     assert!(!posterior::IntegrationConfig::live().exact_conic_distances);
-    let fixture=Fixture::new([50.0,-150.0,250.0]);
-    fixture.with_request([true,true],24,|request| {
-        let baseline=Problem::new(request).unwrap();
-        let candidate=baseline.clone().with_exact_distances(true);
-        let p=baseline.initial;
-        let a=baseline.conics(&p).unwrap();let b=candidate.conics(&p).unwrap();
-        for (a,b) in a.iter().flatten().flatten().zip(b.iter().flatten().flatten()) {
-            assert_eq!(a.0,b.0);
+    let fixture = Fixture::new([50.0, -150.0, 250.0]);
+    fixture.with_request([true, true], 24, |request| {
+        let baseline = Problem::new(request).unwrap();
+        let candidate = baseline.clone().with_exact_distances(true);
+        let p = baseline.initial;
+        let a = baseline.conics(&p).unwrap();
+        let b = candidate.conics(&p).unwrap();
+        for (a, b) in a
+            .iter()
+            .flatten()
+            .flatten()
+            .zip(b.iter().flatten().flatten())
+        {
+            assert_eq!(a.0, b.0);
             assert!(a.1.is_none() && b.1.is_some());
         }
-        let selection=baseline.select(&a);
+        let selection = baseline.select(&a);
         for cache in &selection.cached_arcs {
-            let arc=cache.arc;let exact=b[arc.eye][arc.boundary].unwrap();
-            assert!(cache.at(arc,exact,1).is_none(),"a changed metric cannot reuse Sampson costs");
+            let arc = cache.arc;
+            let exact = b[arc.eye][arc.boundary].unwrap();
+            assert!(
+                cache.at(arc, exact, 1).is_none(),
+                "a changed metric cannot reuse Sampson costs"
+            );
         }
-        let solution=candidate.solution(&p,0.0).unwrap();
+        let solution = candidate.solution(&p, 0.0).unwrap();
         for arc in &solution.arcs {
-            let eye=arc.exposure.roi.0 as usize-1;
-            let conic=b[eye][boundary_index(arc.kind).unwrap()].unwrap();
-            let expected=(arc.points_roi_px.iter().map(|&p|conic.residual_px(p).powi(2)).sum::<f64>()/arc.points_roi_px.len() as f64).sqrt();
-            assert!((arc.rms_px-expected).abs()<1.0e-10);
+            let eye = arc.exposure.roi.0 as usize - 1;
+            let conic = b[eye][boundary_index(arc.kind).unwrap()].unwrap();
+            let expected = (arc
+                .points_roi_px
+                .iter()
+                .map(|&p| conic.residual_px(p).powi(2))
+                .sum::<f64>()
+                / arc.points_roi_px.len() as f64)
+                .sqrt();
+            assert!((arc.rms_px - expected).abs() < 1.0e-10);
         }
     });
 }

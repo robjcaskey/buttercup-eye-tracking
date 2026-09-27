@@ -8,11 +8,15 @@ use crate::geometry::{ellipse_axis_point, ellipse_coordinate, Ellipse};
 use std::cmp::Ordering as CmpOrdering;
 use std::f64::consts::PI;
 
+pub(crate) mod camera_mount;
+pub(crate) mod continuous_gaze_sign;
 pub(crate) mod fidelity;
 pub(crate) mod joint;
 pub(crate) use joint::{solve_joint_conics, JointConicRequest, JointConicUnavailable};
 #[cfg(test)]
 mod constraint_tests;
+pub(crate) mod parallax_sign;
+pub(crate) mod nested_pupil;
 
 /// Conservative camera-and-anatomy envelope for treating an image conic as
 /// the projection of the physical limbus.

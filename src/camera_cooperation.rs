@@ -25,6 +25,8 @@ static STOP: AtomicBool = AtomicBool::new(false);
 static WATCHDOG: Mutex<Option<thread::JoinHandle<()>>> = Mutex::new(None);
 const LIMIT: u64 = 65536;
 
+mod diagnostics;
+
 fn err(message: impl Into<String>) -> io::Error {
     io::Error::other(message.into())
 }
@@ -452,8 +454,9 @@ impl Session {
 /// Runs before any camera setup or worker creation. Contention waits inside
 /// this call; failure is a startup error, never a direct-camera fallback.
 pub(crate) fn start(capture: &str, control: &str) -> Result<(), String> {
+    let root = runtime_root();
     let session = Session::acquire(
-        runtime_root(),
+        root.clone(),
         capture
             .parse()
             .map_err(|e| format!("camera endpoint: {e}"))?,
@@ -462,7 +465,19 @@ pub(crate) fn start(capture: &str, control: &str) -> Result<(), String> {
             .map_err(|e| format!("control endpoint: {e}"))?,
         Duration::from_secs(10),
     )
-    .map_err(|e| format!("UPC camera startup refused: {e}"))?;
+    .map_err(|e| {
+        eprintln!(
+            "CAMERA OWNERSHIP STARTUP REFUSED: runtime={} capture={capture} control={control}: {e}",
+            root.display(),
+        );
+        eprintln!("CAMERA RECOVERY: restore the UPC camera publisher and its fresh descriptor, or wait for the current owner to release the camera. An existing unavailable runtime cannot authorize standalone access. Do not delete the runtime or replace its lock. See docs/camera-startup.md.");
+        format!("UPC camera startup refused: {e}")
+    })?;
+    eprintln!(
+        "CAMERA SESSION: ownership={} capture={capture} control={control} runtime={}",
+        if session.lease.is_some() { "UPC retained lease" } else { "standalone; UPC runtime absent" },
+        root.display(),
+    );
     let mut current = SESSION
         .lock()
         .unwrap_or_else(|_| fatal("camera session mutex poisoned"));
@@ -574,6 +589,7 @@ fn runtime_root() -> PathBuf {
 /// camera threads alive. Avoid dumping a potentially huge model-bearing core.
 fn fatal(reason: &str) -> ! {
     eprintln!("FATAL ASSERTION: UPC camera ownership invariant violated: {reason}");
+    eprintln!("CAMERA RECOVERY: this process is aborting all camera workers. Check initialization order and the UPC publisher/attachment, then restart the viewer; do not reuse the old session or remove ownership files. See docs/camera-startup.md.");
     unsafe {
         let limit = libc::rlimit {
             rlim_cur: 0,
@@ -586,9 +602,14 @@ fn fatal(reason: &str) -> ! {
 
 pub(crate) fn connect_timeout(address: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
     assert_access(Some(*address));
-    let stream = TcpStream::connect_timeout(address, timeout)?;
+    let result = TcpStream::connect_timeout(address, timeout);
+    // Ownership loss during a failed TCP attempt is still process-fatal. Only
+    // an ordinary transport failure may reach the caller or recovery hints.
     assert_access(Some(*address));
-    Ok(stream)
+    if let Err(error) = &result {
+        diagnostics::connection_failed(*address, timeout, error);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -783,6 +804,18 @@ mod tests {
             return;
         };
         match mode.as_str() {
+            "transport" => {
+                let endpoint = env::var("BUTTERCUP_UPC_TEST_ENDPOINT").unwrap();
+                start(&endpoint, "127.0.0.1:1").unwrap();
+                for _ in 0..2 {
+                    let error = connect_timeout(&endpoint.parse().unwrap(), Duration::from_millis(100))
+                        .unwrap_err();
+                    assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+                    assert_eq!(error.raw_os_error(), Some(libc::ECONNREFUSED));
+                }
+                finish();
+                return;
+            }
             "uninitialized" => {
                 let _: io::Result<_> = connect_timeout(
                     &env::var("BUTTERCUP_UPC_TEST_ENDPOINT")
@@ -807,6 +840,25 @@ mod tests {
             _ => panic!("unknown child scenario"),
         }
         panic!("camera invariant violation was not process-fatal");
+    }
+    #[test]
+    fn ordinary_connection_refusal_keeps_original_error_and_reports_recovery_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        drop(listener);
+        let f = Fixture::new();
+        let output = Command::new(env::current_exe().unwrap())
+            .args(["--exact", "camera_cooperation::tests::fatal_child", "--nocapture"])
+            .env("UPC_ROOT", f.path.join("absent"))
+            .env("BUTTERCUP_UPC_TEST_CHILD", "transport")
+            .env("BUTTERCUP_UPC_TEST_ENDPOINT", endpoint.to_string())
+            .output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(stderr.matches("CAMERA TCP UNAVAILABLE:").count(), 1, "{stderr}");
+        assert!(stderr.contains(&format!("endpoint={endpoint}")), "{stderr}");
+        assert!(stderr.contains("tools/deploy.py"), "{stderr}");
+        assert!(!stderr.contains("FATAL ASSERTION"), "{stderr}");
     }
     #[test]
     fn violations_abort_the_process_before_connecting_and_during_existing_sessions() {
@@ -841,6 +893,8 @@ mod tests {
             );
             assert!(String::from_utf8_lossy(&output.stderr)
                 .contains("FATAL ASSERTION: UPC camera ownership invariant violated"));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("CAMERA TCP UNAVAILABLE:"),
+                "ownership failures must never become recoverable transport errors");
             assert_eq!(
                 listener.accept().unwrap_err().kind(),
                 io::ErrorKind::WouldBlock

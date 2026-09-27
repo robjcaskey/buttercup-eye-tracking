@@ -37,6 +37,7 @@ pub(super) struct Report {
     eyes: [EyeEvidence; 2],
     publication: Option<Arc<PublishedJoint>>,
     sign_resolved: bool,
+    continuous_gaze_enabled: bool,
     skew_ns: Option<u64>,
 }
 
@@ -139,6 +140,7 @@ pub(super) fn inspect(snapshot: &Snapshot) -> Report {
         eyes: std::array::from_fn(|_| EyeEvidence::default()),
         publication: None,
         sign_resolved: false,
+        continuous_gaze_enabled: snapshot.continuous_gaze_sign,
         skew_ns: None,
     };
     for (i, result) in report.eyes.iter_mut().enumerate() {
@@ -250,6 +252,10 @@ pub(super) fn inspect(snapshot: &Snapshot) -> Report {
                 })
                 .filter_map(|f| joint_gaze_live::surface(f, true))
                 .any(|s| s.sign_resolved);
+            if publication.orientation_ready.is_some_and(|ready| !ready.into_iter().any(|v|v)) {
+                report.state="SCREEN ORIENTATION NEEDED";
+                report.reason="Look at the top plus during M calibration. Shift+M reorients using an existing display calibration.".into();
+            }
             for (i, eye) in report.eyes.iter_mut().enumerate() {
                 let mut used_square = 0.0;
                 let mut rejected_square = 0.0;
@@ -333,6 +339,8 @@ impl Report {
             "ipd_basis": "solved iris-center separation; metric scale prior dependent",
             "target_camera_mm": solution.map(|s| s.target_camera_mm),
             "direction_sign_resolved": self.sign_resolved,
+            "screen_orientation_ready": self.publication.as_ref().and_then(|p|p.orientation_ready),
+            "continuous_gaze_sign": self.publication.as_ref().filter(|_|self.continuous_gaze_enabled).and_then(|p|p.continuous_gaze_sign.as_ref()).map(|r|r.json()),
             "probability": null, "target_covariance": null,
             "uncertainty_status": solution.and_then(|s|s.posterior.as_ref()).map_or("not estimated",|p|p.status),
             "local_uncertainty": solution.and_then(|s|s.local_uncertainty.as_ref()).map(|u|u.json()),
@@ -371,6 +379,10 @@ impl Report {
         ];
         if let Some(p) = &self.publication {
             let s = &p.solution;
+            if let Some(report)=p.continuous_gaze_sign.as_ref().filter(|_|self.continuous_gaze_enabled) {
+                rows.push(format!("CONTINUOUS GAZE (EXPERIMENT): {}",report.status));
+                rows.push("Trajectory score does not establish sign truth.".into());
+            }
             if let Some(posterior) = &s.posterior {
                 rows.push(format!("MODEL UNCERTAINTY: {}", posterior.status));
                 rows.push(format!(
@@ -707,7 +719,12 @@ fn draw_stereo_segments_at(
         }
     });
     if joint.is_none() {
-        draw_text(pixels,width,height,4,8,"WAITING FOR MATCHING STEREO SEGMENTS",0x007e_8b98);
+        let message = if !frame.joint_gaze_active {
+            "STEREO OFF - SHIFT+3 TO ENABLE"
+        } else {
+            "WAITING FOR MATCHING STEREO SEGMENTS"
+        };
+        draw_text(pixels,width,height,4,8,message,0x007e_8b98);
     }
     draw_text(pixels,width,height,4,height.saturating_sub(24) as i32,"CURVES: FIT / DOTS: MEASURED POINTS",0x00ff_ffff);
     draw_text(pixels,width,height,4,height.saturating_sub(12) as i32,"FIT WEIGHT / X=REJECT / H=HELD LABEL",0x00ff_ffff);
@@ -1180,6 +1197,8 @@ mod tests {
             refinement_steps: 12,
         };
         let publication = Arc::new(PublishedJoint {
+            orientation_ready: None,
+            continuous_gaze_sign: None,
             exposures,
             sensor_origins_px: std::array::from_fn(|i| {
                 let p = snapshot.eyes[i]
@@ -1241,6 +1260,8 @@ mod tests {
                 .unwrap())
             .clone();
             publication.solution.posterior = Some(ModelPosterior {
+                direction_prior: Default::default(),
+                camera_mount: crate::conic_solver::camera_mount::CameraMount::Flexible,
                 status: "estimated-conditional",
                 samples: 512,
                 feasible_samples: 230,

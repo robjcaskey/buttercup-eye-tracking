@@ -18,10 +18,28 @@ use std::sync::mpsc::RecvTimeoutError;
 #[cfg(feature = "checkerboard")]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const SQUARE_MM: f64 = 102.0 / 6.0;
+/// Default physical pitch of the printed green/white target.
+pub const DEFAULT_SQUARE_MM: f64 = 102.0 / 6.0;
 pub const CENTRAL_SQUARES: usize = 6;
 pub const INNER_CORNERS: usize = CENTRAL_SQUARES + 1;
-pub const CENTRAL_SPAN_MM: f64 = SQUARE_MM * CENTRAL_SQUARES as f64;
+
+/// Measured square pitch of the physical board in use. Another board can be
+/// used by setting `BUTTERCUP_CHECKERBOARD_SQUARE_MM` to its measured pitch;
+/// the pitch only scales object points, so an error biases pose distance, not
+/// the fitted focal length or principal point.
+pub fn square_mm() -> f64 {
+    static PITCH: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *PITCH.get_or_init(|| match std::env::var("BUTTERCUP_CHECKERBOARD_SQUARE_MM") {
+        Ok(value) => match value.trim().parse::<f64>() {
+            Ok(pitch) if pitch.is_finite() && (2.0..=100.0).contains(&pitch) => pitch,
+            _ => panic!("BUTTERCUP_CHECKERBOARD_SQUARE_MM must be a pitch between 2 and 100 mm; got {value:?}"),
+        },
+        Err(_) => DEFAULT_SQUARE_MM,
+    })
+}
+pub fn central_span_mm() -> f64 {
+    square_mm() * CENTRAL_SQUARES as f64
+}
 
 const MIN_VIEWS: usize = 15;
 const MAX_TRAINING_RMS_PX: f64 = 2.5;
@@ -106,7 +124,7 @@ impl Default for StatusSnapshot {
             generation: 0,
             state: "off".to_string(),
             detail: format!(
-                "press C to collect the central {CENTRAL_SQUARES}x{CENTRAL_SQUARES} squares at {SQUARE_MM:.1} mm pitch"
+                "press C to collect the central {CENTRAL_SQUARES}x{CENTRAL_SQUARES} squares at {:.1} mm pitch", square_mm()
             ),
             frames_seen: 0,
             detections: 0,
@@ -237,8 +255,10 @@ impl Client {
         if frame.eye_index != self.eye_index.load(Ordering::Acquire)
             || frame.width < 64
             || frame.height < 64
-            || frame.width & 1 != 0
-            || frame.height & 1 != 0
+            // Only Quad Bayer planes need whole 2x2 phase blocks; the current
+            // camera service's linear snapshot is 500x375 (odd height).
+            || (frame.layout == SampleLayout::QuadBayerRaw10
+                && (frame.width & 1 != 0 || frame.height & 1 != 0))
             || frame.pixels.len() != frame.width.saturating_mul(frame.height)
             || frame.sensor_extent.0 == 0
             || frame.sensor_extent.1 == 0
@@ -801,9 +821,9 @@ impl WorkerSession {
             "focus_position": status.focus_position,
             "target": {
                 "colors": ["green", "white"],
-                "square_pitch_mm": SQUARE_MM,
+                "square_pitch_mm": square_mm(),
                 "central_intersections": [INNER_CORNERS, INNER_CORNERS],
-                "central_span_mm": CENTRAL_SPAN_MM,
+                "central_span_mm": central_span_mm(),
                 "outer_squares": "excluded",
             },
             "training_rms_px": status.training_rms_px,
@@ -849,9 +869,11 @@ fn start_worker(
                     match WorkerSession::new(&output, requested_generation) {
                         Ok(next) => {
                             eprintln!(
-                                "checkerboard calibration generation={} output={} square_pitch_mm={SQUARE_MM:.6} central_span_mm={CENTRAL_SPAN_MM:.3}",
+                                "checkerboard calibration generation={} output={} square_pitch_mm={:.6} central_span_mm={:.3}",
                                 requested_generation,
                                 next.output.display(),
+                                square_mm(),
+                                central_span_mm(),
                             );
                             session = Some(next);
                         }
@@ -997,9 +1019,9 @@ fn persist_accepted_raw(
         },
         "target": {
             "colors": ["green", "white"],
-            "square_pitch_mm": SQUARE_MM,
+            "square_pitch_mm": square_mm(),
             "central_intersections": [INNER_CORNERS, INNER_CORNERS],
-            "central_span_mm": CENTRAL_SPAN_MM,
+            "central_span_mm": central_span_mm(),
             "outer_squares": "excluded-before-fit",
         },
         "corners_sensor_px": view.image_points,
@@ -1210,8 +1232,8 @@ fn persist_fit(
         "readiness_reasons": readiness,
         "target": {
             "colors": ["green", "white"],
-            "square_pitch_mm": SQUARE_MM,
-            "central_span_mm": CENTRAL_SPAN_MM,
+            "square_pitch_mm": square_mm(),
+            "central_span_mm": central_span_mm(),
             "outer_squares": "excluded",
         },
         "method": "Zhang/Bouguet planar calibration with whole-view holdout",
@@ -1250,7 +1272,7 @@ fn persist_compatible_artifact(
         "holdout_view_count": fit.holdout_views,
         "holdout_rms_basis_px": fit.holdout_rms_px,
         "source": "native green/white checkerboard central 6x6-square calibration",
-        "square_pitch_mm": SQUARE_MM,
+        "square_pitch_mm": square_mm(),
         "auto_applied": false,
     });
     write_atomic_json(&output.join("camera-intrinsics-relative.json"), &document)
@@ -1397,8 +1419,8 @@ fn checker_object_points() -> opencv::core::Vector<opencv::core::Point3f> {
     for row in 0..INNER_CORNERS {
         for column in 0..INNER_CORNERS {
             points.push(Point3f::new(
-                (column as f64 * SQUARE_MM) as f32,
-                (row as f64 * SQUARE_MM) as f32,
+                (column as f64 * square_mm()) as f32,
+                (row as f64 * square_mm()) as f32,
                 0.0,
             ));
         }
@@ -1487,7 +1509,7 @@ fn project_fit_overlay(
         })
         .collect();
 
-    let axis_length = (CENTRAL_SPAN_MM * 0.45) as f32;
+    let axis_length = (central_span_mm() * 0.45) as f32;
     let axes = [
         Point3f::new(0.0, 0.0, 0.0),
         Point3f::new(axis_length, 0.0, 0.0),
@@ -1951,8 +1973,13 @@ fn central_complete_window(
     let mut windows = Vec::new();
     for start_row in 0..=rows - INNER_CORNERS {
         for start_column in 0..=columns - INNER_CORNERS {
-            let complete = (0..INNER_CORNERS).all(|row| {
-                (0..INNER_CORNERS).all(|column| {
+            // OpenCV metadata labels each corner as the top-left corner of a
+            // black/white cell; the last corner row and column of any grid have
+            // no cell and are always 0. Require the window's 6x6 cells, whose
+            // corners are exactly its 7x7 intersections. Requiring all 49 labels
+            // rejected every view of an exact 8x8 board.
+            let complete = (0..INNER_CORNERS - 1).all(|row| {
+                (0..INNER_CORNERS - 1).all(|column| {
                     metadata
                         .get((start_row + row) * columns + start_column + column)
                         .copied()

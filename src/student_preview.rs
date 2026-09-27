@@ -8,6 +8,8 @@ const LIMBUS: u32 = 0x0000_ffff;
 const PUPIL: u32 = 0x00ff_c857;
 const KEEP: u32 = 0x005f_ff69;
 const REJECT: u32 = 0x00ff_3ca6;
+const REFINEMENT_BEFORE: u32 = 0x0040_dfff;
+const REFINEMENT_AFTER: u32 = 0x00ff_60b5;
 const OTHER_MASKS: [u32; 4] = [0x00ff_a020, 0x00dd_60ff, 0x00ff_4050, 0x0060_a0ff];
 
 struct CachedSource {
@@ -23,7 +25,7 @@ thread_local! {
     static SOURCES: RefCell<[Option<CachedSource>; 2]> = const { RefCell::new([None, None]) };
 }
 
-fn source(frame: &EyeFrame) -> Option<&Arc<sam31_outer::ProposalMasks>> {
+pub(super) fn source(frame: &EyeFrame) -> Option<&Arc<sam31_outer::ProposalMasks>> {
     let p = frame.sam31_proposal_masks.as_ref()?;
     (p.eye_index < 2
         && frame.eye_id == p.eye_index as u32 + 1
@@ -40,7 +42,7 @@ pub(super) fn source_dimensions(frame: &EyeFrame) -> Option<(usize, usize)> {
     source(frame).map(|p| (p.source_width, p.source_height))
 }
 
-fn source_pixels(frame: &EyeFrame, mode: ViewMode) -> Option<Arc<Vec<u32>>> {
+pub(super) fn source_pixels(frame: &EyeFrame, mode: ViewMode) -> Option<Arc<Vec<u32>>> {
     let p = source(frame)?;
     Some(SOURCES.with(|sources| {
         let mut sources = sources.borrow_mut();
@@ -190,16 +192,23 @@ impl Layer<'_> {
     fn status(&mut self, message: &str) {
         // Missing evidence is explicit. Successful lean layers have no status
         // text covering the anatomy; the surrounding UI supplies view/clock.
-        draw_text_scaled(
-            self.pixels,
-            self.width,
-            self.height,
-            3,
-            3,
-            message,
-            PUPIL,
-            1,
-        );
+        let rows = message.lines().map(str::to_owned).collect::<Vec<_>>();
+        for (row, line) in viewer_ui::wrapped_lines(&rows, self.width.saturating_sub(6) / 6)
+            .iter()
+            .enumerate()
+            .take(self.height.saturating_sub(6) / 9)
+        {
+            draw_text_scaled(
+                self.pixels,
+                self.width,
+                self.height,
+                3,
+                3 + row as i32 * 9,
+                line,
+                PUPIL,
+                1,
+            );
+        }
     }
 
     fn masks(
@@ -300,15 +309,16 @@ impl Layer<'_> {
         let joint_ellipse = joint_gaze_live::source_ellipse(frame);
         let ellipse = joint_ellipse.unwrap_or(review.ellipse);
         self.ellipse(ellipse, LIMBUS);
-        let surface = frame.virtual_contact_surface_gaze.filter(|s| {
-            s.source_timestamp_ns == Some(p.source_timestamp_ns)
-                && s.sign_resolved
-                && s.relative_gaze.is_camera_facing()
-                && (!frame.joint_gaze_active || joint_ellipse.is_some())
-        });
+        let surface = match contact_surface(frame, p, joint_ellipse.is_some()) {
+            Ok(surface) => surface,
+            Err(reason) => {
+                self.status(reason);
+                return 0;
+            }
+        };
         let boundary = ellipse.dense_points(240);
-        let Some(pose) = provisional_surface_pose(surface, &boundary) else {
-            self.status("WAITING FOR SOURCE SURFACE DIRECTION");
+        let Some(pose) = provisional_surface_pose(Some(surface), &boundary) else {
+            self.status("SOURCE CONTACT GEOMETRY UNAVAILABLE");
             return 0;
         };
         // Four thin globe meridians only: no retained/rejected points, pupil
@@ -332,8 +342,222 @@ impl Layer<'_> {
             self.width,
             self.height,
         );
+        if !surface.sign_resolved {
+            // The stereo scene also displays the conditional candidate. Keep
+            // it inspectable here, but never promote it to accepted gaze.
+            self.status(
+                if surface
+                    .sign_diagnostics
+                    .is_some_and(|d| d.orientation_reference_ready == Some(false))
+                {
+                    "UNCONFIRMED DIRECTION\nSHIFT+M TO REORIENT"
+                } else {
+                    "UNCONFIRMED DIRECTION"
+                },
+            );
+        }
         1
     }
+}
+
+fn contact_surface(
+    frame: &EyeFrame,
+    p: &sam31_outer::ProposalMasks,
+    matched_joint: bool,
+) -> Result<SurfaceGazeSample, &'static str> {
+    if frame.gaze_policy_error.is_some() {
+        return Err("WAITING FOR CURRENT GAZE SETTINGS");
+    }
+    if frame.joint_gaze_active && !matched_joint {
+        return Err("WAITING FOR MATCHING STEREO SOURCE");
+    }
+    let surface = frame
+        .virtual_contact_surface_gaze
+        .filter(|s| s.source_timestamp_ns == Some(p.source_timestamp_ns))
+        .ok_or("WAITING FOR MATCHING SURFACE SOURCE")?;
+    if !surface.relative_gaze.is_camera_facing() {
+        return Err("NO CAMERA-FACING SOURCE SURFACE");
+    }
+    Ok(surface)
+}
+
+// Read only the worker's immutable decision. A rejected proposal is not an
+// "after" edge, and selecting this view must never load/run the refiner.
+fn refinement_edges(
+    p: &sam31_outer::ProposalMasks,
+) -> Option<(
+    &sam31_outer::OuterMaskFitReview,
+    Option<&sam31_outer::OuterMaskFitReview>,
+    String,
+)> {
+    let current = p.outer_fit.as_ref()?;
+    match p.limbus_refinement.as_ref() {
+        Some(attempt) if attempt.applied => {
+            let before = &attempt.baseline;
+            if before.retained_points.len() != current.retained_points.len() {
+                return Some((
+                    before,
+                    None,
+                    "SOURCE EDGE CORRESPONDENCE UNAVAILABLE".into(),
+                ));
+            }
+            let maximum = before
+                .retained_points
+                .iter()
+                .zip(current.retained_points.iter())
+                .map(|(a, b)| (a.0 - b.0).hypot(a.1 - b.1))
+                .fold(0_f64, f64::max);
+            Some((
+                before,
+                Some(current),
+                format!("REFINED / MAX SHIFT {maximum:.2} PX"),
+            ))
+        }
+        Some(attempt) => Some((
+            &attempt.baseline,
+            None,
+            format!("UNCHANGED / {}", attempt.status),
+        )),
+        None => Some((
+            current,
+            None,
+            "BASELINE ONLY / SHIFT+F TO TOGGLE REFINEMENT".into(),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_refinement_edges(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+    scale: usize,
+    p: &sam31_outer::ProposalMasks,
+) -> usize {
+    let comparison = refinement_edges(p);
+    let mut count = 0;
+    if let Some((before, after, _)) = &comparison {
+        // Draw at presentation resolution so a subpixel native correction
+        // remains visible when the source ROI is magnified. Trace only the
+        // retained samples and their original runs; never close missing arcs
+        // with a fitted ellipse, an eyelid chord, or a rejected model field.
+        let project = |q: (f64, f64)| {
+            (q.0.is_finite()
+                && q.1.is_finite()
+                && q.0 >= 0.
+                && q.1 >= 0.
+                && q.0 < p.source_width as f64
+                && q.1 < p.source_height as f64)
+                .then_some((x as f64 + q.0 * scale as f64, y as f64 + q.1 * scale as f64))
+        };
+        let mut paint = |q: (f64, f64), color: u32| {
+            let (px, py) = (q.0.round() as i32, q.1.round() as i32);
+            if px >= x.max(0)
+                && py >= y.max(0)
+                && px < (x + (p.source_width * scale) as i32).min(width as i32)
+                && py < (y + (p.source_height * scale) as i32).min(height as i32)
+            {
+                pixels[py as usize * width + px as usize] = color;
+            }
+        };
+        for (review, color, dashed) in [
+            Some((*before, REFINEMENT_BEFORE, false)),
+            after.map(|a| (a, REFINEMENT_AFTER, true)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for run in review.conic_segments.iter() {
+                let mut travelled = 0.;
+                for pair in run.windows(2) {
+                    let Some((a, b)) = review
+                        .retained_points
+                        .get(pair[0])
+                        .zip(review.retained_points.get(pair[1]))
+                    else {
+                        continue;
+                    };
+                    let Some((a, b)) = project(*a).zip(project(*b)) else {
+                        continue;
+                    };
+                    let length = (a.0 - b.0).hypot(a.1 - b.1);
+                    let steps = length.ceil().clamp(1., 8192.) as usize;
+                    for k in 0..=steps {
+                        let t = k as f64 / steps as f64;
+                        if !dashed || ((travelled + t * length) as usize / 4) % 2 == 0 {
+                            paint((a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1)), color);
+                        }
+                    }
+                    travelled += length;
+                }
+            }
+            // Isolated retained observations remain visible even without a run.
+            for q in review.retained_points.iter().filter_map(|q| project(*q)) {
+                paint(q, color);
+            }
+        }
+        count = before.retained_points.len();
+    }
+    let font = scale.clamp(1, 2);
+    let row = 9 * font as i32;
+    let columns = ((p.source_width * scale).saturating_sub(8) / (6 * font)).max(1);
+    let label = comparison
+        .as_ref()
+        .map_or("NO SOURCE LIMBUS EDGES".to_owned(), |(_, _, status)| {
+            status.clone()
+        });
+    let status = format!("SOURCE {} / {label}", p.source_sequence);
+    let status_lines = viewer_ui::wrapped_lines(&[status], columns);
+    fill_rect(
+        pixels,
+        width,
+        height,
+        x,
+        y,
+        (p.source_width * scale) as i32,
+        (status_lines.len().min(2) as i32 * row + 6).min((p.source_height * scale) as i32),
+        0x0010_1010,
+    );
+    for (i, line) in status_lines.iter().take(2).enumerate() {
+        draw_text_scaled(
+            pixels,
+            width,
+            height,
+            x + 3,
+            y + 3 + i as i32 * row,
+            line,
+            0x00ff_ffff,
+            font as i32,
+        );
+    }
+    let legend = viewer_ui::wrapped_lines(&["CYAN BEFORE / PINK DASHES AFTER".into()], columns);
+    let legend_rows = legend.len().min(2);
+    let legend_height = (legend_rows as i32 * row + 3).min((p.source_height * scale) as i32);
+    fill_rect(
+        pixels,
+        width,
+        height,
+        x,
+        y + (p.source_height * scale) as i32 - legend_height,
+        (p.source_width * scale) as i32,
+        legend_height,
+        0x0010_1010,
+    );
+    for (i, line) in legend.iter().take(legend_rows).enumerate() {
+        draw_text_scaled(
+            pixels,
+            width,
+            height,
+            x + 3,
+            y + (p.source_height * scale) as i32 - (legend_rows - i) as i32 * row,
+            line,
+            REFINEMENT_BEFORE,
+            font as i32,
+        );
+    }
+    count
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -355,7 +579,7 @@ pub(super) fn draw(
             height,
             x + 3,
             y + 3,
-            "WAITING FOR STUDENT SOURCE",
+            "WAITING FOR DETECTOR SOURCE",
             PUPIL,
             1,
         );
@@ -368,8 +592,10 @@ pub(super) fn draw(
         height: p.source_height,
     };
     let count = match overlay {
-        RoiOverlayMode::StereoContributions => viewer_ui::draw_stereo_segments(
-            layer.pixels, layer.width, layer.height, frame, p),
+        RoiOverlayMode::LimbusRefinementEdges => 0, // drawn after magnifying the source pixels below
+        RoiOverlayMode::StereoContributions => {
+            viewer_ui::draw_stereo_segments(layer.pixels, layer.width, layer.height, frame, p)
+        }
         RoiOverlayMode::SamOuterIrisMasks => layer.masks(p, true, false),
         RoiOverlayMode::SamSegmentationOnly => layer.masks(p, false, false),
         RoiOverlayMode::StudentMaskOutline => layer.masks(p, false, true),
@@ -383,8 +609,9 @@ pub(super) fn draw(
             }
         }
         RoiOverlayMode::SamDeflattenedVirtualContact => layer.contact(frame, p),
-        RoiOverlayMode::SamTweakedContactGeometry => limbus_refiner_view::draw(
-            layer.pixels, layer.width, layer.height, 0, 0, 1, frame),
+        RoiOverlayMode::SamTweakedContactGeometry => {
+            limbus_refiner_view::draw(layer.pixels, layer.width, layer.height, 0, 0, 1, frame)
+        }
         RoiOverlayMode::StudentSourceRaw => 0,
         RoiOverlayMode::SamOuterIrisFit
         | RoiOverlayMode::SamConicSegments
@@ -439,6 +666,9 @@ pub(super) fn draw(
                 image[row * p.source_width + column],
             );
         }
+    }
+    if overlay == RoiOverlayMode::LimbusRefinementEdges {
+        return draw_refinement_edges(pixels, width, height, x, y, scale, p);
     }
     count
 }
@@ -631,17 +861,19 @@ mod tests {
     fn student_cycle_adds_sparse_layers_without_changing_sam() {
         let method = SegmentationMode::EyeStudent;
         let available = RoiOverlayMode::available(method);
-        assert_eq!(available.len(), 12);
+        assert_eq!(available.len(), 15);
+        assert!(available.contains(&RoiOverlayMode::StereoContributions));
+        assert!(available.contains(&RoiOverlayMode::PinkWellSightline));
         assert_eq!(available.last(), Some(&RoiOverlayMode::FullDiagnostics));
         let mut mode = available[0];
         for (i, expected) in available.iter().enumerate() {
             assert_eq!(mode, *expected);
-            assert_eq!(mode.position_for(method), (i + 1, 12));
+            assert_eq!(mode.position_for(method), (i + 1, 15));
             assert!(!mode.label_for(method).contains("ENTER EDIT"));
             mode = mode.cycled_for(method);
         }
         assert_eq!(mode, available[0]);
-        assert_eq!(RoiOverlayMode::available(SegmentationMode::Sam31).len(), 8);
+        assert_eq!(RoiOverlayMode::available(SegmentationMode::Sam31).len(), 11);
         for mode in [
             RoiOverlayMode::StudentMaskOutline,
             RoiOverlayMode::StudentEllipseOnly,
@@ -779,7 +1011,211 @@ mod tests {
     }
 
     #[test]
-    fn student_contact_never_borrows_other_exposure_unsigned_or_concave_surface() {
+    fn refinement_edges_use_only_the_accepted_source_decision() {
+        let mut frame = fixture();
+        let p = Arc::make_mut(frame.sam31_proposal_masks.as_mut().unwrap());
+        let before = p.outer_fit.as_ref().unwrap().clone();
+        let mut after = before.clone();
+        after.retained_points = Arc::new(
+            before
+                .retained_points
+                .iter()
+                .map(|q| (q.0 + 0.35, q.1 + 0.25))
+                .collect(),
+        );
+        after.ellipse.center.0 += 0.35;
+        after.ellipse.center.1 += 0.25;
+        // A deliberately unrelated field must not replace the worker's final
+        // accepted edge product or make a rejected candidate look accepted.
+        p.limbus_refinement = Some(sam31_outer::limbus_refinement::Attempt {
+            baseline: before.clone(),
+            applied: true,
+            status: "TEST ACCEPTED".into(),
+            field: Some(Arc::new(limbus_refiner::Field {
+                baseline: before.ellipse,
+                unmodified_refit: None,
+                candidate: Some(before.ellipse),
+                samples: vec![],
+                corrected_points: vec![(2., 2.)],
+                elapsed_ms: 0.,
+                status: "UNRELATED FIELD",
+            })),
+        });
+        p.outer_fit = Some(after.clone());
+        let (a, b, status) = refinement_edges(p).unwrap();
+        assert_eq!(a.retained_points, before.retained_points);
+        assert_eq!(b.unwrap().retained_points, after.retained_points);
+        assert!(status.contains("0.43 PX"));
+        let expected = render(&frame, RoiOverlayMode::LimbusRefinementEdges);
+        for method in [SegmentationMode::Sam31, SegmentationMode::EyeStudent] {
+            let mut moved = frame.clone();
+            moved.segmentation_mode = method;
+            moved.width += 100;
+            moved.height += 80;
+            moved.sensor_x += 400;
+            moved.sensor_y += 200;
+            moved.quad_color = Arc::new(vec![0; moved.width * moved.height]);
+            moved.timestamp_ns += 9_000_000;
+            let authority = mouse_gaze_surface(&moved);
+            assert_eq!(
+                render(&moved, RoiOverlayMode::LimbusRefinementEdges),
+                expected
+            );
+            assert_eq!(mouse_gaze_surface(&moved), authority);
+        }
+        let p = Arc::make_mut(frame.sam31_proposal_masks.as_mut().unwrap());
+        p.limbus_refinement.as_mut().unwrap().applied = false;
+        p.limbus_refinement.as_mut().unwrap().status =
+            "REFINEMENT REJECTED: SOURCE RAW SUPPORT".into();
+        p.outer_fit = Some(before.clone());
+        let (a, b, status) = refinement_edges(p).unwrap();
+        assert_eq!(a.retained_points, before.retained_points);
+        assert!(b.is_none());
+        assert!(status.starts_with("UNCHANGED"));
+        assert!(!render(&frame, RoiOverlayMode::LimbusRefinementEdges).contains(&REFINEMENT_AFTER));
+        let p = Arc::make_mut(frame.sam31_proposal_masks.as_mut().unwrap());
+        p.limbus_refinement = None;
+        assert!(refinement_edges(p).unwrap().1.is_none());
+        p.outer_fit = None;
+        assert!(refinement_edges(p).is_none());
+    }
+
+    #[test]
+    fn refinement_edges_preserve_gaps_and_reveal_subpixel_changes_when_magnified() {
+        let mut frame = fixture();
+        let p = Arc::make_mut(frame.sam31_proposal_masks.as_mut().unwrap());
+        let mut before = p.outer_fit.as_ref().unwrap().clone();
+        before.retained_points = Arc::new(vec![(25., 55.), (45., 55.), (95., 55.), (115., 55.)]);
+        before.conic_segments = Arc::new(vec![vec![0, 1], vec![2, 3]]);
+        let mut after = before.clone();
+        after.retained_points = Arc::new(
+            before
+                .retained_points
+                .iter()
+                .map(|q| (q.0, q.1 + 0.35))
+                .collect(),
+        );
+        p.outer_fit = Some(after);
+        p.limbus_refinement = Some(sam31_outer::limbus_refinement::Attempt {
+            baseline: before,
+            field: None,
+            applied: true,
+            status: "TEST SUBPIXEL SHIFT".into(),
+        });
+        let p = frame.sam31_proposal_masks.as_ref().unwrap();
+        let (w, h, scale) = (640, 480, 4);
+        let mut image = vec![0; w * h];
+        draw_refinement_edges(&mut image, w, h, 0, 0, scale, p);
+        assert_eq!(image[220 * w + 140], REFINEMENT_BEFORE);
+        assert_eq!(image[221 * w + 100], REFINEMENT_AFTER);
+        for row in 218..224 {
+            assert!(
+                image[row * w + 200..row * w + 370].iter().all(|p| *p == 0),
+                "excluded gap must not get an ellipse/chord/pupil overlay"
+            );
+        }
+        if let Some(root) = std::env::var_os("BUTTERCUP_STUDENT_VIEW_TEST_EXPORT") {
+            let root = PathBuf::from(root);
+            std::fs::create_dir_all(&root).unwrap();
+            let mut image = vec![0; w * h];
+            draw(
+                &mut image,
+                w,
+                h,
+                0,
+                0,
+                scale,
+                &frame,
+                ViewMode::QuadColor,
+                RoiOverlayMode::LimbusRefinementEdges,
+            );
+            export_eye_ppm(&root.join("refinement-subpixel-gaps.ppm"), &image, w, h).unwrap();
+        }
+    }
+
+    #[test]
+    fn pink_well_uses_the_same_registered_source_for_both_detectors() {
+        let frame = fixture();
+        let expected = render(&frame, RoiOverlayMode::PinkWellSightline);
+        for method in [SegmentationMode::Sam31, SegmentationMode::EyeStudent] {
+            let mut moved = frame.clone();
+            moved.segmentation_mode = method;
+            moved.width += 64;
+            moved.height += 32;
+            moved.sensor_x += 200;
+            moved.sensor_y += 100;
+            moved.sequence += 20;
+            moved.quad_color = Arc::new(vec![0x00987654; moved.width * moved.height]);
+            let authority = mouse_gaze_surface(&moved);
+            assert_eq!(render(&moved, RoiOverlayMode::PinkWellSightline), expected);
+            assert_eq!(mouse_gaze_surface(&moved), authority);
+            assert_eq!(
+                moved.sam31_proposal_masks.as_ref().unwrap().source_sequence,
+                195
+            );
+        }
+    }
+
+    #[test]
+    fn contact_previews_the_conditional_candidate_without_authorizing_gaze() {
+        let mut frame = fixture();
+        let proposal = Arc::clone(frame.sam31_proposal_masks.as_ref().unwrap());
+        assert!(contact_surface(&frame, &proposal, false).is_ok());
+        let surface = frame.virtual_contact_surface_gaze.as_mut().unwrap();
+        surface.sign_resolved = false;
+        assert!(
+            !contact_surface(&frame, &proposal, false)
+                .unwrap()
+                .sign_resolved
+        );
+        assert!(render(&frame, RoiOverlayMode::SamDeflattenedVirtualContact).contains(&0x00ff_00ff));
+        assert!(
+            gaze_output_direction(&frame).is_none(),
+            "preview must not authorize a mouse direction"
+        );
+        frame
+            .virtual_contact_surface_gaze
+            .as_mut()
+            .unwrap()
+            .sign_diagnostics = Some(crate::eye_scene_model::SurfaceSignDiagnostics {
+            orientation_reference_ready: Some(false),
+            continuous_gaze: None,
+            evidence: crate::eye_scene_model::SurfaceSignEvidence::Unresolved,
+            selected_branch: 0,
+            branch_residual_ema_px: [f64::NAN; 2],
+            source_motion_residual_px: None,
+            temporal_margin_px: None,
+            pending_anchor_votes: 0,
+            near_frontal_continuation: false,
+        });
+        assert!(
+            !contact_surface(&frame, &proposal, false)
+                .unwrap()
+                .sign_resolved
+        );
+        frame.joint_gaze_active = true;
+        assert_eq!(
+            contact_surface(&frame, &proposal, false).unwrap_err(),
+            "WAITING FOR MATCHING STEREO SOURCE"
+        );
+        assert!(
+            !contact_surface(&frame, &proposal, true)
+                .unwrap()
+                .sign_resolved
+        );
+        frame
+            .virtual_contact_surface_gaze
+            .as_mut()
+            .unwrap()
+            .source_timestamp_ns = Some(1);
+        assert_eq!(
+            contact_surface(&frame, &proposal, true).unwrap_err(),
+            "WAITING FOR MATCHING SURFACE SOURCE"
+        );
+    }
+
+    #[test]
+    fn student_contact_never_borrows_other_exposure_or_concave_surface() {
         let mut frame = fixture();
         let good = frame.virtual_contact_surface_gaze.unwrap();
         for surface in [
@@ -789,10 +1225,6 @@ mod tests {
             },
             SurfaceGazeSample {
                 source_timestamp_ns: None,
-                ..good
-            },
-            SurfaceGazeSample {
-                sign_resolved: false,
                 ..good
             },
             SurfaceGazeSample {

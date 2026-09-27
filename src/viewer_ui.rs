@@ -2,6 +2,7 @@
 //! camera acquisition is always a separate, explicit action.
 use super::*;
 mod stereo;
+pub(super) mod void_sightline;
 pub(super) use stereo::draw_stereo_segments;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -33,9 +34,11 @@ pub(super) enum LinkedView {
     Compare,
     StereoSolver,
     StereoSegments,
+    LimbusRefinementEdges,
     Timing,
     Contacts,
     TweakedContacts,
+    PinkWellSightline,
     StudentMaskOutline,
     StudentEllipseOnly,
     StudentPupilOnly,
@@ -43,9 +46,9 @@ pub(super) enum LinkedView {
 impl LinkedView {
     fn available(method: SegmentationMode) -> &'static [Self] {
         match method {
-            SegmentationMode::Sam31 => &[Self::Compare, Self::StereoSolver, Self::StereoSegments, Self::Timing, Self::Contacts, Self::TweakedContacts],
-            SegmentationMode::EyeStudent => &[Self::Compare, Self::StereoSolver, Self::StereoSegments, Self::StudentEllipseOnly,
-                Self::StudentMaskOutline, Self::StudentPupilOnly, Self::Contacts, Self::TweakedContacts, Self::Timing],
+            SegmentationMode::Sam31 => &[Self::Compare, Self::StereoSolver, Self::StereoSegments, Self::LimbusRefinementEdges, Self::Timing, Self::Contacts, Self::TweakedContacts, Self::PinkWellSightline],
+            SegmentationMode::EyeStudent => &[Self::Compare, Self::StereoSolver, Self::StereoSegments, Self::LimbusRefinementEdges, Self::StudentEllipseOnly,
+                Self::StudentMaskOutline, Self::StudentPupilOnly, Self::Contacts, Self::TweakedContacts, Self::PinkWellSightline, Self::Timing],
             _ => &[Self::Compare, Self::Timing, Self::Contacts],
         }
     }
@@ -63,9 +66,11 @@ impl LinkedView {
             Self::Compare => "COMPARE",
             Self::StereoSolver => "STEREO SOLVER",
             Self::StereoSegments => "STEREO SEGMENTS / FITTING SUPPORT",
+            Self::LimbusRefinementEdges => "LIMBUS EDGES BEFORE / AFTER",
             Self::Timing => "SOURCE TIMING",
             Self::Contacts => "CONTACT GEOMETRY",
             Self::TweakedContacts => "TWEAKED CONTACT GEOMETRY / EXPERIMENTAL",
+            Self::PinkWellSightline => "PINK WELL + SIGHT LINE",
             Self::StudentMaskOutline => "STUDENT MASK OUTLINES",
             Self::StudentEllipseOnly => "STUDENT FITTED LIMBUS ONLY",
             Self::StudentPupilOnly => "STUDENT PUPIL ONLY",
@@ -206,6 +211,11 @@ impl Workspace {
             PreviewEditScope::GlobalDefaults => self.preview_defaults.overlay = overlay,
             PreviewEditScope::SelectedPreview => self.preview_overrides[self.selected].overlay = Some(overlay),
         }
+    }
+    /// Whether any eye preview currently shows a presentation-only buffer.
+    pub(super) fn wants_display_only_previews(&self) -> bool {
+        self.preview_defaults.pixels.uses_display_only_preview()
+            || self.preview_overrides.iter().any(|o| o.pixels.is_some_and(ViewMode::uses_display_only_preview))
     }
     fn set_pixels(&mut self, pixels: ViewMode) {
         match self.preview_edit_scope {
@@ -380,12 +390,21 @@ pub(super) enum Action {
     ResetPreviewOverrides,
     StereoSolver,
     ToggleStereo,
+    ToggleContinuousGazeSign,
     ToggleLimbusRefinement,
     CycleCameraMount,
     StereoLayer(stereo::Layer),
 }
 pub(super) fn apply(app: &mut App, action: Action) {
     match action {
+        Action::ToggleContinuousGazeSign => {
+            if let Ok(mut s)=app.shared.lock() {
+                let next=!s.continuous_gaze_sign_enabled;
+                if let Err(error)=set_continuous_gaze_sign_at(&mut s,next,Path::new(CONTINUOUS_GAZE_PATH)) {
+                    s.ui_prompt_request=Some(format!("Continuous sign unchanged: {error}"));
+                }
+            }
+        }
         Action::StereoSolver => {
             if app.shared.lock().is_ok_and(|s| s.segmentation_mode.uses_mask_geometry()) {
                 app.ui.scope = Scope::Linked;
@@ -397,8 +416,10 @@ pub(super) fn apply(app: &mut App, action: Action) {
             if let Ok(mut s)=app.shared.lock() {
                 let next=s.camera_mount.next();
                 if let Err(error)=set_camera_mount(&mut s,next) {
-                    s.monitor_location.status=format!("CAMERA MOUNT SAVE FAILED: {error}");
-                    eprintln!("CAMERA MOUNT SAVE FAILED: {error}");
+                    s.monitor_location.status=format!("CAMERA MOUNT UNCHANGED: {error}");
+                    s.ui_prompt_request=Some(error.clone());
+                    app.ui.panel=Panel::Selection;
+                    eprintln!("CAMERA MOUNT UNCHANGED: {error}");
                 }
             }
         }
@@ -415,7 +436,10 @@ pub(super) fn apply(app: &mut App, action: Action) {
             if let Ok(mut s) = app.shared.lock() {
                 if s.segmentation_mode.uses_mask_geometry() {
                     let enabled = !s.stereo_solver_enabled;
-                    set_stereo_solver(&mut s, enabled);
+                    if let Err(error)=set_stereo_solver_saved(&mut s, enabled, std::path::Path::new(STEREO_SOLVER_PATH)) {
+                        eprintln!("STEREO_SOLVER setting not saved: {error}");
+                        set_stereo_solver(&mut s, enabled);
+                    }
                 }
             }
         }
@@ -770,6 +794,7 @@ fn roi_card(
     enabled: bool,
     present: bool,
     checkerboard: &checkerboard_calibration::StatusSnapshot,
+    worker: &sam31_outer::StatusSnapshot,
 ) {
     let heading = format!(
         "{} / {}",
@@ -796,17 +821,27 @@ fn roi_card(
         c.text(body, "NO CURRENT ROI FRAME", MUTED);
         return;
     };
-    // Render native geometry once then fit the result into a bounded card.
-    // No scaling decision may change the inference frame or source clock.
+    // Most layers render once at native size. The before/after edge view
+    // needs presentation-resolution sampling before fitting into the card:
+    // otherwise native-pixel rounding erases subpixel refinement shifts.
+    // This never changes the inference frame or its source clock.
     let (source_width,source_height)=roi_card_source_size(frame,view.overlay);
-    let w = source_width + 16;
-    let h = source_height + 36;
+    let image = Rect { h: body.h.saturating_sub(20), ..body };
+    let pixel_scale = if view.overlay==RoiOverlayMode::LimbusRefinementEdges {
+        (image.w as f64/source_width.max(1) as f64)
+            .min(image.h as f64/source_height.max(1) as f64).ceil().clamp(1.,8.) as usize
+    } else {1};
+    let (draw_width,draw_height)=(source_width*pixel_scale,source_height*pixel_scale);
+    let w = draw_width + 16;
+    let h = draw_height + 36;
     let mut pixels = vec![BG; w * h];
     let checkerboard = checkerboard.overlay.as_ref().filter(|overlay| {
         overlay.eye_index == i
             && overlay.sensor_origin == (frame.sensor_x, frame.sensor_y)
             && overlay.timestamp_ns.abs_diff(frame.timestamp_ns) <= 1_000_000_000
     });
+    let waiting = method.uses_mask_geometry()
+        && (frame.sam31_proposal_masks.is_none() || worker.state == "error");
     draw_eye_with_spatial_debug(
         &mut pixels,
         w,
@@ -818,19 +853,24 @@ fn roi_card(
         "",
         false,
         present,
-        1,
-        view.overlay,
+        pixel_scale,
+        if waiting { RoiOverlayMode::Clean } else { view.overlay },
         checkerboard,
     );
-    let image = Rect {
-        h: body.h.saturating_sub(20),
-        ..body
-    };
-    let mut image_pixels = Vec::with_capacity(source_width * source_height);
-    for y in 28..28 + source_height {
-        image_pixels.extend_from_slice(&pixels[y * w + 8..y * w + 8 + source_width]);
+    let mut image_pixels = Vec::with_capacity(draw_width * draw_height);
+    for y in 28..28 + draw_height {
+        image_pixels.extend_from_slice(&pixels[y * w + 8..y * w + 8 + draw_width]);
     }
-    c.image(image, &image_pixels, source_width, source_height);
+    c.image(image, &image_pixels, draw_width, draw_height);
+    if waiting {
+        let lines = wrapped_lines(&worker_status_lines(method, worker), (body.w / 12).max(1));
+        let status = Rect {h: (lines.len() * 20).min(body.h), ..body};
+        c.fill(status, BG);
+        for (i, line) in lines.iter().enumerate().take(status.h / 20) {
+            c.text(Rect {y: status.y + i*20, h: 16, ..status}, line, ACCENT);
+        }
+        return;
+    }
     let source = frame
         .sam31_proposal_masks
         .as_ref()
@@ -851,8 +891,18 @@ fn roi_card(
     );
 }
 
+fn worker_status_lines(method: SegmentationMode, worker: &sam31_outer::StatusSnapshot) -> Vec<String> {
+    let detail = if worker.detail.contains("Cannot initialize CUDA without ATen_cuda") {
+        "CUDA hooks were initialized before the GPU library loaded. Restart the updated viewer."
+    } else { worker.detail.lines().next().unwrap_or("No worker status") };
+    vec![format!("{}: {}", method.display_label(), worker.state), detail.into(),
+        format!("Completed {} / queued {}", worker.completed_batches, worker.accepted_batches)]
+}
+
 fn roi_card_source_size(frame:&EyeFrame,overlay:RoiOverlayMode)->(usize,usize) {
-    if frame.segmentation_mode==SegmentationMode::EyeStudent && overlay.normalized_for(frame.segmentation_mode).uses_student_source() {
+    if (frame.segmentation_mode==SegmentationMode::EyeStudent && overlay.normalized_for(frame.segmentation_mode).uses_student_source())
+        || (frame.segmentation_mode.uses_mask_geometry() && matches!(overlay,
+            RoiOverlayMode::PinkWellSightline | RoiOverlayMode::LimbusRefinementEdges)) {
         return student_preview::source_dimensions(frame).unwrap_or((frame.width, frame.height));
     }
     if frame.segmentation_mode==SegmentationMode::Sam31 && overlay==RoiOverlayMode::SamTweakedContactGeometry {
@@ -890,6 +940,7 @@ fn split_pair(r: Rect) -> [Rect; 2] {
 
 #[derive(Clone)]
 struct Snapshot {
+    workers: [sam31_outer::StatusSnapshot; 2],
     lightbox_status: String,
     monitor_status:String,
     mouse_output_status: String,
@@ -899,6 +950,7 @@ struct Snapshot {
     method: SegmentationMode,
     second: bool,
     stereo: bool,
+    continuous_gaze_sign: bool,
     limbus_refinement: bool,
     camera_mount: eye_scene_model::CameraMount,
     object_running: bool,
@@ -952,6 +1004,7 @@ pub(super) fn render(
             method: s.segmentation_mode,
             second: s.second_roi_enabled,
             stereo: s.stereo_solver_enabled,
+            continuous_gaze_sign: s.continuous_gaze_sign_enabled,
             camera_mount: s.camera_mount,
             limbus_refinement: sam31_outer::limbus_refinement::mode()==sam31_outer::limbus_refinement::Mode::Experimental,
             object_running: s.sam31_object_inspection,
@@ -981,6 +1034,7 @@ pub(super) fn render(
             host_telemetry: app.host_telemetry.clone(),
             camera_telemetry: app.camera_telemetry.clone(),
             checkerboard: app.checkerboard_status.clone(),
+            workers: s.sam31_worker_status.clone(),
             analysis_detail: s.segmentation_status.clone(),
         }
     };
@@ -1002,10 +1056,14 @@ pub(super) fn render(
             "global_gaze":{"detector":s.segmentation_mode.label(),"settings_generation":s.segmentation_generation,
                 "detector_display":s.segmentation_mode.display_label(),
                 "stereo_enabled":s.stereo_solver_enabled,
+                "continuous_gaze_sign_enabled":s.continuous_gaze_sign_enabled,
+                "continuous_gaze_sign_hotkey":"F9",
                 "limbus_refinement":sam31_outer::limbus_refinement::mode().label(),
                 "calibration_reloaded":app.calibrated_display.is_some_and(|c|c.restored),
                 "calibration_file":GAZE_CALIBRATION_PATH,
                 "camera_mount":s.camera_mount.label(),"camera_mount_hotkey":"F8",
+                "expected_camera_mount":s.expected_camera_mount.map(|m|m.label()),
+                "mount_conflict":camera_mount_conflict(s.camera_mount,s.expected_camera_mount),
                 "reference_eye":eye_name(app.focus_eye),"outputs":"focus / uinput / J cursor / calibration / accuracy"},
             "monitor":s.monitor_location.snapshot(),
             "mouse_output":s.mouse_output.snapshot(),
@@ -1066,6 +1124,9 @@ pub(super) fn configure_hotkeys(
         key: "3", label: "Toggle stereo solver",
     });
     map.bindings.push(keyboard_peeper::Binding {
+        modifiers: 0, enabled: !editing, key: "F9", label: "Toggle continuous gaze sign",
+    });
+    map.bindings.push(keyboard_peeper::Binding {
         // KPP/1 uses bit 1 for Shift (independent of winit's bit layout).
         modifiers: 1 << 1,
         enabled: !editing,
@@ -1109,6 +1170,7 @@ fn render_snapshot(
         method,
         second,
         stereo,
+        continuous_gaze_sign,
         limbus_refinement,
         camera_mount,
         object_running,
@@ -1124,6 +1186,7 @@ fn render_snapshot(
         record,
         eyes,
         source_arrival_age: _,
+        workers: _,
         present,
         backdrop,
         editor,
@@ -1228,6 +1291,19 @@ fn render_snapshot(
             if stereo { "STEREO ON" } else { "STEREO OFF" }, stereo, Action::ToggleStereo);
     }
     let mut area = layout.canvas.inset(8);
+    let sign_row=Rect {h:32.min(area.h),..area};
+    area.y+=sign_row.h;area.h-=sign_row.h;
+    button(&mut c,ui,Rect {w:292.min(sign_row.w),h:28.min(sign_row.h),..sign_row},
+        if continuous_gaze_sign {"F9 CONTINUOUS SIGN ON"} else {"F9 CONTINUOUS SIGN OFF"},
+        continuous_gaze_sign,Action::ToggleContinuousGazeSign);
+    if continuous_gaze_sign && sign_row.w>300 {
+        let status=snapshot.eyes.iter().flatten().find_map(|frame| {
+            if stereo {frame.joint_conic.as_ref().and_then(|p|p.continuous_gaze_sign.as_ref()).map(|r|r.status)}
+            else {frame.virtual_contact_surface_gaze.or(frame.surface_gaze)
+                .and_then(|s|s.sign_diagnostics).and_then(|d|d.continuous_gaze).map(|r|r.status)}
+        }).unwrap_or("waiting for fresh sign evidence");
+        c.text(Rect {x:sign_row.x+300,w:sign_row.w-300,..sign_row},&format!("EXPERIMENT: {status}"),MUTED);
+    }
     if stereo && method.uses_mask_geometry() && !object_running
         && matches!(ui.scope, Scope::Roi | Scope::Linked) && !ui.stereo_view()
         && area.h >= 180 && area.w >= 240
@@ -1279,6 +1355,7 @@ fn render_snapshot(
                 i == 0 || second,
                 present[i],
                 &checkerboard,
+                &snapshot.workers[i],
             );
             overview(&mut c, context, backdrop.as_ref(), &eyes);
         }
@@ -1307,6 +1384,8 @@ fn render_snapshot(
                     LinkedView::StudentMaskOutline => view.overlay = RoiOverlayMode::StudentMaskOutline,
                     LinkedView::StudentEllipseOnly => view.overlay = RoiOverlayMode::StudentEllipseOnly,
                     LinkedView::StudentPupilOnly => view.overlay = RoiOverlayMode::StudentPupilOnly,
+                    LinkedView::PinkWellSightline => view.overlay = RoiOverlayMode::PinkWellSightline,
+                    LinkedView::LimbusRefinementEdges => view.overlay = RoiOverlayMode::LimbusRefinementEdges,
                     _ => {}
                 }
                 roi_card(
@@ -1319,6 +1398,7 @@ fn render_snapshot(
                     i == 0 || second,
                     present[i],
                     &checkerboard,
+                    &snapshot.workers[i],
                 );
             }
             let info = Rect {
@@ -1481,6 +1561,7 @@ fn render_snapshot(
         text_area.h = text_area.h.saturating_sub(32);
     }
     let mut rows = vec![format!("F8 CAMERA MOUNT: {} (ASSUMPTION)",camera_mount.label().to_ascii_uppercase())];
+    rows.push(camera_mount.description().into());
     if ui.panel == Panel::Analysis && method.uses_mask_geometry() {
         let rect = Rect { h: 28.min(text_area.h), ..text_area };
         button(&mut c, ui, rect, "OPEN STEREO SOLVER", ui.stereo_view(), Action::StereoSolver);
@@ -1735,7 +1816,7 @@ fn text_rows(c: &mut Canvas, r: Rect, rows: &[String], scroll: usize) {
     }
 }
 
-fn wrapped_lines(rows: &[String], cols: usize) -> Vec<String> {
+pub(super) fn wrapped_lines(rows: &[String], cols: usize) -> Vec<String> {
     let cols = cols.max(1);
     let mut result = vec![];
     for row in rows {
@@ -1765,6 +1846,25 @@ fn wrapped_lines(rows: &[String], cols: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn missing_sam_answer_shows_wrapped_error_in_both_roi_cards() {
+        let mut snapshot = example_snapshot();
+        for frame in snapshot.eyes.iter_mut().flatten() { frame.sam31_proposal_masks = None; }
+        snapshot.workers = std::array::from_fn(|_| sam31_outer::StatusSnapshot {
+            state: "error", detail: "Cannot initialize CUDA without ATen_cuda library\nfull native stack".into(),
+            ..Default::default()
+        });
+        let lines=wrapped_lines(&worker_status_lines(SegmentationMode::Sam31,&snapshot.workers[0]),25);
+        assert!(lines.len()>2);
+        assert!(lines.iter().all(|l|l.chars().count()<=25 && !l.contains("...")));
+        assert!(lines.join(" ").contains("Restart the updated viewer."));
+        let mut pixels=vec![0;1200*850];
+        let mut ui=Workspace::default();ui.scope=Scope::Linked;ui.linked=LinkedView::Contacts;
+        render_snapshot(&mut ui,&mut pixels,1200,850,&snapshot);
+        if let Some(dir)=std::env::var_os("BUTTERCUP_UI_TEST_EXPORT") {
+            export_eye_ppm(&PathBuf::from(dir).join("sam-worker-error.ppm"),&pixels,1200,850).unwrap();
+        }
+    }
     pub(super) fn example_snapshot() -> Snapshot {
         let mut frame = crate::tests::control_eye_frame(120);
         frame.width = 384;
@@ -1810,6 +1910,7 @@ mod tests {
         left.timestamp_ns += 10_000_000;
         left.sensor_x += 1200;
         Snapshot {
+            workers: std::array::from_fn(|_| sam31_outer::StatusSnapshot::default()),
             lightbox_status: "B lightbox OFF / N SOLID WHITE".into(),
             method: SegmentationMode::Sam31,
             mouse_output_status: "MOUSE OFF / Super+Shift+M".into(),
@@ -1817,6 +1918,7 @@ mod tests {
             gaze_settings_status: "GLOBAL GAZE: SAM31 / SUBJECT RIGHT".into(),
             second: true,
             stereo: true,
+            continuous_gaze_sign: false,
             limbus_refinement: false,
             camera_mount: eye_scene_model::CameraMount::Flexible,
             object_running: false,
@@ -1846,6 +1948,26 @@ mod tests {
             analysis_detail: "SYNTHETIC FIXTURE".into(),
             monitor_status:"MONITOR POSE SESSION ONLY".into(),
             monitor_unsaved:true,
+        }
+    }
+    #[test]
+    fn continuous_sign_control_is_global_across_detectors_and_stereo_modes() {
+        for method in [SegmentationMode::Native,SegmentationMode::Sam31,SegmentationMode::EyeStudent] {
+            for stereo in [false,true] {
+                for (w,h) in [(320,240),(640,480),(1200,850)] {
+                    let mut snapshot=example_snapshot();snapshot.method=method;snapshot.stereo=stereo;
+                    snapshot.continuous_gaze_sign=true;
+                    let mut ui=Workspace::default();let mut pixels=vec![0;w*h];
+                    render_snapshot(&mut ui,&mut pixels,w,h,&snapshot);
+                    let (r,_)=ui.hits.iter().find(|(_,a)|matches!(a,Action::ToggleContinuousGazeSign))
+                        .expect("sign control must be available without stereo");
+                    assert!(r.w>0 && r.h>0 && r.x+r.w<=w && r.y+r.h<=h);
+                    if let Some(dir)=std::env::var_os("BUTTERCUP_UI_TEST_EXPORT") {
+                        export_eye_ppm(&PathBuf::from(dir).join(format!("continuous-{}-{stereo}-{w}x{h}.ppm",method.label())),
+                            &pixels,w,h).unwrap();
+                    }
+                }
+            }
         }
     }
     #[test]
@@ -2038,9 +2160,11 @@ mod tests {
     #[test]
     fn tweaked_contact_is_available_for_both_mask_methods() {
         assert_eq!(LinkedView::Contacts.next(SegmentationMode::Sam31),LinkedView::TweakedContacts);
-        assert_eq!(LinkedView::TweakedContacts.next(SegmentationMode::Sam31),LinkedView::Compare);
+        assert_eq!(LinkedView::TweakedContacts.next(SegmentationMode::Sam31),LinkedView::PinkWellSightline);
+        assert_eq!(LinkedView::PinkWellSightline.next(SegmentationMode::Sam31),LinkedView::Compare);
         assert_eq!(LinkedView::Contacts.next(SegmentationMode::EyeStudent),LinkedView::TweakedContacts);
-        assert_eq!(LinkedView::TweakedContacts.next(SegmentationMode::EyeStudent),LinkedView::Timing);
+        assert_eq!(LinkedView::TweakedContacts.next(SegmentationMode::EyeStudent),LinkedView::PinkWellSightline);
+        assert_eq!(LinkedView::PinkWellSightline.next(SegmentationMode::EyeStudent),LinkedView::Timing);
         let mut snapshot=example_snapshot();
         snapshot.method=SegmentationMode::Sam31;
         let mut ui=Workspace::default();
@@ -2064,11 +2188,63 @@ mod tests {
             source_width:384,source_height:256,source_raw:Arc::new(vec![100;384*256]),
             ..Default::default()}));
         assert_eq!(roi_card_source_size(&frame,RoiOverlayMode::SamTweakedContactGeometry),(384,256));
+        assert_eq!(roi_card_source_size(&frame,RoiOverlayMode::PinkWellSightline),(384,256));
+        assert_eq!(roi_card_source_size(&frame,RoiOverlayMode::LimbusRefinementEdges),(384,256));
         assert_eq!(roi_card_source_size(&frame,RoiOverlayMode::Clean),(420,280));
         frame.segmentation_mode=SegmentationMode::EyeStudent;
         assert_eq!(roi_card_source_size(&frame,RoiOverlayMode::SamTweakedContactGeometry),(384,256));
+        assert_eq!(roi_card_source_size(&frame,RoiOverlayMode::PinkWellSightline),(384,256));
+        assert_eq!(roi_card_source_size(&frame,RoiOverlayMode::LimbusRefinementEdges),(384,256));
         Arc::make_mut(frame.sam31_proposal_masks.as_mut().unwrap()).source_raw=Arc::default();
         assert_eq!(roi_card_source_size(&frame,RoiOverlayMode::SamTweakedContactGeometry),(420,280));
+        assert_eq!(roi_card_source_size(&frame,RoiOverlayMode::PinkWellSightline),(420,280));
+        assert_eq!(roi_card_source_size(&frame,RoiOverlayMode::LimbusRefinementEdges),(420,280));
+    }
+
+    #[test]
+    fn limbus_edge_card_preserves_subpixel_corrections_through_presentation_scaling() {
+        const BEFORE:u32=0x0040_dfff;
+        const AFTER:u32=0x00ff_60b5;
+        let mut frame=example_snapshot().eyes[0].take().unwrap();
+        let p=Arc::make_mut(frame.sam31_proposal_masks.as_mut().unwrap());
+        p.source_width=160;p.source_height=120;
+        p.source_raw=Arc::new(vec![400;160*120]);
+        let mut baseline=p.outer_fit.as_ref().unwrap().clone();
+        baseline.retained_points=Arc::new(vec![(25.,55.),(45.,55.),(95.,55.),(115.,55.)]);
+        baseline.conic_segments=Arc::new(vec![vec![0,1],vec![2,3]]);
+        let mut refined=baseline.clone();
+        refined.retained_points=Arc::new(baseline.retained_points.iter()
+            .map(|q|(q.0,q.1+0.35)).collect());
+        let (w,h)=(900,700);
+        let render=|frame:&EyeFrame| {
+            let mut pixels=vec![BG;w*h];
+            roi_card(&mut Canvas {pixels:&mut pixels,w,h},Rect {x:0,y:0,w,h},
+                Some(frame),0,RoiView {pixels:ViewMode::QuadColor,
+                    overlay:RoiOverlayMode::LimbusRefinementEdges},frame.segmentation_mode,
+                true,true,&Default::default(),&Default::default());
+            pixels
+        };
+        for method in [SegmentationMode::Sam31,SegmentationMode::EyeStudent] {
+            frame.segmentation_mode=method;
+            let p=Arc::make_mut(frame.sam31_proposal_masks.as_mut().unwrap());
+            p.outer_fit=Some(baseline.clone());p.limbus_refinement=None;
+            let before=render(&frame);
+            let p=Arc::make_mut(frame.sam31_proposal_masks.as_mut().unwrap());
+            p.outer_fit=Some(refined.clone());
+            p.limbus_refinement=Some(sam31_outer::limbus_refinement::Attempt {
+                baseline:baseline.clone(),field:None,applied:true,status:"TEST SUBPIXEL SHIFT".into(),
+            });
+            let after=render(&frame);
+            // Native-size rasterization rounds both traces onto the same row.
+            // The actual UI card must preserve their displacement at screen size.
+            assert!(after.iter().zip(&before).filter(|(a,b)|**a==AFTER && **b!=BEFORE).count()>20,
+                "subpixel refinement must survive the final image card for {method:?}");
+            assert!(after.contains(&BEFORE));
+            if let Some(dir)=std::env::var_os("BUTTERCUP_UI_TEST_EXPORT") {
+                export_eye_ppm(&PathBuf::from(dir).join(format!("limbus-edge-card-{method:?}.ppm")),
+                    &after,w,h).unwrap();
+            }
+        }
     }
 
     #[test]
@@ -2220,6 +2396,7 @@ mod tests {
         let mut pixels = vec![0; 1200 * 850];
         let views = LinkedView::available(snapshot.method);
         assert!(views.contains(&LinkedView::StudentEllipseOnly));
+        assert!(views.contains(&LinkedView::LimbusRefinementEdges));
         assert!(views.contains(&LinkedView::StudentMaskOutline));
         assert!(views.contains(&LinkedView::StudentPupilOnly));
         for index in 0..views.len() {
@@ -2230,7 +2407,7 @@ mod tests {
         assert_eq!(ui.linked, LinkedView::Compare);
         assert_eq!(ui.preview_defaults, original);
         assert_eq!(LinkedView::available(SegmentationMode::Sam31),
-            &[LinkedView::Compare, LinkedView::StereoSolver, LinkedView::StereoSegments, LinkedView::Timing, LinkedView::Contacts, LinkedView::TweakedContacts]);
+            &[LinkedView::Compare, LinkedView::StereoSolver, LinkedView::StereoSegments, LinkedView::LimbusRefinementEdges, LinkedView::Timing, LinkedView::Contacts, LinkedView::TweakedContacts, LinkedView::PinkWellSightline]);
     }
 
     #[test]

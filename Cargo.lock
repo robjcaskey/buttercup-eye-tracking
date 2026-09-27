@@ -142,6 +142,7 @@ dependencies = [
  "sha2",
  "softbuffer",
  "tch",
+ "wayland-client",
  "winit",
  "zip",
 ]

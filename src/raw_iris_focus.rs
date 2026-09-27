@@ -14013,7 +14013,11 @@ fn coarse_limbus_seed_from_plane(
     let maximum_center_x = width.saturating_sub(3);
     let maximum_center_y = height.saturating_sub(3);
     let center_step = 4;
-    for center_y in (minimum_center_y..maximum_center_y).step_by(center_step) {
+    // Rows are scored in parallel and consumed in the original row-major,
+    // radius-ascending order, so both leader lists are exactly the serial ones.
+    let center_rows = (minimum_center_y..maximum_center_y).step_by(center_step).collect::<Vec<_>>();
+    let scored_rows = crate::parallel_work::ordered_map(&center_rows, 2, |&center_y| {
+        let mut row = Vec::new();
         for center_x in (minimum_center_x..maximum_center_x).step_by(center_step) {
             let mut radius = minimum_radius;
             while radius <= maximum_radius {
@@ -14025,21 +14029,26 @@ fn coarse_limbus_seed_from_plane(
                     radius,
                     dark_center_limit,
                 ) {
-                    if candidate.censored_edges == 0 {
-                        leaders.push(candidate);
-                    } else {
-                        truncated_leaders.push(candidate);
-                    }
+                    row.push(candidate);
                 }
                 radius += 2.0;
             }
+        }
+        row
+    });
+    for candidate in scored_rows.into_iter().flatten() {
+        if candidate.censored_edges == 0 {
+            leaders.push(candidate);
+        } else {
+            truncated_leaders.push(candidate);
         }
     }
     // A crop edge censors evidence; it is not negative evidence. Run a
     // separate, still fixed-size beam only for circles that intersect an ROI
     // boundary. These hypotheses must later win on their observable material
     // ordering, rather than receiving a generic edge bonus.
-    for center_y in (minimum_center_y..maximum_center_y).step_by(center_step) {
+    let censored_rows = crate::parallel_work::ordered_map(&center_rows, 2, |&center_y| {
+        let mut row = Vec::new();
         for center_x in (minimum_center_x..maximum_center_x).step_by(center_step) {
             let center = (center_x as f64, center_y as f64);
             let mut radius = minimum_radius;
@@ -14054,13 +14063,15 @@ fn coarse_limbus_seed_from_plane(
                         dark_center_limit,
                         true,
                     ) {
-                        truncated_leaders.push(candidate);
+                        row.push(candidate);
                     }
                 }
                 radius += 2.0;
             }
         }
-    }
+        row
+    });
+    truncated_leaders.extend(censored_rows.into_iter().flatten());
     // A 9x6-style spatial beam keeps distinct compact voids alive. Around
     // each void, test only a small family of 3D-meridian-compatible limbus
     // scales. This recovers a large, clipped eye even when a smaller glasses
@@ -14115,14 +14126,16 @@ fn coarse_limbus_seed_from_plane(
     // Pupil topology is more expensive than a 17-ray material check.  Apply
     // it only to a bounded shortlist, then rerank before fine refinement.
     leaders.truncate(64);
-    for candidate in &mut leaders {
-        *candidate =
-            add_reduced_pupil_topology(plane, width, height, dark_center_limit, *candidate);
-    }
+    leaders = crate::parallel_work::ordered_map(&leaders, 8, |candidate| {
+        add_reduced_pupil_topology(plane, width, height, dark_center_limit, *candidate)
+    });
     leaders.sort_by(|left, right| right.score.total_cmp(&left.score));
     leaders.truncate(4);
     let mut best = leaders.first().copied();
-    for leader in leaders {
+    // Enumerate the refinement lattice in the original leader/dy/dx/dr order,
+    // score in parallel, then apply the same strict-improvement rule serially.
+    let mut lattice = Vec::with_capacity(leaders.len() * 75);
+    for leader in &leaders {
         for dy in -2..=2 {
             for dx in -2..=2 {
                 let center = (leader.center.0 + dx as f64, leader.center.1 + dy as f64);
@@ -14138,27 +14151,20 @@ fn coarse_limbus_seed_from_plane(
                     if radius < minimum_radius || radius > maximum_radius + 1.0 {
                         continue;
                     }
-                    if let Some(candidate) = score_reduced_limbus_candidate(
-                        plane,
-                        width,
-                        height,
-                        center,
-                        radius,
-                        dark_center_limit,
-                    ) {
-                        let candidate = add_reduced_pupil_topology(
-                            plane,
-                            width,
-                            height,
-                            dark_center_limit,
-                            candidate,
-                        );
-                        if best.is_none_or(|old| candidate.score > old.score) {
-                            best = Some(candidate);
-                        }
-                    }
+                    lattice.push((center, radius));
                 }
             }
+        }
+    }
+    let refined = crate::parallel_work::ordered_map(&lattice, 16, |&(center, radius)| {
+        score_reduced_limbus_candidate(plane, width, height, center, radius, dark_center_limit)
+            .map(|candidate| {
+                add_reduced_pupil_topology(plane, width, height, dark_center_limit, candidate)
+            })
+    });
+    for candidate in refined.into_iter().flatten() {
+        if best.is_none_or(|old| candidate.score > old.score) {
+            best = Some(candidate);
         }
     }
 

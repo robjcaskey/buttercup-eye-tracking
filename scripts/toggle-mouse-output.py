@@ -15,14 +15,14 @@ IDENTIFIER = "0:0:Buttercup_Gaze_Pointer"
 SOCKET = "/tmp/buttercup-eye-control.sock"
 
 
-def command(path, action, *, focus=False):
+def command(path, action, *, focus=False, eyes=False, cursor=False):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(2)
         try:
             connection.connect(path)
         except (FileNotFoundError, ConnectionRefusedError) as error:
             raise RuntimeError(f"Buttercup viewer is not running at {path}. Start the viewer before enabling gaze mouse movement.") from error
-        prefix = "GAZE FOCUS" if focus else "MOUSE OUTPUT"
+        prefix = "GAZE CURSOR" if cursor else ("WLEYES" if eyes else ("GAZE FOCUS" if focus else "MOUSE OUTPUT"))
         connection.sendall(f"{prefix} {action}\n".encode())
         connection.shutdown(socket.SHUT_WR)
         data = bytearray()
@@ -36,10 +36,22 @@ def command(path, action, *, focus=False):
     reply = json.loads(data)
     if not reply.get("ok"):
         raise RuntimeError(reply.get("error") or "Viewer rejected mouse command")
-    status = reply.get("gaze_focus" if focus else "mouse_output")
+    status = reply.get("gaze_cursor" if cursor else ("wleyes" if eyes else ("gaze_focus" if focus else "mouse_output")))
     if not isinstance(status, dict) or not isinstance(status.get("enabled"), bool):
-        raise RuntimeError("Viewer does not support desktop mouse output; restart the updated viewer")
+        raise RuntimeError("Viewer does not support this gaze output; restart the updated viewer")
     return status
+
+
+def cursor_toggle(args):
+    if args.action == "status":
+        print(json.dumps(command(args.socket, "STATUS", cursor=True)))
+        return
+    status = command(args.socket, "STATUS", cursor=True)
+    enable = {"on": True, "off": False}.get(args.action, not status["enabled"])
+    status = command(args.socket, "ON" if enable else "OFF", cursor=True)
+    if not args.quiet:
+        notify("Buttercup gaze cursor " + ("ON" if status["enabled"] else "OFF"),
+               "A ring shows where your calibrated gaze lands. The pointer is not moved." if status["enabled"] else "Gaze ring hidden.")
 
 
 def focus_toggle(args):
@@ -64,6 +76,50 @@ def focus_toggle(args):
         notify("Buttercup gaze focus " + ("ON" if enable else "OFF"),
                "Look at a window briefly to focus it. Pointer movement is OFF." if enable
                else "Focus follows eyes disabled. Pointer position unchanged.")
+
+
+def eyes_toggle(args):
+    """Only toggle the viewer-owned cartoon; no pointer/focus operations."""
+    status = command(args.socket, "STATUS", eyes=True)
+    if args.action == "status":
+        print(json.dumps(status))
+        return
+    enable = args.action == "on" or (args.action == "toggle" and not status["enabled"])
+    status = command(args.socket, "ON" if enable else "OFF", eyes=True)
+    if status["enabled"] != enable:
+        raise RuntimeError("Viewer did not confirm the requested wleyes state")
+    if enable:
+        place_eyes()
+    if not args.quiet:
+        notify("Buttercup wleyes " + ("ON" if enable else "OFF"),
+               "Little eyes follow your gaze. Sleepy eyes mean tracking is unavailable." if enable else "Little eyes hidden.")
+
+
+def place_eyes():
+    outputs = [o for o in sway("-t", "get_outputs") if o.get("active")]
+    output = next((o for o in outputs if o.get("focused")), outputs[0] if outputs else None)
+    if output is None:
+        raise RuntimeError("No active Sway output for wleyes")
+    def find(node):
+        if node.get("app_id") == "buttercup-wleyes":
+            return node
+        for child in node.get("nodes", []) + node.get("floating_nodes", []):
+            found = find(child)
+            if found:
+                return found
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        window = find(sway("-t", "get_tree"))
+        if window:
+            rect = output["rect"]
+            x = rect["x"] + max(0, rect["width"] - window["rect"]["width"] - 16)
+            y = rect["y"] + 40
+            reply = sway(f'[con_id={int(window["id"])}] move absolute position {int(x)} {int(y)}')
+            if not reply or not all(r.get("success") for r in reply):
+                raise RuntimeError("Sway could not position wleyes")
+            return
+        time.sleep(0.04)
+    raise RuntimeError("Viewer did not create the wleyes window")
 
 
 def sway(*args):
@@ -142,7 +198,10 @@ def main():
     parser.add_argument("action", choices=("toggle", "on", "off", "status"), default="toggle", nargs="?")
     parser.add_argument("--socket", default=os.environ.get("BUTTERCUP_CONTROL_SOCKET", SOCKET))
     parser.add_argument("--output", default=os.environ.get("BUTTERCUP_MOUSE_OUTPUT"))
-    parser.add_argument("--focus", action="store_true", help="toggle window focus instead of pointer movement")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--focus", action="store_true", help="toggle window focus instead of pointer movement")
+    mode.add_argument("--eyes", action="store_true", help="toggle the viewer-owned wleyes cartoon")
+    mode.add_argument("--cursor", action="store_true", help="toggle the on-screen calibrated gaze ring (never moves the pointer)")
     parser.add_argument("--quiet", action="store_true", help="suppress success notifications, never errors")
     args = parser.parse_args()
     try:
@@ -159,13 +218,17 @@ def main():
                     if time.monotonic() >= deadline:
                         raise RuntimeError("Another Buttercup mouse toggle is still pending")
                     time.sleep(0.02)
-            if args.focus:
+            if args.cursor:
+                cursor_toggle(args)
+            elif args.eyes:
+                eyes_toggle(args)
+            elif args.focus:
                 focus_toggle(args)
             else:
                 toggle(args)
         return 0
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
-        notify("Buttercup gaze focus warning" if args.focus else "Buttercup mouse warning", str(error), error=True)
+        notify("Buttercup wleyes warning" if args.eyes else ("Buttercup gaze focus warning" if args.focus else "Buttercup mouse warning"), str(error), error=True)
         return 1
 
 

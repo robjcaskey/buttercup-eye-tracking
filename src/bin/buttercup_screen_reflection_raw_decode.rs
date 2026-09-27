@@ -1,4 +1,5 @@
 #![recursion_limit = "256"]
+use buttercup_eye_tracking::recorded_bundle::BundleSource;
 
 #[path = "../screen_reflection_clock.rs"]
 mod screen_reflection_clock;
@@ -30,7 +31,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 const RAW_DECODE_SCHEMA: &str = "buttercup-screen-reflection-raw-decode-v1";
@@ -615,138 +616,6 @@ fn load_frame_index(bytes: &[u8]) -> Result<Vec<FrameRecord>, String> {
         });
     }
     Ok(frames)
-}
-
-#[derive(Clone, Copy, Debug)]
-struct TarEntry {
-    data_offset: u64,
-    size: u64,
-}
-
-#[derive(Debug)]
-enum BundleSource {
-    Directory(PathBuf),
-    Tar {
-        path: PathBuf,
-        entries: HashMap<String, TarEntry>,
-    },
-}
-
-fn tar_text(field: &[u8]) -> String {
-    let end = field
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(field.len());
-    String::from_utf8_lossy(&field[..end]).trim().to_string()
-}
-
-fn tar_octal(field: &[u8]) -> Result<u64, String> {
-    let text = String::from_utf8_lossy(field)
-        .trim_matches(|character: char| character == '\0' || character.is_ascii_whitespace())
-        .to_string();
-    if text.is_empty() {
-        return Ok(0);
-    }
-    u64::from_str_radix(&text, 8).map_err(|error| format!("invalid tar size {text:?}: {error}"))
-}
-
-impl BundleSource {
-    fn open(path: &Path) -> Result<Self, String> {
-        if path.is_dir() {
-            return Ok(Self::Directory(path.to_path_buf()));
-        }
-        let mut file = File::open(path)
-            .map_err(|error| format!("open RAW bundle {}: {error}", path.display()))?;
-        let file_size = file
-            .metadata()
-            .map_err(|error| format!("stat {}: {error}", path.display()))?
-            .len();
-        let mut entries = HashMap::new();
-        let mut header_offset = 0u64;
-        while header_offset + 512 <= file_size {
-            file.seek(SeekFrom::Start(header_offset))
-                .map_err(|error| format!("seek tar: {error}"))?;
-            let mut header = [0u8; 512];
-            file.read_exact(&mut header)
-                .map_err(|error| format!("read tar header: {error}"))?;
-            if header.iter().all(|byte| *byte == 0) {
-                break;
-            }
-            let name = tar_text(&header[..100]);
-            let prefix = tar_text(&header[345..500]);
-            let name = if prefix.is_empty() {
-                name
-            } else {
-                format!("{prefix}/{name}")
-            };
-            let size = tar_octal(&header[124..136])?;
-            let data_offset = header_offset + 512;
-            if data_offset.saturating_add(size) > file_size {
-                return Err(format!("tar entry {name:?} extends beyond bundle"));
-            }
-            entries.insert(name, TarEntry { data_offset, size });
-            header_offset = data_offset + size.div_ceil(512) * 512;
-        }
-        if entries.is_empty() {
-            return Err(format!(
-                "{} is not a populated POSIX tar bundle",
-                path.display()
-            ));
-        }
-        Ok(Self::Tar {
-            path: path.to_path_buf(),
-            entries,
-        })
-    }
-
-    fn read_range(&self, name: &str, offset: u64, length: usize) -> Result<Vec<u8>, String> {
-        let length_u64 = length as u64;
-        let (path, absolute_offset, entry_size) = match self {
-            Self::Directory(root) => {
-                let path = root.join(name);
-                let size = fs::metadata(&path)
-                    .map_err(|error| format!("stat {}: {error}", path.display()))?
-                    .len();
-                (path, offset, size)
-            }
-            Self::Tar { path, entries } => {
-                let entry = entries
-                    .get(name)
-                    .ok_or_else(|| format!("tar bundle lacks entry {name:?}"))?;
-                (path.clone(), entry.data_offset + offset, entry.size)
-            }
-        };
-        if offset.saturating_add(length_u64) > entry_size {
-            return Err(format!(
-                "read {name:?} range {offset}+{length} exceeds {entry_size} bytes"
-            ));
-        }
-        let mut file =
-            File::open(&path).map_err(|error| format!("open {}: {error}", path.display()))?;
-        file.seek(SeekFrom::Start(absolute_offset))
-            .map_err(|error| format!("seek {}: {error}", path.display()))?;
-        let mut bytes = vec![0u8; length];
-        file.read_exact(&mut bytes)
-            .map_err(|error| format!("read {}: {error}", path.display()))?;
-        Ok(bytes)
-    }
-
-    fn read_entry(&self, name: &str) -> Result<Vec<u8>, String> {
-        let size = match self {
-            Self::Directory(root) => fs::metadata(root.join(name))
-                .map_err(|error| format!("stat bundle entry {name:?}: {error}"))?
-                .len(),
-            Self::Tar { entries, .. } => {
-                entries
-                    .get(name)
-                    .ok_or_else(|| format!("tar bundle lacks entry {name:?}"))?
-                    .size
-            }
-        };
-        let length = usize::try_from(size)
-            .map_err(|_| format!("bundle entry {name:?} is too large for this host"))?;
-        self.read_range(name, 0, length)
-    }
 }
 
 #[derive(Debug)]

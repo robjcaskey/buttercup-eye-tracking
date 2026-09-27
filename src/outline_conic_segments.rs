@@ -12,11 +12,11 @@ use crate::geometry::{ellipse_axis_point, Ellipse};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub(crate) mod partial_outline;
 /// Offline-only temporal exclusion experiment; the stateless live fitter below
 /// deliberately does not call this module.
 pub(crate) mod recent_exclusion;
 pub(crate) mod sparse_evidence;
-pub(crate) mod partial_outline;
 
 /// Geometric evidence extracted from an ordered semantic-mask contour.
 /// Points and ellipse share the caller's pixel frame (model space during
@@ -54,10 +54,16 @@ fn supported_conic_runs(kept: &[bool]) -> Vec<Vec<usize>> {
     let mut run = Vec::new();
     let mut retained_index = 0;
     for &keep in kept {
-        if keep { run.push(retained_index); retained_index += 1; }
-        else if !run.is_empty() { runs.push(std::mem::take(&mut run)); }
+        if keep {
+            run.push(retained_index);
+            retained_index += 1;
+        } else if !run.is_empty() {
+            runs.push(std::mem::take(&mut run));
+        }
     }
-    if !run.is_empty() { runs.push(run); }
+    if !run.is_empty() {
+        runs.push(run);
+    }
     // The contour is cyclic. Merge its end only when both boundary samples
     // were retained; rejected samples anywhere else still split the arc.
     if runs.len() > 1 && kept.first() == Some(&true) && kept.last() == Some(&true) {
@@ -73,26 +79,38 @@ mod segment_tests {
     use super::*;
     #[test]
     fn conic_segments_do_not_bridge_rejected_samples() {
-        assert_eq!(supported_conic_runs(&[false,true,true,true,false,true,true,true,false]),
-            vec![vec![0,1,2],vec![3,4,5]]);
-        assert_eq!(supported_conic_runs(&[true,true,false,true,true,true]),vec![vec![2,3,4,0,1]]);
-        assert!(supported_conic_runs(&[true,false,true,false]).is_empty());
+        assert_eq!(
+            supported_conic_runs(&[false, true, true, true, false, true, true, true, false]),
+            vec![vec![0, 1, 2], vec![3, 4, 5]]
+        );
+        assert_eq!(
+            supported_conic_runs(&[true, true, false, true, true, true]),
+            vec![vec![2, 3, 4, 0, 1]]
+        );
+        assert!(supported_conic_runs(&[true, false, true, false]).is_empty());
         assert!(supported_conic_runs(&[]).is_empty());
     }
 
     #[test]
     fn observation_domain_censoring_preserves_gaps_and_real_support() {
-        let expected = Ellipse { center: (192.0, 128.0), major_radius: 80.0,
-            minor_radius: 60.0, angle: 0.0 };
+        let expected = Ellipse {
+            center: (192.0, 128.0),
+            major_radius: 80.0,
+            minor_radius: 60.0,
+            angle: 0.0,
+        };
         let contour = expected.dense_points(256);
         let censored = |point: (f64, f64)| (point.0 - 192.0).abs() < 30.0;
-        let fit = deflattened_mask_fit_with_censoring(
-            contour, expected, None, 1.0, false, censored).unwrap();
+        let fit =
+            deflattened_mask_fit_with_censoring(contour, expected, None, 1.0, false, censored)
+                .unwrap();
         assert!(fit.retained_points.iter().all(|&p| !censored(p)));
         assert!(fit.conic_segments.len() >= 2);
         for run in fit.conic_segments.iter() {
             let side = (fit.retained_points[run[0]].0 - 192.0).signum();
-            assert!(run.iter().all(|&i| (fit.retained_points[i].0 - 192.0).signum() == side));
+            assert!(run
+                .iter()
+                .all(|&i| (fit.retained_points[i].0 - 192.0).signum() == side));
         }
         assert!((fit.ellipse.major_radius - 80.0).abs() < 1.0);
         assert!((fit.ellipse.minor_radius - 60.0).abs() < 1.0);
@@ -100,33 +118,63 @@ mod segment_tests {
 
     #[test]
     fn artificial_search_arc_cannot_complete_a_shadow_into_a_pupil() {
-        let search = Ellipse { center: (192.0, 128.0), major_radius: 80.0,
-            minor_radius: 60.0, angle: 0.0 };
+        let search = Ellipse {
+            center: (192.0, 128.0),
+            major_radius: 80.0,
+            minor_radius: 60.0,
+            angle: 0.0,
+        };
         // A dark half-plane intersected with an elliptical search produces a
         // perfectly curved *artificial* rim and one actual straight shadow edge.
-        let contour = search.dense_points(256).into_iter()
-            .filter(|p| p.1 >= 108.0).collect::<Vec<_>>();
-        assert!(deflattened_mask_fit_with_noise(
-            contour.clone(), search, None, 1.0, false).is_some());
-        assert!(deflattened_mask_fit_with_censoring(
-            contour, search, None, 1.0, false,
-            |p| crate::geometry::ellipse_coordinate(p, search) > 0.98).is_none());
+        let contour = search
+            .dense_points(256)
+            .into_iter()
+            .filter(|p| p.1 >= 108.0)
+            .collect::<Vec<_>>();
+        assert!(
+            deflattened_mask_fit_with_noise(contour.clone(), search, None, 1.0, false).is_some()
+        );
+        assert!(
+            deflattened_mask_fit_with_censoring(contour, search, None, 1.0, false, |p| {
+                crate::geometry::ellipse_coordinate(p, search) > 0.98
+            })
+            .is_none()
+        );
     }
 
     #[test]
     fn conditioning_audit_does_not_reinstate_unretained_samples() {
-        let ellipse = Ellipse { center: (192.0, 128.0), major_radius: 80.0,
-            minor_radius: 60.0, angle: 0.0 };
+        let ellipse = Ellipse {
+            center: (192.0, 128.0),
+            major_radius: 80.0,
+            minor_radius: 60.0,
+            angle: 0.0,
+        };
         let contour = ellipse.dense_points(256);
         let samples = censor_occluding_chords(&contour, ellipse).unwrap().samples;
-        let full = inspect_contour_arc_constraints(
-            &contour, ellipse, ellipse, &samples, 4.0, |_| false).unwrap();
+        let full =
+            inspect_contour_arc_constraints(&contour, ellipse, ellipse, &samples, 4.0, |_| false)
+                .unwrap();
         assert_eq!(full["positional_shape_supported"], true);
         let partial = inspect_contour_arc_constraints(
-            &contour, ellipse, ellipse, &samples[..24], 4.0, |_| false).unwrap();
+            &contour,
+            ellipse,
+            ellipse,
+            &samples[..24],
+            4.0,
+            |_| false,
+        )
+        .unwrap();
         assert_eq!(partial["positional_shape_supported"], false);
-        assert!(partial["positional_inliers"].as_array().unwrap().iter()
-            .filter(|v| v.as_bool() == Some(true)).count() <= 24);
+        assert!(
+            partial["positional_inliers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|v| v.as_bool() == Some(true))
+                .count()
+                <= 24
+        );
     }
 }
 
@@ -555,7 +603,8 @@ pub(crate) struct ChordCensoredContour {
 }
 
 pub(crate) fn censor_occluding_chords(
-    contour: &[(f64, f64)], reference: Ellipse,
+    contour: &[(f64, f64)],
+    reference: Ellipse,
 ) -> Option<ChordCensoredContour> {
     // Preserve boundary order: polar sorting can jump between the true limbus
     // and an occluding lid chord and manufacture exactly the flattened conic
@@ -588,21 +637,22 @@ pub(crate) fn censor_occluding_chords(
             flat_tire[(run.start + offset) % samples.len()] = true;
         }
     }
-    Some(ChordCensoredContour {samples,smoothed,flat_tire,
-        upper_flat_tire:upper.is_some_and(|run|run.side==FlatTireSide::Upper),
-        lower_flat_tire:lower.is_some_and(|run|run.side==FlatTireSide::Lower)})
+    Some(ChordCensoredContour {
+        samples,
+        smoothed,
+        flat_tire,
+        upper_flat_tire: upper.is_some_and(|run| run.side == FlatTireSide::Upper),
+        lower_flat_tire: lower.is_some_and(|run| run.side == FlatTireSide::Lower),
+    })
 }
 
-fn contour_tangent_constraints(
-    smoothed: &[(f64, f64)], excluded: &[bool],
-) -> ConicArcConstraints {
+fn contour_tangent_constraints(smoothed: &[(f64, f64)], excluded: &[bool]) -> ConicArcConstraints {
     ConicArcConstraints {
         tangents: (0..smoothed.len())
             .filter(|&i| !excluded[i])
             .map(|i| {
                 let n = smoothed.len();
-                if (-2isize..=2)
-                    .any(|d| excluded[(i as isize + d).rem_euclid(n as isize) as usize])
+                if (-2isize..=2).any(|d| excluded[(i as isize + d).rem_euclid(n as isize) as usize])
                 {
                     return None;
                 }
@@ -617,25 +667,48 @@ fn contour_tangent_constraints(
 /// Offline inspection uses the exact same samples, exclusions and tangents as
 /// the fitter. A supplied ellipse is a hypothesis, never a new observation.
 pub(crate) fn inspect_contour_arc_constraints(
-    contour: &[(f64, f64)], reference: Ellipse, hypothesis: Ellipse,
-    observed_points: &[(f64, f64)], tolerance: f64, censored: impl Fn((f64, f64)) -> bool,
+    contour: &[(f64, f64)],
+    reference: Ellipse,
+    hypothesis: Ellipse,
+    observed_points: &[(f64, f64)],
+    tolerance: f64,
+    censored: impl Fn((f64, f64)) -> bool,
 ) -> Option<serde_json::Value> {
-    let ChordCensoredContour {samples, smoothed, mut flat_tire, ..} =
-        censor_occluding_chords(contour, reference)?;
+    let ChordCensoredContour {
+        samples,
+        smoothed,
+        mut flat_tire,
+        ..
+    } = censor_occluding_chords(contour, reference)?;
     for (&point, excluded) in samples.iter().zip(&mut flat_tire) {
         *excluded |= censored(point);
     }
     let constraints = contour_tangent_constraints(&smoothed, &flat_tire);
-    let points = samples.iter().zip(&flat_tire)
-        .filter_map(|(&p, &excluded)| (!excluded).then_some(p)).collect::<Vec<_>>();
+    let points = samples
+        .iter()
+        .zip(&flat_tire)
+        .filter_map(|(&p, &excluded)| (!excluded).then_some(p))
+        .collect::<Vec<_>>();
     // A conditioning audit cannot reinstate samples the actual fit discarded.
-    let observed = points.iter().map(|p| observed_points.contains(p)).collect::<Vec<_>>();
-    let positional = points.iter().zip(&observed)
+    let observed = points
+        .iter()
+        .map(|p| observed_points.contains(p))
+        .collect::<Vec<_>>();
+    let positional = points
+        .iter()
+        .zip(&observed)
         .map(|(&p, &kept)| kept && ellipse_residual(p, hypothesis) <= tolerance)
         .collect::<Vec<_>>();
-    let tangent = points.iter().enumerate()
-        .map(|(i, &p)| constraints.tangent_agrees(i, p, hypothesis)).collect::<Vec<_>>();
-    let combined = positional.iter().zip(&tangent).map(|(&p, &t)| p && t).collect::<Vec<_>>();
+    let tangent = points
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| constraints.tangent_agrees(i, p, hypothesis))
+        .collect::<Vec<_>>();
+    let combined = positional
+        .iter()
+        .zip(&tangent)
+        .map(|(&p, &t)| p && t)
+        .collect::<Vec<_>>();
     Some(serde_json::json!({
         "canonical_points": points,
         "retained_by_hypothesis_fit": observed,
@@ -658,7 +731,13 @@ pub(crate) fn deflattened_mask_fit_with_noise(
     constrain_arcs: bool,
 ) -> Option<ContourFitEvidence> {
     deflattened_mask_fit_with_censoring(
-        contour, reference, scale_context, pixel_scale, constrain_arcs, |_| false)
+        contour,
+        reference,
+        scale_context,
+        pixel_scale,
+        constrain_arcs,
+        |_| false,
+    )
 }
 
 /// Exclude known observation-domain boundaries before fitting. Keep the full
@@ -672,8 +751,13 @@ pub(crate) fn deflattened_mask_fit_with_censoring(
     constrain_arcs: bool,
     censored: impl Fn((f64, f64)) -> bool,
 ) -> Option<ContourFitEvidence> {
-    let ChordCensoredContour {samples,smoothed,mut flat_tire,upper_flat_tire,lower_flat_tire}=
-        censor_occluding_chords(&contour,reference)?;
+    let ChordCensoredContour {
+        samples,
+        smoothed,
+        mut flat_tire,
+        upper_flat_tire,
+        lower_flat_tire,
+    } = censor_occluding_chords(&contour, reference)?;
     for (&point, excluded) in samples.iter().zip(&mut flat_tire) {
         *excluded |= censored(point);
     }

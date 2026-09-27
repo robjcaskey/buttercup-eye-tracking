@@ -1,9 +1,10 @@
 //! Source-keyed real-time orchestration of the joint segment objective.
 //! No independently solved gaze point enters this module. A previous joint
 //! target is only an optimization start, never a new observation or smoothing.
+//! Explicit direction priors are separately applied to both MAP and posterior.
 
 use crate::binocular_coordinator::source_pairing::{PairingUnavailable, SourcePairer};
-use crate::conic_solver::joint::{solve_joint_conic_hypotheses, solve_joint_conic_distribution, JointConicRequest, JointConicSolution, JointConicUnavailable, PinholeCamera};
+use crate::conic_solver::joint::{solve_joint_conics_with_mount, JointConicRequest, JointConicSolution, JointConicUnavailable, PinholeCamera};
 use crate::eye_scene_model::binocular_pose::{approximate_scene, CoarseBinocularScene, EyePoseInput};
 use crate::outline_conic_segments::sparse_evidence::OwnedRoiEvidence;
 use crate::roi_evidence::{ExposureKey, SourceClock};
@@ -11,6 +12,26 @@ use std::sync::Arc;
 
 const MAX_SOURCE_SEEDS: usize = 32;
 const MAX_SEED_AGE_NS: u64 = 500_000_000;
+
+/// Offline hypothesis only: a local diagonal approximation to a radial lens.
+/// It matches the reference ray and diagonal projection derivatives, but omits
+/// cross-axis shear and curvature across the ROI. Never a calibrated lens model.
+#[cfg(test)]
+fn local_radial_camera(camera:PinholeCamera,k1:f64,reference:[f64;2])->PinholeCamera {
+    if k1==0.0 {return camera;}
+    let distorted:[f64;2]=std::array::from_fn(|i|(reference[i]-camera.principal_px[i])/camera.focal_px[i]);
+    let rd=distorted[0].hypot(distorted[1]);
+    if rd<1e-12 {return camera;}
+    let mut radius=rd;
+    for _ in 0..16 {
+        radius-=(radius*(1.0+k1*radius*radius)-rd)/(1.0+3.0*k1*radius*radius);
+    }
+    let undistorted=distorted.map(|v|v*radius/rd);
+    let radial=1.0+k1*radius*radius;
+    let focal_px=std::array::from_fn(|i|camera.focal_px[i]*(radial+2.0*k1*undistorted[i]*undistorted[i]));
+    let principal_px=std::array::from_fn(|i|reference[i]-focal_px[i]*undistorted[i]);
+    PinholeCamera {focal_px,principal_px}
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TargetSeed {
@@ -68,10 +89,26 @@ mod tests {
     use crate::roi_evidence::{BoundaryKind,RoiId};
 
     fn camera()->PinholeCamera {PinholeCamera {focal_px:[4000.0;2],principal_px:[4000.0,3000.0]}}
+    #[test]
+    fn radial_camera_diagnostic_preserves_the_reference_ray_and_radial_derivative() {
+        let c=camera();let k=0.4;let u=0.3;
+        let reference=[4000.0,3000.0+4000.0*u*(1.0+k*u*u)];
+        let local=local_radial_camera(c,k,reference);
+        assert!((local.focal_px[1]-4000.0*(1.0+3.0*k*u*u)).abs()<1e-9);
+        assert!((local.focal_px[0]-4000.0*(1.0+k*u*u)).abs()<1e-9);
+        assert!((local.principal_px[1]+local.focal_px[1]*u-reference[1]).abs()<1e-9);
+        let identity=local_radial_camera(c,0.0,reference);
+        assert_eq!(identity.focal_px,c.focal_px);assert_eq!(identity.principal_px,c.principal_px);
+        let centered=local_radial_camera(c,k,c.principal_px);
+        assert_eq!(centered.focal_px,c.focal_px);assert_eq!(centered.principal_px,c.principal_px);
+    }
     fn frame(eye:usize,time:u64)->FrameEvidence {
+        frame_with_target(eye,time,[70.0,-130.0,250.0])
+    }
+    fn frame_with_target(eye:usize,time:u64,target:[f64;3])->FrameEvidence {
         let center=[if eye==0 {-32.0} else {32.0},0.0,-350.0];
         let origin=if eye==0 {[3420,2860]} else {[4100,2860]};
-        let normal=normalized3(sub3([70.0,-130.0,250.0],center)).unwrap();
+        let normal=normalized3(sub3(target,center)).unwrap();
         let e=ProjectedCircle::project(camera(),center,normal,6.0,origin).unwrap().ellipse().unwrap();
         FrameEvidence {packet:OwnedRoiEvidence {
             exposure:ExposureKey {roi:RoiId(eye as u32+1),clock:SourceClock {domain:1,epoch:5},
@@ -84,11 +121,43 @@ mod tests {
     }
 
     #[test]
+    fn native_screen_orientation_then_offscreen_continuation_retains_conditional_posterior() {
+        use crate::eye_scene_model::CameraMount;
+        let mut tracker=JointTracker {camera_mount:CameraMount::BelowEyes,
+            legacy_mount_filter:false,..Default::default()};
+        tracker.set_probabilistic(true);
+        tracker.set_orientation_active(true);
+        tracker.begin(frame(0,1_000_000_000).packet.exposure.clock,1);
+        let mut last=None;
+        for i in 0..16 {
+            let time=1_000_000_000+i*500_000_000;
+            for eye in 0..2 {
+                last=tracker.observe_with_pair_wait(frame_with_target(eye,time,[70.,-400.,50.]),camera(),true).unwrap().or(last);
+            }
+        }
+        let initialized=last.unwrap();
+        assert_eq!(initialized.orientation_ready,Some([true,true]),"{:?}",initialized.solution.posterior.as_ref().map(|p|p.json()));
+        tracker.set_orientation_active(false);
+        for (i,y) in [-250.,-100.,0.,100.,200.].into_iter().enumerate() {
+            let time=9_000_000_000+i as u64*500_000_000;
+            for eye in 0..2 {
+                if let Some(p)=tracker.observe_with_pair_wait(frame_with_target(eye,time,[70.,y,50.]),camera(),true).unwrap() {
+                    assert_eq!(p.orientation_ready,Some([true,true]));
+                    let posterior=p.solution.posterior.as_ref().unwrap();
+                    assert_eq!(posterior.direction_prior.label(),"temporal-continuation-conditional");
+                    assert_eq!(posterior.camera_mount,CameraMount::Flexible);
+                    if y==200. {assert!(p.solution.eye_normals.iter().flatten().all(|n|n[1]>0.));}
+                }
+            }
+        }
+    }
+
+    #[test]
     fn camera_mount_filters_whole_optimized_stereo_hypotheses() {
         use crate::eye_scene_model::CameraMount;
         let time=1_000_000_000;
         for mode in [CameraMount::Flexible,CameraMount::BelowEyes,CameraMount::AboveEyes] {
-            let mut tracker=JointTracker::default();tracker.camera_mount=mode;
+            let mut tracker=JointTracker::default();tracker.camera_mount=mode;tracker.legacy_mount_filter=true;
             tracker.begin(frame(0,time).packet.exposure.clock,1);
             for eye in 0..2 {
                 match tracker.observe(frame(eye,time),camera()) {
@@ -107,16 +176,58 @@ mod tests {
     }
 
     #[test]
+    fn mounted_probabilistic_publications_keep_the_selected_modes_confidence() {
+        use crate::eye_scene_model::CameraMount;
+        let time=1_000_000_000;
+        let mut publications=0;
+        for mode in [CameraMount::BelowEyes,CameraMount::AboveEyes] {
+            let mut tracker=JointTracker::default();
+            tracker.camera_mount=mode;
+            tracker.legacy_mount_filter=true;
+            tracker.set_probabilistic(true);
+            tracker.set_posterior_diagnostic(crate::conic_solver::joint::posterior::IntegrationConfig {
+                budget:512,early_stop:false,..Default::default()
+            });
+            tracker.begin(frame(0,time).packet.exposure.clock,1);
+            for eye in 0..2 {
+                match tracker.observe(frame(eye,time),camera()) {
+                    Ok(Some(publication))=> {
+                        let posterior=publication.solution.posterior.as_ref().expect("mounted alternative lost its posterior");
+                        assert_eq!(posterior.camera_mount,mode);
+                        assert_eq!(posterior.modeled_eyes,publication.solution.modeled_eyes);
+                        assert!(publication.solution.eye_normals.iter().flatten().all(|n|mode.supports(n[1])));
+                        // An unavailable/under-sampled integration is not a
+                        // license to publish a resolved direction.
+                        if posterior.status!="estimated-conditional" {
+                            assert!(!posterior.supports_direction(0));
+                            assert!(!posterior.supports_direction(1));
+                        }
+                        publications+=1;
+                    }
+                    Err(TrackingUnavailable::MountingAssumptionConflict)=>{},
+                    other=>panic!("unexpected mounted posterior result: {other:?}"),
+                }
+            }
+        }
+        assert!(publications>=2,"fixture must exercise actual mounted publications");
+    }
+
+    #[test]
     fn diagnostic_hypotheses_preserve_the_default_winner_and_optimizer_budget() {
         let time=1_000_000_000;
         let clock=frame(0,time).packet.exposure.clock;
         let mut baseline=JointTracker::default();baseline.begin(clock,1);
         let mut diagnostic=JointTracker::default();diagnostic.begin(clock,1);
         diagnostic.retain_diagnostic_hypotheses(true);
+        diagnostic.set_continuous_gaze_diagnostic(true);
         for eye in 0..2 {
             let a=baseline.observe(frame(eye,time),camera()).unwrap().unwrap();
             let b=diagnostic.observe(frame(eye,time),camera()).unwrap().unwrap();
             assert!(a.diagnostic_hypotheses.is_empty());
+            assert!(a.continuous_gaze_sign.is_none());
+            let trajectory=b.continuous_gaze_sign.as_ref().unwrap();
+            assert_eq!(trajectory.candidate_scope,"unconditioned");
+            assert_eq!(trajectory.preferred_candidate,None,"one exposure cannot establish trajectory support");
             assert!((1..=4).contains(&b.diagnostic_hypotheses.len()));
             assert_eq!(a.solution.target_camera_mm,b.solution.target_camera_mm);
             assert_eq!(a.solution.robust_cost,b.solution.robust_cost);
@@ -309,6 +420,25 @@ mod tests {
     }
 
     #[test]
+    fn explicit_pair_wait_preserves_complete_solves_without_publishing_held_sources() {
+        let time=1_000_000_000;let clock=frame(0,time).packet.exposure.clock;
+        let mut baseline=JointTracker::default();let mut deferred=JointTracker::default();
+        for tracker in [&mut baseline,&mut deferred] {tracker.begin(clock,1);tracker.set_probabilistic(true);}
+        for (step,first) in [(0,0),(1,1)] {
+            let at=time+step*100_000_000;
+            baseline.observe(frame(first,at),camera()).unwrap();
+            assert!(deferred.observe_with_pair_wait(frame(first,at),camera(),true).unwrap().is_none());
+            assert!(deferred.latest(first,clock,at,500_000_000).is_none(),"held geometry cannot be the new exposure");
+            let a=baseline.observe(frame(1-first,at),camera()).unwrap().unwrap();
+            let b=deferred.observe_with_pair_wait(frame(1-first,at),camera(),true).unwrap().unwrap();
+            assert_eq!(format!("{:?}",a.solution),format!("{:?}",b.solution),"paired solve and posterior changed");
+            assert_eq!(a.exposures,b.exposures);
+        }
+        assert!(deferred.observe(frame(0,time+200_000_000),camera()).unwrap().is_some(),
+            "independent single-ROI reads must keep their normal path");
+    }
+
+    #[test]
     fn a_failed_completed_pair_retires_only_its_own_provisional_seed() {
         let time=1_000_000_000;
         let clock=frame(0,time).packet.exposure.clock;
@@ -484,6 +614,10 @@ mod tests {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PublishedJoint {
+    pub(crate) continuous_gaze_sign: Option<crate::conic_solver::continuous_gaze_sign::Report>,
+    /// None for legacy/unconstrained paths. Otherwise screen-reference readiness
+    /// is separate from current-source posterior support and signal quality.
+    pub(crate) orientation_ready: Option<[bool;2]>,
     pub(crate) exposures: [Option<ExposureKey>; 2],
     pub(crate) sensor_origins_px: [Option<[u32;2]>; 2],
     pub(crate) dimensions_px: [Option<[u32;2]>; 2],
@@ -500,12 +634,22 @@ pub(crate) enum TrackingUnavailable {
     Pairing(PairingUnavailable),
     NoSceneSupport,
     MountingAssumptionConflict,
+    DirectionReferenceContradicted,
     Conic(JointConicUnavailable),
 }
 
 #[derive(Default)]
 pub(crate) struct JointTracker {
+    pub(crate) parallax_enabled: bool,
+    pub(crate) parallax_normals: [Option<[[f64;3];2]>;2],
+    continuous_gaze_enabled: bool,
+    continuous_gaze: crate::conic_solver::continuous_gaze_sign::ContinuousGazeSign,
     pub(crate) camera_mount: crate::eye_scene_model::CameraMount,
+    /// Explicit historical comparison only; live and ordinary trackers use the new phase policy.
+    pub(crate) legacy_mount_filter: bool,
+    direction_continuation: crate::conic_solver::camera_mount::DirectionContinuation,
+    audit_source: Option<u64>,
+    audit_sources: usize,
     lineage: Option<(SourceClock,u64)>,
     pairing: SourcePairer<FrameEvidence>,
     latest: [Option<Arc<PublishedJoint>>;2],
@@ -517,13 +661,49 @@ pub(crate) struct JointTracker {
     probabilistic: bool,
     #[cfg(test)]
     posterior_diagnostic: Option<crate::conic_solver::joint::posterior::IntegrationConfig>,
+    #[cfg(test)]
+    camera_diagnostic: Option<PinholeCamera>,
+    #[cfg(test)]
+    radial_camera_diagnostic: Option<f64>,
 }
 
 impl JointTracker {
+    pub(crate) fn set_continuous_gaze_diagnostic(&mut self, enabled:bool) {
+        if enabled!=self.continuous_gaze_enabled {self.continuous_gaze=Default::default();}
+        self.continuous_gaze_enabled=enabled;
+    }
+    pub(crate) fn anchor_orientation_source(&mut self, source:u64) {
+        self.direction_continuation.anchor_source(source);
+    }
+    pub(crate) fn set_orientation_active(&mut self, active:bool) {
+        if active!=self.direction_continuation.orientation_active {
+            self.audit_source=None;self.audit_sources=0;
+        }
+        self.direction_continuation.set_orientation(active);
+    }
+    pub(crate) fn set_screen_fixation(&mut self, active:bool) {
+        self.direction_continuation.set_screen_fixation(active);
+    }
+    pub(crate) fn set_routine_acquisition(&mut self, enabled:bool) {
+        self.direction_continuation.set_routine_acquisition(enabled);
+    }
     pub(crate) fn set_probabilistic(&mut self, enabled: bool) { self.probabilistic=enabled; }
     #[cfg(test)]
     pub(crate) fn set_posterior_diagnostic(&mut self, config:crate::conic_solver::joint::posterior::IntegrationConfig) {
         self.posterior_diagnostic=Some(config);
+    }
+    #[cfg(test)]
+    pub(crate) fn set_camera_diagnostic(&mut self, camera:PinholeCamera) {
+        assert!(self.lineage.is_none(), "set the camera trial before admitting any source");
+        assert!(camera.focal_px.into_iter().all(|v|v.is_finite() && v>0.0));
+        assert!(camera.principal_px.into_iter().all(f64::is_finite));
+        self.camera_diagnostic=Some(camera);
+    }
+    #[cfg(test)]
+    pub(crate) fn set_radial_camera_diagnostic(&mut self,k1:f64) {
+        assert!(self.lineage.is_none(), "set the lens trial before admitting any source");
+        assert!(k1.is_finite() && (0.0..=1.0).contains(&k1));
+        self.radial_camera_diagnostic=Some(k1);
     }
     pub(crate) fn retain_diagnostic_hypotheses(&mut self, enabled: bool) {
         self.retain_diagnostic_hypotheses = enabled;
@@ -535,6 +715,15 @@ impl JointTracker {
         self.lineage=Some((clock,generation));self.pairing.begin(clock);self.latest=[None,None];
         self.newest_observation_ns=[None;2];
         self.source_seeds.0.clear();
+        self.continuous_gaze=Default::default();
+        let active=self.direction_continuation.orientation_active;
+        let fixation=self.direction_continuation.screen_fixation;
+        let routine=self.direction_continuation.routine_acquisition;
+        self.direction_continuation=Default::default();
+        self.direction_continuation.set_orientation(active);
+        self.direction_continuation.set_screen_fixation(fixation);
+        self.direction_continuation.set_routine_acquisition(routine);
+        self.audit_source=None;self.audit_sources=0;
     }
 
     fn clear_current_sources(&mut self,sources:[Option<ExposureKey>;2]) {
@@ -546,6 +735,16 @@ impl JointTracker {
 
     pub(crate) fn observe(&mut self, frame:FrameEvidence, camera:PinholeCamera)
         ->Result<Option<Arc<PublishedJoint>>,TrackingUnavailable> {
+        self.observe_with_pair_wait(frame,camera,false)
+    }
+
+    /// Explicit atomic two-ROI requests need no provisional one-eye solve.
+    /// Keep the evidence and current-source floor while waiting; never count a
+    /// held publication as this exposure, or use a same-time provisional seed.
+    pub(crate) fn observe_with_pair_wait(&mut self, frame:FrameEvidence, camera:PinholeCamera, wait_for_pair:bool)
+        ->Result<Option<Arc<PublishedJoint>>,TrackingUnavailable> {
+        #[cfg(test)]
+        let camera=self.camera_diagnostic.unwrap_or(camera);
         let source=frame.packet.exposure;
         let frames=match self.pairing.insert(source,frame) {
             Ok(frames)=>frames,
@@ -554,9 +753,16 @@ impl JointTracker {
         };
         let seen=&mut self.newest_observation_ns[source.roi.0 as usize-1];
         *seen=Some(seen.unwrap_or(0).max(source.timestamp_ns));
+        if wait_for_pair && frames.iter().any(Option::is_none) {return Ok(None);}
         let exposures=frames.each_ref().map(|f|f.as_ref().map(|f|f.packet.exposure));
         self.source_seeds.supersede(source.timestamp_ns);
         let poses=frames.each_ref().map(|f|f.as_ref().map(|f|f.pose));
+        #[cfg(test)]
+        let camera=self.radial_camera_diagnostic.map_or(camera,|k1| {
+            let points=poses.iter().flatten().map(|p|p.limbus_center_sensor_px).collect::<Vec<_>>();
+            let reference=std::array::from_fn(|i|points.iter().map(|p|p[i]).sum::<f64>()/points.len() as f64);
+            local_radial_camera(camera,k1,reference)
+        });
         let Some(mut scene)=approximate_scene(camera,poses) else {
             self.clear_current_sources(exposures);
             return Err(TrackingUnavailable::NoSceneSupport);
@@ -574,38 +780,91 @@ impl JointTracker {
             maximum_hypotheses:16,maximum_refinements:12,maximum_source_skew_ns:0,
             // Engineering allowance, not a measured bound on rolling rows.
             exposure_uncertainty_ns:2_000_000,motion_bound_px_per_second:150.0};
+        let orientation_only=!self.parallax_enabled && !self.legacy_mount_filter
+            && self.camera_mount==crate::eye_scene_model::CameraMount::BelowEyes;
+        let effective_mount=if orientation_only || self.parallax_enabled {crate::eye_scene_model::CameraMount::Flexible} else {self.camera_mount};
+        let direction_prior=if self.parallax_enabled {crate::conic_solver::camera_mount::DirectionPrior::Parallax(self.parallax_normals)} else if orientation_only {self.direction_continuation.prior(source.timestamp_ns)} else {Default::default()};
         let count=if self.camera_mount!=crate::eye_scene_model::CameraMount::Flexible {16}
-            else if self.retain_diagnostic_hypotheses { 4 } else { 1 };
+            else if self.retain_diagnostic_hypotheses || self.continuous_gaze_enabled { 4 } else { 1 };
         let result=if self.probabilistic {
             #[cfg(test)]
-            {if let Some(config)=self.posterior_diagnostic {
+            {if let Some(mut config)=self.posterior_diagnostic {
+                config.camera_mount=effective_mount;
+                config.direction_prior=direction_prior;
                 crate::conic_solver::joint::solve_joint_conic_distribution_diagnostic(request,count,config)
-            } else {solve_joint_conic_distribution(request,count)}}
+            } else {crate::conic_solver::joint::solve_joint_conics_with_direction(request,count,effective_mount,true,direction_prior)}}
             #[cfg(not(test))]
-            {solve_joint_conic_distribution(request,count)}
+            {crate::conic_solver::joint::solve_joint_conics_with_direction(request,count,effective_mount,true,direction_prior)}
         }
-            else {solve_joint_conic_hypotheses(request,count)};
+            else {crate::conic_solver::joint::solve_joint_conics_with_direction(request,count,effective_mount,false,direction_prior)};
         let mut hypotheses=match result {
             Ok(hypotheses)=>hypotheses,
             Err(error)=>{
                 self.clear_current_sources(exposures);
+                if error==JointConicUnavailable::MountingAssumptionConflict {
+                    return Err(TrackingUnavailable::MountingAssumptionConflict);
+                }
                 return Err(TrackingUnavailable::Conic(error));
             }
         };
-        // Select a genuinely optimized compatible solution; never mirror a
-        // fitted stereo normal after solving or inflate its posterior support.
-        if self.camera_mount!=crate::eye_scene_model::CameraMount::Flexible {
-            hypotheses.retain(|h|h.eye_normals.iter().flatten().all(|n|self.camera_mount.supports(n[1])));
-            if hypotheses.is_empty() {
-                self.clear_current_sources(exposures);
-                return Err(TrackingUnavailable::MountingAssumptionConflict);
+        let solution=hypotheses.remove(0);
+        // Periodically challenge the continuation prior with the same raw
+        // objective, without that prior. Three independent contradictory reads
+        // release the reference; an isolated fit cannot cause a branch flip.
+        // This audit is MAP-only and does not replace/copy a posterior.
+        if orientation_only && (matches!(direction_prior,
+            crate::conic_solver::camera_mount::DirectionPrior::Continue(_))
+            // Screen fixation continues surviving references; audit them too.
+            || (!self.direction_continuation.orientation_active && matches!(direction_prior,
+                crate::conic_solver::camera_mount::DirectionPrior::ScreenAndContinue(n)
+                | crate::conic_solver::camera_mount::DirectionPrior::AcquireAndContinue(n) if n.iter().any(Option::is_some))))
+            && self.audit_source.is_none_or(|old|source.timestamp_ns>old) {
+            self.audit_source=Some(source.timestamp_ns);self.audit_sources+=1;
+            if self.audit_sources%8==0 || self.direction_continuation.contradiction_pending() {
+                let alternative=solve_joint_conics_with_mount(request,1,effective_mount,false)
+                    .ok().and_then(|mut fits|(!fits.is_empty()).then(||fits.remove(0)));
+                let contradicts=alternative.as_ref().is_some_and(|other|
+                    other.robust_cost+9.0<solution.robust_cost
+                    && (0..2).any(|eye|other.eye_normals[eye].zip(other.eye_centers_camera_mm[eye])
+                        .is_some_and(|(n,c)|!direction_prior.supports(eye,c,n))));
+                if self.direction_continuation.observe_contradiction(source.timestamp_ns,contradicts) {
+                    self.clear_current_sources(exposures);
+                    return Err(TrackingUnavailable::DirectionReferenceContradicted);
+                }
             }
         }
-        let solution=hypotheses.remove(0);
+        assert!((0..2).all(|eye|solution.eye_normals[eye].is_none_or(|n|
+            effective_mount.supports(n[1]) && solution.eye_centers_camera_mm[eye]
+                .is_some_and(|c|direction_prior.supports(eye,c,n)))));
+        let expects_posterior=self.probabilistic;
+        #[cfg(test)]
+        let expects_posterior=expects_posterior && self.posterior_diagnostic.is_none_or(|c|c.budget>0);
+        assert!(!expects_posterior || solution.posterior.is_some(),
+            "probabilistic publication must retain the selected mode's posterior");
+        if orientation_only {
+            let supported=std::array::from_fn(|eye|solution.contributing_eyes[eye]
+                && solution.posterior.as_ref().is_some_and(|p|p.supports_direction(eye)));
+            self.direction_continuation.observe(source.timestamp_ns,solution.eye_normals,supported,direction_prior);
+            let continuing=std::array::from_fn(|eye|solution.contributing_eyes[eye]
+                && solution.posterior.as_ref().is_some_and(|p|p.continues_direction(eye)));
+            self.direction_continuation.refresh(source.timestamp_ns,solution.eye_normals,continuing,direction_prior);
+        }
+        let orientation_ready=if self.parallax_enabled {Some(self.parallax_normals.map(|n|n.is_some()))}
+            else {orientation_only.then(||std::array::from_fn(|eye|self.direction_continuation.ready(eye)))};
+        // A diagnostic preference never substitutes a MAP fit or borrows a
+        // different candidate's integrated posterior. Its input scope is explicit.
+        let continuous_gaze_sign=self.continuous_gaze_enabled.then(|| {
+            use crate::conic_solver::continuous_gaze_sign::Candidate;
+            let candidates=std::iter::once(&solution).chain(&hypotheses)
+                .map(Candidate::from_solution).collect::<Option<Vec<_>>>().unwrap_or_default();
+            self.continuous_gaze.observe(source.timestamp_ns,candidates,
+                if effective_mount!=crate::eye_scene_model::CameraMount::Flexible {"legacy-mount-filtered"}
+                else {direction_prior.label()})
+        });
         let diagnostic_hypotheses = if self.retain_diagnostic_hypotheses {
             let mut all=vec![solution.clone()];all.extend(hypotheses);all
         } else {Vec::new()};
-        let publication=Arc::new(PublishedJoint {solution,scene,diagnostic_hypotheses,
+        let publication=Arc::new(PublishedJoint {solution,scene,diagnostic_hypotheses,orientation_ready,continuous_gaze_sign,
             exposures,
             sensor_origins_px:frames.each_ref().map(|f|f.as_ref().map(|f|f.packet.sensor_origin_px)),
             dimensions_px:frames.each_ref().map(|f|f.as_ref().map(|f|f.packet.dimensions_px)),
