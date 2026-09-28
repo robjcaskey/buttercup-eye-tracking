@@ -451,6 +451,12 @@ const SEGMENTER_IRIS_ANCHOR_SAMPLES: usize = 3;
 const SEGMENTER_IRIS_ANCHOR_MAX_AGE_NS: u64 = 600_000_000;
 const SEGMENTER_IRIS_ANCHOR_SPREAD_PX: f64 = 24.0;
 const SEGMENTER_IRIS_ANCHOR_TOLERANCE_PX: f64 = 40.0;
+/// Partner-eye crop aiming: offsets from segmenter centers at most SKEW apart,
+/// at least MIN of the last OFFSETS, the newest no older than MAX_AGE.
+const SEGMENTER_IRIS_PAIR_MAX_SKEW_NS: u64 = 150_000_000;
+const SEGMENTER_IRIS_PAIR_OFFSETS: usize = 5;
+const SEGMENTER_IRIS_PAIR_MIN_OFFSETS: usize = 3;
+const SEGMENTER_IRIS_PAIR_MAX_AGE_NS: u64 = 10_000_000_000;
 const ROI_CENSORED_CENTER_HISTORY: usize = 7;
 const ROI_CENSORED_CENTER_MIN_SAMPLES: usize = 4;
 const ROI_CENSORED_CENTER_MAD_LIMIT: i32 = 8;
@@ -29490,6 +29496,9 @@ struct RawRoiTracker {
     /// Recent segmenter iris centers (source ns, sensor px), recorded before
     /// any crop-origin gating so a pivot plan can be checked against them.
     segmenter_iris_centers: [VecDeque<(u64, (f64, f64))>; 2],
+    /// Recent (source ns, subject-right minus subject-left iris offset) from
+    /// near-simultaneous segmenter centers. Aims a crop only; never gaze.
+    segmenter_iris_pair_offsets: VecDeque<(u64, (f64, f64))>,
     /// Last position independently established by MediaPipe or the bilateral
     /// fixed-context matcher. Eye-local fits are bounded around this anchor.
     trusted_absolute: [(i32, i32); 2],
@@ -29612,6 +29621,37 @@ impl RawRoiTracker {
         if history.back().is_some_and(|(previous, _)| source_timestamp_ns <= *previous) { return; }
         history.push_back((source_timestamp_ns, center));
         while history.len() > SEGMENTER_IRIS_ANCHOR_SAMPLES { history.pop_front(); }
+        let eye_index = eye_index.min(1);
+        if let Some(&(partner_ns, partner)) = self.segmenter_iris_centers[1 - eye_index].back() {
+            if source_timestamp_ns.abs_diff(partner_ns) <= SEGMENTER_IRIS_PAIR_MAX_SKEW_NS {
+                let (right, left) = if eye_index == 0 { (center, partner) } else { (partner, center) };
+                let offsets = &mut self.segmenter_iris_pair_offsets;
+                offsets.push_back((source_timestamp_ns.max(partner_ns), (right.0 - left.0, right.1 - left.1)));
+                while offsets.len() > SEGMENTER_IRIS_PAIR_OFFSETS { offsets.pop_front(); }
+            }
+        }
+    }
+
+    /// When an eye has no fresh segmenter iris of its own, aim its crop at the
+    /// partner's fresh iris translated by their recently observed offset.
+    /// Both eyes rotate together, so this is accurate to a few pixels in the
+    /// corpus; it places a camera crop and is never used as gaze evidence.
+    fn partner_iris_anchor(&self, eye_index: usize, timestamp_ns: u64) -> Option<(f64, f64)> {
+        let eye_index = eye_index.min(1);
+        let offsets = &self.segmenter_iris_pair_offsets;
+        if offsets.len() < SEGMENTER_IRIS_PAIR_MIN_OFFSETS
+            || offsets.back().is_none_or(|(at, _)| timestamp_ns.saturating_sub(*at) > SEGMENTER_IRIS_PAIR_MAX_AGE_NS) {
+            return None;
+        }
+        let partner = self.segmenter_iris_anchor(1 - eye_index, timestamp_ns)?;
+        let median = |axis: fn(&(f64, f64)) -> f64| {
+            let mut values = offsets.iter().map(|(_, o)| axis(o)).collect::<Vec<_>>();
+            values.sort_by(f64::total_cmp);
+            values[values.len() / 2]
+        };
+        let offset = (median(|o| o.0), median(|o| o.1));
+        let sign = if eye_index == 0 { 1.0 } else { -1.0 };
+        Some((partner.0 + sign * offset.0, partner.1 + sign * offset.1))
     }
 
     /// Median of the last few segmenter iris centers when they are fresh and
@@ -29639,7 +29679,8 @@ impl RawRoiTracker {
     /// crop position so the iris is re-captured; band containment is kept.
     fn crop_following_segmenter_iris(&self, eye_index: usize, planned: (i32, i32), band_y: u32,
         timestamp_ns: u64) -> (i32, i32) {
-        let Some(center) = self.segmenter_iris_anchor(eye_index, timestamp_ns) else { return planned; };
+        let Some(center) = self.segmenter_iris_anchor(eye_index, timestamp_ns)
+            .or_else(|| self.partner_iris_anchor(eye_index, timestamp_ns)) else { return planned; };
         let offset = (center.0 - (planned.0 + self.eye_size.0 / 2) as f64,
             center.1 - (planned.1 + self.eye_size.1 / 2) as f64);
         if offset.0.abs() <= SEGMENTER_IRIS_ANCHOR_TOLERANCE_PX && offset.1.abs() <= SEGMENTER_IRIS_ANCHOR_TOLERANCE_PX {
@@ -29791,11 +29832,6 @@ impl RawRoiTracker {
             }
             _ => plan.band_y,
         };
-        for eye in 0..2 {
-            if mask & (1 << eye) != 0 {
-                desired[eye] = self.crop_following_segmenter_iris(eye, desired[eye], band_y, current_timestamp_ns);
-            }
-        }
         // One eye often lacks an admitted 3D surface. Retaining its existing
         // physical crop is NOT a fresh pivot observation. Keep that crop when
         // it fits; packing conflict may evict it, without inventing anatomy.
@@ -29804,6 +29840,13 @@ impl RawRoiTracker {
                 && desired[eye].1 >= band_y as i32
                 && desired[eye].1 + self.eye_size.1 <= band_y as i32 + self.window.1
             { mask |= 1 << eye; }
+        }
+        // Includes a retained crop whose own pivot has expired: that is the
+        // eye most likely to have been parked beside its iris.
+        for eye in 0..2 {
+            if mask & (1 << eye) != 0 {
+                desired[eye] = self.crop_following_segmenter_iris(eye, desired[eye], band_y, current_timestamp_ns);
+            }
         }
         if mask == 0 { return; }
         // Preserve the independently established left/right identity ordering.
@@ -29888,6 +29931,7 @@ impl RawRoiTracker {
             roi_censored_center_history: [Vec::new(), Vec::new()],
             roi_censored_center_last_timestamp_ns: [None; 2],
             segmenter_iris_centers: std::array::from_fn(|_| VecDeque::new()),
+            segmenter_iris_pair_offsets: VecDeque::new(),
             trusted_absolute: absolute,
             roi_censored_last_step: [None; 2],
             valid_seen: [false; 2],
@@ -49612,6 +49656,30 @@ mod tests {
         assert_eq!(tracker.crop_following_segmenter_iris(0,near,2300,now),near,"within tolerance keeps the plan");
         tracker.record_segmenter_iris_center(0,1_300_000_000,(3900.0,2587.0));
         assert_eq!(tracker.crop_following_segmenter_iris(0,planned,2300,1_350_000_000),planned,"inconsistent samples do not steer");
+    }
+
+    #[test]
+    fn eye_without_segmenter_iris_is_aimed_from_partner_offset() {
+        // Calibration 1790548034, top-right: subject-right's segmenter found no
+        // iris while subject-left was tracked; its crop stayed ~110 px off.
+        let mut tracker=synthetic_tracker();
+        tracker.eye_size=(420,280);
+        tracker.window.1=576;
+        for i in 0..3u64 {
+            let t=1_000_000_000+i*100_000_000;
+            tracker.record_segmenter_iris_center(1,t,(4700.0,2600.0));
+            tracker.record_segmenter_iris_center(0,t+10_000_000,(3810.0,2620.0));
+        }
+        // Subject-right now fails; subject-left keeps observing.
+        for i in 3..6u64 { tracker.record_segmenter_iris_center(1,1_000_000_000+i*100_000_000,(4702.0,2601.0)); }
+        let now=1_650_000_000;
+        assert!(tracker.segmenter_iris_anchor(0,now).is_none(),"own iris is stale");
+        let anchor=tracker.partner_iris_anchor(0,now).unwrap();
+        assert!((anchor.0-3812.0).abs()<1.0 && (anchor.1-2621.0).abs()<1.0);
+        let planned=(3712,2480);
+        let moved=tracker.crop_following_segmenter_iris(0,planned,2400,now);
+        assert_eq!(moved,((3812-210)&!3,(2621-140)&!1));
+        assert!(tracker.partner_iris_anchor(0,now+20_000_000_000).is_none(),"old pair offsets do not aim");
     }
 
     #[test]
