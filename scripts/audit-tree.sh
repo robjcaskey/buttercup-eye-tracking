@@ -118,6 +118,7 @@ mapfile -t unexpected_files < <(
       ./src/bin/buttercup_sign_expert_trial.rs \
       ./src/bin/buttercup_sign_expert_trial/scene.rs \
       ./src/bin/buttercup_prepare_eye_student.rs \
+      ./src/bin/buttercup_calibration_strata.rs \
       ./src/bin/buttercup_prepare_limbus_refiner.rs \
       ./src/bin/buttercup_report_eye_student.rs \
       ./src/bin/buttercup_report_limbus_refiner.rs \

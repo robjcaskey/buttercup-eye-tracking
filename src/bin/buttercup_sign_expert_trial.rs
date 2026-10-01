@@ -1,5 +1,7 @@
 //! CPU-only synthetic sign-expert arbitration trial. Not a live gaze model.
 //! RAW reflection statistics set missingness/clipping scenarios, never sign truth.
+#[path = "../parallel_work.rs"]
+mod parallel_work;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};

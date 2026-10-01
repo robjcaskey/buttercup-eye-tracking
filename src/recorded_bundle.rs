@@ -120,6 +120,24 @@ impl BundleSource {
         Ok(bytes)
     }
 
+    /// File path and absolute byte range of an entry, so an index can address
+    /// native RAW bytes inside an uncompressed bundle without copying it.
+    pub fn entry_location(&self, name: &str) -> Result<(PathBuf, u64, u64), String> {
+        match self {
+            Self::Directory(root) => {
+                let path = root.join(name);
+                let size = fs::metadata(&path)
+                    .map_err(|error| format!("stat {}: {error}", path.display()))?
+                    .len();
+                Ok((path, 0, size))
+            }
+            Self::Tar { path, entries } => entries
+                .get(name)
+                .map(|entry| (path.clone(), entry.data_offset, entry.size))
+                .ok_or_else(|| format!("tar bundle lacks entry {name:?}")),
+        }
+    }
+
     pub fn read_entry(&self, name: &str) -> Result<Vec<u8>, String> {
         let size = match self {
             Self::Directory(root) => fs::metadata(root.join(name))

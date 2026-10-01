@@ -1,6 +1,8 @@
 //! Bounded evaluation: native regional RAW tracks versus candidate circle motion.
 //! Historical conics are hypotheses, never sign labels. No live solver changes.
 #![allow(dead_code)]
+#[path = "../parallel_work.rs"]
+mod parallel_work;
 #[path = "../"]
 mod native {
     pub mod conic_solver;

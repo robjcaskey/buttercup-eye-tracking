@@ -2,6 +2,8 @@
 //! No live viewer/model settings are changed. See docs/flat-tire-area-and-motion.md.
 #![allow(dead_code)]
 
+#[path = "../parallel_work.rs"]
+mod parallel_work;
 #[path = "../geometry.rs"]
 mod geometry;
 // The directory wrapper preserves Rust's normal child-module lookup for the

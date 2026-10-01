@@ -2,6 +2,8 @@
 //! contour exports. This is component validation, not measured gaze accuracy.
 //! Human labels and screen target positions are deliberately not inputs.
 #![allow(dead_code)]
+#[path = "../parallel_work.rs"]
+mod parallel_work;
 #[path="../geometry.rs"] mod geometry;
 #[path="../raw10.rs"] mod raw10;
 #[path="../"] mod native {

@@ -1,5 +1,7 @@
 //! Offline conventional perspective-twin replay; no model loads or live actions.
 #![allow(dead_code)]
+#[path = "../parallel_work.rs"]
+mod parallel_work;
 #[path = "../geometry.rs"]
 mod geometry;
 #[path = "../raw10.rs"]

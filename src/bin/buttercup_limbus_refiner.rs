@@ -1,5 +1,7 @@
 //! Supervised native-RAW local limbus model; no camera IO.
 #![allow(dead_code)]
+#[path = "../parallel_work.rs"]
+mod parallel_work;
 #[path = "../geometry.rs"]
 mod geometry;
 #[path = "../raw10.rs"]

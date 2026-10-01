@@ -1,6 +1,8 @@
 //! Source-bound extension of the independent projected eye-centre experiment.
 //! Reuses exported native conics, never the previous replay's branch choices.
 #![allow(dead_code)]
+#[path = "../parallel_work.rs"]
+mod parallel_work;
 #[path = "../geometry.rs"]
 mod geometry;
 #[path = "../raw10.rs"]

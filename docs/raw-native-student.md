@@ -111,6 +111,28 @@ also requires the same stamped source tree. Receipts pin supplied SAM assets,
 but do not independently prove their original upstream acquisition/export chain.
 A structural DAG certificate is not proof of successful cold execution.
 
+### Calibration-target strata
+
+The first run's 574 training exposures under-represent far-right and near-
+camera gaze. `buttercup_calibration_strata` indexes calibration recordings by
+the **displayed** target instead, using acquisition metadata only: each
+session tar's presentation events (`host_submit_end_unix_ns`) and native frame
+records. A frame is tagged only after the viewer's 2.1 s settle interval; the
+tag says what was shown, not where the person looked. No model, recorded
+prediction, gaze estimate or fitted geometry is read, so selection adds no
+learned ancestor. Each session is one lineage (both eyes, one partition).
+
+```sh
+data/target/live/buttercup_calibration_strata "$RUN/strata-index.jsonl" outputs/calibration-corpus/*.session.json
+data/target/live/buttercup_prepare_eye_student "$RUN/strata-index.jsonl" "$RUN/frames.jsonl" --per-eye-session 2
+```
+
+Rows carrying `student_stratum` are capped per session, eye and stratum, so a
+target held longer (a failing calibration waits on it) is not over-sampled.
+Sessions recorded before `metadata.oim1` existed are reported as failed and
+skipped, not guessed. Sessions heavily used for development remain in whatever
+partition their lineage hashes to; confirm on newly recorded sessions.
+
 ## Interpretation
 
 `BUTTERCUP_EYE_STUDENT_TIMING=1` synchronizes CUDA for separate preparation,

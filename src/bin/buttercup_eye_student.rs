@@ -13,6 +13,8 @@ mod roi_continuity;
 mod roi_visibility;
 #[path = "../sam31_outer.rs"]
 mod sam31_outer;
+#[path = "../parallel_work.rs"]
+mod parallel_work;
 #[path = "../"]
 mod native {
     pub(crate) mod conic_solver;

@@ -78,7 +78,10 @@ fn prepare(options: &Options) -> Result<Value> {
     if !fs::canonicalize(parent)?.starts_with(&root) {
         return Err("output must be under outputs".into());
     }
-    let mut groups: BTreeMap<(String, Eye), Vec<Value>> = BTreeMap::new();
+    // Optional acquisition stratum (e.g. displayed calibration target): the
+    // per-eye cap then applies per session, eye and stratum. Absent strata keep
+    // the original per session and eye behaviour.
+    let mut groups: BTreeMap<(String, Eye, String), Vec<Value>> = BTreeMap::new();
     let mut seen = HashSet::new();
     let mut sizes = HashMap::new();
     let mut unavailable = 0usize;
@@ -108,6 +111,7 @@ fn prepare(options: &Options) -> Result<Value> {
         let key = (
             string(&row, "clock_lineage")?.to_owned(),
             eye(&row["frame"]["eye_id"])?,
+            row["student_stratum"].as_str().unwrap_or_default().to_owned(),
         );
         // Validate timestamps before sorting; malformed inputs must fail, never silently reorder.
         integer(&row["frame"]["timestamp_ns"])?;
@@ -115,7 +119,7 @@ fn prepare(options: &Options) -> Result<Value> {
     }
     let mut lineages: Vec<_> = groups
         .keys()
-        .map(|(lineage, _)| lineage.clone())
+        .map(|(lineage, _, _)| lineage.clone())
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
@@ -125,7 +129,7 @@ fn prepare(options: &Options) -> Result<Value> {
     }
     let allowed: HashSet<_> = lineages.into_iter().collect();
     let mut selected = Vec::new();
-    for ((lineage, _), mut rows) in groups {
+    for ((lineage, _, _), mut rows) in groups {
         if !allowed.contains(&lineage) {
             continue;
         }
@@ -190,7 +194,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Options>> {
     let mut max_sessions = 0usize;
     while let Some(arg) = args.next() {
         if arg == "--help" || arg == "-h" {
-            println!("Usage: buttercup_prepare_eye_student INDEX OUTPUT [--per-eye-session 20] [--max-sessions 0]\nSelect source-native, source-clock-disjoint examples and verify selected RAW hashes.");
+            println!("Usage: buttercup_prepare_eye_student INDEX OUTPUT [--per-eye-session 20] [--max-sessions 0]\nSelect source-native, source-clock-disjoint examples and verify selected RAW hashes.\nRows with student_stratum are capped per session, eye and stratum.");
             return Ok(None);
         }
         let (name, inline) = arg
@@ -291,6 +295,31 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn stratum_caps_each_target_separately_within_one_session_and_eye() {
+        let f = Fixture::new();
+        let mut rows = vec![];
+        // One long-held target (six frames) and one short target (two frames).
+        for stamp in 1..=6 {
+            let mut row = f.row("session", 1, stamp);
+            row["student_stratum"] = json!("calibration-target-0.90-0.10");
+            rows.push(row);
+        }
+        for stamp in 7..=8 {
+            let mut row = f.row("session", 1, stamp);
+            row["student_stratum"] = json!("calibration-target-0.10-0.10");
+            rows.push(row);
+        }
+        f.rows(&rows);
+        let result = prepare(&f.options()).unwrap();
+        assert_eq!(result["frames"], 4, "two per stratum, not four from the longer hold");
+        let chosen = f.selected();
+        for stratum in ["calibration-target-0.90-0.10", "calibration-target-0.10-0.10"] {
+            assert_eq!(chosen.iter().filter(|r| r["student_stratum"] == stratum).count(), 2);
+        }
+        assert!(chosen.iter().all(|r| r["student_split"] == partition("session")));
     }
 
     #[test]
