@@ -1109,6 +1109,7 @@ mod tests {
                 width: 48,
                 height: 32,
                 selected_query: Some(0),
+                tile_slice: None,
                 masks: vec![sam31_outer::ProposalMask {
                     query: 0,
                     score: 0.9,
@@ -1293,6 +1294,8 @@ mod tests {
                 mask_state_proposals: vec![],
                 population_integration: None,
                 supported_mode_selection: None,
+                global_gaze_moments: [None; 2],
+                map_gaze_directions: [None; 2],
             });
             let publication = Arc::new(publication);
             for frame in snapshot.eyes.iter_mut().flatten() {

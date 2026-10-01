@@ -113,6 +113,7 @@ pub(super) fn finalize(
         outer_boundary_logits,
         limbus_refinement,
         inner_pupil_fit: proposal_pupil_fit,
+        pupil_occlusion: None,
         adapters: Vec::new(),
     });
     let admitted = (|| {
@@ -190,7 +191,8 @@ pub(crate) fn joint_evidence(
     exposure: crate::roi_evidence::ExposureKey,
 ) -> Option<crate::outline_conic_segments::sparse_evidence::OwnedRoiEvidence> {
     use crate::outline_conic_segments::sparse_evidence::{
-        append_raw_ring_arcs, append_retained_sam_arcs, OwnedRoiEvidence, RawArcConfig,
+        append_occluded_raw_ring_arcs, append_raw_ring_arcs, append_retained_sam_arcs,
+        OwnedRoiEvidence, RawArcConfig,
     };
     use crate::roi_evidence::BoundaryKind;
     if proposal.eye_index.checked_add(1)? != exposure.roi.0 as usize
@@ -231,14 +233,29 @@ pub(crate) fn joint_evidence(
                 )
             }))
     {
-        append_raw_ring_arcs(
-            &mut packet,
-            &proposal.source_raw,
-            pupil.ellipse,
-            BoundaryKind::PupillaryBoundary,
-            100,
-            config,
-        );
+        if let Some(occlusion) = &proposal.pupil_occlusion {
+            // A diagnostic occluder must bind to this exact source; a mismatch
+            // is an error in the caller, not permission to use the baseline.
+            assert!(occlusion.binds_to(&packet), "pupil occlusion bound to another source");
+            append_occluded_raw_ring_arcs(
+                &mut packet,
+                &proposal.source_raw,
+                pupil.ellipse,
+                BoundaryKind::PupillaryBoundary,
+                100,
+                config,
+                occlusion,
+            );
+        } else {
+            append_raw_ring_arcs(
+                &mut packet,
+                &proposal.source_raw,
+                pupil.ellipse,
+                BoundaryKind::PupillaryBoundary,
+                100,
+                config,
+            );
+        }
     }
     Some(packet)
 }

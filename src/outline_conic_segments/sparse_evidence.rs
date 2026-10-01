@@ -46,6 +46,43 @@ pub(crate) struct OwnedRoiEvidence {
     pub(crate) detail_reliability: Option<f64>,
 }
 
+/// Diagnostic, source-bound occluder support in native CFA cells: cell
+/// (cx, cy) is native pixels 4cx..4cx+3 by 4cy..4cy+3. A ring-probe sample
+/// with nonzero interpolation weight on any listed cell is MISSING before
+/// contrast and peak selection (no bridging, no width). It applies only to the
+/// exact exposure, sensor origin and dimensions it was derived for; an empty
+/// cell set reproduces the unoccluded measurement exactly.
+#[derive(Clone, Debug)]
+pub(crate) struct CellOcclusion {
+    pub(crate) roi: u32,
+    pub(crate) sequence: u64,
+    pub(crate) timestamp_ns: u64,
+    pub(crate) sensor_origin_px: [u32; 2],
+    pub(crate) dimensions_px: [u32; 2],
+    pub(crate) lineage: String,
+    pub(crate) cells: std::collections::HashSet<(usize, usize)>,
+}
+
+impl CellOcclusion {
+    pub(crate) fn binds_to(&self, packet: &OwnedRoiEvidence) -> bool {
+        self.roi == packet.exposure.roi.0
+            && self.sequence == packet.exposure.sequence
+            && self.timestamp_ns == packet.exposure.timestamp_ns
+            && self.sensor_origin_px == packet.sensor_origin_px
+            && self.dimensions_px == packet.dimensions_px
+    }
+
+    /// Whether a CfaGrid sample at (x, y) draws on an occluded cell.
+    fn touches(&self, x: f64, y: f64) -> bool {
+        let (gx, gy) = ((x - 1.5) / 4.0, (y - 1.5) / 4.0);
+        let (ix, iy) = (gx.floor() as usize, gy.floor() as usize);
+        let (wx, wy) = (gx - ix as f64, gy - iy as f64);
+        [(0, 0, true), (1, 0, wx > 0.0), (0, 1, wy > 0.0), (1, 1, wx > 0.0 && wy > 0.0)]
+            .into_iter()
+            .any(|(dx, dy, weighted)| weighted && self.cells.contains(&(ix + dx, iy + dy)))
+    }
+}
+
 pub(crate) struct PreparedRoiEvidence<'a> {
     source: &'a OwnedRoiEvidence,
     arcs: Vec<BoundaryArcObservation<'a>>,
@@ -676,6 +713,35 @@ pub(crate) fn append_raw_ring_arcs(
     append_raw_ring_arcs_with_cohesion(packet, raw, guide, kind, group_base, config, false)
 }
 
+/// Diagnostic: `append_raw_ring_arcs` with probe samples on a source-bound
+/// occluder treated as missing. Refuses (appends nothing) if not bound.
+pub(crate) fn append_occluded_raw_ring_arcs(
+    packet: &mut OwnedRoiEvidence,
+    raw: &[u16],
+    guide: Ellipse,
+    kind: BoundaryKind,
+    group_base: u32,
+    config: RawArcConfig,
+    occlusion: &CellOcclusion,
+) -> usize {
+    if !occlusion.binds_to(packet) || !matches!(config.sampling, RawSampling::CfaGrid) {
+        return 0;
+    }
+    append_raw_ring_arcs_paths(
+        packet,
+        raw,
+        guide,
+        kind,
+        group_base,
+        config,
+        false,
+        false,
+        false,
+        ConicPathPolicy::None,
+        Some(occlusion),
+    )
+}
+
 /// Explicit offline comparison until matched corpus checks justify promotion.
 pub(crate) fn append_raw_ring_arcs_with_cohesion(
     packet: &mut OwnedRoiEvidence,
@@ -697,6 +763,7 @@ pub(crate) fn append_raw_ring_arcs_with_cohesion(
         false,
         false,
         ConicPathPolicy::None,
+        None,
     )
 }
 
@@ -720,6 +787,7 @@ pub(crate) fn append_shape_checked_raw_ring_arcs(
         true,
         false,
         ConicPathPolicy::None,
+        None,
     )
 }
 
@@ -744,6 +812,7 @@ pub(crate) fn append_optical_raw_ring_arcs(
         false,
         true,
         ConicPathPolicy::None,
+        None,
     )
 }
 
@@ -766,6 +835,7 @@ pub(crate) fn append_conic_associated_raw_ring_arcs(
         false,
         false,
         ConicPathPolicy::Replace,
+        None,
     )
 }
 
@@ -791,6 +861,7 @@ pub(crate) fn append_augmented_raw_ring_arcs(
         false,
         false,
         ConicPathPolicy::Augment,
+        None,
     )
 }
 
@@ -942,6 +1013,7 @@ fn raw_ring_profiles(
     guide: Ellipse,
     config: RawArcConfig,
     optical: bool,
+    occlusion: Option<&CellOcclusion>,
 ) -> ([[Option<Edge>; 2]; 64], [(f64, f64); 64]) {
     let (sine, cosine) = guide.angle.sin_cos();
     let search = config.radial_search_px.min(12.0);
@@ -970,15 +1042,16 @@ fn raw_ring_profiles(
             .min(990.0);
         let measure = |center: (f64, f64), side: f64| -> Option<f64> {
             let sample = |along: f64| {
+                let (x, y) = (
+                    center.0 + side * normal.0 - along * normal.1,
+                    center.1 + side * normal.1 + along * normal.0,
+                );
+                if occlusion.is_some_and(|o| o.touches(x, y)) {
+                    return None;
+                }
                 config
                     .sampling
-                    .sample(
-                        raw,
-                        width,
-                        height,
-                        center.0 + side * normal.0 - along * normal.1,
-                        center.1 + side * normal.1 + along * normal.0,
-                    )
+                    .sample(raw, width, height, x, y)
                     .filter(|v| *v <= ceiling)
             };
             if optical {
@@ -990,9 +1063,21 @@ fn raw_ring_profiles(
             }
         };
         let mut profiles = Vec::with_capacity(17);
+        // Profiles whose samples an occluder hid: unknown, so they may not
+        // narrow any peak's supported width below the unoccluded bound.
+        let mut hidden_profiles = 0usize;
         for offset_index in -8..=8 {
             let offset = offset_index as f64 * step;
             let center = (point.0 + offset * normal.0, point.1 + offset * normal.1);
+            if let Some(occlusion) = occlusion {
+                let alongs: &[f64] = if optical { &[-4.0, 0.0, 4.0] } else { &[0.0] };
+                if [-3.0, 3.0].iter().any(|side| alongs.iter().any(|along| occlusion.touches(
+                    center.0 + side * normal.0 - along * normal.1,
+                    center.1 + side * normal.1 + along * normal.0,
+                ))) {
+                    hidden_profiles += 1;
+                }
+            }
             let (Some(inner), Some(outer)) = (measure(center, -3.0), measure(center, 3.0)) else {
                 profiles.push(None);
                 continue;
@@ -1039,7 +1124,7 @@ fn raw_ring_profiles(
                     connected_profile_width(&profiles, i, step).unwrap_or(supported_width)
                 } else {
                     supported_width
-                };
+                } + hidden_profiles as f64 * step;
                 Some(Edge {
                     point: (
                         point.0 + refinement * normal.0,
@@ -1076,7 +1161,7 @@ pub(crate) fn raw_ring_path_audit(
             && guide.major_radius >= guide.minor_radius
             && guide.angle.is_finite()
     );
-    let (profiles, centers) = raw_ring_profiles(raw, width, height, guide, config, false);
+    let (profiles, centers) = raw_ring_profiles(raw, width, height, guide, config, false, None);
     let paths = conic_edge_paths(&profiles, guide, config.radial_search_px.min(12.0));
     let edge = |e: Edge| {
         serde_json::json!({"point":e.point,"profile":e.profile_index,
@@ -1111,6 +1196,85 @@ pub(crate) fn raw_ring_path_audit(
         "contract":"Existing whole-pupil paths assign the unchanged measured RAW peaks. They are detector-conditioned association hypotheses, not anatomical truth or extra observations."})
 }
 
+/// Exact native RAW support of every accepted ring peak (diagnostic). A peak
+/// at offset index i depends on profiles i-1, i, i+1 (the bracket test), each
+/// the difference of two samples 3 px either side along the guide normal; a
+/// CfaGrid sample is bilinear over up to four 4x4 CFA cells. Only cells with
+/// nonzero interpolation weight are listed. `width_profiles` separately lists
+/// the offsets whose contrast sets the reported peak width (arc weighting),
+/// which is a dependency of the arc weight, not of the peak position.
+#[cfg(test)]
+pub(crate) fn raw_ring_footprints(
+    raw: &[u16],
+    width: usize,
+    height: usize,
+    guide: Ellipse,
+    config: RawArcConfig,
+) -> serde_json::Value {
+    assert!(matches!(config.sampling, RawSampling::CfaGrid));
+    assert!(!config.subpixel_peaks && !config.connected_peak_width);
+    let (profiles, _) = raw_ring_profiles(raw, width, height, guide, config, false, None);
+    let (sine, cosine) = guide.angle.sin_cos();
+    let step = config.radial_search_px.min(12.0) / 8.0;
+    let cells = |x: f64, y: f64| {
+        let (gx, gy) = ((x - 1.5) / 4.0, (y - 1.5) / 4.0);
+        let (ix, iy) = (gx.floor() as i64, gy.floor() as i64);
+        let (wx, wy) = (gx - ix as f64, gy - iy as f64);
+        [(0, 0, (1.0 - wx) * (1.0 - wy)), (1, 0, wx * (1.0 - wy)),
+            (0, 1, (1.0 - wx) * wy), (1, 1, wx * wy)]
+            .into_iter()
+            .filter(|c| c.2 > 0.0)
+            .map(|(dx, dy, w)| serde_json::json!([ix + dx, iy + dy, w]))
+            .collect::<Vec<_>>()
+    };
+    let mut peaks = Vec::new();
+    for (index, pair) in profiles.iter().enumerate() {
+        let phase = std::f64::consts::TAU * index as f64 / 64.0;
+        let (x, y) = (guide.major_radius * phase.cos(), guide.minor_radius * phase.sin());
+        let point = (guide.center.0 + cosine * x - sine * y, guide.center.1 + sine * x + cosine * y);
+        let (nx, ny) = (phase.cos() / guide.major_radius, phase.sin() / guide.minor_radius);
+        let norm = nx.hypot(ny);
+        let normal = ((cosine * nx - sine * ny) / norm, (sine * nx + cosine * ny) / norm);
+        let at = |offset_index: i64| {
+            let offset = offset_index as f64 * step;
+            (point.0 + offset * normal.0, point.1 + offset * normal.1)
+        };
+        for (rank, edge) in pair.iter().enumerate() {
+            let Some(edge) = edge else { continue };
+            let peak = (edge.offset / step).round() as i64;
+            let center = at(peak);
+            // Self-check: without subpixel refinement the edge is the profile centre.
+            assert!((center.0 - edge.point.0).hypot(center.1 - edge.point.1) < 1e-9);
+            let probes = (peak - 1..=peak + 1)
+                .flat_map(|j| {
+                    let c = at(j);
+                    [("inner", -3.0), ("outer", 3.0)].map(|(role, side)| {
+                        let s = (c.0 + side * normal.0, c.1 + side * normal.1);
+                        serde_json::json!({"offset_index": j, "role": role,
+                            "bracket": if j == peak {"peak"} else {"neighbour"},
+                            "sample": [s.0, s.1], "cells": cells(s.0, s.1)})
+                    })
+                })
+                .collect::<Vec<_>>();
+            peaks.push(serde_json::json!({"profile": index, "rank": rank,
+                "point": [edge.point.0, edge.point.1], "offset_index": peak,
+                "normal": [normal.0, normal.1], "contrast": edge.contrast,
+                "width_profiles": (-8..=8).filter(|&j| {
+                    let c = at(j);
+                    let v = |side: f64| config.sampling.sample(raw, width, height,
+                        c.0 + side * normal.0, c.1 + side * normal.1)
+                        .filter(|v| *v <= config.maximum_profile_luma_raw10.unwrap_or(990.0).min(990.0));
+                    matches!((v(-3.0), v(3.0)), (Some(i), Some(o)) if o - i >= edge.contrast * 0.5)
+                }).collect::<Vec<_>>(),
+                "probes": probes}));
+        }
+    }
+    serde_json::json!({"guide": {"center": [guide.center.0, guide.center.1],
+        "major_radius": guide.major_radius, "minor_radius": guide.minor_radius, "angle": guide.angle},
+        "step_px": step, "cell_px": 4, "cell_pixel_centres": "cell (cx, cy) covers native pixel centres x 4cx..4cx+3, y 4cy..4cy+3",
+        "ceiling_raw10": config.maximum_profile_luma_raw10, "peaks": peaks})
+}
+
 fn append_raw_ring_arcs_paths(
     packet: &mut OwnedRoiEvidence,
     raw: &[u16],
@@ -1122,7 +1286,9 @@ fn append_raw_ring_arcs_paths(
     shape: bool,
     optical: bool,
     conic_policy: ConicPathPolicy,
+    occlusion: Option<&CellOcclusion>,
 ) -> usize {
+    assert!(occlusion.is_none_or(|o| o.binds_to(packet) && matches!(config.sampling, RawSampling::CfaGrid)));
     let [width, height] = packet.dimensions_px.map(|v| v as usize);
     if width < 12
         || height < 12
@@ -1148,7 +1314,7 @@ fn append_raw_ring_arcs_paths(
     {
         return 0;
     }
-    let (edges, profile_centers) = raw_ring_profiles(raw, width, height, guide, config, optical);
+    let (edges, profile_centers) = raw_ring_profiles(raw, width, height, guide, config, optical, occlusion);
     let search = config.radial_search_px.min(12.0);
     let start = packet.arcs.len();
     let conic_paths = if conic_policy != ConicPathPolicy::None {
@@ -1811,6 +1977,75 @@ mod tests {
     }
 
     #[test]
+    fn pupil_ring_occlusion_is_source_bound_and_only_removes_touched_probes() {
+        let guide = Ellipse {
+            major_radius: 30.0,
+            minor_radius: 24.0,
+            ..ellipse()
+        };
+        // Dark pupil on brighter iris: a clean positive edge on every ray.
+        let raw = (0..256 * 192)
+            .map(|i| {
+                let r = crate::geometry::ellipse_coordinate(((i % 256) as f64, (i / 256) as f64), guide);
+                if r < 1.0 { 40 } else { 160 }
+            })
+            .collect::<Vec<u16>>();
+        let config = RawArcConfig { maximum_profile_luma_raw10: Some(500.0), ..Default::default() };
+        let points = |p: &OwnedRoiEvidence| {
+            p.arcs.iter().flat_map(|a| a.points_roi_px.iter().copied()).collect::<Vec<_>>()
+        };
+        let bound = |cells| CellOcclusion {
+            roi: 1, sequence: 1, timestamp_ns: 1, sensor_origin_px: [0, 0], dimensions_px: [256, 192],
+            lineage: "test".into(), cells,
+        };
+        let mut baseline = packet();
+        append_raw_ring_arcs(&mut baseline, &raw, guide, BoundaryKind::PupillaryBoundary, 100, config);
+        assert!(!baseline.arcs.is_empty());
+        // Empty occluder: identical evidence.
+        let mut empty = packet();
+        append_occluded_raw_ring_arcs(&mut empty, &raw, guide, BoundaryKind::PupillaryBoundary, 100, config,
+            &bound(Default::default()));
+        assert_eq!(points(&baseline), points(&empty));
+        // Occlude every cell below the guide centre by more than 20 px.
+        let cells = (0..64).flat_map(|cx| (0..48).map(move |cy| (cx, cy)))
+            .filter(|&(_, cy)| 4.0 * cy as f64 > 96.0 + 20.0).collect();
+        let occlusion = bound(cells);
+        let mut occluded = packet();
+        append_occluded_raw_ring_arcs(&mut occluded, &raw, guide, BoundaryKind::PupillaryBoundary, 100, config,
+            &occlusion);
+        let (before, after) = (points(&baseline), points(&occluded));
+        assert!(!after.is_empty() && after.len() < before.len());
+        assert!(after.iter().all(|p| p.1 < 96.0 + 20.0));
+        // Surviving points are unchanged measurements, not re-fitted ones.
+        assert!(after.iter().all(|p| before.contains(p)));
+        // Hidden profiles are unknown, never observed narrowness: no surviving
+        // peak's width (and so its normal band) may tighten.
+        let (full, _) = raw_ring_profiles(&raw, 256, 192, guide, config, false, None);
+        let (masked, _) = raw_ring_profiles(&raw, 256, 192, guide, config, false, Some(&occlusion));
+        let mut compared = 0;
+        for (a, b) in full.iter().flatten().flatten().zip(masked.iter().flatten()) {
+            if let Some(b) = b {
+                if a.point == b.point {
+                    assert!(b.width >= a.width, "{} < {}", b.width, a.width);
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared > 0);
+        let (empty_profiles, _) =
+            raw_ring_profiles(&raw, 256, 192, guide, config, false, Some(&bound(Default::default())));
+        for (a, b) in full.iter().flatten().zip(empty_profiles.iter().flatten()) {
+            assert_eq!(a.map(|e| (e.point, e.width, e.contrast)), b.map(|e| (e.point, e.width, e.contrast)));
+        }
+        // Another source: refused, nothing appended.
+        let mut other = packet();
+        other.exposure.sequence = 2;
+        assert_eq!(append_occluded_raw_ring_arcs(&mut other, &raw, guide, BoundaryKind::PupillaryBoundary, 100,
+            config, &occlusion), 0);
+        assert!(other.arcs.is_empty());
+    }
+
+    #[test]
     fn weak_pupil_core_rejects_a_local_dark_ring_without_reweighting_outer_arcs() {
         let guide = Ellipse {
             major_radius: 30.0,
@@ -2460,5 +2695,55 @@ mod tests {
                 iris_tissue_luma_ceiling(256, 192, e, |x, y| Some(gain * sample(x, y))).unwrap();
             assert!((scaled - gain * base).abs() < 1.0e-9);
         }
+    }
+
+    /// Diagnostic replay: BUTTERCUP_FOOTPRINT_EXPORT (offline stereo export
+    /// JSONL), BUTTERCUP_FOOTPRINT_KEYS ("seq:roi,..."), BUTTERCUP_FOOTPRINT_OUT.
+    /// Replays the pupil ring probes with CURRENT code at the export's recorded
+    /// pupil guide (pupil_void) and outer fit (baseline_ellipse), exactly as the
+    /// bridge replay builds its proposal. Not the archived live probe inputs.
+    #[test]
+    #[ignore]
+    fn export_pupil_ring_footprints() {
+        use std::io::{Read, Seek};
+        let export = std::env::var("BUTTERCUP_FOOTPRINT_EXPORT").unwrap();
+        let keys = std::env::var("BUTTERCUP_FOOTPRINT_KEYS").unwrap();
+        let keys: Vec<(u64, u64)> = keys.split(',').map(|k| {
+            let (a, b) = k.split_once(':').unwrap(); (a.parse().unwrap(), b.parse().unwrap())
+        }).collect();
+        let ellipse = |v: &serde_json::Value| Some(Ellipse {
+            center: (v["center"][0].as_f64()?, v["center"][1].as_f64()?),
+            major_radius: v["major_radius"].as_f64()?, minor_radius: v["minor_radius"].as_f64()?,
+            angle: v["angle"].as_f64()?,
+        });
+        let mut out = String::new();
+        for line in std::fs::read_to_string(&export).unwrap().lines() {
+            let case: serde_json::Value = serde_json::from_str(line).unwrap();
+            let (row, meta) = (&case["input"], &case["input"]["frame"]);
+            let n = |k: &str| meta[k].as_u64().unwrap();
+            if !keys.contains(&(n("sequence"), n("eye_id"))) { continue; }
+            let mut file = std::fs::File::open(row["raw_file"].as_str().unwrap()).unwrap();
+            file.seek(std::io::SeekFrom::Start(row["raw_offset"].as_u64().unwrap())).unwrap();
+            let mut packed = vec![0; row["raw_length"].as_u64().unwrap() as usize];
+            file.read_exact(&mut packed).unwrap();
+            let (w, h) = (n("width") as usize, n("height") as usize);
+            let raw = crate::raw10::try_unpack_raw10(&packed, w, h, n("stride") as usize).unwrap();
+            let outer = case["candidates"].as_array().and_then(|c| c.first())
+                .and_then(|c| ellipse(&c["baseline_ellipse"]));
+            let pupil = ellipse(&case["pupil_void"]["ellipse"]);
+            let mut record = serde_json::json!({"sequence": n("sequence"), "roi": n("eye_id"),
+                "source_key": meta["source_clock"]["source_key"], "sensor_origin": [n("sensor_x"), n("sensor_y")],
+                "provenance": "replay with current raw_ring_profiles at the export's pupil_void guide and baseline_ellipse outer; not archived live probe inputs",
+                "export": export});
+            match (outer, pupil) {
+                (Some(outer), Some(pupil)) => match RawArcConfig::for_pupil(&raw, w, h, outer) {
+                    Some(config) => record["footprints"] = raw_ring_footprints(&raw, w, h, pupil, config),
+                    None => record["abstain"] = "for_pupil config unavailable".into(),
+                },
+                _ => record["abstain"] = "no outer fit or pupil guide in export".into(),
+            }
+            out.push_str(&record.to_string()); out.push('\n');
+        }
+        std::fs::write(std::env::var("BUTTERCUP_FOOTPRINT_OUT").unwrap(), out).unwrap();
     }
 }

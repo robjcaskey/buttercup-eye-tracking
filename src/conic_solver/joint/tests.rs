@@ -209,6 +209,7 @@ fn scene() -> JointScenePrior {
         secondary_target_seed_camera_mm: None,
         maximum_gaze_slope: 1.5,
         interocular_distance_mm: Some(support(64.0, 12.0, 8.0)),
+        measured_boundary_sigma_px: [None; 3],
     }
 }
 

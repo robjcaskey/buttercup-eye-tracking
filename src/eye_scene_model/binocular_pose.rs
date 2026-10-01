@@ -156,6 +156,7 @@ pub(crate) fn approximate_scene(
                 maximum: 100.0,
                 sigma: 18.0,
             }),
+            measured_boundary_sigma_px: [None; 3],
         },
         scale_provenance,
         independent_pixels_per_mm: independent,

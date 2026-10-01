@@ -2,6 +2,8 @@
 #![recursion_limit = "256"]
 
 #[cfg(feature = "sam31")]
+#[path = "../parallel_work.rs"]
+mod parallel_work;
 #[path = "../geometry.rs"]
 mod geometry;
 #[cfg(feature = "sam31")]
@@ -103,6 +105,7 @@ mod enabled {
         evidence_only: bool,
         mask_width: usize,
         mask_height: usize,
+        tile_slice: Option<sam31_outer::TileSlice>,
         mask: ProposalMask,
         fitted: Option<Ellipse>,
         fit_points: Arc<Vec<(f64, f64)>>,
@@ -1579,6 +1582,44 @@ mod enabled {
         })
     }
 
+    /// Opt-in diagnostic export of every returned candidate mask (binary PGM at
+    /// the mask's own low resolution) plus a JSON index, so overlap with other
+    /// evidence can be measured offline. Masks are SAM proposals, not labels.
+    fn export_prompt_lab_masks(directory: &Path, prompts: &[String], rows: &[PromptLabRow]) -> Result<(), String> {
+        fs::create_dir_all(directory).map_err(|error| format!("create {}: {error}", directory.display()))?;
+        let mut index = Vec::new();
+        for (row_index, row) in rows.iter().enumerate() {
+            for step in &row.steps {
+                for candidate in &step.all_candidates {
+                    let name = format!("row{row_index:02}-seq{}-prompt{}-query{}.pgm", row.sequence, step.prompt_index, candidate.query);
+                    let mut bytes = format!("P5\n{} {}\n255\n", candidate.mask_width, candidate.mask_height).into_bytes();
+                    bytes.extend(candidate.mask.pixels.iter().map(|&v| if v == 0 { 0u8 } else { 255u8 }));
+                    fs::write(directory.join(&name), bytes).map_err(|error| format!("write {name}: {error}"))?;
+                    // Exact slice provenance carried from latest_tile_proposal_masks;
+                    // null when the pass was not a filmstrip slice.
+                    let transform = candidate.tile_slice.map(|slice| json!({
+                        "provenance": "recorded at latest_tile_proposal_masks from the model output shape",
+                        "x_legacy": "(start_x + local_x + 0.5) * filmstrip_width / full_mask_width - 0.5 - tile * frame_width",
+                        "y_legacy": "(local_y + 0.5) * frame_height / mask_height - 0.5",
+                        "legacy_frame": "384x256 source frame (the centre crop when BUTTERCUP_SAM31_LEGACY_CENTER_CROP is set; native RAW pixel = legacy + (sensor_origin here - native frame sensor_origin); the exported sensor_origin is the cropped one)",
+                        "full_mask_width": slice.full_mask_width, "tile_start_x": slice.start_x, "tile_index": slice.tile,
+                        "filmstrip_width": sam31_outer::FRAME_WIDTH * sam31_outer::HISTORY_FRAMES,
+                        "frame_width": sam31_outer::FRAME_WIDTH, "frame_height": sam31_outer::FRAME_HEIGHT}));
+                    index.push(json!({"file": name, "row": row_index, "source": row.source, "sequence": row.sequence,
+                        "tile_transform": transform,
+                        "sensor_origin": [row.sensor_origin.0, row.sensor_origin.1], "source_width": row.width, "source_height": row.height,
+                        "prompt_index": step.prompt_index,
+                        "prompt": step.prompt_index.checked_sub(1).and_then(|i| prompts.get(i)),
+                        "query": candidate.query, "score": candidate.score, "area_fraction": candidate.area_fraction,
+                        "mask_width": candidate.mask_width, "mask_height": candidate.mask_height,
+                        "semantics": "SAM proposal mask on the latest temporal tile; map to the source frame with tile_transform, not by scaling the tile to the frame"}));
+                }
+            }
+        }
+        fs::write(directory.join("index.json"), serde_json::to_vec_pretty(&index).map_err(|error| error.to_string())?)
+            .map_err(|error| format!("write mask index: {error}"))
+    }
+
     fn prompt_label_benchmark(prompts: &[String], rows: &[PromptLabRow]) -> Value {
         let labeled_rows = rows
             .iter()
@@ -1727,6 +1768,9 @@ mod enabled {
                 OsStr::new(input),
                 preprocess,
             )?);
+        }
+        if let Some(directory) = std::env::var_os("BUTTERCUP_SAM31_PROMPT_LAB_MASK_DIR") {
+            export_prompt_lab_masks(Path::new(&directory), &prompts, &rows)?;
         }
         let contact_sheet = output.join("top4-source-rows-contact-sheet.png");
         let affine_review = output.join("affine-review.mkv");
@@ -1989,6 +2033,7 @@ mod enabled {
                         evidence_only,
                         mask_width: pass.width,
                         mask_height: pass.height,
+                        tile_slice: pass.tile_slice,
                         mask: mask.clone(),
                         fitted,
                         fit_points,
@@ -2372,9 +2417,18 @@ mod enabled {
             let width = number("width", sam31_outer::FRAME_WIDTH as u64) as usize;
             let height = number("height", sam31_outer::FRAME_HEIGHT as u64) as usize;
             let stride = number("stride", (width / 4 * 5) as u64) as usize;
-            if width != sam31_outer::FRAME_WIDTH || height != sam31_outer::FRAME_HEIGHT {
+            // Opt-in diagnostic: centre-crop larger native crops (live 420x280)
+            // to the legacy offline size. Native pixels only (no resampling);
+            // 4-pixel-aligned offsets keep the quad-Bayer phase; the sensor
+            // origin moves with the crop.
+            let legacy_crop = std::env::var_os("BUTTERCUP_SAM31_LEGACY_CENTER_CROP").is_some()
+                && width >= sam31_outer::FRAME_WIDTH
+                && height >= sam31_outer::FRAME_HEIGHT;
+            if !legacy_crop
+                && (width != sam31_outer::FRAME_WIDTH || height != sam31_outer::FRAME_HEIGHT)
+            {
                 return Err(format!(
-                    "capture frame {} is {width}x{height}; expected {}x{}",
+                    "capture frame {} is {width}x{height}; expected {}x{} (BUTTERCUP_SAM31_LEGACY_CENTER_CROP=1 crops larger frames)",
                     number("sequence", 0),
                     sam31_outer::FRAME_WIDTH,
                     sam31_outer::FRAME_HEIGHT,
@@ -2406,7 +2460,16 @@ mod enabled {
                     stream_path.display()
                 )
             })?;
-            let pixels = raw10::try_unpack_raw10(&packed, width, height, stride)?;
+            let mut pixels = raw10::try_unpack_raw10(&packed, width, height, stride)?;
+            let (mut crop_x, mut crop_y, mut width, mut height) = (0usize, 0usize, width, height);
+            if legacy_crop {
+                crop_x = (width - sam31_outer::FRAME_WIDTH) / 2 / 4 * 4;
+                crop_y = (height - sam31_outer::FRAME_HEIGHT) / 2 / 4 * 4;
+                pixels = (crop_y..crop_y + sam31_outer::FRAME_HEIGHT)
+                    .flat_map(|row| pixels[row * width + crop_x..row * width + crop_x + sam31_outer::FRAME_WIDTH].to_vec())
+                    .collect();
+                (width, height) = (sam31_outer::FRAME_WIDTH, sam31_outer::FRAME_HEIGHT);
+            }
             let sequence = number("sequence", 0);
             loaded.push(LoadedRaw {
                 // A stable virtual per-frame name lets the ordinary label
@@ -2417,8 +2480,8 @@ mod enabled {
                     eye_index: number("eye_id", 1).max(1) as usize - 1,
                     sequence,
                     timestamp_ns: number("timestamp_ns", 0),
-                    sensor_x: number("sensor_x", 0) as u32,
-                    sensor_y: number("sensor_y", 0) as u32,
+                    sensor_x: number("sensor_x", 0) as u32 + crop_x as u32,
+                    sensor_y: number("sensor_y", 0) as u32 + crop_y as u32,
                     width,
                     height,
                     registration_anchor: None,

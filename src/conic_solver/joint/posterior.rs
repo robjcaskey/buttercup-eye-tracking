@@ -146,6 +146,41 @@ pub(crate) struct SupportedModeSelection {
     pub(crate) selected_robust_cost: f64,
 }
 
+/// Global per-eye gaze moments over every weighted posterior sample, taken
+/// before any supported-mode selection so competing (mirror) mass is kept.
+/// Diagnostic only: not a gate, a branch probability, or calibrated accuracy.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GazeMoments {
+    /// Posterior weight carried by samples with a gaze for this eye.
+    pub(crate) weight: f64,
+    /// m = E[g] over those samples (unit gaze vectors, same weights).
+    pub(crate) mean: [f64; 3],
+    /// |m|: 1 for a concentrated posterior, lower for spread or split mass.
+    pub(crate) resultant_length: f64,
+    /// E[g g^T] - m m^T.
+    pub(crate) covariance: [[f64; 3]; 3],
+}
+
+fn gaze_moments(samples: &[PosteriorSample], weights: &[f64], eye: usize) -> Option<GazeMoments> {
+    let (mut weight, mut first, mut second) = (0.0, [0.0; 3], [[0.0; 3]; 3]);
+    for (sample, &w) in samples.iter().zip(weights) {
+        let Some(g) = sample.1[eye] else { continue };
+        weight += w;
+        for i in 0..3 {
+            first[i] += w * g[i];
+            for j in 0..3 { second[i][j] += w * g[i] * g[j]; }
+        }
+    }
+    if !(weight > 0.0) { return None; }
+    let mean = first.map(|v| v / weight);
+    Some(GazeMoments {
+        weight,
+        mean,
+        resultant_length: norm3(mean),
+        covariance: std::array::from_fn(|i| std::array::from_fn(|j| second[i][j] / weight - mean[i] * mean[j])),
+    })
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ModelPosterior {
     pub(crate) direction_prior: crate::conic_solver::camera_mount::DirectionPrior,
@@ -176,6 +211,9 @@ pub(crate) struct ModelPosterior {
     pub(crate) mask_state_proposals: Vec<serde_json::Value>,
     pub(crate) population_integration: Option<serde_json::Value>,
     pub(crate) supported_mode_selection: Option<SupportedModeSelection>,
+    pub(crate) global_gaze_moments: [Option<GazeMoments>; 2],
+    /// Gaze of the original MAP before any supported-mode selection.
+    pub(crate) map_gaze_directions: [Option<[f64; 3]>; 2],
 }
 
 impl ModelPosterior {
@@ -250,6 +288,12 @@ impl ModelPosterior {
             "selected_fit":"unchanged joint MAP geometry; posterior mean is diagnostic only",
             "mounting_contract":"conditional on the explicit camera mounting prior; excluded whole surface normals have zero model mass; not measured sign accuracy",
         });
+        json["global_gaze_moments"]=serde_json::json!(self.global_gaze_moments.map(|m|m.map(|m|
+            serde_json::json!({"weight":m.weight,"mean":m.mean,"resultant_length":m.resultant_length,
+                "mean_direction":(m.resultant_length>0.0).then(||m.mean.map(|v|v/m.resultant_length)),
+                "covariance":m.covariance}))));
+        json["map_gaze_directions"]=serde_json::json!(self.map_gaze_directions);
+        json["global_gaze_moments_contract"]=serde_json::json!("Per-eye E[g], |E[g]| and E[gg^T]-mm^T over all weighted samples before supported-mode selection; diagnostic only, not a gate, branch probability or calibrated accuracy. Importance-sampling path only.");
         json["direction_numerics"]=serde_json::json!(self.direction_numerics.map(|n|n.map(|n|
             serde_json::json!({"mass_within_15_degrees":n.mass,"mass_standard_error":n.standard_error,
                 "two_standard_error_lower":n.mass-2.0*n.standard_error,
@@ -1637,6 +1681,8 @@ pub(super) fn integrate(
         target_mean_camera_mm: None,
         target_covariance_mm2: None,
         gaze_radius_90_degrees: [None; 2],
+        global_gaze_moments: [None; 2],
+        map_gaze_directions: [None; 2],
         direction_numerics: [None; 2],
         require_numerical_margin: config.numerical_admission,
         marginalized_inner_radii: 0,
@@ -2227,6 +2273,8 @@ pub(super) fn integrate(
             );
         }
     }
+    result.global_gaze_moments = std::array::from_fn(|eye| gaze_moments(&samples, &weights, eye));
+    result.map_gaze_directions = best.eye_gaze_directions;
     if config.select_supported_mode {
         DirectionSamples {
             samples: &samples,
@@ -2245,6 +2293,24 @@ pub(super) fn integrate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_gaze_moments_keep_split_mass_and_ignore_missing_eyes() {
+        let a = [0.0, -0.6, 0.8];
+        let b = [0.0, 0.6, 0.8];
+        let samples: Vec<PosteriorSample> = vec![
+            ([0.0; 3], [Some(a), None], 0),
+            ([0.0; 3], [Some(b), None], 1),
+            ([0.0; 3], [None, None], 0),
+        ];
+        let weights = [0.3, 0.3, 0.4];
+        let m = gaze_moments(&samples, &weights, 0).unwrap();
+        assert!((m.weight - 0.6).abs() < 1e-12);
+        assert!(m.mean[1].abs() < 1e-12 && (m.mean[2] - 0.8).abs() < 1e-12);
+        assert!((m.resultant_length - 0.8).abs() < 1e-12, "a split posterior has resultant below one");
+        assert!((m.covariance[1][1] - 0.36).abs() < 1e-12);
+        assert!(gaze_moments(&samples, &weights, 1).is_none());
+    }
 
     #[test]
     fn profile_transport_proposal_preserves_fixation_and_recovers_known_uniform_moments() {

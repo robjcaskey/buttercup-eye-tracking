@@ -52628,6 +52628,7 @@ mod tests {
                 width: 10,
                 height: 8,
                 selected_query: Some(0),
+                tile_slice: None,
                 masks: vec![sam31_outer::ProposalMask {
                     query: 0,
                     score: 0.75,
@@ -52637,6 +52638,7 @@ mod tests {
             }),
             outer_fit: None,
             inner_pupil_fit: None,
+            pupil_occlusion: None,
             adapters: Vec::new(),
         };
         let canvas_width = 120;
@@ -52681,7 +52683,7 @@ mod tests {
             source_raw: Arc::new(vec![512; 160 * 120]),
             semantic: Some(sam31_outer::SemanticProposalMasks {
                 prompt_index: 0, width: 160, height: 120,
-                selected_query: None, masks: vec![],
+                selected_query: None, tile_slice: None, masks: vec![],
             }),
             outer_fit: Some(sam31_outer::OuterMaskFitReview {
                 ellipse: geometry::Ellipse { center: (80.0,60.0), major_radius:40.0, minor_radius:25.0, angle:0.0 },
@@ -52815,6 +52817,7 @@ mod tests {
                 lower_flat_tire: false,
             }),
             inner_pupil_fit: None,
+            pupil_occlusion: None,
             adapters: Vec::new(),
         };
         let boundary =
@@ -53189,6 +53192,7 @@ mod tests {
                     strong_sectors: 7,
                 },
             }),
+            pupil_occlusion: None,
             adapters: Vec::new(),
         };
         let boundary =
@@ -71203,5 +71207,103 @@ mod segmentation_presence_tests {
         });
         assert!(triggered.is_some_and(|reason| reason.contains("failed eye-presence confidence")),
             "without segmenter presence the existing global search still fires");
+    }
+}
+
+#[cfg(test)]
+mod calibration_replay_scorer {
+    use super::*;
+
+    /// Diagnostic: score replayed per-target calibration samples with the
+    /// exact live fit sequence (target estimate, coverage, plane at the
+    /// session's recorded display size, mapping, shared support).
+    /// BUTTERCUP_CAL_SAMPLES = samples.json from samples_from_bridge.py;
+    /// BUTTERCUP_CAL_SCORES = JSONL output (one row per session x mode).
+    #[test]
+    #[ignore]
+    fn score_replayed_calibration_samples() {
+        let runs: Vec<serde_json::Value> = serde_json::from_str(
+            &std::fs::read_to_string(std::env::var("BUTTERCUP_CAL_SAMPLES").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let mut out = String::new();
+        for run in runs {
+            let session: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(run["session"].as_str().unwrap()).unwrap(),
+            )
+            .unwrap();
+            let dimensions = session["display_aspect"].as_array().map(|d| {
+                (d[0].as_f64().unwrap(), d[1].as_f64().unwrap())
+            });
+            for mode in run["modes"].as_array().unwrap() {
+                let mode = mode.as_str().unwrap();
+                let mut measured = Vec::new();
+                let mut targets = Vec::new();
+                let mut indices: Vec<_> = run["targets"].as_object().unwrap().keys().cloned().collect();
+                indices.sort_by_key(|k| k.parse::<usize>().unwrap());
+                for index in indices {
+                    let t = &run["targets"][&index];
+                    let target = (t["target"][0].as_f64().unwrap(), t["target"][1].as_f64().unwrap());
+                    let samples: Vec<(f64, f64)> = t[mode].as_array().map_or(Vec::new(), |s| {
+                        s.iter().map(|p| (p[0].as_f64().unwrap(), p[1].as_f64().unwrap())).collect()
+                    });
+                    let estimate = calibration_target_estimate(&samples);
+                    if let Some(e) = &estimate {
+                        measured.push((e.feature, target));
+                    }
+                    targets.push(serde_json::json!({"index": index, "target": [target.0, target.1],
+                        "samples": samples.len(),
+                        "estimate": estimate.as_ref().map(|e| serde_json::json!({"feature": [e.feature.0, e.feature.1],
+                            "inliers": e.inliers, "total": e.total, "angular_rms_deg": e.angular_rms.to_degrees()}))}));
+                }
+                let coverage = calibration_targets_have_required_coverage(measured.iter().map(|(_, t)| *t));
+                let mut diagnostics = gaze_target_solver::DisplayPlaneFitDiagnostics::default();
+                let plane = coverage
+                    .then(|| match dimensions {
+                        Some(d) => gaze_target_solver::fit_virtual_display_plane_diagnosed(&measured, d, Some(&mut diagnostics)),
+                        None => fit_virtual_display_plane(&measured),
+                    })
+                    .flatten();
+                let mapping = plane.and_then(|p| fit_calibrated_gaze_mapping(p, &measured));
+                let shared = plane.zip(mapping).is_some_and(|(p, (a, input))| {
+                    calibration_mapping_has_shared_support(p, a, input, &measured)
+                });
+                // Diagnostic only: residual of an unconstrained least-squares
+                // affine from features to targets (not an acceptance rule).
+                let affine_rms = (measured.len() >= 3).then(|| {
+                    let n = measured.len() as f64;
+                    let (mut ata, mut atu, mut atv) = ([[0.0; 3]; 3], [0.0; 3], [0.0; 3]);
+                    for ((x, y), (u, v)) in &measured {
+                        let a = [*x, *y, 1.0];
+                        for i in 0..3 {
+                            for j in 0..3 { ata[i][j] += a[i] * a[j]; }
+                            atu[i] += a[i] * u; atv[i] += a[i] * v;
+                        }
+                    }
+                    let solve = |b: [f64; 3]| {
+                        let m = ata;
+                        let det = |m: [[f64; 3]; 3]| m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+                            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+                        let d = det(m);
+                        (0..3).map(|c| { let mut k = m; for r in 0..3 { k[r][c] = b[r]; } det(k) / d }).collect::<Vec<_>>()
+                    };
+                    let (cu, cv) = (solve(atu), solve(atv));
+                    (measured.iter().map(|((x, y), (u, v))| {
+                        (cu[0] * x + cu[1] * y + cu[2] - u).powi(2) + (cv[0] * x + cv[1] * y + cv[2] - v).powi(2)
+                    }).sum::<f64>() / n).sqrt()
+                });
+                let row = serde_json::json!({"session": run["session"], "mode": mode,
+                    "measured_targets": measured.len(), "coverage": coverage, "plane": plane.is_some(),
+                    "plane_refined_candidates": diagnostics.refined_candidates,
+                    "plane_best_partial": diagnostics.best_partial.map(|(_, inliers, rms)| serde_json::json!({"inliers": inliers, "rms": rms})),
+                    "affine": mapping.is_some(), "shared": shared,
+                    "accepted": coverage && plane.is_some() && mapping.is_some() && shared,
+                    "unconstrained_affine_rms_screen": affine_rms, "targets": targets});
+                out.push_str(&row.to_string());
+                out.push('\n');
+            }
+        }
+        std::fs::write(std::env::var("BUTTERCUP_CAL_SCORES").unwrap(), out).unwrap();
     }
 }

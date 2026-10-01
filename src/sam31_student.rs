@@ -1515,6 +1515,7 @@ mod cuda {
                     width: 64,
                     height: 64,
                     selected_query: Some(7),
+                    tile_slice: None,
                     masks: vec![
                         ProposalMask { query: 0, score: 0.99,
                             pixels: Arc::new(vec![0; 64 * 64]),

@@ -228,6 +228,12 @@ pub(crate) struct JointScenePrior {
     /// Optional independently supported eye-center separation. A coarse IPD
     /// is a model prior, not a measurement of the current iris radii.
     pub(crate) interocular_distance_mm: Option<ScalarSupport>,
+    /// Boundary localization noise MEASURED from this tracking session's own
+    /// solved residuals, per boundary kind (outer limbus, inner limbus,
+    /// pupil). When present it replaces the engineering optical/band
+    /// allowances for that kind; timing uncertainty is still added. None
+    /// keeps the engineering allowance (no residuals measured yet).
+    pub(crate) measured_boundary_sigma_px: [Option<f64>; 3],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1138,6 +1144,12 @@ impl<'a> Problem<'a> {
                     .unwrap_or(optical_sigma)
                     .hypot(band)
                     .hypot(timing_sigma);
+                let sigma = match request.scene.measured_boundary_sigma_px[boundary] {
+                    Some(measured) if measured.is_finite() && measured > 0.0 => {
+                        measured.hypot(timing_sigma)
+                    }
+                    _ => sigma,
+                };
                 let weight = (length_px / SUPPORT_CORRELATION_LENGTH_PX.max(8.0 * sigma)).min(16.0);
                 // Corpus-only sensitivity trial: change information mass, not
                 // measured positions, localization, or the hypothesis support.

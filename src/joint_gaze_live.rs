@@ -136,6 +136,7 @@ impl Bridge {
         self.tracker.camera_mount=mode;
         self.tracker.legacy_mount_filter=false;
         self.tracker.set_probabilistic(true);
+        self.tracker.set_measured_boundary_noise(true);
     }
     pub(crate) fn set_enabled(&mut self, enabled:bool, authority_generations:&mut [u64;2]) {
         if self.enabled==enabled {return;}
@@ -143,6 +144,7 @@ impl Bridge {
         self.enabled=enabled;self.signature=None;self.submitted=[None,None];self.last_status=[None,None];self.tracker=JointTracker::default();
         self.tracker.set_continuous_gaze_diagnostic(self.continuous_gaze_diagnostic);
         self.tracker.set_probabilistic(true);
+        self.tracker.set_measured_boundary_noise(true);
         self.tracker.camera_mount=self.camera_mount;
         self.tracker.legacy_mount_filter=false;
         // A monocular-surface calibration is not silently reused for a
@@ -908,6 +910,21 @@ mod tests {
         let output=std::env::var("BUTTERCUP_JOINT_CALIBRATION_REPORT").unwrap();
         let require_ready=std::env::var("BUTTERCUP_JOINT_CALIBRATION_REQUIRE_READY").as_deref()==Ok("1");
         let omit_pupil=std::env::var("BUTTERCUP_JOINT_CALIBRATION_OMIT_PUPIL").as_deref()==Ok("1");
+        // Diagnostic source-bound pupil occluders (JSONL, one per exact source);
+        // frames without a fixture are unchanged.
+        let occlusions:std::collections::HashMap<(u32,u64,u64),Arc<crate::outline_conic_segments::sparse_evidence::CellOcclusion>>=
+            std::env::var("BUTTERCUP_JOINT_PUPIL_OCCLUSION").ok().map(|path| std::fs::read_to_string(path).unwrap().lines().map(|line| {
+                let v:Value=serde_json::from_str(line).unwrap();
+                assert_eq!(v["schema"].as_str(),Some("buttercup-source-occlusion-cells-diagnostic-v0"));
+                let n=|k:&str|v[k].as_str().map(|s|s.parse::<u64>().unwrap()).or_else(||v[k].as_u64()).unwrap();
+                let pair=|k:&str|[v[k][0].as_u64().unwrap() as u32,v[k][1].as_u64().unwrap() as u32];
+                let occlusion=crate::outline_conic_segments::sparse_evidence::CellOcclusion {
+                    roi:n("roi") as u32,sequence:n("sequence"),timestamp_ns:n("sensor_timestamp_ns"),
+                    sensor_origin_px:pair("sensor_origin_px"),dimensions_px:pair("dimensions_px"),
+                    lineage:v["lineage"].as_str().unwrap().to_string(),
+                    cells:v["cells"].as_array().unwrap().iter().map(|c|(c[0].as_u64().unwrap() as usize,c[1].as_u64().unwrap() as usize)).collect()};
+                ((occlusion.roi,occlusion.sequence,occlusion.timestamp_ns),Arc::new(occlusion))
+            }).collect()).unwrap_or_default();
         let half_pupil_weight=std::env::var("BUTTERCUP_JOINT_PUPIL_HALF_WEIGHT").as_deref()==Ok("1");
         assert!(!(omit_pupil && half_pupil_weight),"choose one pupil ablation");
         let ignore_source_group=std::env::var("BUTTERCUP_JOINT_CALIBRATION_IGNORE_SOURCE_GROUP").as_deref()==Ok("1");
@@ -1028,6 +1045,8 @@ mod tests {
             // Test-only ablation: omit the measured pupil proposal before shared
             // RAW evidence extraction, never replace it with fitted points.
             if omit_pupil {proposal.inner_pupil_fit=None;}
+            proposal.pupil_occlusion=occlusions.get(&(eye as u32+1,sequence,time)).cloned();
+            let applied_occlusion=proposal.pupil_occlusion.as_ref().map(|o|json!({"lineage":o.lineage,"cells":o.cells.len()}));
             let scale=&row["scale_hint"];
             let scale=scale["pixels_per_10mm"].as_f64().and_then(|estimate|Some([estimate,
                 scale["bounds_px_per_10mm"][0].as_f64()?,scale["bounds_px_per_10mm"][1].as_f64()?]));
@@ -1079,7 +1098,7 @@ mod tests {
                 (q.source_ns,s.relative_gaze.projected(),q.epoch)));
             let native_processing_ns=native_processing_started.elapsed().as_nanos() as u64;
             let report=json!({"input_index":row["index"],"source_ns":time.to_string(),"elapsed_ms":elapsed_ns/1_000_000,
-                "pupil_evidence_ablation":if omit_pupil {"omit-measured-pupil"} else if half_pupil_weight {"half-weight"} else {"none"},
+                "pupil_occlusion":applied_occlusion,"pupil_evidence_ablation":if omit_pupil {"omit-measured-pupil"} else if half_pupil_weight {"half-weight"} else {"none"},
                 "coupled_native_processing":native.is_some(),
                 "coupled_processing_contract":native.is_some().then_some(
                     "CPU workers remain active during scalar native completion processing; buffered-pair optimization not applied by this hook; synchronous diagnostic export also loads the pump; no renderer or scanout timing"),

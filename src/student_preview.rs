@@ -749,6 +749,7 @@ mod tests {
                 width: 80,
                 height: 60,
                 selected_query: Some(0),
+                tile_slice: None,
                 masks: vec![sam31_outer::ProposalMask {
                     query: 0,
                     score: 0.9,

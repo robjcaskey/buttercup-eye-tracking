@@ -509,7 +509,19 @@ pub struct AdapterProposalMasks {
     pub width: usize,
     pub height: usize,
     pub selected_query: Option<usize>,
+    /// Where these tile columns came from in the model's full filmstrip mask.
+    pub tile_slice: Option<TileSlice>,
     pub masks: Vec<ProposalMask>,
+}
+
+/// Exact provenance of a latest-tile mask: columns `start_x..start_x+width`
+/// of tile `tile` in a full low-resolution filmstrip mask `full_mask_width`
+/// wide, as mapped by `low_to_tile_point`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TileSlice {
+    pub full_mask_width: usize,
+    pub start_x: usize,
+    pub tile: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -518,6 +530,8 @@ pub struct SemanticProposalMasks {
     pub width: usize,
     pub height: usize,
     pub selected_query: Option<usize>,
+    /// `None` when the mask is not a slice of a filmstrip output.
+    pub tile_slice: Option<TileSlice>,
     pub masks: Vec<ProposalMask>,
 }
 
@@ -561,6 +575,9 @@ pub struct ProposalMasks {
     /// so consumers can disambiguate the two projected normal branches
     /// without borrowing a pupil or limbus from another frame/algorithm.
     pub inner_pupil_fit: Option<PupilVoidFitReview>,
+    /// Diagnostic only (never set live): source-bound occluder cells that
+    /// make pupil ring-probe samples missing before peak selection.
+    pub pupil_occlusion: Option<Arc<crate::outline_conic_segments::sparse_evidence::CellOcclusion>>,
     pub adapters: Vec<AdapterProposalMasks>,
 }
 
@@ -7302,7 +7319,7 @@ mod runtime {
                     return Ok(LiveTemporalOuterProposal {
                         semantic:SemanticProposalMasks {prompt_index:OUTER_IRIS_PROMPT,
                             width:output.mask_width,height:output.mask_height,
-                            selected_query:None,masks:diagnostic_partial_masks},
+                            selected_query:None,tile_slice:None,masks:diagnostic_partial_masks},
                         outer_fit:None,outer_logits:None,outer_support:RawRingSupport::default(),pupil_fit:None,
                     });
                 };
@@ -7454,6 +7471,7 @@ mod runtime {
                 width: mask_width,
                 height: mask_height,
                 selected_query: Some(0),
+                tile_slice: None,
                 masks: vec![proposal],
             },
             outer_fit: Some(selected.fit),
@@ -8083,7 +8101,7 @@ mod runtime {
             selection.map(|(pupil,_)|pupil)
         });
         Ok(LiveTemporalOuterProposal {semantic:SemanticProposalMasks {prompt_index:OUTER_IRIS_PROMPT,
-            width:output.mask_width,height:output.mask_height,selected_query:(!mask.iter().all(|&v|v==0)).then_some(0),
+            width:output.mask_width,height:output.mask_height,selected_query:(!mask.iter().all(|&v|v==0)).then_some(0),tile_slice:None,
             masks:vec![ProposalMask {query:0,score:output.scores[0],pixels:Arc::new(mask.clone()),
                 boundary_pixels:Arc::new(binary_mask_boundary_indices(mask,output.mask_width,output.mask_height))}]},
             outer_logits:capture_outer_logits(&output.logits,
@@ -8456,6 +8474,7 @@ mod runtime {
                 width: 0,
                 height: 0,
                 selected_query,
+                tile_slice: None,
                 masks: Vec::new(),
             };
         };
@@ -8484,6 +8503,11 @@ mod runtime {
             width,
             height,
             selected_query,
+            tile_slice: Some(TileSlice {
+                full_mask_width: output.mask_width,
+                start_x,
+                tile,
+            }),
             masks,
         }
     }
@@ -8497,6 +8521,7 @@ mod runtime {
             width: adapter.width,
             height: adapter.height,
             selected_query: adapter.selected_query,
+            tile_slice: adapter.tile_slice,
             masks: adapter.masks,
         }
     }
@@ -8968,7 +8993,7 @@ mod runtime {
         }
         fn partial(prompt_index:usize,masks:Vec<ProposalMask>)->LiveTemporalOuterProposal {
             LiveTemporalOuterProposal {semantic:SemanticProposalMasks {prompt_index,width:3,height:2,
-                selected_query:None,masks},outer_fit:None,outer_logits:None,outer_support:RawRingSupport::default(),pupil_fit:None}
+                selected_query:None,tile_slice:None,masks},outer_fit:None,outer_logits:None,outer_support:RawRingSupport::default(),pupil_fit:None}
         }
         #[test]
         fn a_current_unfitted_or_empty_mask_is_published_without_admitting_an_ellipse() {
@@ -9124,6 +9149,7 @@ mod runtime {
             outer_boundary_logits: None, // legacy adapter consensus does not retain a selected current plane
             limbus_refinement: None, // legacy adapter consensus is not this source-local video path
             inner_pupil_fit: proposal_pupil_fit,
+            pupil_occlusion: None,
             adapters: proposal_adapters,
         });
         // Publish the queries before anatomical consensus and RAW support are

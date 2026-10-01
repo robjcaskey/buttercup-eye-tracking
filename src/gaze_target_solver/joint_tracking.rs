@@ -90,6 +90,24 @@ mod tests {
 
     fn camera()->PinholeCamera {PinholeCamera {focal_px:[4000.0;2],principal_px:[4000.0,3000.0]}}
     #[test]
+    fn measured_boundary_noise_is_pooled_over_residual_degrees_of_freedom() {
+        use crate::conic_solver::joint::ArcSupport;
+        use crate::roi_evidence::{ExposureKey,SourceClock};
+        let arc=|roi:u32,kind,n:usize,rms:f64,used:bool| ArcSupport {
+            exposure:ExposureKey {roi:RoiId(roi),clock:SourceClock {domain:1,epoch:1},sequence:1,timestamp_ns:1},
+            evidence_group:0,arc_index:0,points_roi_px:vec![(0.0,0.0);n],kind,rms_px:rms,sigma_px:3.0,
+            support_length_px:10.0,evidence_weight:1.0,boundary_normal_samples:0,boundary_normal_rms_radians:None,
+            mask_level:None,used};
+        // Two eyes' limbus: 10 points at rms 1 and 10 at rms 2; 2 x 5 conic parameters.
+        let sigma=measured_boundary_sigma_px(&[arc(1,BoundaryKind::OuterLimbus,10,1.0,true),
+            arc(2,BoundaryKind::OuterLimbus,10,2.0,true),
+            arc(1,BoundaryKind::OuterLimbus,40,50.0,false),           // unused arcs are not evidence
+            arc(1,BoundaryKind::PupillaryBoundary,5,0.1,true)]);      // no spare degrees of freedom
+        assert!((sigma[0].unwrap()-((10.0*1.0+10.0*4.0)/(20.0-10.0f64)).sqrt()).abs()<1e-12);
+        assert_eq!(sigma[1],None);
+        assert_eq!(sigma[2],None,"a perfectly fitted minimal arc must not claim near-zero noise");
+    }
+    #[test]
     fn radial_camera_diagnostic_preserves_the_reference_ray_and_radial_derivative() {
         let c=camera();let k=0.4;let u=0.3;
         let reference=[4000.0,3000.0+4000.0*u*(1.0+k*u*u)];
@@ -612,6 +630,29 @@ mod tests {
     }
 }
 
+/// Localization noise per boundary kind (outer limbus, inner limbus, pupil)
+/// from one solve's residuals: pooled squared residual over the residual
+/// degrees of freedom (points minus five conic parameters per eye and kind).
+/// None when a kind has no spare degrees of freedom to measure from.
+pub(crate) fn measured_boundary_sigma_px(arcs:&[crate::conic_solver::joint::ArcSupport]) -> [Option<f64>;3] {
+    let mut sum=[0.0f64;3]; let mut points=[0usize;3]; let mut eyes=[[false;2];3];
+    for arc in arcs.iter().filter(|a|a.used && a.rms_px.is_finite()) {
+        let kind=match arc.kind {
+            crate::roi_evidence::BoundaryKind::OuterLimbus=>0,
+            crate::roi_evidence::BoundaryKind::InnerLimbus=>1,
+            crate::roi_evidence::BoundaryKind::PupillaryBoundary=>2,
+            crate::roi_evidence::BoundaryKind::Unclassified=>continue,
+        };
+        let n=arc.points_roi_px.len();
+        sum[kind]+=arc.rms_px*arc.rms_px*n as f64; points[kind]+=n;
+        if let Some(eye)=(arc.exposure.roi.0 as usize).checked_sub(1).filter(|e|*e<2) {eyes[kind][eye]=true;}
+    }
+    std::array::from_fn(|kind| {
+        let parameters=5*eyes[kind].iter().filter(|e|**e).count();
+        (points[kind]>parameters).then(||(sum[kind]/(points[kind]-parameters) as f64).sqrt()).filter(|s|*s>0.0)
+    })
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PublishedJoint {
     pub(crate) continuous_gaze_sign: Option<crate::conic_solver::continuous_gaze_sign::Report>,
@@ -658,6 +699,9 @@ pub(crate) struct JointTracker {
     /// this time floor and let a delayed historical pair resurrect old gaze.
     newest_observation_ns: [Option<u64>;2],
     retain_diagnostic_hypotheses: bool,
+    /// Measure boundary localization noise from each solve's own pilot
+    /// residuals instead of fixed engineering allowances (see observe).
+    measured_boundary_noise: bool,
     probabilistic: bool,
     #[cfg(test)]
     posterior_diagnostic: Option<crate::conic_solver::joint::posterior::IntegrationConfig>,
@@ -668,6 +712,8 @@ pub(crate) struct JointTracker {
 }
 
 impl JointTracker {
+    pub(crate) fn set_measured_boundary_noise(&mut self, enabled:bool) {self.measured_boundary_noise=enabled;}
+
     pub(crate) fn set_continuous_gaze_diagnostic(&mut self, enabled:bool) {
         if enabled!=self.continuous_gaze_enabled {self.continuous_gaze=Default::default();}
         self.continuous_gaze_enabled=enabled;
@@ -776,13 +822,26 @@ impl JointTracker {
             .map(|seed|seed.target_camera_mm);
         let prepared=frames.each_ref().map(|f|f.as_ref().map(|f|f.packet.prepare()));
         let evidence=prepared.each_ref().map(|p|p.as_ref().map(|p|p.evidence()));
+        let orientation_only=!self.parallax_enabled && !self.legacy_mount_filter
+            && self.camera_mount==crate::eye_scene_model::CameraMount::BelowEyes;
+        let effective_mount=if orientation_only || self.parallax_enabled {crate::eye_scene_model::CameraMount::Flexible} else {self.camera_mount};
+        // Boundary noise is measured, not assumed: a MAP pilot with the
+        // engineering allowances, then this solve's own residuals per boundary
+        // kind replace them. Depends only on the current evidence and seeds.
+        if self.measured_boundary_noise {
+            let pilot=JointConicRequest {eyes:evidence,scene:&scene.prior,
+                maximum_hypotheses:16,maximum_refinements:12,maximum_source_skew_ns:0,
+                exposure_uncertainty_ns:2_000_000,motion_bound_px_per_second:150.0};
+            let measured=solve_joint_conics_with_mount(pilot,1,effective_mount,false).ok()
+                .and_then(|fits|fits.first().map(|fit|measured_boundary_sigma_px(&fit.arcs)));
+            #[cfg(test)]
+            let measured=measured.filter(|_|std::env::var("BUTTERCUP_JOINT_HANDSET_SIGMA").as_deref()!=Ok("1"));
+            scene.prior.measured_boundary_sigma_px=measured.unwrap_or([None;3]);
+        }
         let request=JointConicRequest {eyes:evidence,scene:&scene.prior,
             maximum_hypotheses:16,maximum_refinements:12,maximum_source_skew_ns:0,
             // Engineering allowance, not a measured bound on rolling rows.
             exposure_uncertainty_ns:2_000_000,motion_bound_px_per_second:150.0};
-        let orientation_only=!self.parallax_enabled && !self.legacy_mount_filter
-            && self.camera_mount==crate::eye_scene_model::CameraMount::BelowEyes;
-        let effective_mount=if orientation_only || self.parallax_enabled {crate::eye_scene_model::CameraMount::Flexible} else {self.camera_mount};
         let direction_prior=if self.parallax_enabled {crate::conic_solver::camera_mount::DirectionPrior::Parallax(self.parallax_normals)} else if orientation_only {self.direction_continuation.prior(source.timestamp_ns)} else {Default::default()};
         let count=if self.camera_mount!=crate::eye_scene_model::CameraMount::Flexible {16}
             else if self.retain_diagnostic_hypotheses || self.continuous_gaze_enabled { 4 } else { 1 };
