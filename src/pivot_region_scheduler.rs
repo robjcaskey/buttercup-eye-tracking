@@ -183,6 +183,13 @@ struct Placement {
     score: f64,
 }
 
+/// Live A/B switch for the crop hold: BUTTERCUP_CROP_HOLD=0 restores the
+/// previous eight-pixel deadband. Read once per process.
+fn crop_hold_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("BUTTERCUP_CROP_HOLD").as_deref() != Ok("0"))
+}
+
 #[derive(Debug)]
 pub(crate) struct PivotRegionScheduler {
     config: Config,
@@ -352,10 +359,13 @@ impl PivotRegionScheduler {
             preferred[axis] = ((center / align).round() * align).clamp(lower, upper) as u32;
             if let Some(rect) = track.rect {
                 let previous = if axis == 0 { rect.x } else { rect.y };
-                // Eight-pixel deadband only while all guarded support still fits.
+                // Keep the crop wherever all guarded support still fits. The
+                // pivot carries per-solve noise; re-centering on every jitter
+                // hands the segmenter a shifted image and feeds that noise back
+                // into the next solve. Move only when the support would leave.
                 if previous >= ranges[axis][0]
                     && previous <= ranges[axis][1]
-                    && previous.abs_diff(preferred[axis]) <= 8
+                    && (crop_hold_enabled() || previous.abs_diff(preferred[axis]) <= 8)
                 {
                     preferred[axis] = previous;
                 }
@@ -567,6 +577,31 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn pivot_jitter_inside_guarded_support_keeps_the_applied_crop() {
+        let mut s = scheduler();
+        s.observe(observation(0, 3000.0, 2400.0, 1));
+        let first = s.plan(1, 2200);
+        apply(&mut s, 1, &first);
+        let crop = first.regions[0].rect.unwrap();
+        // Per-solve pivot noise of tens of pixels: support still fits the crop.
+        for (frame, (dx, dy)) in [(28.0, -24.0), (-30.0, 20.0), (12.0, 30.0), (-26.0, -28.0)].into_iter().enumerate() {
+            let time = 2 + frame as u64 * 40_000_000;
+            s.observe(observation(0, 3000.0 + dx, 2400.0 + dy, time));
+            let p = s.plan(time, first.band_y);
+            validate(&p);
+            assert_eq!(p.regions[0].rect, Some(crop), "jitter {dx},{dy} must not move the crop");
+            apply(&mut s, time, &p);
+        }
+        // A real translation that would push guarded support out of the crop moves it.
+        let time = 1_000_000_000;
+        s.observe(observation(0, 3000.0 + 160.0, 2400.0, time));
+        let p = s.plan(time, first.band_y);
+        validate(&p);
+        let moved = p.regions[0].rect.unwrap();
+        assert!(moved.x > crop.x, "support leaving the crop must move it");
+    }
+
     #[test]
     fn translations_use_sensor_headroom_not_old_band_clamping() {
         let mut s = scheduler();
