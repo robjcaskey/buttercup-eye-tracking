@@ -74,6 +74,23 @@ def click(args):
         print(json.dumps(reply))
 
 
+def focus_once(args):
+    """Focus the window under the current calibrated gaze; no pointer, no click."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(2)
+        try:
+            connection.connect(args.socket)
+        except (FileNotFoundError, ConnectionRefusedError) as error:
+            raise RuntimeError(f"Buttercup viewer is not running at {args.socket}.") from error
+        connection.sendall(b"GAZE FOCUS ONCE\n")
+        connection.shutdown(socket.SHUT_WR)
+        reply = json.loads(connection.recv(65536))
+    if not reply.get("ok"):
+        raise RuntimeError(reply.get("error") or "Viewer rejected the focus")
+    if args.verbose:
+        print(json.dumps(reply))
+
+
 def focus_toggle(args):
     """Independent window focus; never open uinput or map/move a pointer."""
     status = command(args.socket, "STATUS", focus=True)
@@ -243,6 +260,7 @@ def main():
     mode.add_argument("--eyes", action="store_true", help="toggle the viewer-owned wleyes cartoon")
     mode.add_argument("--cursor", action="store_true", help="toggle the on-screen calibrated gaze ring (never moves the pointer)")
     mode.add_argument("--click", choices=("left", "right"), help="look-and-click: press this button once at the calibrated gaze")
+    mode.add_argument("--focus-once", action="store_true", help="look-to-focus: focus the window under the calibrated gaze (no click)")
     parser.add_argument("--verbose", action="store_true", help="print the viewer's click reply")
     parser.add_argument("--quiet", action="store_true", help="suppress success notifications, never errors")
     args = parser.parse_args()
@@ -260,7 +278,9 @@ def main():
                     if time.monotonic() >= deadline:
                         raise RuntimeError("Another Buttercup mouse toggle is still pending")
                     time.sleep(0.02)
-            if args.click:
+            if args.focus_once:
+                focus_once(args)
+            elif args.click:
                 click(args)
             elif args.cursor:
                 cursor_toggle(args)
@@ -272,9 +292,10 @@ def main():
                 toggle(args)
         return 0
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
-        if args.click:
+        if args.click or args.focus_once:
             # Just the warning; the full status card stays one hotkey away.
-            notify("Buttercup click warning", str(error), error=True, compact=True)
+            notify("Buttercup focus warning" if args.focus_once else "Buttercup click warning",
+                   str(error), error=True, compact=True)
             return 1
         notify( "Buttercup wleyes warning" if args.eyes else ("Buttercup gaze focus warning" if args.focus else "Buttercup mouse warning"), str(error), error=True)
         return 1

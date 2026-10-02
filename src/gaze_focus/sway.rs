@@ -321,6 +321,47 @@ fn hit_test(tree: &Value, output_name: &str, uv: (f64, f64)) -> Option<Hit> {
     })
 }
 
+fn scene_windows(node: &Value, floating: bool, out: &mut Vec<super::soft::SceneWindow>) {
+    let mut found = vec![];
+    leaves(node, &mut found);
+    out.extend(found.into_iter().map(|target| {
+        let app = find_app(node, target.id).unwrap_or_default();
+        super::soft::SceneWindow { target, floating, class: super::soft::WindowClass::from_app_id(&app) }
+    }));
+}
+
+/// app_id (Wayland) or X11 class of the leaf with this id.
+fn find_app(node: &Value, id: u64) -> Option<String> {
+    if node["id"].as_u64() == Some(id) {
+        return node["app_id"].as_str().or_else(|| node["window_properties"]["class"].as_str()).map(str::to_owned);
+    }
+    children(node, "nodes").iter().chain(children(node, "floating_nodes")).find_map(|n| find_app(n, id))
+}
+
+/// Every visible window on the output's current workspace, for soft focus.
+fn scene(tree: &Value, output_name: &str) -> Option<super::soft::Scene> {
+    let output = children(tree, "nodes")
+        .iter()
+        .find(|n| n["type"] == "output" && n["name"] == output_name)?;
+    let output_rect = rect(output)?;
+    let workspace = children(output, "nodes").iter().find(|w| {
+        w["type"] == "workspace" && w["name"].as_str().is_some() && w["name"] == output["current_workspace"]
+    })?;
+    let mut windows = vec![];
+    for node in children(workspace, "floating_nodes") {
+        scene_windows(node, true, &mut windows);
+    }
+    for node in children(workspace, "nodes") {
+        scene_windows(node, false, &mut windows);
+    }
+    Some(super::soft::Scene {
+        workspace: workspace["id"].as_u64()?,
+        focused: focused(workspace)?,
+        output: output_rect,
+        windows,
+    })
+}
+
 fn focus_command(target: Target) -> String {
     // The dynamic workspace criterion is rechecked by Sway at execution time:
     // a workspace switch between GET_TREE and this command cannot pull it back.
@@ -347,6 +388,16 @@ impl Backend for Sway {
             focused: 0,
             target: None,
         }))
+    }
+
+    fn scene(&mut self) -> Result<Option<super::soft::Scene>, String> {
+        let binding = request(&self.socket, 12, "")?;
+        let empty = super::soft::Scene { workspace: 0, focused: 0, output: Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 }, windows: vec![] };
+        if binding["name"] != "default" {
+            return Ok(Some(empty));
+        }
+        let tree = request(&self.socket, 4, "")?;
+        Ok(Some(scene(&tree, &self.output).unwrap_or(empty)))
     }
 
     fn focus(&mut self, target: Target) -> Result<(), String> {
@@ -507,6 +558,10 @@ pub(super) mod tests {
         let mut backend = Sway::connect().unwrap();
         for x in [0.2, 0.5, 0.8] {
             println!("gaze {x},0.5: {:?}", backend.hit((x, 0.5)).unwrap());
+        }
+        let scene = backend.scene().unwrap().unwrap();
+        for w in &scene.windows {
+            println!("window {} {} floating={} {:?}", w.target.id, w.class.label(), w.floating, w.target.rect);
         }
     }
 }

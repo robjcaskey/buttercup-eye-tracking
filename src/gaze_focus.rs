@@ -7,6 +7,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+mod soft;
 mod sway;
 pub(crate) use sway::{ViewportCache, WindowViewport};
 #[cfg(test)]
@@ -49,6 +50,16 @@ struct Hit {
 trait Backend: Send + 'static {
     fn hit(&mut self, point: (f64, f64)) -> Result<Hit, String>;
     fn focus(&mut self, target: Target) -> Result<(), String>;
+    /// All visible windows for soft focus; `None` uses the hard hit test.
+    fn scene(&mut self) -> Result<Option<soft::Scene>, String> {
+        Ok(None)
+    }
+}
+
+/// Soft evidence focus unless BUTTERCUP_GAZE_FOCUS_POLICY=dwell.
+fn soft_policy() -> bool {
+    static SOFT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SOFT.get_or_init(|| !std::env::var("BUTTERCUP_GAZE_FOCUS_POLICY").is_ok_and(|v| v.eq_ignore_ascii_case("dwell")))
 }
 
 #[derive(Default)]
@@ -130,6 +141,7 @@ struct State {
     error: Option<String>,
     output: Option<String>,
     pending: Option<u64>,
+    pending_odds: Option<f64>,
     focused: Option<u64>,
     changes: u64,
 }
@@ -157,6 +169,8 @@ impl Controller {
         json!({"enabled":s.enabled_at.is_some(), "mode":"window-focus-only", "moves_pointer":false,
             "status":if s.enabled_at.is_none() && s.error.is_none() {"off"} else {&s.status},
             "error":s.error,"output":s.output,"dwell_ms":DWELL.as_millis(),"minimum_fresh_samples":MIN_SAMPLES,
+            "policy":if soft_policy() {"soft-evidence"} else {"dwell"},"pending_odds":s.pending_odds,
+            "evidence_half_life_ms":soft::HORIZON.as_millis(),
             "pending_window":s.pending,"last_focused_window":s.focused,"focus_changes":s.changes})
     }
 
@@ -270,6 +284,29 @@ impl Controller {
     }
 }
 
+/// One focus decision at `target` (monitor fraction): the window with the
+/// highest soft-focus likelihood, including the per-app reading priors.
+/// Never moves the pointer or clicks.
+pub(crate) fn focus_once(target: Option<(f64, f64)>) -> Value {
+    let result = (|| {
+        let uv = target.ok_or("no fresh calibrated gaze to focus with")?;
+        if !(0.0..=1.0).contains(&uv.0) || !(0.0..=1.0).contains(&uv.1) {
+            return Err("gaze is off screen; focus unchanged".to_string());
+        }
+        let mut backend = sway::Sway::connect()?;
+        let scene = backend.scene()?.ok_or("no Sway scene")?;
+        let window = scene.most_likely(uv).ok_or("no window under gaze")?;
+        if window.id != scene.focused {
+            backend.focus(window)?;
+        }
+        Ok(json!({"window": window.id, "changed": window.id != scene.focused}))
+    })();
+    match result {
+        Ok(focus) => json!({"ok": true, "focus": focus}),
+        Err(error) => json!({"ok": false, "error": error}),
+    }
+}
+
 impl Drop for Controller {
     fn drop(&mut self) {
         self.disable();
@@ -288,6 +325,7 @@ fn run_worker(channel: Arc<Channel>, generation: u64, mut backend: impl Backend)
     let mut last_policy_revision = None;
     let mut last_source = None;
     let mut dwell = Dwell::default();
+    let mut soft = soft::SoftFocus::default();
     loop {
         let mut s = channel.state.lock().unwrap_or_else(|e| e.into_inner());
         while s.enabled_at.is_some() && s.generation == generation && s.revision == last_revision {
@@ -300,6 +338,7 @@ fn run_worker(channel: Arc<Channel>, generation: u64, mut backend: impl Backend)
                 .is_some_and(|input| input.at.elapsed() > MAX_SOURCE_AGE)
             {
                 dwell = Dwell::default();
+                soft = soft::SoftFocus::default();
                 s.pending = None;
                 s.status = "paused: viewer updates stopped".into();
             }
@@ -310,6 +349,7 @@ fn run_worker(channel: Arc<Channel>, generation: u64, mut backend: impl Backend)
         let policy_revision = s.policy_revision;
         if last_policy_revision != Some(policy_revision) {
             dwell = Dwell::default();
+            soft = soft::SoftFocus::default();
             last_policy_revision = Some(policy_revision);
         }
         last_revision = s.revision;
@@ -319,8 +359,10 @@ fn run_worker(channel: Arc<Channel>, generation: u64, mut backend: impl Backend)
         let sample = match input.fresh(Instant::now(), enabled_at) {
             Ok(sample) => sample,
             Err(reason) => {
+                // Soft evidence decays on its own clock; brief tracking gaps
+                // (unresolved sign, a glance at the keyboard) must not erase it.
                 dwell = Dwell::default();
-                s.pending = None;
+                if !soft_policy() { s.pending = None; }
                 s.status = reason.into();
                 continue;
             }
@@ -330,7 +372,11 @@ fn run_worker(channel: Arc<Channel>, generation: u64, mut backend: impl Backend)
         }
         last_source = Some(sample.source);
         drop(s);
-        let hit = backend.hit(sample.target);
+        let scene = if soft_policy() { backend.scene() } else { Ok(None) };
+        let hit = match scene {
+            Ok(None) => Some(backend.hit(sample.target)),
+            _ => None,
+        };
         let mut s = channel.state.lock().unwrap_or_else(|e| e.into_inner());
         if s.enabled_at.is_none() || s.generation != generation {
             return;
@@ -347,10 +393,23 @@ fn run_worker(channel: Arc<Channel>, generation: u64, mut backend: impl Backend)
         {
             continue;
         }
-        let result = match hit {
-            Ok(hit) => {
+        let observed = match (scene, hit) {
+            (Ok(Some(scene)), _) => {
+                let decision = soft.observe(Instant::now(), sample.source, sample.target, &scene);
+                s.pending_odds = soft.odds(scene.focused);
+                Ok((decision, soft.pending.map(|p| p.0.id)))
+            }
+            (Err(error), _) | (_, Some(Err(error))) => Err(error),
+            (Ok(None), Some(Ok(hit))) => {
                 let decision = dwell.observe(Instant::now(), sample.source, hit);
-                s.pending = dwell.pending.map(|p| p.0.id);
+                s.pending_odds = None;
+                Ok((decision, dwell.pending.map(|p| p.0.id)))
+            }
+            (Ok(None), None) => unreachable!("hit is queried whenever there is no scene"),
+        };
+        let result = match observed {
+            Ok((decision, pending)) => {
+                s.pending = pending;
                 s.status = if s.pending.is_some() {
                     "dwelling"
                 } else {
@@ -365,6 +424,7 @@ fn run_worker(channel: Arc<Channel>, generation: u64, mut backend: impl Backend)
                         s.changes += 1;
                         s.pending = None;
                         dwell = Dwell::default();
+                        soft = soft::SoftFocus::default();
                     })
                 } else {
                     Ok(())

@@ -7975,6 +7975,15 @@ fn handle_control_command(command: &str, shared: &Arc<Mutex<SharedState>>) -> St
                 && reply["mouse_output"]["enabled"] == true { state.gaze_focus.disable(); }
             reply.to_string()
         }
+        [gaze, focus, once]
+            if gaze.eq_ignore_ascii_case("GAZE") && focus.eq_ignore_ascii_case("FOCUS")
+                && once.eq_ignore_ascii_case("ONCE") =>
+        {
+            // Look-to-focus on request: the same tracked gaze as look-and-click,
+            // no pointer motion and no click.
+            let target = state.mouse_output.fresh_target().or(state.gaze_cursor.target());
+            gaze_focus::focus_once(target).to_string()
+        }
         [gaze, focus, action]
             if gaze.eq_ignore_ascii_case("GAZE") && focus.eq_ignore_ascii_case("FOCUS") =>
         {
