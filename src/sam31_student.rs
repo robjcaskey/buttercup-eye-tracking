@@ -120,7 +120,7 @@ fn known_architecture_manifest(meta: &serde_json::Value) -> bool {
 pub fn default_model_path() -> PathBuf {
     std::env::var_os("BUTTERCUP_EYE_STUDENT_MODEL")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("data/models/eye_student_v1.ot"))
+        .unwrap_or_else(|| PathBuf::from("data/models/eye_student_raw_v5.ot"))
 }
 
 pub fn metadata_path(model: &Path) -> PathBuf {
@@ -657,6 +657,11 @@ mod cuda {
         Legacy,
         ShadowCrop,
         MixedShadowCrop,
+        /// ShadowCrop plus physically modeled reduced light on RAW input.
+        ShadowCropNoise,
+        /// ShadowCropNoise plus RAW-domain optics: per-block light colour,
+        /// glare, defocus/motion blur and uncompensated dim light.
+        ShadowCropOptics,
     }
 
     impl TrainingAugmentation {
@@ -665,6 +670,8 @@ mod cuda {
                 "legacy" => Ok(Self::Legacy),
                 "shadow-crop-v1" => Ok(Self::ShadowCrop),
                 "mixed-shadow-crop-v1" => Ok(Self::MixedShadowCrop),
+                "shadow-crop-noise-v1" => Ok(Self::ShadowCropNoise),
+                "shadow-crop-optics-v1" => Ok(Self::ShadowCropOptics),
                 _ => Err(format!("unknown Student training augmentation: {label}")),
             }
         }
@@ -673,6 +680,8 @@ mod cuda {
                 Self::Legacy => "legacy",
                 Self::ShadowCrop => "shadow-crop-v1",
                 Self::MixedShadowCrop => "mixed-shadow-crop-v1",
+                Self::ShadowCropNoise => "shadow-crop-noise-v1",
+                Self::ShadowCropOptics => "shadow-crop-optics-v1",
             }
         }
     }
@@ -784,6 +793,201 @@ mod cuda {
             )
         })
     }
+    /// Measured sensor shot-noise model for reduced-light augmentation, per
+    /// quad-RGGB sensor phase block (R, G top, G bottom, B): variance in RAW10
+    /// codes = K * (code - black). Loaded from a measurement file, never
+    /// invented; recorded verbatim in the trained model's metadata.
+    struct LightNoiseModel {
+        k: Tensor,
+        black: Tensor,
+        light_range: [f64; 2],
+        /// Optional lowest simulated signal (RAW codes above black): each
+        /// frame's light factor reaches down to floor / its own mean signal,
+        /// so bright frames can be dimmed to real low-light levels while dim
+        /// frames are not pushed below anything recorded.
+        signal_floor: Option<f64>,
+        source: Value,
+    }
+
+    impl LightNoiseModel {
+        fn load(device: Device) -> Result<Self, String> {
+            let path = std::env::var("BUTTERCUP_EYE_STUDENT_TRAIN_NOISE_MODEL")
+                .map_err(|_| "shadow-crop-noise-v1 requires BUTTERCUP_EYE_STUDENT_TRAIN_NOISE_MODEL")?;
+            let source: Value = serde_json::from_str(&std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?)
+                .map_err(|e| format!("{path}: {e}"))?;
+            let block = |name: &str, key: &str| source[name][key].as_f64().filter(|v| v.is_finite())
+                .ok_or_else(|| format!("{path}: missing {name}.{key}"));
+            let names = ["R", "G_top", "G_bottom", "B"];
+            let mut k = [0f32; 16];
+            let mut black = [0f32; 16];
+            // Channel c = 4*(sensor_y mod 4)+(sensor_x mod 4); 2x2 phase blocks.
+            for c in 0..16 {
+                let name = names[((c / 4) / 2) * 2 + (c % 4) / 2];
+                k[c] = block(name, "K")? as f32;
+                black[c] = block(name, "black")? as f32;
+            }
+            let range = std::env::var("BUTTERCUP_EYE_STUDENT_TRAIN_LIGHT_RANGE").unwrap_or_else(|_| "0.25,1".into());
+            let parts: Vec<f64> = range.split(',').map(str::parse).collect::<Result<_, _>>()
+                .map_err(|e| format!("light range {range}: {e}"))?;
+            if parts.len() != 2 || !(0.0 < parts[0] && parts[0] <= parts[1] && parts[1] <= 1.0) {
+                return Err(format!("light range must be LOW,HIGH within (0,1]: {range}"));
+            }
+            let signal_floor = match std::env::var("BUTTERCUP_EYE_STUDENT_TRAIN_SIGNAL_FLOOR") {
+                Ok(v) => Some(v.parse::<f64>().ok().filter(|f| f.is_finite() && *f > 0.0)
+                    .ok_or_else(|| format!("signal floor must be a positive number of codes: {v}"))?),
+                Err(_) => None,
+            };
+            Ok(Self {
+                k: Tensor::from_slice(&k).reshape([1, 16, 1, 1]).to_device(device),
+                black: Tensor::from_slice(&black).reshape([1, 16, 1, 1]).to_device(device),
+                light_range: [parts[0], parts[1]],
+                signal_floor,
+                source,
+            })
+        }
+
+        /// Light reduced by k (log-uniform in light_range) with gain 1/k, as
+        /// auto exposure compensates: the frame gains shot noise of std
+        /// sqrt(K*signal*(1/k-1)) codes. Noise is drawn per photosite of each
+        /// phase lattice and resampled like the RAW fields, so its variance
+        /// and neighbor correlation match the registered input.
+        /// Log-uniform light factor per frame in [low, high]; with a signal
+        /// floor, low = max(range low, floor / frame mean signal), capped at high.
+        fn light_factor(&self, signal: &Tensor) -> Tensor {
+            let n = signal.size()[0];
+            let device = signal.device();
+            let [low, high] = self.light_range;
+            let low = match self.signal_floor {
+                Some(floor) => {
+                    let mean = signal.mean_dim([1i64, 2, 3].as_slice(), true, Kind::Float).clamp_min(1e-3);
+                    (mean.reciprocal() * floor).clamp(low, high)
+                }
+                None => Tensor::full([n, 1, 1, 1], low, (Kind::Float, device)),
+            };
+            let (log_low, log_high) = (low.log(), high.ln());
+            (Tensor::rand([n, 1, 1, 1], (Kind::Float, device)) * (-&log_low + log_high) + &log_low).exp()
+        }
+
+        fn apply(&self, image: &Tensor) -> Tensor {
+            let size = image.size();
+            let (n, h, w) = (size[0], size[2], size[3]);
+            let device = image.device();
+            let codes = image * 1023.0;
+            let signal = (&codes - &self.black).clamp_min(0.0);
+            let k = self.light_factor(&signal);
+            // 420x280 sources have 105x70 photosites per phase lattice.
+            let lattice = Tensor::randn([n, 16, 70, 105], (Kind::Float, device))
+                .upsample_bilinear2d([h, w], false, None, None);
+            let std = (&self.k * signal * (k.reciprocal() - 1.0)).clamp_min(0.0).sqrt();
+            ((codes + lattice * std) / 1023.0).clamp(0.0, 1.0)
+        }
+
+        /// As apply, but half of the frames keep the reduced light without
+        /// gain: black + k*signal plus the shot noise of that dimmer signal.
+        fn apply_mixed(&self, image: &Tensor) -> Tensor {
+            let size = image.size();
+            let (n, h, w) = (size[0], size[2], size[3]);
+            let device = image.device();
+            let compensated = Tensor::rand([n, 1, 1, 1], (Kind::Float, device)).ge(0.5).to_kind(Kind::Float);
+            let codes = image * 1023.0;
+            let signal = (&codes - &self.black).clamp_min(0.0);
+            let k = self.light_factor(&signal);
+            let lattice = Tensor::randn([n, 16, 70, 105], (Kind::Float, device))
+                .upsample_bilinear2d([h, w], false, None, None);
+            let gained = &codes + &lattice * (&self.k * &signal * (k.reciprocal() - 1.0)).clamp_min(0.0).sqrt();
+            let dim = &self.black + &k * &signal
+                + &lattice * (&self.k * &signal * (&k - &k * &k)).clamp_min(0.0).sqrt();
+            let uncompensated: Tensor = compensated.ones_like() - &compensated;
+            ((&compensated * gained + uncompensated * dim) / 1023.0).clamp(0.0, 1.0)
+        }
+    }
+
+    /// Input pixels per photosite of one phase lattice (4 native px resampled
+    /// from a 420 px source to the 192 px RAW field width).
+    const INPUT_PX_PER_PHOTOSITE: f64 = 4.0 * 192.0 / 420.0;
+
+    /// Independent light-colour gain per quad phase block, log-uniform in
+    /// [1/2, 2]: the per-recording channel ratios measured across the corpus
+    /// span R/G 0.9-1.8 and B/G 0.35-1.6.
+    fn optics_block_gains(n: i64, device: Device) -> Tensor {
+        let blocks: Vec<i64> = (0..16).map(|c| ((c / 4) / 2) * 2 + (c % 4) / 2).collect();
+        (Tensor::rand([n, 4, 1, 1], (Kind::Float, device)) * 2.0 - 1.0)
+            .multiply_scalar(std::f64::consts::LN_2).exp()
+            .index_select(1, &Tensor::from_slice(&blocks).to_device(device))
+    }
+
+    /// Glare: 0 (half of frames) or 1-3 soft Gaussian blobs of white light,
+    /// sigma 1.5..15 native px (glint to lens reflection), peak 0.3..1.5 of
+    /// full scale before clipping. Half are centred on the outer-iris
+    /// boundary taken from the (already warped) label.
+    fn optics_glare(image: &Tensor, truth: &Tensor) -> Tensor {
+        let size = image.size();
+        let (n, h, w) = (size[0], size[2], size[3]);
+        let device = image.device();
+        let options = (Kind::Float, device);
+        let iris = truth.narrow(1, 0, 1);
+        let boundary = (iris.avg_pool2d([3, 3], [1, 1], [1, 1], false, true, None::<i64>) - &iris).abs().gt(0.05).to_kind(Kind::Float);
+        let th = truth.size()[2];
+        let tw = truth.size()[3];
+        let picks = (boundary.reshape([n, th * tw]) + 1e-6).multinomial(3, true);
+        let ys = Tensor::linspace(0.0, 1.0, h, options).reshape([1, 1, h, 1]);
+        let xs = Tensor::linspace(0.0, 1.0, w, options).reshape([1, 1, 1, w]);
+        let mut light = Tensor::zeros([n, 1, h, w], options);
+        for blob in 0..3 {
+            let on = Tensor::rand([n, 1, 1, 1], options).lt(if blob == 0 { 0.5 } else { 0.25 }).to_kind(Kind::Float);
+            let on_boundary = Tensor::rand([n, 1, 1, 1], options).lt(0.5).to_kind(Kind::Float);
+            let index = picks.select(1, blob).to_kind(Kind::Float);
+            let by = (&index / tw as f64).floor() / (th - 1).max(1) as f64;
+            let bx = (index.fmod(tw as f64)) / (tw - 1).max(1) as f64;
+            let ry = Tensor::rand([n], options);
+            let rx = Tensor::rand([n], options);
+            let pick: Tensor = on_boundary.reshape([n]);
+            let free: Tensor = pick.ones_like() - &pick;
+            let cy: Tensor = (&pick * &by + &free * &ry).reshape([n, 1, 1, 1]);
+            let cx: Tensor = (&pick * &bx + &free * &rx).reshape([n, 1, 1, 1]);
+            let sigma_native = (Tensor::rand([n, 1, 1, 1], options) * (10.0f64).ln() + (1.5f64).ln()).exp();
+            let sy = &sigma_native / 280.0;
+            let sx = &sigma_native / 420.0;
+            let peak = Tensor::rand([n, 1, 1, 1], options) * 1.2 + 0.3;
+            let d2 = ((&ys - &cy) / &sy).square() + ((&xs - &cx) / &sx).square();
+            light = light + on * peak * (d2 * -0.5).exp();
+        }
+        image + light
+    }
+
+    /// Optical blur shared by a batch: defocus (Gaussian, sigma up to 1.5
+    /// photosites) for half of batches, motion smear (line up to 2
+    /// photosites, random direction) for a quarter, none otherwise. Applied
+    /// per RAW field, like light spreading before the photosite lattices.
+    fn optics_blur(image: &Tensor, random: &mut impl FnMut() -> f64) -> Tensor {
+        let choice = random();
+        let radius = 7i64;
+        let size = (2 * radius + 1) as usize;
+        let mut kernel = vec![0f32; size * size];
+        if choice < 0.5 {
+            let sigma = (random() * 1.5 * INPUT_PX_PER_PHOTOSITE).max(0.05);
+            for y in 0..size { for x in 0..size {
+                let (dy, dx) = (y as f64 - radius as f64, x as f64 - radius as f64);
+                kernel[y * size + x] = (-(dx * dx + dy * dy) / (2.0 * sigma * sigma)).exp() as f32;
+            }}
+        } else if choice < 0.75 {
+            let length = random() * 2.0 * INPUT_PX_PER_PHOTOSITE;
+            let angle = random() * std::f64::consts::PI;
+            for step in 0..=32 {
+                let t = (step as f64 / 32.0 - 0.5) * length;
+                let (x, y) = ((radius as f64 + t * angle.cos()).round() as usize, (radius as f64 + t * angle.sin()).round() as usize);
+                kernel[y * size + x] += 1.0;
+            }
+        } else {
+            return image.shallow_clone();
+        }
+        let total: f32 = kernel.iter().sum();
+        let kernel = Tensor::from_slice(&kernel.iter().map(|v| v / total).collect::<Vec<_>>())
+            .reshape([1, 1, size as i64, size as i64]).repeat([16, 1, 1, 1]).to_device(image.device());
+        image.pad([radius, radius, radius, radius], "replicate", None)
+            .conv2d(&kernel, None::<Tensor>, [1, 1], [0, 0], [1, 1], 16)
+    }
+
     fn train(data_path: &Path, model_path: &Path, epochs: usize) -> Result<(), String> {
         runtime_output(model_path)?;
         runtime_output(&metadata_path(model_path))?;
@@ -797,12 +1001,17 @@ mod cuda {
         let architecture=std::env::var("BUTTERCUP_EYE_STUDENT_TRAIN_ARCHITECTURE").unwrap_or_else(|_|"rgb".into());
         let raw_native=architecture=="raw16-v1";
         let luma_context=if raw_native {false} else {training_luma_context(&architecture)?};
+        if matches!(augmentation, TrainingAugmentation::ShadowCropNoise | TrainingAugmentation::ShadowCropOptics) && !raw_native {
+            return Err("shadow-crop-noise-v1 models RAW sensor noise; use raw16-v1".into());
+        }
         let initial_model =
             std::env::var_os("BUTTERCUP_EYE_STUDENT_TRAIN_INITIAL_MODEL").map(PathBuf::from);
         runtime::student_cuda_init()?;
         tch::set_num_threads(2);
         tch::manual_seed(17091);
         let device = Device::Cuda(0);
+        let light_noise = matches!(augmentation, TrainingAugmentation::ShadowCropNoise | TrainingAugmentation::ShadowCropOptics)
+            .then(|| LightNoiseModel::load(device)).transpose()?;
         let data = Dataset::load(data_path,raw_native)?;
         if data.manifest["schema"]!="buttercup-eye-student-teacher-v2" {
             return Err("training requires a fresh hash-verified current-checkout teacher export".into());
@@ -888,7 +1097,7 @@ mod cuda {
                 // Same affine for image and labels; never a completed-ellipse target.
                 let n = ids.len() as i64;
                 let angles = (Tensor::rand([n], (Kind::Float, device)) - 0.5) * 0.25;
-                let spatial = augmentation == TrainingAugmentation::ShadowCrop
+                let spatial = matches!(augmentation, TrainingAugmentation::ShadowCrop | TrainingAugmentation::ShadowCropNoise | TrainingAugmentation::ShadowCropOptics)
                     || (augmentation == TrainingAugmentation::MixedShadowCrop
                         && random_u() % 4 == 0);
                 let scales = Tensor::rand([n], (Kind::Float, device))
@@ -916,7 +1125,9 @@ mod cuda {
                     truth=warped_truth; valid=mask;
                 }else{(image, truth, valid) = resample_training_pair(&image, &truth, &grid, spatial);}
                 let mut gain = Tensor::rand([n,3,1,1],(Kind::Float,device))*0.35+0.80;
-                if raw_native {
+                if augmentation == TrainingAugmentation::ShadowCropOptics {
+                    gain = optics_block_gains(n, device);
+                } else if raw_native {
                     let colors:Vec<i64>=(0..16).map(|c|match (c/4<2,c%4<2) {(true,true)=>0,(false,false)=>2,_=>1}).collect();
                     gain=gain.index_select(1,&Tensor::from_slice(&colors).to_device(device));
                 }
@@ -926,6 +1137,29 @@ mod cuda {
                 if spatial {
                     image = if raw_native {augment_spatial_shadow(&(image*255.))/255.}else{augment_spatial_shadow(&image)};
                 }
+                // Light before the lens (glare), then optics (blur), then the
+                // sensor (photon noise, clipping): the physical order.
+                let mut saturated = None;
+                if augmentation == TrainingAugmentation::ShadowCropOptics {
+                    image = optics_glare(&image, &truth);
+                    let mut random = || random_u() as f64 / u64::MAX as f64;
+                    image = optics_blur(&image, &mut random);
+                    // Clipped photosites carry no boundary information.
+                    saturated = Some(image.ge(1.0).any_dim(1, true).to_kind(Kind::Float));
+                    image = image.clamp(0.0, 1.0);
+                }
+                // Photon counts follow the final illumination: noise last.
+                if let Some(model) = &light_noise {
+                    image = if augmentation == TrainingAugmentation::ShadowCropOptics {model.apply_mixed(&image)} else {model.apply(&image)};
+                }
+                let valid = match (valid, saturated) {
+                    (Some(valid), Some(sat)) => {
+                        let sat = sat.upsample_nearest2d([valid.size()[2], valid.size()[3]], None, None);
+                        let keep: Tensor = sat.ones_like() - &sat;
+                        Some(valid * keep)
+                    }
+                    (valid, _) => valid,
+                };
                 let value =
                     loss_with_valid_pixels(&net.forward(&image), &truth, &weights, valid.as_ref());
                 let scalar = value.double_value(&[]);
@@ -965,6 +1199,12 @@ mod cuda {
             "training_source":source,"weights_sha256":hash_file(model_path)?,
             "derived_context":if luma_context {luma_context_contract()} else {Value::Null},
             "training_augmentation":augmentation.label(),"training_seed":17091,
+            "light_noise_model":light_noise.as_ref().map(|m|json!({"light_range":m.light_range,"signal_floor_codes":m.signal_floor,"model":m.source,
+                "uncompensated_fraction":if augmentation==TrainingAugmentation::ShadowCropOptics {0.5} else {0.0}})),
+            "optics_augmentation":(augmentation==TrainingAugmentation::ShadowCropOptics).then(||json!({
+                "block_gain_range":[0.5,2.0],"glare_sigma_native_px":[1.5,15.0],"glare_peak_full_scale":[0.3,1.5],
+                "glare_on_iris_boundary_fraction":0.5,"defocus_sigma_photosites_max":1.5,"motion_photosites_max":2.0,
+                "saturated_pixels":"excluded from loss"})),
             "initial_model":initial_model,
             "learning_rate_range":if initial_model.is_some() {json!([0.00002,0.0002])} else {json!([0.00005,0.001])},
             "input_shape":if raw_native {json!([16,raw::HEIGHT,raw::WIDTH])}else{json!([3,FRAME_HEIGHT,FRAME_WIDTH])},
@@ -1325,10 +1565,94 @@ mod cuda {
                 TrainingAugmentation::parse("mixed-shadow-crop-v1").unwrap(),
                 TrainingAugmentation::MixedShadowCrop
             );
+            assert_eq!(
+                TrainingAugmentation::parse("shadow-crop-noise-v1").unwrap(),
+                TrainingAugmentation::ShadowCropNoise
+            );
+            assert_eq!(TrainingAugmentation::ShadowCropNoise.label(), "shadow-crop-noise-v1");
             assert!(TrainingAugmentation::parse("shdaow").is_err());
             assert!(!training_luma_context("rgb").unwrap());
             assert!(training_luma_context("luma-context-v2").unwrap());
             assert!(training_luma_context("auto").is_err());
+        }
+
+        #[test]
+        fn signal_floor_dims_bright_frames_further_than_dim_ones() {
+            let model = LightNoiseModel {
+                k: Tensor::from_slice(&[2.0f32; 16]).reshape([1, 16, 1, 1]),
+                black: Tensor::from_slice(&[50.0f32; 16]).reshape([1, 16, 1, 1]),
+                light_range: [0.01, 1.0],
+                signal_floor: Some(20.0),
+                source: Value::Null,
+            };
+            let bright = Tensor::full([256, 16, 4, 4], 350.0, (Kind::Float, Device::Cpu));
+            let dim = Tensor::full([256, 16, 4, 4], 80.0, (Kind::Float, Device::Cpu));
+            let kb = model.light_factor(&bright);
+            let kd = model.light_factor(&dim);
+            // floor/signal: 20/350 for bright, 20/80 for dim; never above 1.
+            assert!(kb.min().double_value(&[]) >= 20.0 / 350.0 - 1e-6 && kb.max().double_value(&[]) <= 1.0);
+            assert!(kd.min().double_value(&[]) >= 20.0 / 80.0 - 1e-6 && kd.max().double_value(&[]) <= 1.0);
+            assert!(kb.min().double_value(&[]) < 20.0 / 80.0, "bright frames reach darker than dim frames' floor");
+        }
+
+        #[test]
+        fn optics_augmentations_are_physical_and_bounded() {
+            let device = Device::Cpu;
+            let gains = optics_block_gains(64, device);
+            let (lo, hi) = (gains.min().double_value(&[]), gains.max().double_value(&[]));
+            assert!(lo >= 0.5 - 1e-6 && hi <= 2.0 + 1e-6, "gain range {lo}..{hi}");
+            // Channels of one phase block (c=0,1,4,5) share a gain.
+            for c in [1i64, 4, 5] {
+                assert!((gains.select(1, c) - gains.select(1, 0)).abs().max().double_value(&[]) < 1e-6);
+            }
+            let image = Tensor::full([32, 16, 128, 192], 0.3, (Kind::Float, device));
+            let mut truth = Tensor::zeros([32, 6, 256, 384], (Kind::Float, device));
+            let _ = truth.narrow(2, 64, 128).narrow(3, 128, 128).narrow(1, 0, 1).fill_(1.0);
+            let lit = optics_glare(&image, &truth);
+            assert!((&lit - &image).min().double_value(&[]) >= 0.0, "glare only adds light");
+            assert!((&lit - &image).max().double_value(&[]) > 0.25, "some glare is strong");
+            let mut sequence = [0.1, 0.6, 0.6, 0.9].into_iter().cycle();
+            let mut random = || sequence.next().unwrap();
+            for _ in 0..3 {
+                let blurred = optics_blur(&image, &mut random);
+                assert!((blurred - &image).abs().max().double_value(&[]) < 1e-5, "blur keeps a flat field");
+            }
+            let mut none = || 0.9;
+            assert!(optics_blur(&lit, &mut none).equal(&lit));
+            let model = LightNoiseModel {
+                k: Tensor::from_slice(&[2.0f32; 16]).reshape([1, 16, 1, 1]),
+                black: Tensor::from_slice(&[50.0f32; 16]).reshape([1, 16, 1, 1]),
+                light_range: [0.25, 0.25],
+                signal_floor: None,
+                source: Value::Null,
+            };
+            let mixed = model.apply_mixed(&image) * 1023.0;
+            let means = mixed.mean_dim([1i64, 2, 3].as_slice(), false, Kind::Float);
+            let bright = means.ge(1023.0 * 0.3 - 8.0).sum(Kind::Int64).int64_value(&[]);
+            let dark = means.le(50.0 + 0.25 * (1023.0 * 0.3 - 50.0) + 8.0).sum(Kind::Int64).int64_value(&[]);
+            assert_eq!(bright + dark, 32, "each frame is either gain-compensated or left dim");
+            assert!(bright > 0 && dark > 0);
+        }
+
+        #[test]
+        fn light_noise_is_identity_at_full_light_and_adds_modeled_shot_noise_when_dimmed() {
+            let model = |range: [f64; 2]| LightNoiseModel {
+                k: Tensor::from_slice(&[2.0f32; 16]).reshape([1, 16, 1, 1]),
+                black: Tensor::from_slice(&[50.0f32; 16]).reshape([1, 16, 1, 1]),
+                light_range: range,
+                signal_floor: None,
+                source: Value::Null,
+            };
+            let image = Tensor::full([8, 16, 128, 192], 300.0 / 1023.0, (Kind::Float, Device::Cpu));
+            let same = model([1.0, 1.0]).apply(&image);
+            assert!((same - &image).abs().max().double_value(&[]) < 1e-6);
+            let dim = model([0.25, 0.25]).apply(&image);
+            let added = (dim - &image) * 1023.0;
+            assert!(added.mean(Kind::Float).double_value(&[]).abs() < 1.0, "zero-mean noise");
+            // Photosite std sqrt(K*signal*(1/k-1)) = sqrt(2*250*3) ~ 38.7 codes,
+            // reduced but not removed by resampling 105x70 lattices to 192x128.
+            let std = added.std(true).double_value(&[]);
+            assert!((0.4 * 38.7..=38.7).contains(&std), "std {std}");
         }
 
         #[test]

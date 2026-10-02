@@ -98,7 +98,7 @@ if loading or CUDA initialization fails.
 `G` also offers the experimental `EYE-STUDENT` mode immediately after SAM.
 It uses a compact CUDA-trained SAM mask student and the same RAW/conic/3D gaze
 pipeline. Start it directly with `--segmentation eye-student`; weights and their
-manifest live under `data/models/eye_student_v1.*`. It is faster but has lower
+manifest live under `data/models/eye_student_raw_v5.*`. It is faster but has lower
 pupil coverage on the initial replay, so SAM remains the default. See
 [training, measurements, and limitations](docs/eye-student.md).
 

@@ -146,8 +146,9 @@ scale/human-label evidence. Shared Student optimization remains Rust with
 CUDA-capable LibTorch. This is not a per-user adaptation trainer: optional
 user/scenario refinements must train and run on CPU under the contract.
 
-The default model path is `data/models/eye_student_v1.ot`, with a sibling
-`eye_student_v1.json` manifest. Override it with `BUTTERCUP_EYE_STUDENT_MODEL`.
+The default model path is `data/models/eye_student_raw_v5.ot`, with sibling
+`eye_student_raw_v5.json` manifest and `.bootstrap.json` provenance (see
+[RAW-domain v5](#raw-domain-perturbation-training-v5-october-2026)). Override it with `BUTTERCUP_EYE_STUDENT_MODEL`.
 An explicit `--segmentation eye-student` starts the student directly without
 loading SAM weights; the optional native LibTorch/CUDA build is still required.
 
@@ -419,3 +420,28 @@ masking and bounded directional shadows. The standalone CUDA build, portable
 no-CUDA check, and source-tree audit pass. Replaying the unchanged installed
 weights with the updated code reproduces all 258 original clip admissions,
 outer fits, pupil observations and retained/censored contour records exactly.
+
+### RAW-domain perturbation training (v5), October 2026
+
+The default is now `eye_student_raw_v5.ot` (`raw16-v1`, input contract
+`quad-rggb16-linear-code-f32-v1`), trained with
+`BUTTERCUP_EYE_STUDENT_TRAIN_AUGMENTATION=shadow-crop-optics-v1` and
+`BUTTERCUP_EYE_STUDENT_TRAIN_NOISE_MODEL` set to the measured photon-transfer
+model (per quad-Bayer phase block, variance = K·(code − black)). Every
+perturbation is applied in linear sensor codes before the 16-phase packing:
+reduced light with modeled shot noise (compensated and uncompensated), per-block
+colour gains, glare blobs (saturated pixels excluded from the loss), and
+photosite-scaled defocus and motion blur. `BUTTERCUP_EYE_STUDENT_TRAIN_LIGHT_RANGE`
+bounds the light factor; `BUTTERCUP_EYE_STUDENT_TRAIN_SIGNAL_FLOOR` (codes)
+dims bright frames further than dim ones.
+
+Against the prior raw16 checkpoint (v3) on held-out frames: detection 97% → 98%;
+centre shift under synthetic glare 20.8 → 2.2 px median; under noise, darkening,
+defocus and motion 10–30% lower. Ground-truth stimulus replay: fixed-target error
+1.19° median (p90 2.43°). Live blinded ABBA calibrations: v5 beat v3 in the dark
+and tied with the lit frame.
+
+A v6 trained mostly on lit frames with a signal floor was more stable under
+perturbation (jitter −15%) but lost a blinded v5/v6 ABBA (`outputs/ab-v5v6-20261002`):
+3/4 calibrations accepted vs 4/4, with looser lit fits (rms 0.030–0.040 vs
+0.021–0.024). v5 stays the default.
