@@ -229,6 +229,10 @@ impl<D: Pointer> Controller<D> {
         open: impl FnOnce() -> io::Result<D>,
     ) -> Result<[i32; 2], String> {
         let target = target.ok_or("no fresh calibrated gaze to click at (calibrated, eyes tracked?)")?;
+        // Never clamp an off-screen gaze onto the screen edge and click there.
+        if !(0.0..=1.0).contains(&target.0) || !(0.0..=1.0).contains(&target.1) {
+            return Err("gaze is off screen; nothing clicked".into());
+        }
         let point = absolute_position(target).ok_or("gaze target is not finite")?;
         let device = match (self.device.as_mut(), self.click_device.is_some()) {
             (Some(device), _) => device,
@@ -474,6 +478,7 @@ mod tests {
         assert!(c.click_with(Button::Left, None, open).is_err());
         assert_eq!(opens.get(), 0, "no device opened without a gaze target");
         assert!(c.click_with(Button::Left, Some((f64::NAN, 0.5)), open).is_err());
+        assert!(c.click_with(Button::Left, Some((-0.9, -0.6)), open).is_err(), "off-screen gaze is never clamped");
         let point = c.click_with(Button::Left, Some((0.5, 0.25)), open).unwrap();
         c.click_with(Button::Right, Some((1.0, 0.0)), open).unwrap();
         assert_eq!(opens.get(), 1);
