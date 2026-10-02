@@ -591,6 +591,7 @@ fn usage() -> &'static str {
      --large-cells                 one 8x4 code tile instead of four repeats\n\
      --temporal-code               63-symbol error-checked whole-field color clock\n\
      --fixed-target                keep fixation centered for clock diagnosis\n\
+     --motion-period-scale F       stretch the target's Lissajous periods (slower pursuit) [1]\n\
      --self-test-render            exercise encoder and 4K renderer without a window\n\
      Keys in stimulus: Z/Esc/Q exit, Space pause/resume"
 }
@@ -637,6 +638,14 @@ where
             "--large-cells" => config.code_layout = SpatialCodeLayout::LEGACY,
             "--temporal-code" => config.temporal_code = true,
             "--fixed-target" => config.fixed_target = true,
+            "--motion-period-scale" => {
+                let scale = option_f64("--motion-period-scale", arguments.next())?;
+                if !(scale.is_finite() && (1.0..=20.0).contains(&scale)) {
+                    return Err("--motion-period-scale must be in 1..=20".to_string());
+                }
+                config.horizontal_period_seconds *= scale;
+                config.vertical_period_seconds *= scale;
+            }
             "--self-test-render" => config.self_test_render = true,
             "-h" | "--help" => {
                 println!("{}", usage());

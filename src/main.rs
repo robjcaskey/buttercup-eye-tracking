@@ -9605,9 +9605,14 @@ struct MouseCalibrationLightbox {
 
 impl MouseCalibrationLightbox {
     fn new(now: Instant) -> Self {
+        // BUTTERCUP_LIGHTBOX_START_WIDTH starts the frame lit at that width
+        // (same 0.04..0.44 bounds as the [ ] keys) so repeated sessions match.
+        let start_width = std::env::var("BUTTERCUP_LIGHTBOX_START_WIDTH").ok()
+            .and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.04, 0.44));
         Self {
-            enabled: screen_reflection_border::spatial_trial(),
-            width_fraction: 0.16,
+            enabled: screen_reflection_border::spatial_trial() || start_width.is_some(),
+            width_fraction: start_width.unwrap_or(0.16),
             pattern: if screen_reflection_border::spatial_trial() {LightboxPattern::OpticalClock} else {LightboxPattern::SteadyNeutral},
             pattern_started: now,
             clock_epoch: screen_reflection_border::Epoch::new(now),
