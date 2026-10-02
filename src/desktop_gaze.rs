@@ -18,14 +18,12 @@ pub(crate) fn tick(app: &mut App) {
                 s.mouse_output.enabled_generation(),
                 s.gaze_focus.enabled_generation(),
                 s.wleyes.enabled_generation(),
-                s.gaze_cursor.enabled_generation(),
+                // Look-and-click aims at any time, so the gaze target is
+                // always tracked; the ring merely displays it.
+                Some(s.gaze_cursor.tracking_generation()),
             )
         })
         .unwrap_or((None, None, None, None));
-    if mouse_generation.is_none() && focus_generation.is_none() && eyes_generation.is_none()
-        && cursor_generation.is_none() {
-        return;
-    }
     // refresh_viewer_frames updates each image only when its source changes.
     let sample = if crate::refresh_viewer_frames(app).is_err() {
         Err("paused: viewer state unavailable")

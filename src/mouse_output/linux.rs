@@ -1,7 +1,8 @@
 //! Minimal userspace Linux uinput ABI. The kernel supplies the driver.
-//! ABS_X/Y + BTN_LEFT classifies as an absolute mouse in udev/libinput. The
-//! button capability is for classification ONLY: we never send button events.
-use super::{Pointer, AXIS_MAX, DEVICE_NAME};
+//! ABS_X/Y + BTN_LEFT classifies as an absolute mouse in udev/libinput.
+//! Buttons are sent only for an explicit look-and-click request: one atomic
+//! report that moves to the gaze point, presses and releases.
+use super::{Button, Pointer, AXIS_MAX, DEVICE_NAME};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
@@ -15,6 +16,7 @@ const SYN_REPORT: u16 = 0;
 const ABS_X: u16 = 0;
 const ABS_Y: u16 = 1;
 const BTN_LEFT: u16 = 0x110;
+const BTN_RIGHT: u16 = 0x111;
 const BUS_VIRTUAL: u16 = 0x06;
 
 pub(crate) struct UinputPointer(File);
@@ -31,6 +33,7 @@ impl UinputPointer {
             (100, EV_KEY),
             (100, EV_ABS),
             (101, BTN_LEFT),
+            (101, BTN_RIGHT),
             (103, ABS_X),
             (103, ABS_Y),
             (110, libc::INPUT_PROP_POINTER),
@@ -100,7 +103,45 @@ fn position_events(point: [i32; 2]) -> [libc::input_event; 3] {
     events
 }
 
+fn click_events(point: [i32; 2], button: Button) -> [libc::input_event; 7] {
+    let code = match button { Button::Left => BTN_LEFT, Button::Right => BTN_RIGHT };
+    let mut events: [libc::input_event; 7] = unsafe { std::mem::zeroed() };
+    for (event, (kind, code, value)) in events.iter_mut().zip([
+        (EV_ABS, ABS_X, point[0]),
+        (EV_ABS, ABS_Y, point[1]),
+        (EV_SYN, SYN_REPORT, 0),
+        (EV_KEY, code, 1),
+        (EV_SYN, SYN_REPORT, 0),
+        (EV_KEY, code, 0),
+        (EV_SYN, SYN_REPORT, 0),
+    ]) {
+        event.type_ = kind;
+        event.code = code;
+        event.value = value;
+    }
+    events
+}
+
+impl UinputPointer {
+    fn write_events(&mut self, events: &[libc::input_event]) -> io::Result<()> {
+        // SAFETY: fully initialized contiguous kernel ABI records, alive until
+        // the synchronous write returns.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(events.as_ptr().cast::<u8>(), std::mem::size_of_val(events))
+        };
+        match self.0.write(bytes) {
+            Ok(n) if n == bytes.len() => Ok(()),
+            Ok(_) => Err(io::Error::new(io::ErrorKind::WriteZero, "incomplete pointer report")),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 impl Pointer for UinputPointer {
+    fn click(&mut self, point: [i32; 2], button: Button) -> io::Result<()> {
+        self.write_events(&click_events(point, button))
+    }
+
     fn position(&mut self, point: [i32; 2]) -> io::Result<()> {
         let events = position_events(point);
         // SAFETY: fully initialized contiguous kernel ABI records, alive until

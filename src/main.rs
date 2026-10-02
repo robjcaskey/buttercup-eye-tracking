@@ -7957,6 +7957,14 @@ fn handle_control_command(command: &str, shared: &Arc<Mutex<SharedState>>) -> St
     match fields {
         [ping] if ping.eq_ignore_ascii_case("PING") => "{\"ok\":true,\"reply\":\"PONG\"}".to_string(),
         [status] if status.eq_ignore_ascii_case("STATUS") => control_status_json(&state),
+        [mouse, click, button]
+            if mouse.eq_ignore_ascii_case("MOUSE") && click.eq_ignore_ascii_case("CLICK") =>
+        {
+            // Look-and-click: the pointer's own gaze target when movement is
+            // ON, else the continuously tracked (held-fresh) ring target.
+            let target = state.mouse_output.fresh_target().or(state.gaze_cursor.target());
+            state.mouse_output.click(button, target).to_string()
+        }
         [mouse, output, action]
             if mouse.eq_ignore_ascii_case("MOUSE") && output.eq_ignore_ascii_case("OUTPUT") =>
         {
@@ -7976,8 +7984,13 @@ fn handle_control_command(command: &str, shared: &Arc<Mutex<SharedState>>) -> St
             reply.to_string()
         }
         [eyes, action] if eyes.eq_ignore_ascii_case("WLEYES") => state.wleyes.command(action).to_string(),
-        [gaze, cursor, action] if gaze.eq_ignore_ascii_case("GAZE") && cursor.eq_ignore_ascii_case("CURSOR") =>
-            state.gaze_cursor.command(action).to_string(),
+        [gaze, cursor, action] if gaze.eq_ignore_ascii_case("GAZE") && cursor.eq_ignore_ascii_case("CURSOR") => {
+            let reply = state.gaze_cursor.command(action);
+            // The ring is the look-and-click aim: have the click device
+            // registered with the compositor before the first click.
+            if reply["gaze_cursor"]["enabled"] == true { state.mouse_output.prepare_click_device(); }
+            reply.to_string()
+        }
         [monitor, status] if monitor.eq_ignore_ascii_case("MONITOR") && status.eq_ignore_ascii_case("STATUS") => {
             serde_json::json!({"ok":true,"monitor":state.monitor_location.snapshot()}).to_string()
         }
@@ -45446,7 +45459,6 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         if wleyes::window_event(self, id, &event) { return; }
-        if gaze_cursor::window_event(self, id, &event) { return; }
         match event {
             WindowEvent::ModifiersChanged(modifiers) => { self.keyboard_modifiers = modifiers.state(); }
             WindowEvent::CursorMoved { position, .. } => { self.ui.pointer=(position.x,position.y); }
@@ -46279,7 +46291,7 @@ impl ApplicationHandler for App {
         }
         desktop_gaze::tick(self);
         wleyes::sync_window(self, event_loop);
-        gaze_cursor::sync_window(self, event_loop);
+        gaze_cursor::sync_window(self);
         if let Some(state) = self.window_state.as_ref() {
             state.window.request_redraw();
         }

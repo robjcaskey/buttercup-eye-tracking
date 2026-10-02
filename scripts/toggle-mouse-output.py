@@ -54,6 +54,26 @@ def cursor_toggle(args):
                "A ring shows where your calibrated gaze lands. The pointer is not moved." if status["enabled"] else "Gaze ring hidden.")
 
 
+def click(args):
+    """Look-and-click: one press/release at the current calibrated gaze."""
+    # Map before the click device reports, so device coordinates span one monitor.
+    map_output(args.output)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(2)
+        try:
+            connection.connect(args.socket)
+        except (FileNotFoundError, ConnectionRefusedError) as error:
+            raise RuntimeError(f"Buttercup viewer is not running at {args.socket}.") from error
+        connection.sendall(f"MOUSE CLICK {args.click.upper()}\n".encode())
+        connection.shutdown(socket.SHUT_WR)
+        data = connection.recv(65536)
+    reply = json.loads(data)
+    if not reply.get("ok"):
+        raise RuntimeError(reply.get("error") or "Viewer rejected the click")
+    if args.verbose:
+        print(json.dumps(reply))
+
+
 def focus_toggle(args):
     """Independent window focus; never open uinput or map/move a pointer."""
     status = command(args.socket, "STATUS", focus=True)
@@ -146,7 +166,7 @@ def map_output(requested):
     return output
 
 
-def osd(title, body, error=False):
+def osd(title, body, error=False, compact=False):
     """Show the change on the attention-style eye overview card; False if unavailable."""
     try:
         import importlib.util
@@ -159,14 +179,14 @@ def osd(title, body, error=False):
         return module.show({"kind": "status", "eyebrow": "EYE TRACKING",
                             "title": title.removeprefix("Buttercup ").capitalize(), "detail": body,
                             "tone": "error" if error else ("success" if enabled else "waiting"),
-                            "sticky_tone": True, "hold_s": 3.0})
+                            "sticky_tone": True, "hold_s": 3.0, "compact": compact})
     except (OSError, ImportError, ValueError, AttributeError):
         return False
 
 
-def notify(title, body, error=False):
+def notify(title, body, error=False, compact=False):
     print(f"{title}: {body}", file=sys.stderr if error else sys.stdout)
-    if osd(title, body, error):
+    if osd(title, body, error, compact):
         return
     try:
         subprocess.run(["notify-send", "--app-name=Buttercup", "--urgency=" + ("critical" if error else "normal"),
@@ -222,6 +242,8 @@ def main():
     mode.add_argument("--focus", action="store_true", help="toggle window focus instead of pointer movement")
     mode.add_argument("--eyes", action="store_true", help="toggle the viewer-owned wleyes cartoon")
     mode.add_argument("--cursor", action="store_true", help="toggle the on-screen calibrated gaze ring (never moves the pointer)")
+    mode.add_argument("--click", choices=("left", "right"), help="look-and-click: press this button once at the calibrated gaze")
+    parser.add_argument("--verbose", action="store_true", help="print the viewer's click reply")
     parser.add_argument("--quiet", action="store_true", help="suppress success notifications, never errors")
     args = parser.parse_args()
     try:
@@ -238,7 +260,9 @@ def main():
                     if time.monotonic() >= deadline:
                         raise RuntimeError("Another Buttercup mouse toggle is still pending")
                     time.sleep(0.02)
-            if args.cursor:
+            if args.click:
+                click(args)
+            elif args.cursor:
                 cursor_toggle(args)
             elif args.eyes:
                 eyes_toggle(args)
@@ -248,7 +272,11 @@ def main():
                 toggle(args)
         return 0
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
-        notify("Buttercup wleyes warning" if args.eyes else ("Buttercup gaze focus warning" if args.focus else "Buttercup mouse warning"), str(error), error=True)
+        if args.click:
+            # Just the warning; the full status card stays one hotkey away.
+            notify("Buttercup click warning", str(error), error=True, compact=True)
+            return 1
+        notify( "Buttercup wleyes warning" if args.eyes else ("Buttercup gaze focus warning" if args.focus else "Buttercup mouse warning"), str(error), error=True)
         return 1
 
 

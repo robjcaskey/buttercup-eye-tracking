@@ -1,4 +1,5 @@
-//! Opt-in, absolute desktop pointer output. No clicks, acceleration or easing.
+//! Opt-in, absolute desktop pointer output, plus explicit look-and-click.
+//! No acceleration or easing; clicks happen only on request at the gaze point.
 //!
 //! Device lifetime is the enable switch: OFF drops the uinput descriptor. An
 //! open/setup/write failure is fail-closed; there is no permission escalation.
@@ -17,6 +18,14 @@ pub(crate) const MAX_SOURCE_AGE: Duration = Duration::from_millis(500);
 
 pub(crate) trait Pointer: Send {
     fn position(&mut self, point: [i32; 2]) -> io::Result<()>;
+    /// Move to `point`, press and release `button` in one atomic report.
+    fn click(&mut self, point: [i32; 2], button: Button) -> io::Result<()>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Button {
+    Left,
+    Right,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +53,10 @@ pub(crate) struct Controller<D = UinputPointer> {
     emitted: u64,
     pause: &'static str,
     error: Option<String>,
+    /// Click-only device for look-and-click while pointer movement is OFF.
+    /// Opened ahead of use so the compositor has registered it.
+    click_device: Option<D>,
+    clicks: u64,
 }
 
 impl<D> Default for Controller<D> {
@@ -57,6 +70,8 @@ impl<D> Default for Controller<D> {
             emitted: 0,
             pause: "off",
             error: None,
+            click_device: None,
+            clicks: 0,
         }
     }
 }
@@ -122,7 +137,8 @@ impl<D: Pointer> Controller<D> {
         json!({
             "enabled": self.device.is_some(), "device": "/dev/uinput",
             "device_name": DEVICE_NAME, "input_identifier": DEVICE_IDENTIFIER,
-            "mode": "absolute", "clicks": false,
+            "mode": "absolute", "clicks": "look-and-click on request",
+            "click_device_ready": self.device.is_some() || self.click_device.is_some(), "emitted_clicks": self.clicks,
             "status": if self.error.is_some() { "error" } else { self.pause },
             "error": self.error, "emitted_positions": self.emitted,
             "last_unclamped_target": self.last_target,
@@ -139,6 +155,11 @@ impl<D: Pointer> Controller<D> {
         } else {
             "MOUSE OFF / Super+Shift+M".into()
         }
+    }
+
+    /// Target last emitted while pointer movement is ON and still tracking.
+    pub(crate) fn fresh_target(&self) -> Option<(f64, f64)> {
+        (self.device.is_some() && self.pause == "tracking").then_some(self.last_target).flatten()
     }
 
     /// Caller snapshots the generation before projecting. A concurrent OFF (or
@@ -197,6 +218,64 @@ impl<D: Pointer> Controller<D> {
     }
 }
 
+impl<D: Pointer> Controller<D> {
+    /// Click at a calibrated gaze target. Uses the movement device when ON,
+    /// else the click-only device (opened on demand). Never clicks without a
+    /// fresh finite target.
+    fn click_with(
+        &mut self,
+        button: Button,
+        target: Option<(f64, f64)>,
+        open: impl FnOnce() -> io::Result<D>,
+    ) -> Result<[i32; 2], String> {
+        let target = target.ok_or("no fresh calibrated gaze to click at (calibrated, eyes tracked?)")?;
+        let point = absolute_position(target).ok_or("gaze target is not finite")?;
+        let device = match (self.device.as_mut(), self.click_device.is_some()) {
+            (Some(device), _) => device,
+            (None, true) => self.click_device.as_mut().expect("present"),
+            (None, false) => {
+                self.click_device = Some(open().map_err(|e| enable_error(&e).replace("Mouse movement remains OFF", "Click unavailable"))?);
+                self.click_device.as_mut().expect("just opened")
+            }
+        };
+        device.click(point, button).map_err(|e| format!("click write failed: {e}"))?;
+        self.clicks += 1;
+        Ok(point)
+    }
+
+    fn prepare_click_device_with(&mut self, open: impl FnOnce() -> io::Result<D>) {
+        if self.device.is_none() && self.click_device.is_none() {
+            self.click_device = open().ok();
+        }
+    }
+}
+
+impl Controller<UinputPointer> {
+    /// MOUSE CLICK LEFT|RIGHT at `target` (the latest fresh calibrated gaze).
+    pub(crate) fn click(&mut self, action: &str, target: Option<(f64, f64)>) -> Value {
+        let button = match action.to_ascii_uppercase().as_str() {
+            "LEFT" => Button::Left,
+            "RIGHT" => Button::Right,
+            _ => return json!({"ok": false, "error": "MOUSE CLICK LEFT|RIGHT"}),
+        };
+        if target.is_some() && self.device.is_none() && self.click_device.is_none() {
+            // A brand-new uinput device drops events until the compositor has
+            // registered it; normally the gaze ring opened it ahead of time.
+            self.prepare_click_device();
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        match self.click_with(button, target, UinputPointer::create) {
+            Ok(point) => json!({"ok": true, "clicked": format!("{button:?}"), "target": target, "device_point": point}),
+            Err(error) => json!({"ok": false, "error": error}),
+        }
+    }
+
+    /// Open the click-only device ahead of the first look-and-click.
+    pub(crate) fn prepare_click_device(&mut self) {
+        self.prepare_click_device_with(UinputPointer::create);
+    }
+}
+
 impl Controller<UinputPointer> {
     pub(crate) fn command(&mut self, action: &str) -> Value {
         let enabled = match action.to_ascii_uppercase().as_str() {
@@ -239,9 +318,15 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         points: Arc<Mutex<Vec<[i32; 2]>>>,
+        clicks: Arc<Mutex<Vec<([i32; 2], Button)>>>,
         fail: bool,
     }
     impl Pointer for Fake {
+        fn click(&mut self, point: [i32; 2], button: Button) -> io::Result<()> {
+            self.clicks.lock().unwrap().push((point, button));
+            Ok(())
+        }
+
         fn position(&mut self, point: [i32; 2]) -> io::Result<()> {
             if self.fail {
                 return Err(io::Error::from(io::ErrorKind::PermissionDenied));
@@ -375,6 +460,26 @@ mod tests {
             .unwrap();
         c.update(generation, now, sample(2, Duration::ZERO, (0.5, 0.5)));
         assert_eq!(c.emitted, 0);
+    }
+
+    #[test]
+    fn click_needs_a_fresh_target_and_reuses_one_click_device() {
+        let mut c = Controller::<Fake>::default();
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let opens = std::cell::Cell::new(0);
+        let open = || {
+            opens.set(opens.get() + 1);
+            Ok(Fake { clicks: Arc::clone(&clicks), ..Fake::default() })
+        };
+        assert!(c.click_with(Button::Left, None, open).is_err());
+        assert_eq!(opens.get(), 0, "no device opened without a gaze target");
+        assert!(c.click_with(Button::Left, Some((f64::NAN, 0.5)), open).is_err());
+        let point = c.click_with(Button::Left, Some((0.5, 0.25)), open).unwrap();
+        c.click_with(Button::Right, Some((1.0, 0.0)), open).unwrap();
+        assert_eq!(opens.get(), 1);
+        assert_eq!(*clicks.lock().unwrap(), vec![(point, Button::Left), ([AXIS_MAX, 0], Button::Right)]);
+        assert_eq!(c.snapshot()["enabled"], false, "clicking never enables pointer movement");
+        assert!(c.fresh_target().is_none());
     }
 
     #[test]

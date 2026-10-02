@@ -1,15 +1,13 @@
-//! On-screen gaze cursor: a small click-through ring that Sway places at the
-//! calibrated screen gaze. It never moves the pointer or takes focus. Only the
+//! On-screen gaze cursor: a small click-through ring on the layer-shell
+//! overlay (visible above fullscreen windows) at the calibrated screen gaze. It never moves the pointer or takes focus. Only the
 //! accepted (sign-resolved, calibrated) desktop gaze sample drives it.
 use crate::{mouse_output::Sample, App};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::Arc;
-use winit::{dpi::LogicalSize, event::WindowEvent, event_loop::ActiveEventLoop,
-    platform::wayland::WindowAttributesExtWayland, window::{Window, WindowId}};
 
-const APP_ID: &str = "buttercup-gaze-cursor";
+mod overlay;
+
 /// Logical window size; the ring is drawn once at this size. At least Sway's
 /// default 75x50 floating minimum, so the ring stays centered in its window.
 const SIZE: f64 = 76.0;
@@ -21,11 +19,19 @@ pub(crate) struct Controller {
     enabled: bool,
     generation: u64,
     target: Option<(f64, f64)>,
+    /// When the shown target's source was captured. A brief tracking gap
+    /// keeps showing (and clicking at) it while it is still fresh.
+    target_captured: Option<std::time::Instant>,
     status: String,
 }
 
 impl Controller {
     pub fn enabled_generation(&self) -> Option<u64> { self.enabled.then_some(self.generation) }
+    /// Gaze is tracked even with the ring hidden, so look-and-click can aim
+    /// at any time; the ring only displays this target.
+    pub fn tracking_generation(&self) -> u64 { self.generation }
+    /// Latest fresh calibrated target (the ring shows it when enabled).
+    pub fn target(&self) -> Option<(f64, f64)> { self.target }
     pub fn command(&mut self, action: &str) -> Value {
         let enabled = match action.to_ascii_uppercase().as_str() {
             "STATUS" => self.enabled,
@@ -35,112 +41,59 @@ impl Controller {
         if enabled != self.enabled {
             self.enabled = enabled;
             self.generation = self.generation.wrapping_add(1);
-            self.target = None;
-            self.status = if enabled {"waiting for calibrated gaze"} else {"off"}.into();
+            if self.target.is_none() { self.status = "waiting for calibrated gaze".into(); }
         }
         json!({"ok":true,"gaze_cursor":{"enabled":self.enabled,"status":self.status,"target":self.target}})
     }
     pub fn publish(&mut self, generation: u64, input: Result<Sample, &'static str>) {
-        if self.enabled_generation() != Some(generation) { return; }
+        if self.tracking_generation() != generation { return; }
+        let now = std::time::Instant::now();
+        let age = input.as_ref().map(|s| s.age).unwrap_or_default();
         match input.and_then(|s| {
             if s.age > std::time::Duration::from_nanos(crate::SAM31_RESULT_MAX_AGE_NS) { Err("waiting for fresh gaze") }
             else if !s.target.0.is_finite() || !s.target.1.is_finite() { Err("invalid gaze") }
             else { Ok(s.target) }
         }) {
-            Ok(target) => { self.target = Some(target); self.status = "tracking".into(); }
-            Err(reason) => { self.target = None; self.status = reason.into(); }
+            Ok(target) => {
+                self.target = Some(target);
+                self.target_captured = Some(now - age);
+                self.status = "tracking".into();
+            }
+            Err(reason) => {
+                // Same freshness bound as a live sample, measured from capture.
+                let fresh = self.target_captured.is_some_and(|captured|
+                    now.duration_since(captured) <= std::time::Duration::from_nanos(crate::SAM31_RESULT_MAX_AGE_NS));
+                if !fresh { self.target = None; self.target_captured = None; }
+                self.status = if fresh { format!("holding last gaze ({reason})") } else { reason.into() };
+            }
         }
     }
 }
 
 /// Owned by the viewer event loop beside the wleyes overlay.
 pub(crate) struct CursorWindow {
-    window: crate::wleyes::ArgbWindow,
-    drawn: bool,
-    placed: Option<(i32, i32)>,
-    hidden: bool,
-    output: Option<[f64; 4]>,
-    sway: Option<UnixStream>,
+    overlay: overlay::CursorOverlay,
+    sent: Option<Option<(f64, f64)>>,
 }
 
-pub(crate) fn sync_window(app: &mut App, event_loop: &ActiveEventLoop) {
+pub(crate) fn sync_window(app: &mut App) {
     let (enabled, target) = app.shared.lock()
         .map(|s| (s.gaze_cursor.enabled, s.gaze_cursor.target)).unwrap_or((false, None));
     if !enabled { app.gaze_cursor_window = None; return; }
-    if app.gaze_cursor_window.is_none() {
-        // Never take keyboard focus: register the rule before the window maps,
-        // and remember what was focused so it can be restored if needed.
-        let mut sway = sway_connect();
-        sway_run(&mut sway, &format!("no_focus [app_id=\"^{APP_ID}$\"]"));
-        let previous_focus = sway_focused_container(&mut sway);
-        let attributes = Window::default_attributes()
-            .with_name(APP_ID, APP_ID)
-            .with_title("Buttercup gaze cursor")
-            .with_transparent(true)
-            .with_decorations(false).with_resizable(false).with_active(false)
-            .with_inner_size(LogicalSize::new(SIZE, SIZE));
-        let created = event_loop.create_window(attributes).map_err(|e| e.to_string())
-            .and_then(|window| {
-                // Clicks and hover pass through to whatever is underneath.
-                let _ = window.set_cursor_hittest(false);
-                crate::wleyes::ArgbWindow::new(Arc::new(window))
-            });
-        match created {
-            Ok(window) => {
-                sway_run(&mut sway, &format!(
-                    "[app_id=\"^{APP_ID}$\"] floating enable, border none, sticky enable"));
-                if let Some(id) = previous_focus {
-                    sway_run(&mut sway, &format!("[con_id={id}] focus"));
-                }
-                let output = sway_focused_output(&mut sway);
-                app.gaze_cursor_window = Some(CursorWindow {
-                    window, drawn: false, placed: None, hidden: false, output, sway,
-                });
-            }
-            Err(error) => {
-                eprintln!("gaze cursor window: {error}");
-                if let Ok(mut s) = app.shared.lock() { s.gaze_cursor.command("OFF"); s.gaze_cursor.status = error; }
-                return;
-            }
-        }
+    let cursor = app.gaze_cursor_window.get_or_insert_with(|| {
+        // Normalized targets refer to the focused Sway output.
+        let output = sway_focused_output_name(&mut sway_connect());
+        CursorWindow { overlay: overlay::CursorOverlay::spawn(output), sent: None }
+    });
+    if let Some(error) = cursor.overlay.error() {
+        app.gaze_cursor_window = None;
+        if let Ok(mut s) = app.shared.lock() { s.gaze_cursor.command("OFF"); s.gaze_cursor.status = error; }
+        return;
     }
-    let Some(cursor) = app.gaze_cursor_window.as_mut() else { return };
-    let Some([ox, oy, ow, oh]) = cursor.output else { return };
-    match target {
-        Some((x, y)) => {
-            let place = (
-                (ox + x.clamp(0.0, 1.0) * ow - SIZE / 2.0).round() as i32,
-                (oy + y.clamp(0.0, 1.0) * oh - SIZE / 2.0).round() as i32,
-            );
-            let moved = cursor.placed.is_none_or(|(px, py)|
-                f64::from((px - place.0).abs().max((py - place.1).abs())) >= MOVE_THRESHOLD);
-            if moved || cursor.hidden {
-                sway_run(&mut cursor.sway, &format!(
-                    "[app_id=\"^{APP_ID}$\"] move absolute position {} {}", place.0, place.1));
-                cursor.placed = Some(place);
-                if cursor.hidden { cursor.hidden = false; cursor.drawn = false; }
-            }
-        }
-        None if !cursor.hidden => { cursor.hidden = true; cursor.drawn = false; }
-        None => {}
+    if cursor.sent != Some(target) {
+        cursor.overlay.show(target);
+        cursor.sent = Some(target);
     }
-    if !cursor.drawn { cursor.window.request_redraw(); }
-}
-
-pub(crate) fn window_event(app: &mut App, id: WindowId, event: &WindowEvent) -> bool {
-    let Some(cursor) = app.gaze_cursor_window.as_mut().filter(|c| c.window.window.id() == id) else { return false };
-    if let WindowEvent::RedrawRequested = event {
-        let size = cursor.window.window.inner_size();
-        if size.width == 0 || size.height == 0 { return true; }
-        let mut pixels = vec![0u32; size.width as usize * size.height as usize];
-        if !cursor.hidden { render_ring(&mut pixels, size.width as usize, size.height as usize); }
-        match cursor.window.present(&pixels, size.width, size.height) {
-            Ok(()) => cursor.drawn = true,
-            Err(error) => eprintln!("gaze cursor present: {error}"),
-        }
-    }
-    // Overlay input must never reach viewer shortcuts.
-    true
 }
 
 /// Premultiplied ARGB ring: dark outline around a bright ring, clear center.
@@ -188,33 +141,14 @@ fn sway_request(stream: &mut Option<UnixStream>, kind: u32, payload: &str) -> Op
     reply
 }
 
-fn sway_run(stream: &mut Option<UnixStream>, command: &str) {
-    if stream.is_none() { *stream = sway_connect(); }
-    if sway_request(stream, 0, command).is_none() {
-        eprintln!("gaze cursor: sway command failed: {command}");
-    }
-}
-
-fn sway_focused_container(stream: &mut Option<UnixStream>) -> Option<i64> {
-    fn find(node: &Value) -> Option<i64> {
-        if node["focused"] == true { return node["id"].as_i64(); }
-        node["nodes"].as_array().into_iter().chain(node["floating_nodes"].as_array())
-            .flatten().find_map(find)
-    }
-    if stream.is_none() { *stream = sway_connect(); }
-    let body = sway_request(stream, 4, "")?;
-    find(&serde_json::from_slice(&body).ok()?)
-}
-
-/// Logical rectangle [x, y, width, height] of the focused output.
-fn sway_focused_output(stream: &mut Option<UnixStream>) -> Option<[f64; 4]> {
+/// Name of the focused (else first active) Sway output.
+fn sway_focused_output_name(stream: &mut Option<UnixStream>) -> Option<String> {
     let body = sway_request(stream, 3, "")?;
     let outputs: Value = serde_json::from_slice(&body).ok()?;
     let output = outputs.as_array()?.iter()
         .find(|o| o["focused"] == true && o["active"] == true)
         .or_else(|| outputs.as_array()?.iter().find(|o| o["active"] == true))?;
-    let rect = &output["rect"];
-    Some([rect["x"].as_f64()?, rect["y"].as_f64()?, rect["width"].as_f64()?, rect["height"].as_f64()?])
+    output["name"].as_str().map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -232,6 +166,13 @@ mod tests {
         assert_eq!(at(10.0), 0, "gap between dot and ring");
         assert_ne!(at(19.0), 0, "ring");
     }
+    fn sample_at(target: (f64, f64), age: std::time::Duration) -> Result<Sample, &'static str> {
+        Ok(Sample {
+            source: crate::mouse_output::Source { eye: 0, authority: 1, sign_epoch: 1, timestamp_ns: 1 },
+            age,
+            target,
+        })
+    }
     #[test]
     fn controller_ignores_stale_generations_and_clears_on_error() {
         let mut c = Controller::default();
@@ -241,7 +182,19 @@ mod tests {
         assert_eq!(c.status, "waiting for calibrated gaze");
         c.publish(generation, Err("paused"));
         assert!(c.target.is_none());
+        c.publish(generation, sample_at((0.25, 0.75), std::time::Duration::ZERO));
+        c.publish(generation, Err("paused: unresolved gaze sign"));
+        assert_eq!(c.target(), Some((0.25, 0.75)), "a brief gap holds the fresh target");
+        assert!(c.status.starts_with("holding"));
+        c.publish(generation, sample_at((0.5, 0.5), std::time::Duration::from_secs(2)));
+        assert_eq!(c.target(), Some((0.25, 0.75)), "a stale sample never replaces the shown target");
+        c.publish(generation, sample_at((0.5, 0.5), std::time::Duration::from_millis(890)));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        c.publish(generation, Err("paused"));
+        assert!(c.target().is_none(), "the hold ends when the shown sample goes stale");
         c.command("OFF");
         assert!(c.enabled_generation().is_none());
+        c.publish(c.tracking_generation(), sample_at((0.1, 0.2), std::time::Duration::ZERO));
+        assert_eq!(c.target(), Some((0.1, 0.2)), "click aim keeps tracking with the ring hidden");
     }
 }

@@ -8,7 +8,8 @@ a click-through layer-shell overlay that never takes keyboard focus.
     eye-focus-osd.py status           # toggle the pinned overview (press again to hide)
 
 JSON fields: title, detail, tone (working|success|waiting|error), position,
-kind (focus|exposure|status), eyebrow, range [min, max], log_scale, hold_s.
+kind (focus|exposure|status), eyebrow, range [min, max], log_scale, hold_s,
+compact (just the message, with a discreet hint for the full status card).
 """
 import json
 import os
@@ -56,6 +57,7 @@ window.eye-focus-osd { background-color: rgba(0,0,0,0); background-image: none; 
 .kv-key { color: #8a8a98; font-size: 16px; font-weight: 600; min-width: 190px; }
 .kv-value { color: #f4f4f6; font-size: 18px; font-weight: 700; min-width: 230px; }
 .dialog-footer { color: #a6a6b5; font-size: 15px; margin-top: 26px; }
+.compact-hint { color: #6e6e7c; font-size: 13px; margin-top: 18px; }
 """
 TONES = ("working", "success", "waiting", "error")
 
@@ -104,6 +106,7 @@ def viewer_status(command, key):
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SETTINGS = os.path.join(REPO, "outputs", "settings")
 CARD_WIDTH = 900
+COMPACT_WIDTH = 620
 # Fine eye mode: 14704 pixel clocks per line (camera FINE_LINE_LENGTH); the
 # line period measured from frame length vs delivered frame rate is ~34.5 us.
 LINE_TIME_US = 34.5
@@ -294,7 +297,7 @@ def serve():
         gauge.append(fill)
         for widget in (eyebrow, title, detail, gauge):
             card.append(widget)
-        rows = {}
+        rows, sections = {}, []
         for key, heading in (("camera", "CAMERA"), ("tracking", "EYE TRACKING"), ("outputs", "OUTPUTS")):
             label = Gtk.Label(label=heading, xalign=0)
             label.add_css_class("section")
@@ -307,11 +310,15 @@ def serve():
             card.append(flow)
             card.append(grid)
             rows[key] = (flow, grid)
+            sections.append(label)
         footer = Gtk.Label(xalign=0, wrap=True,
                            label="Super+] [ exposure   Shift+] [ focus   \\ autofocus   Shift+\\ auto exposure\n"
                                  "Super+/ status   Shift+M gaze mouse   Shift+O gaze ring   Y wleyes   (Magic works too)")
         footer.add_css_class("dialog-footer")
         card.append(footer)
+        hint = Gtk.Label(label="Super+/ full status", xalign=1, halign=Gtk.Align.END)
+        hint.add_css_class("compact-hint")
+        card.append(hint)
         window.set_child(card)
 
         def set_pills(flow, pills):
@@ -356,12 +363,19 @@ def serve():
             else:
                 fraction = (position - low) / (high - low)
             fill.set_size_request(max(10, int((CARD_WIDTH - 88) * min(1.0, max(0.0, fraction)))), 10)
-            gauge.set_visible(message.get("kind") != "status")
+            compact = bool(message.get("compact"))
+            card.set_size_request(COMPACT_WIDTH if compact else CARD_WIDTH, -1)
+            gauge.set_visible(message.get("kind") != "status" and not compact)
+            for label in sections:
+                label.set_visible(not compact)
+            footer.set_visible(not compact)
+            hint.set_visible(compact)
             for key, section in overview.items():
                 flow, grid = rows[key]
                 set_pills(flow, section["pills"])
-                flow.set_visible(bool(section["pills"]))
+                flow.set_visible(bool(section["pills"]) and not compact)
                 set_values(grid, section["values"])
+                grid.set_visible(bool(section["values"]) and not compact)
 
         def poll():
             changed = False
@@ -396,7 +410,7 @@ def serve():
                 message = dict(state["message"])
                 position = message.get("position")
                 snapshot = camera_snapshot()
-                if message.get("kind") == "status":
+                if message.get("kind") == "status" or message.get("compact"):
                     pass
                 elif message.get("kind") == "exposure":
                     exposure = snapshot.get("exposure") or {}

@@ -140,6 +140,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "smithay-client-toolkit",
  "softbuffer",
  "tch",
  "wayland-client",
